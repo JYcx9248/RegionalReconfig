@@ -1,4 +1,4 @@
-# rtier — regional-tier reconfiguration prototype
+# regional-tier reconfiguration prototype
 
 Skeleton for non-disruptive reconfiguration of the regional tier of a distributed,
 FusionANNS-style vector search system. A Go control plane (reusing Koala's structure) drives
@@ -179,8 +179,3 @@ node would need for the whole dataset. Pick the number from a first run: each no
 `pq.codes_resident` in `metrics.jsonl`, and with the range-assignment placeholder a node holds
 far more than its share of the codes (boundary vectors are replicated into up to 8 lists), so a
 budget much below ~90% of all codes will fail the staging on purpose.
-
-## Provenance
-
-See `NOTICE`. Koala-derived code is marked in package comments; the engine is the FusionANNS
-reimplementation from the paper (FAST '25), with rtier additions listed in `engine/README.md`.
