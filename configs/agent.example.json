@@ -1,0 +1,17 @@
+{
+  "name": "n1",
+  "controller": "127.0.0.1:7100",
+  "query_listen": "127.0.0.1:0",
+  "bulk_listen": "127.0.0.1:0",
+  "advertise_host": "",
+  "node_addr": "127.0.0.1:7200",
+  "node_conns": 8,
+  "work_dir": "/tmp/rtier-run/n1",
+  "partitions_dir": "/tmp/rtier-run/partitions",
+  "strategy": "two-phase",
+  "selector": "owner",
+  "transfer_rate_bytes_per_sec": 200000000,
+  "transfer_adapter": "fixed",
+  "chunk_bytes": 1048576,
+  "metrics_interval": "1s"
+}

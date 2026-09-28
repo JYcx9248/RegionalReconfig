@@ -1,0 +1,7 @@
+/bin/
+/engine/build*/
+*.part
+*.tmp
+metrics.jsonl
+results/
+__pycache__/

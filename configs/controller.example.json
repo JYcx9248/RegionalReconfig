@@ -1,0 +1,18 @@
+{
+  "listen": "127.0.0.1:7100",
+  "api_listen": "127.0.0.1:7101",
+  "index_dir": "/tmp/rtier-run/index",
+  "partitions_dir": "/tmp/rtier-run/partitions",
+  "initial_nodes": 2,
+  "initial_entries": 0,
+  "new_node_roles": ["aggregator", "data", "entry"],
+  "placement": "even",
+  "protocol": "lazy",
+  "epoch_store": "memory",
+  "metrics_path": "metrics.jsonl",
+  "call_timeout": "10s",
+  "stage_timeout": "30m",
+  "graph_priority": "background",
+  "raw_priority": "background",
+  "entry_flip_interval": "1s"
+}

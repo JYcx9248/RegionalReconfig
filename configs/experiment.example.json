@@ -1,0 +1,52 @@
+{
+  "WorkDir": "/tmp/rtier-run",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "data/bigann-10M.u8bin",
+  "Queries": "data/bigann-query.u8bin",
+  "GroundTruth": "data/bigann-10M-gt100.ibin",
+  "BuildArgs": [
+    "--pq-m",
+    "32"
+  ],
+  "Assignment": "data/assign.bin",
+  "Nodes": 3,
+  "InitialNodes": 2,
+  "Backend": "cpu",
+  "NodeArgs": [
+    "--workers",
+    "4",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Protocol": "lazy",
+  "Placement": "even",
+  "Strategy": "two-phase",
+  "TransferRateBytesPerSec": 200000000,
+  "MetricsInterval": "1s",
+  "Load": {
+    "Rate": 200,
+    "DurationSeconds": 60,
+    "K": 10,
+    "NProbe": 64,
+    "N": 200,
+    "Arrivals": "poisson"
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 20,
+      "DataNodes": 3
+    },
+    {
+      "TriggerTimeSeconds": 40,
+      "DataNodes": 2
+    }
+  ],
+  "Emulation": {
+    "Netns": false,
+    "Delay": "100us",
+    "Rate": "10gbit"
+  }
+}

@@ -1,0 +1,27 @@
+rtier includes or adapts code from the following projects.
+
+Koala (CASP-Systems-BU/koala), Apache License 2.0
+  Adapted (restructured, dataflow parts removed, log.Fatalf replaced by errors):
+    internal/placement   <- internal/keyby/partitionTable.go, internal/keyby/partition/
+                            partitionPolicy.go, evenPartitionPolicy.go,
+                            coordinator/apiServiceUtil.go (GenerateMigrationPlan),
+                            coordinator BucketOwnerHistory
+    internal/controller  <- coordinator/coordinator.go, workerManager.go, managedWorker.go,
+                            controlService.go, apiService.go (Rescale, rescaleLazy steps)
+    internal/agent       <- worker/worker.go, worker/controlPlane.go
+    internal/ctrl        <- the coordinator/worker control-stream pattern (rpc.proto)
+    internal/frame       <- worker/stateCommUtil/stateCommTcpUtil.go framing
+    internal/transfer    <- worker/stateCommUtil/stateCommRpcUtil.go (StateChunkSender)
+    internal/metrics     <- metric/metric.go, coordinator/metricCollectorService.go
+    scripts/run_local.py <- scripts/runExperiment.py
+    internal/syncflag    <- internal/syncflag/syncflag.go (Signal/Reset reworked for WaitContext)
+  A copy of the Apache License 2.0 is in LICENSES/Apache-2.0.txt.
+
+hnswlib v0.8.0 (nmslib/hnswlib), Apache License 2.0
+  engine/third_party/hnswlib, unmodified.
+
+FusionANNS
+  engine/ is a reimplementation written from the paper (Tian et al., FAST '25); the authors
+  have not released code.
+
+The license of rtier itself has not been chosen yet.
