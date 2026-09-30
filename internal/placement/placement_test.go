@@ -245,3 +245,57 @@ func TestReversibleRestoresPlacement(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// BlockPolicy hands each new node a donor's tail whole: 2 -> 4 on 64 partitions gives
+// quarters, where round-robin gives each new node two eighths from different donors. Where a
+// new node needs every donor's excess (2 -> 3) both policies agree, and a scale-in still
+// returns partitions home.
+func TestBlocksHandOutWholeTails(t *testing.T) {
+	two := []NodeID{1, 2}
+	four := []NodeID{1, 2, 3, 4}
+	start, err := BlockPolicy{}.Initial(64, two)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := BlockPolicy{}.Repartition(start, four, NewHistory(start))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, o := range next.Owners {
+		if want := []NodeID{1, 3, 2, 4}[p/16]; o != want {
+			t.Fatalf("2 -> 4: partition %d on node %d, want %d (whole quarters)", p, o, want)
+		}
+	}
+	rr, _, err := ReversiblePolicy{}.Repartition(start, four, NewHistory(start))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr.Owners[16] != 4 || rr.Owners[31] != 3 {
+		t.Fatalf("round-robin 2 -> 4 changed: partition 16 on %d, 31 on %d", rr.Owners[16], rr.Owners[31])
+	}
+	three := []NodeID{1, 2, 3}
+	b3, _, err := BlockPolicy{}.Repartition(start, three, NewHistory(start))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r3, _, err := ReversiblePolicy{}.Repartition(start, three, NewHistory(start))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p := range b3.Owners {
+		if b3.Owners[p] != r3.Owners[p] {
+			t.Fatalf("2 -> 3: partition %d on %d with blocks, %d round-robin", p, b3.Owners[p], r3.Owners[p])
+		}
+	}
+	h := NewHistory(start)
+	h.Record(next)
+	back, _, err := BlockPolicy{}.Repartition(next, two, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p := range back.Owners {
+		if back.Owners[p] != start.Owners[p] {
+			t.Fatalf("4 -> 2: partition %d on %d, started on %d", p, back.Owners[p], start.Owners[p])
+		}
+	}
+}

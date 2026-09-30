@@ -55,7 +55,7 @@ func (EvenPolicy) Initial(numPartitions int, nodes []NodeID) (Table, error) {
 }
 
 func (EvenPolicy) Repartition(old Table, nodes []NodeID, _ Past) (Table, Changes, error) {
-	return repartitionEven(old, nodes, nil)
+	return repartitionEven(old, nodes, nil, false)
 }
 
 // ReversiblePolicy is EvenPolicy with one rule added: on scale-in a partition goes back to a
@@ -78,11 +78,31 @@ func (ReversiblePolicy) Initial(numPartitions int, nodes []NodeID) (Table, error
 }
 
 func (ReversiblePolicy) Repartition(old Table, nodes []NodeID, past Past) (Table, Changes, error) {
-	return repartitionEven(old, nodes, past)
+	return repartitionEven(old, nodes, past, false)
 }
 
-// repartitionEven is Koala's even repartitioning; past != nil adds the scale-in rule above.
-func repartitionEven(old Table, nodes []NodeID, past Past) (Table, Changes, error) {
+// BlockPolicy is even-reversible except that a new node takes its partitions from one donor
+// at a time -- the donor's tail, as a block -- instead of one from each donor per pass. With
+// the spatial numbering of scripts/testing/make_spatial_assignment.py the tail of a donor's
+// run is a region of the space, so a new node gets a region instead of pieces of several, and
+// fewer queries straddle it: 2 -> 4 on 64 partitions hands out quarters, 1.67 owners per
+// query against 1.97 (BIGANN-10M, nprobe 32; cmd/rtier-overhead -owners -rescale). The price
+// is that a new node pulls from fewer sources. An option for experiments, not a decision (U3).
+type BlockPolicy struct{}
+
+func (BlockPolicy) Name() string { return "even-reversible-blocks" }
+
+func (BlockPolicy) Initial(numPartitions int, nodes []NodeID) (Table, error) {
+	return EvenPolicy{}.Initial(numPartitions, nodes)
+}
+
+func (BlockPolicy) Repartition(old Table, nodes []NodeID, past Past) (Table, Changes, error) {
+	return repartitionEven(old, nodes, past, true)
+}
+
+// repartitionEven is Koala's even repartitioning; past != nil adds the scale-in rule above,
+// and blocks makes a new node drain one donor's excess before taking from the next.
+func repartitionEven(old Table, nodes []NodeID, past Past, blocks bool) (Table, Changes, error) {
 	P := old.NumPartitions()
 	if err := checkNodes(P, nodes); err != nil {
 		return Table{}, nil, err
@@ -157,12 +177,15 @@ func repartitionEven(old Table, nodes []NodeID, past Past) (Table, Changes, erro
 				return Table{}, nil, fmt.Errorf("placement: cannot give node %d %d partitions "+
 					"(%d available)", n, need, total)
 			}
-			for need > 0 { // one partition per donor per pass (round-robin)
+			for need > 0 { // one partition per donor per pass (round-robin), or blocks
 				d := existing[di]
-				di = (di + 1) % len(existing)
 				l := donate[d]
 				if len(l) == 0 {
+					di = (di + 1) % len(existing)
 					continue
+				}
+				if !blocks {
+					di = (di + 1) % len(existing)
 				}
 				p := l[len(l)-1]
 				donate[d] = l[:len(l)-1]
@@ -261,6 +284,8 @@ func NewPolicy(name string) (Policy, error) {
 		return ReversiblePolicy{}, nil
 	case "even": // Koala's policy unchanged, kept as the baseline to compare against
 		return EvenPolicy{}, nil
+	case "even-reversible-blocks":
+		return BlockPolicy{}, nil
 	case "weighted":
 		return WeightedPolicy{}, nil
 	}

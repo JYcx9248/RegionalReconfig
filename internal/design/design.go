@@ -95,11 +95,13 @@ var Open = map[string]Question{
 			"depends on which partitions it holds together (boundary replication), and staging " +
 			"must fit each node's budget (--pq-capacity); whether a scale-out should pair each " +
 			"new node with one donor (contiguous block, single source) or take from all donors " +
-			"round-robin (Koala's rule, more source parallelism); rebalance without changing the " +
+			"round-robin (Koala's rule, more source parallelism) -- \"even-reversible-blocks\" does the " +
+			"first, for experiments: 2 -> 4 on 64 spatial partitions gives 1.67 owners per query " +
+			"against 1.97 (BIGANN-10M, nprobe 32); rebalance without changing the " +
 			"node count; which nodes leave on scale-in (now: highest IDs) and which idle nodes " +
 			"join (now: lowest IDs) -- the cache invariant in U1 needs the node that left to be " +
 			"the one that comes back, so the join rule is part of that decision",
-		"internal/placement/policy.go (EvenPolicy, ReversiblePolicy), internal/placement/weighted.go, " +
+		"internal/placement/policy.go (EvenPolicy, ReversiblePolicy, BlockPolicy), internal/placement/weighted.go, " +
 			"internal/controller/reconfig.go (rescale)"},
 	"U5": {"U5", "Global top-n under fixed-n re-ranking",
 		"two-phase is implemented (every owner filters for its own top-n, the aggregator merges " +
