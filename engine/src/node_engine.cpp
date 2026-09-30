@@ -432,6 +432,34 @@ class NodeEngineImpl : public NodeEngine {
     return st;
   }
 
+  FetchStats fetch_stats() const override {
+    FetchStats f;
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      f.cached = cache_.size();
+      f.queued = queued_;
+      f.queued_peak = queued_peak_;
+      f.write_batches = written_batches_;
+    }
+    f.present = raw_->Stats().present;
+    auto get = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+    f.fetched = get(fc_.fetched);
+    f.fetch_calls = get(fc_.fetch_calls);
+    f.fetch_us = get(fc_.fetch_us);
+    f.written = get(fc_.written);
+    f.write_us = get(fc_.write_us);
+    f.sync_installed = get(fc_.sync_installed);
+    f.sync_us = get(fc_.sync_us);
+    f.drain_calls = get(fc_.drain_calls);
+    f.drain_waiting = get(fc_.drain_waiting);
+    f.drain_us = get(fc_.drain_us);
+    f.rerank_disk = get(fc_.rerank_disk);
+    f.rerank_mem = get(fc_.rerank_mem);
+    f.pending_recounts = get(fc_.pending_recounts);
+    f.pending_us = get(fc_.pending_us);
+    return f;
+  }
+
   void SetRawFetcher(RawFetcher fetcher) override {
     std::lock_guard<std::mutex> l(raw_mu_);
     fetcher_ = std::move(fetcher);
@@ -515,6 +543,8 @@ class NodeEngineImpl : public NodeEngine {
       }
     }
     const uint32_t nd = static_cast<uint32_t>(w.disk_ids.size());
+    fc_.rerank_disk.fetch_add(nd, std::memory_order_relaxed);
+    fc_.rerank_mem.fetch_add(w.mem_ids.size(), std::memory_order_relaxed);
     const uint32_t cnt = nd == 0 ? 0 : HeuristicRerank<T>(q, dim_, w.disk_ids.data(), w.disk_locs.data(), nd,
                                                           raw_->layout(), w.reader.get(), w.scratch.get(), rp,
                                                           out_ids, out_dists, st);
@@ -824,6 +854,15 @@ class NodeEngineImpl : public NodeEngine {
     }
     size_t fetched = 0;
     std::vector<uint8_t> buf;
+    Timer t;
+    struct Count {  // also when a fetch throws
+      FetchCounters& fc;
+      Timer& t;
+      ~Count() {
+        fc.fetch_calls.fetch_add(1, std::memory_order_relaxed);
+        fc.fetch_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
+      }
+    } count{fc_, t};
     for (size_t src = 0; src < locs_by.size(); ++src) {
       const std::vector<uint32_t>& ls = locs_by[src];
       if (ls.empty()) continue;
@@ -865,17 +904,23 @@ class NodeEngineImpl : public NodeEngine {
         }
         if (!fresh.empty()) {
           queued_ += fresh.size();
+          queued_peak_ = std::max(queued_peak_, queued_);
           ++queued_batches_;
           write_queue_.push_back(fresh);
         }
       }
     }
     if (full) {
+      Timer t;
       const size_t installed = raw_->Put(locs, n, vecs, RawOrigin::kFetched);
       raw_version_.fetch_add(1);
+      fc_.sync_installed.fetch_add(installed, std::memory_order_relaxed);
+      fc_.sync_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
+      fc_.fetched.fetch_add(installed, std::memory_order_relaxed);
       return installed;
     }
     if (!fresh.empty()) cache_cv_.notify_all();
+    fc_.fetched.fetch_add(fresh.size(), std::memory_order_relaxed);
     return fresh.size();
   }
 
@@ -893,7 +938,10 @@ class NodeEngineImpl : public NodeEngine {
       l.unlock();
       bool ok = true;
       try {
-        raw_->Put(batch.data(), batch.size(), vecs.data(), RawOrigin::kFetched);
+        Timer t;
+        const size_t installed = raw_->Put(batch.data(), batch.size(), vecs.data(), RawOrigin::kFetched);
+        fc_.written.fetch_add(installed, std::memory_order_relaxed);
+        fc_.write_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
       } catch (const std::exception& e) {
         ok = false;  // they stay in the cache, still served from memory
         Log("raw-vector writer: %s", e.what());
@@ -912,9 +960,16 @@ class NodeEngineImpl : public NodeEngine {
   // queries keep fetching during a warm-up, and INFO (which the controller and the metrics
   // call) must not wait for the warm-up to end.
   void DrainWrites() const {
-    std::unique_lock<std::mutex> l(cache_mu_);
-    const uint64_t mine = queued_batches_;
-    cache_cv_.wait(l, [&] { return written_batches_ >= mine; });
+    Timer t;
+    fc_.drain_calls.fetch_add(1, std::memory_order_relaxed);
+    fc_.drain_waiting.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::unique_lock<std::mutex> l(cache_mu_);
+      const uint64_t mine = queued_batches_;
+      cache_cv_.wait(l, [&] { return written_batches_ >= mine; });
+    }
+    fc_.drain_waiting.fetch_sub(1, std::memory_order_relaxed);
+    fc_.drain_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
   }
 
   // Distinct locations named by resident partitions whose vector is not here: recounted only
@@ -924,6 +979,7 @@ class NodeEngineImpl : public NodeEngine {
     const uint64_t v = raw_version_.load();
     std::lock_guard<std::mutex> l(pending_mu_);
     if (v == pending_version_) return pending_count_;
+    Timer t;
     std::vector<std::shared_ptr<const ResidentSegment>> segs;
     {
       std::lock_guard<std::mutex> sl(seg_mu_);
@@ -943,6 +999,8 @@ class NodeEngineImpl : public NodeEngine {
       }
     pending_version_ = v;
     pending_count_ = count;
+    fc_.pending_recounts.fetch_add(1, std::memory_order_relaxed);
+    fc_.pending_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
     return count;
   }
 
@@ -1047,7 +1105,14 @@ class NodeEngineImpl : public NodeEngine {
   std::unordered_map<uint32_t, std::vector<uint8_t>> cache_;
   std::deque<std::vector<uint32_t>> write_queue_;  // batches of cached locations to install
   size_t queued_ = 0;                              // locations in write_queue_
+  size_t queued_peak_ = 0;
   uint64_t queued_batches_ = 0, written_batches_ = 0;  // tickets: DrainWrites waits for its own
+  struct FetchCounters {  // fetch_stats
+    std::atomic<uint64_t> fetched{0}, fetch_calls{0}, fetch_us{0}, written{0}, write_us{0},
+        sync_installed{0}, sync_us{0}, drain_calls{0}, drain_waiting{0}, drain_us{0},
+        rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0};
+  };
+  mutable FetchCounters fc_;
   bool stop_writer_ = false;
   std::thread writer_;
   mutable std::mutex pending_mu_;

@@ -96,6 +96,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   of every vector so a source that lacks one fetches it from its own source (chains)
   (`EnsureRawInLists`, `FetchRaw`, `PeerPool`). What no query needs stays with the old owner,
   which keeps every vector it has held. Only bootstrap reads the index's page file.
+- **Diagnosing a run**: `stats-<node>.jsonl` (per-node counters, `rtier_node --stats-file`) and,
+  with `"NodeResources"`, `cgroups.jsonl` (CPU, disk, dirty pages, pressure), both on the
+  monotonic clock of `clock.json`.
 
 ## Docs
 

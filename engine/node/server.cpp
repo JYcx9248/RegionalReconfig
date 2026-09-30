@@ -364,11 +364,13 @@ void NodeServer::ServeConnection(int fd) {
   ::close(fd);
 }
 
-int NodeServer::AcquireWorker() {
+int NodeServer::AcquireWorker(OpStats* st) {
+  fusion::Timer t;
   std::unique_lock<std::mutex> l(pool_mu_);
   pool_cv_.wait(l, [&] { return !free_workers_.empty(); });
   const int w = free_workers_.back();
   free_workers_.pop_back();
+  st->wait_us += static_cast<uint64_t>(t.Us());
   return w;
 }
 
@@ -546,7 +548,7 @@ Frame NodeServer::Handle(const Frame& req) {
         std::vector<uint32_t> ids(topn);
         std::vector<float> dists(topn);
         fusion::FilterStats fs;
-        worker = AcquireWorker();
+        worker = AcquireWorker(&st);
         const uint32_t n =
             e.Filter(worker, q.data(), lists.data(), nlists, topn, ids.data(), dists.data(), &fs);
         w.Put(n);
@@ -569,7 +571,7 @@ Frame NodeServer::Handle(const Frame& req) {
         std::vector<uint32_t> out_ids(k);
         std::vector<float> out_d(k);
         fusion::RerankStats rs;
-        worker = AcquireWorker();
+        worker = AcquireWorker(&st);
         const uint32_t cnt = e.Rerank(worker, q.data(), ids.data(), n, k, lists.data(), nlists,
                                       out_ids.data(), out_d.data(), &rs);
         w.Put(cnt);
@@ -594,7 +596,7 @@ Frame NodeServer::Handle(const Frame& req) {
         std::vector<uint32_t> ids(sp.k);
         std::vector<float> dists(sp.k);
         fusion::QueryStats qs;
-        worker = AcquireWorker();
+        worker = AcquireWorker(&st);
         const uint32_t n = e.SearchLocal(worker, q.data(), sp, ids.data(), dists.data(), &qs);
         w.Put(n);
         w.PutBytes(ids.data(), n * 4);
@@ -662,20 +664,44 @@ std::string NodeServer::InfoJson() const {
       "\"skipped\":%llu,\"served\":%llu}",
       raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.pending), u(raw.from_index),
       u(raw.streamed), u(raw.fetched), u(raw.fetches), u(raw.skipped), u(raw.served));
-  s += ",\"ops\":{";
+  s += ",\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
+  return s;
+}
+
+std::string NodeServer::OpsJson() const {
+  std::string s = "{";
   bool first = true;
   for (int op = 0; op < 256; ++op) {
     const char* name = OpName(static_cast<uint8_t>(op));
     if (!name) continue;
-    s += fusion::StrFormat("%s\"%s\":{\"count\":%llu,\"errors\":%llu,\"busy_us\":%llu}",
+    s += fusion::StrFormat("%s\"%s\":{\"count\":%llu,\"errors\":%llu,\"busy_us\":%llu,\"wait_us\":%llu}",
                            first ? "" : ",", name,
                            static_cast<unsigned long long>(stats_[op].count.load()),
                            static_cast<unsigned long long>(stats_[op].errors.load()),
-                           static_cast<unsigned long long>(stats_[op].busy_us.load()));
+                           static_cast<unsigned long long>(stats_[op].busy_us.load()),
+                           static_cast<unsigned long long>(stats_[op].wait_us.load()));
     first = false;
   }
-  s += "}}";
-  return s;
+  return s + "}";
+}
+
+std::string NodeServer::FetchJson() const {
+  const fusion::FetchStats f = engine_->fetch_stats();
+  auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+  return fusion::StrFormat(
+      "{\"present\":%llu,\"cached\":%llu,\"queued\":%llu,\"queued_peak\":%llu,\"fetched\":%llu,"
+      "\"fetch_calls\":%llu,\"fetch_us\":%llu,\"written\":%llu,\"write_batches\":%llu,"
+      "\"write_us\":%llu,\"sync_installed\":%llu,\"sync_us\":%llu,\"drain_calls\":%llu,"
+      "\"drain_waiting\":%llu,\"drain_us\":%llu,\"rerank_disk\":%llu,\"rerank_mem\":%llu,"
+      "\"pending_recounts\":%llu,\"pending_us\":%llu}",
+      u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
+      u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
+      u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
+      u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us));
+}
+
+std::string NodeServer::StatsJson() const {
+  return "{\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
 }
 
 }  // namespace rtier

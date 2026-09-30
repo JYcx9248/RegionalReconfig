@@ -62,7 +62,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 | `include/fusion/raw_store.h`, `src/raw_store.cpp` | node-level raw vectors: a sparse local copy of the page file at the canonical offsets, one presence bit per location |
 | `include/fusion/layout.h` (`RawLayout`), `src/rerank.cpp` | page geometry and locations; re-ranking by location (the layout-map variant stays for `fusion::Engine`) |
 | `node/wire.h`, `node/server.{h,cpp}` | rtier wire protocol server (same framing as the Go side, `internal/frame`), and `PeerPool`, the connections a data node uses to fetch raw vectors from another (`RAW_GET`) |
-| `tools/rtier_node.cpp` | data-node service; prints `READY tcp=<port>` when listening; `--raw-file` for its raw vectors |
+| `tools/rtier_node.cpp` | data-node service; prints `READY tcp=<port>` when listening; `--raw-file` for its raw vectors; `--stats-file` appends a JSON line of counters every `--stats-ms` (CLOCK_MONOTONIC) |
 | `tools/rtier_segment.cpp` | applies a list -> partition assignment (choosing it is open question U2); writes every posting's location in `--layout` |
 | `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), PQ store, PQ migration between two nodes, raw store, raw-vector migration (on-demand, chained and streamed, on nodes whose index has no page file), wire protocol |
 

@@ -67,16 +67,24 @@ class NodeServer {
   // Handles one request frame (exposed for tests).
   Frame Handle(const Frame& req);
 
+  // One line of the node's stats log (rtier_node --stats-file): per-operation counters and the
+  // fetch path's (fusion::FetchStats), without INFO's raw-vector totals, which wait for the
+  // writer and rescan the resident postings.
+  std::string StatsJson() const;
+
  private:
   struct OpStats {
     std::atomic<uint64_t> count{0}, errors{0}, busy_us{0};
+    std::atomic<uint64_t> wait_us{0};  // of busy_us, waiting for an engine worker
   };
 
   void AcceptLoop(int listen_fd);
   void ServeConnection(int fd);
-  int AcquireWorker();
+  int AcquireWorker(OpStats* st);
   void ReleaseWorker(int w);
   std::string InfoJson() const;
+  std::string OpsJson() const;
+  std::string FetchJson() const;
 
   fusion::NodeEngine* engine_;
   std::atomic<bool> stop_{false};

@@ -9,7 +9,9 @@ reconfigurations -> collect results -> clean up), without Kafka and SSH:
   3. start the controller, then one rtier_node + rtier-agent per node
   4. wait for the initial deployment, start the open-loop load generator
   5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale)
-  6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg
+  6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg; each
+     node's stats log (stats-<node>.jsonl) and, with "NodeResources", cgroups.jsonl, both on
+     the monotonic clock of clock.json
   7. stop everything
 
 Two things a capacity-driven scale-out run needs:
@@ -152,6 +154,84 @@ def isolation(cfg: dict, i: int, work: str, nodes: int) -> list:
     return ["systemd-run", "--quiet", "--scope", "--collect"] + props
 
 
+def data_disk(path: str) -> str:
+    """MAJ:MIN of the disk that holds path, as the cgroup io.stat names it (a partition's
+    I/O is accounted to its disk)."""
+    dev = os.stat(path).st_dev
+    mm = f"{os.major(dev)}:{os.minor(dev)}"
+    if os.path.exists(f"/sys/dev/block/{mm}/partition"):
+        mm = open(f"/sys/dev/block/{mm}/../dev").read().strip()
+    return mm
+
+
+class CgroupSampler:
+    """With "NodeResources", every node runs in its own cgroup: samples each one's CPU time, I/O
+    on the data disk, dirty and writeback page cache and pressure stall times once a second into
+    cgroups.jsonl, stamped with time.monotonic() (clock.json has the load's start on that clock).
+    Counters are cumulative; take differences between samples."""
+
+    def __init__(self, path: str, disk: str):
+        self.out = open(path, "w")
+        self.disk = disk
+        self.nodes = []  # (name, cgroup directory)
+        self.stop_ = threading.Event()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def add(self, name: str, pid: int) -> None:
+        for line in open(f"/proc/{pid}/cgroup"):
+            if line.startswith("0::"):
+                self.nodes.append((name, "/sys/fs/cgroup" + line[3:].strip()))
+
+    @staticmethod
+    def keyed(path: str) -> dict:
+        try:
+            fields = [l.split() for l in open(path)]
+        except OSError:
+            return {}
+        return {f[0]: int(f[1]) for f in fields if len(f) == 2 and f[1].isdigit()}
+
+    def sample(self, name: str, cg: str) -> dict:
+        r = {"t": round(time.monotonic(), 3), "node": name}
+        r["cpu_usec"] = self.keyed(f"{cg}/cpu.stat").get("usage_usec", 0)
+        io = {}
+        try:
+            for l in open(f"{cg}/io.stat"):
+                f = l.split()
+                if f and f[0] == self.disk:
+                    io = {k: int(v) for k, v in (x.split("=") for x in f[1:])}
+        except OSError:
+            pass
+        r["io"] = {k: io.get(k, 0) for k in ("rbytes", "wbytes", "rios", "wios")}
+        mem = self.keyed(f"{cg}/memory.stat")
+        r["mem"] = {k: mem.get(k, 0) for k in ("anon", "file", "file_dirty", "file_writeback")}
+        psi = {}
+        for res in ("cpu", "io", "memory"):
+            try:
+                for l in open(f"{cg}/{res}.pressure"):
+                    kind, *kv = l.split()
+                    psi[f"{res}_{kind}_us"] = int(dict(x.split("=") for x in kv)["total"])
+            except (OSError, KeyError):
+                pass
+        r["psi"] = psi
+        return r
+
+    def loop(self) -> None:
+        while not self.stop_.wait(1.0 - time.monotonic() % 1.0):
+            for name, cg in self.nodes:
+                self.out.write(json.dumps(self.sample(name, cg)) + "\n")
+            self.out.flush()
+
+    def start(self) -> None:
+        if self.nodes:
+            self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_.set()
+        if self.thread.is_alive():
+            self.thread.join()
+        self.out.close()
+
+
 def rest_cpus(cfg: dict, nodes: int) -> list:
     """The prefix that keeps the controller and the load generator off the nodes' CPUs."""
     res = cfg.get("NodeResources") or {}
@@ -196,6 +276,8 @@ def main(cfg_path: str, out_dir: str) -> None:
 
     procs = Procs(out_dir)
     results = []
+    sampler = CgroupSampler(os.path.join(out_dir, "cgroups.jsonl"), data_disk(work)) \
+        if cfg.get("NodeResources") else None
     try:
         if netns:
             env = dict(os.environ, DELAY=emu.get("Delay", "100us"), RATE=emu.get("Rate", "10gbit"))
@@ -226,8 +308,11 @@ def main(cfg_path: str, out_dir: str) -> None:
             os.makedirs(os.path.join(work, name), exist_ok=True)
             ready = procs.start(f"node-{name}", [f"{ebin}/rtier_node", "--index", index, "--partitions", parts,
                                                  "--listen", f"{host}:0", "--backend", cfg.get("Backend", "cpu"),
-                                                 "--raw-file", os.path.join(work, name, "raw.pages")]
+                                                 "--raw-file", os.path.join(work, name, "raw.pages"),
+                                                 "--stats-file", os.path.join(out_dir, f"stats-{name}.jsonl")]
                                 + cfg.get("NodeArgs", []), prefix=prefix, wait_line="READY tcp=")
+            if sampler:
+                sampler.add(name, procs.procs[-1][1].pid)
             node_addr = f"{host}:{ready.split('=')[1]}"
             agent_cfg = os.path.join(work, f"agent-{name}.json")
             json.dump({
@@ -239,6 +324,9 @@ def main(cfg_path: str, out_dir: str) -> None:
                 "metrics_interval": cfg.get("MetricsInterval", "1s"),
             }, open(agent_cfg, "w"), indent=2)
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
+
+        if sampler:
+            sampler.start()
 
         # 4. initial deployment, then load
         api = Controller(api_addr)
@@ -298,6 +386,7 @@ def main(cfg_path: str, out_dir: str) -> None:
         # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
         # seconds), and the load generator's times are monotonic too.
         t0 = time.monotonic()
+        json.dump({"load_start": round(t0, 3)}, open(os.path.join(out_dir, "clock.json"), "w"))
         for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
             while time.monotonic() - t0 < rc["TriggerTimeSeconds"]:
                 procs.check()
@@ -315,6 +404,8 @@ def main(cfg_path: str, out_dir: str) -> None:
     finally:
         # 7. clean up, then 6. results
         procs.stop()
+        if sampler:
+            sampler.stop()
         if netns:
             subprocess.run([netns_sh, "down", str(nodes)])
         m = os.path.join(out_dir, "metrics.jsonl")

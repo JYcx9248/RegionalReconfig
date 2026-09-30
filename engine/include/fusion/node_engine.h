@@ -111,6 +111,31 @@ struct FilterStats {
   uint32_t unique = 0;    // distinct IDs scored with PQ
 };
 
+// The on-demand fetch path (U9) as the node's stats log samples it: read without waiting for
+// the writer, so that a sample shows what queries and the writer are doing while it runs.
+// Cumulative, except the ones marked "now".
+struct FetchStats {
+  uint64_t present = 0;          // now: raw vectors on the SSD
+  uint64_t cached = 0;           // now: fetched, not on the SSD yet (served from memory)
+  uint64_t queued = 0;           // now: of those, waiting for the writer
+  uint64_t queued_peak = 0;
+  uint64_t fetched = 0;          // new vectors fetched from peers
+  uint64_t fetch_calls = 0;      // fetches that asked a peer (RERANK, SEARCH_LOCAL, RAW_GET chains)
+  uint64_t fetch_us = 0;         // time those callers waited for them, backpressure included
+  uint64_t written = 0;          // installed on the SSD by the writer
+  uint64_t write_batches = 0;
+  uint64_t write_us = 0;         // writer time in RawStore::Put
+  uint64_t sync_installed = 0;   // installed by the fetching caller itself (queue full)
+  uint64_t sync_us = 0;
+  uint64_t drain_calls = 0;      // DrainWrites calls
+  uint64_t drain_waiting = 0;    // now: callers in DrainWrites
+  uint64_t drain_us = 0;
+  uint64_t rerank_disk = 0;      // RERANK candidates read from the SSD
+  uint64_t rerank_mem = 0;       // RERANK candidates re-ranked from memory
+  uint64_t pending_recounts = 0; // scans of the resident postings for the pending count
+  uint64_t pending_us = 0;
+};
+
 class NodeEngine {
  public:
   static std::unique_ptr<NodeEngine> Open(const NodeOptions& opts);
@@ -165,6 +190,7 @@ class NodeEngine {
   // Installs vectors streamed from a peer.
   virtual RawPutResult RawPut(const uint32_t* locs, size_t n, const uint8_t* vecs) = 0;
   virtual RawStats raw_stats() const = 0;
+  virtual FetchStats fetch_stats() const = 0;
   // How the node fetches raw vectors on demand (without one it cannot).
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;
 

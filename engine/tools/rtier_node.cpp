@@ -3,7 +3,11 @@
 // Prints "READY tcp=<port>" on stdout once it accepts connections (the Go agent and the tests
 // wait for that line). SIGINT/SIGTERM stop it.
 #include <signal.h>
+#include <time.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <thread>
 
@@ -36,6 +40,9 @@ static void Usage() {
   --io-depth D           (default 64)
   --no-direct            buffered instead of O_DIRECT reads
   --gpu G                GPU device (default 0)
+  --stats-file PATH      append a stats line (JSON) every --stats-ms: per-operation counters and
+                         the on-demand fetch path's, stamped with CLOCK_MONOTONIC seconds ("t")
+  --stats-ms MS          (default 1000)
 )");
 }
 
@@ -67,6 +74,8 @@ int main(int argc, char** argv) {
     const std::string unix_path = a.Str("unix", "");
     const std::string graph = a.Str("graph", "");
     const std::string load = a.Str("load", "");
+    const std::string stats_file = a.Str("stats-file", "");
+    const uint64_t stats_ms = std::max<uint64_t>(a.U64("stats-ms", 1000), 10);
     a.WarnUnused(flags);
 
     // Block the stop signals in every thread; one thread waits for them.
@@ -106,6 +115,36 @@ int main(int argc, char** argv) {
       server.Stop();
     });
     stopper.detach();
+
+    // The stats log: CLOCK_MONOTONIC is the clock of the experiment scripts (Python's
+    // time.monotonic), so samples line up with the load without trusting the wall clock.
+    std::atomic<bool> serving{true};
+    std::thread stats;
+    struct JoinStats {  // also when Serve throws
+      std::atomic<bool>& serving;
+      std::thread& t;
+      ~JoinStats() {
+        serving = false;
+        if (t.joinable()) t.join();
+      }
+    } join_stats{serving, stats};
+    if (!stats_file.empty()) {
+      FILE* f = std::fopen(stats_file.c_str(), "a");
+      FUSION_CHECK(f != nullptr, "cannot open %s", stats_file.c_str());
+      stats = std::thread([&server, &serving, f, stats_ms] {
+        auto next = std::chrono::steady_clock::now();
+        while (serving.load()) {
+          timespec ts;
+          clock_gettime(CLOCK_MONOTONIC, &ts);
+          std::fprintf(f, "{\"t\":%.3f,%s\n", ts.tv_sec + ts.tv_nsec / 1e9, server.StatsJson().c_str() + 1);
+          std::fflush(f);
+          next += std::chrono::milliseconds(stats_ms);
+          while (serving.load() && std::chrono::steady_clock::now() < next)
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min<uint64_t>(stats_ms, 50)));
+        }
+        std::fclose(f);
+      });
+    }
 
     std::printf("READY tcp=%d\n", port);
     std::fflush(stdout);
