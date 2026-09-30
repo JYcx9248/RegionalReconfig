@@ -183,7 +183,7 @@ func checkResidency(t *testing.T, cl *cluster) {
 	cl.observe()
 	st := cl.ctl.Status()
 	for _, ns := range st.Nodes {
-		info, err := nodeclient.New(ns.Info.NodeAddr, 1).Info(context.Background())
+		info, err := nodeclient.New(ns.Info.NodeAddr, 1).InfoSettled(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -246,7 +246,7 @@ func rawStats(t *testing.T, cl *cluster) map[placement.NodeID]nodeclient.RawStat
 	t.Helper()
 	out := map[placement.NodeID]nodeclient.RawStats{}
 	for _, ns := range cl.ctl.Status().Nodes {
-		info, err := nodeclient.New(ns.Info.NodeAddr, 1).Info(cl.ctx)
+		info, err := nodeclient.New(ns.Info.NodeAddr, 1).InfoSettled(cl.ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +313,7 @@ func rescale(t *testing.T, cl *cluster, dataNodes int) *protocol.RescaleReply {
 	// went online before its codes had arrived.
 	tbl := cl.ctl.Status().Table
 	for _, id := range tbl.Placement.Nodes() {
-		info, err := nodeclient.New(tbl.Nodes[id].NodeAddr, 1).Info(cl.ctx)
+		info, err := nodeclient.New(tbl.Nodes[id].NodeAddr, 1).InfoSettled(cl.ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -350,7 +350,7 @@ func TestReconfigUnderLoad(t *testing.T) {
 			}
 			// The new node got every PQ code and raw vector over the network from the old owners,
 			// once (it has no page file to read them from).
-			newInfo, err := nodeclient.New(cl.ctl.Status().Table.Nodes[out.Added[0]].NodeAddr, 1).Info(cl.ctx)
+			newInfo, err := nodeclient.New(cl.ctl.Status().Table.Nodes[out.Added[0]].NodeAddr, 1).InfoSettled(cl.ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -447,7 +447,7 @@ func TestScaleOutFromOneNode(t *testing.T) {
 	if !tbl.IsEntry(added) {
 		t.Error("new node did not become an entry")
 	}
-	info, err := nodeclient.New(tbl.Nodes[added].NodeAddr, 1).Info(cl.ctx)
+	info, err := nodeclient.New(tbl.Nodes[added].NodeAddr, 1).InfoSettled(cl.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +656,7 @@ func TestStagingFailsCleanly(t *testing.T) {
 		t.Fatalf("epoch moved from %d to %d after a failed staging", before, e)
 	}
 	checkResidency(t, cl) // the small node is idle: no partitions, no PQ codes
-	info, err := nodeclient.New(small.Info().NodeAddr, 1).Info(cl.ctx)
+	info, err := nodeclient.New(small.Info().NodeAddr, 1).InfoSettled(cl.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +716,7 @@ func TestRawVectorsFetchedOnDemand(t *testing.T) {
 		return nil
 	}})
 	info := func(a *agent.Agent) *nodeclient.Info {
-		in, err := nodeclient.New(a.Info().NodeAddr, 1).Info(cl.ctx)
+		in, err := nodeclient.New(a.Info().NodeAddr, 1).InfoSettled(cl.ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -785,7 +785,7 @@ func TestLazyMovesOnlyWhatQueriesNeed(t *testing.T) {
 	second := cl.addNode("n2", query.TwoPhase{})
 	third := cl.addNode("n3", query.TwoPhase{})
 	raw := func(a *agent.Agent) nodeclient.RawStats {
-		in, err := nodeclient.New(a.Info().NodeAddr, 1).Info(cl.ctx)
+		in, err := nodeclient.New(a.Info().NodeAddr, 1).InfoSettled(cl.ctx)
 		if err != nil {
 			t.Fatal(err)
 		}

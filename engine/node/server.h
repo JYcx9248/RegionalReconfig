@@ -82,7 +82,7 @@ class NodeServer {
   void ServeConnection(int fd);
   int AcquireWorker(OpStats* st);
   void ReleaseWorker(int w);
-  std::string InfoJson() const;
+  std::string InfoJson(bool settle) const;
   std::string OpsJson() const;
   std::string FetchJson() const;
 

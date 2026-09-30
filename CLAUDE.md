@@ -94,8 +94,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   query first needs it, and only then: each posting list has a source (the old owner of its
   partition), RERANK requests carry the query's lists on that owner, and RAW_GET names the list
   of every vector so a source that lacks one fetches it from its own source (chains)
-  (`EnsureRawInLists`, `FetchRaw`, `PeerPool`). What no query needs stays with the old owner,
-  which keeps every vector it has held. Only bootstrap reads the index's page file.
+  (`EnsureRawInLists`, `FetchRaw`, `PeerPool`). Fetched vectors are re-ranked from memory
+  (fetch cache) until a background writer installs them with whole-page `O_DIRECT` writes
+  (`WriterLoop`, `RawStore::PutPages`); INFO never waits for it (`nodeclient.InfoSettled` does,
+  for tests). What no query needs stays with the old owner, which keeps every vector it has
+  held. Only bootstrap reads the index's page file.
 - **Diagnosing a run**: `stats-<node>.jsonl` (per-node counters, `rtier_node --stats-file`) and,
   with `"NodeResources"`, `cgroups.jsonl` (CPU, disk, dirty pages, pressure), both on the
   monotonic clock of `clock.json`.
@@ -116,7 +119,10 @@ new nodes become entries in batched flips as their graphs load; graph transfer a
 priority from round-robin sources (U16); no global replica of the raw vectors: canonical
 locations in the segments (U1) and lazy fetch after the flip as the default protocol (U9) --
 since 2026-09-28 on demand only, with sources per posting list (the full background stream is
-the `lazy-stream` baseline).
+the `lazy-stream` baseline); since 2026-09-29 fetched vectors are installed by a background
+writer with whole-page direct writes (the old buffered writer held lazy below capacity for
+minutes after the warm-up), INFO never waits for it, and every run writes per-node stats logs
+(reference runs: `results/bigann10m-spatial-scaleout-v2`).
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current

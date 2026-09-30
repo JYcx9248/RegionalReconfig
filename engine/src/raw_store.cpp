@@ -1,6 +1,8 @@
 #include "fusion/raw_store.h"
 
 #include <fcntl.h>
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -11,6 +13,9 @@
 
 namespace fusion {
 namespace {
+
+constexpr uint32_t kChunkPages = 256;  // pages per round of direct I/O (1 MB at 4 KB pages)
+constexpr uint32_t kIoDepth = 16;      // installs are background work: a modest queue depth
 
 void PwriteAll(int fd, const uint8_t* p, size_t n, uint64_t off, const std::string& path) {
   size_t done = 0;
@@ -52,6 +57,84 @@ void ForEachRun(const std::vector<size_t>& order, const uint32_t* locs, const Ra
 
 }  // namespace
 
+// Batched direct page reads and writes on dfd_: Linux AIO, or pread/pwrite if it is not
+// available.
+class RawStore::DirectIo {
+ public:
+  DirectIo(int fd, uint32_t page_size) : fd_(fd), ps_(page_size) {
+    if (syscall(__NR_io_setup, kIoDepth, &ctx_) < 0) ctx_ = 0;  // synchronous fallback
+    iocbs_.resize(kIoDepth);
+    ptrs_.resize(kIoDepth);
+    events_.resize(kIoDepth);
+  }
+  ~DirectIo() {
+    if (ctx_) syscall(__NR_io_destroy, ctx_);
+  }
+
+  // Reads or writes pages[i] from/to bufs[i] (page_size bytes each, page-aligned).
+  void Run(bool write, const uint32_t* pages, uint8_t* const* bufs, uint32_t count,
+           const std::string& path) {
+    if (!ctx_) {
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t off = static_cast<uint64_t>(pages[i]) * ps_;
+        if (write) {
+          PwriteAll(fd_, bufs[i], ps_, off, path);
+        } else {
+          PreadAll(fd_, bufs[i], ps_, off, path);
+        }
+      }
+      return;
+    }
+    for (uint32_t done = 0; done < count;) {
+      const uint32_t batch = std::min(kIoDepth, count - done);
+      for (uint32_t j = 0; j < batch; ++j) {
+        iocb& cb = iocbs_[j];
+        std::memset(&cb, 0, sizeof(cb));
+        cb.aio_fildes = static_cast<uint32_t>(fd_);
+        cb.aio_lio_opcode = write ? IOCB_CMD_PWRITE : IOCB_CMD_PREAD;
+        cb.aio_buf = reinterpret_cast<uint64_t>(bufs[done + j]);
+        cb.aio_nbytes = ps_;
+        cb.aio_offset = static_cast<int64_t>(pages[done + j]) * ps_;
+        cb.aio_data = done + j;
+        ptrs_[j] = &cb;
+      }
+      for (uint32_t sub = 0; sub < batch;) {
+        const long r = syscall(__NR_io_submit, ctx_, static_cast<long>(batch - sub), ptrs_.data() + sub);
+        if (r < 0) {
+          if (errno == EINTR || errno == EAGAIN) continue;
+          FUSION_CHECK(false, "io_submit on %s: %s", path.c_str(), std::strerror(errno));
+        }
+        sub += static_cast<uint32_t>(r);
+      }
+      for (uint32_t got = 0; got < batch;) {
+        const long r = syscall(__NR_io_getevents, ctx_, static_cast<long>(batch - got),
+                               static_cast<long>(batch - got), events_.data(), nullptr);
+        if (r < 0) {
+          if (errno == EINTR) continue;
+          FUSION_CHECK(false, "io_getevents on %s: %s", path.c_str(), std::strerror(errno));
+        }
+        for (long e = 0; e < r; ++e) {
+          const long long res = static_cast<long long>(events_[e].res);
+          const uint32_t page = pages[static_cast<uint32_t>(events_[e].data)];
+          FUSION_CHECK(res == static_cast<long long>(ps_), "%s of page %u of %s: %s",
+                       write ? "write" : "read", page, path.c_str(),
+                       res < 0 ? std::strerror(static_cast<int>(-res)) : "short transfer");
+        }
+        got += static_cast<uint32_t>(r);
+      }
+      done += batch;
+    }
+  }
+
+ private:
+  int fd_;
+  uint32_t ps_;
+  aio_context_t ctx_ = 0;
+  std::vector<iocb> iocbs_;
+  std::vector<iocb*> ptrs_;
+  std::vector<io_event> events_;
+};
+
 RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct)
     : layout_(layout), path_(path) {
   FUSION_CHECK(layout.vec_bytes > 0 && layout.vectors_per_page >= 1 &&
@@ -85,6 +168,19 @@ RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct
     if (anonymous) ::unlink(path_.c_str());
     throw;
   }
+  if (pages_->direct() && layout.page_size % 4096 == 0) {
+    dfd_ = ::open(path_.c_str(), O_RDWR | O_DIRECT | O_CLOEXEC);  // -1: buffered installs
+    if (dfd_ >= 0) {
+      void* p = nullptr;
+      if (::posix_memalign(&p, 4096, static_cast<size_t>(kChunkPages) * layout.page_size) != 0) {
+        ::close(dfd_);
+        dfd_ = -1;
+      } else {
+        chunk_ = static_cast<uint8_t*>(p);
+        io_ = std::make_unique<DirectIo>(dfd_, layout.page_size);
+      }
+    }
+  }
   if (anonymous) ::unlink(path_.c_str());  // both descriptors keep it alive until we exit
   const uint64_t words = CeilDiv(layout.locations(), 64);
   bits_.reset(new std::atomic<uint64_t>[words]);
@@ -92,6 +188,9 @@ RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct
 }
 
 RawStore::~RawStore() {
+  io_.reset();
+  std::free(chunk_);
+  if (dfd_ >= 0) ::close(dfd_);
   pages_.reset();
   if (fd_ >= 0) ::close(fd_);
 }
@@ -116,9 +215,9 @@ std::vector<uint32_t> RawStore::Missing(const uint32_t* locs, size_t n) const {
 
 size_t RawStore::Put(const uint32_t* locs, size_t n, const uint8_t* vecs, RawOrigin origin) {
   CheckRange(locs, n);
-  const uint32_t vb = layout_.vec_bytes;
+  std::lock_guard<std::mutex> l(put_mu_);
   // The new ones, by location (duplicates in the batch once), so that neighbours on a page go
-  // out in one write.
+  // out in one write. Only Put sets bits, so what is absent now stays absent until it is done.
   std::vector<size_t> order;
   order.reserve(n);
   for (size_t i = 0; i < n; ++i)
@@ -127,14 +226,16 @@ size_t RawStore::Put(const uint32_t* locs, size_t n, const uint8_t* vecs, RawOri
   order.erase(std::unique(order.begin(), order.end(),
                           [&](size_t a, size_t b) { return locs[a] == locs[b]; }),
               order.end());
-  std::vector<uint8_t> run;
-  ForEachRun(order, locs, layout_, [&](size_t first, size_t count) {
-    run.resize(count * vb);
-    for (size_t k = 0; k < count; ++k)
-      std::memcpy(run.data() + k * vb, vecs + order[first + k] * vb, vb);
-    PwriteAll(fd_, run.data(), run.size(), layout_.offset(locs[order[first]]), path_);
-  });
-  // Only now, with every write returned, do the vectors become visible to readers.
+  // Fetched vectors -- the engine's writer, a few scattered vectors per page -- go out as whole
+  // pages with O_DIRECT. Bulk installs (bootstrap, streams) come in sorted batches that fill a
+  // page over several requests: buffered, the page cache combines them per page, where whole
+  // pages would rewrite, and first read back, a page per request (measured: a 64 KB stream
+  // request 3.5-4.6 ms, bootstrap 3x slower).
+  if (dfd_ >= 0 && origin == RawOrigin::kFetched) {
+    PutPages(locs, vecs, order);
+  } else {
+    PutBuffered(locs, vecs, order);
+  }
   size_t installed = 0;
   for (size_t i : order) {
     const uint32_t loc = locs[i];
@@ -148,6 +249,70 @@ size_t RawStore::Put(const uint32_t* locs, size_t n, const uint8_t* vecs, RawOri
   by.fetch_add(installed, std::memory_order_relaxed);
   skipped_.fetch_add(n - installed, std::memory_order_relaxed);
   return installed;
+}
+
+// Writes the vectors of order (positions into locs/vecs, sorted by location), whole pages at a
+// time. Their bits are set by the caller once every write returned.
+void RawStore::PutPages(const uint32_t* locs, const uint8_t* vecs, const std::vector<size_t>& order) {
+  const uint32_t vb = layout_.vec_bytes, ps = layout_.page_size, vpp = layout_.vectors_per_page;
+  std::vector<uint32_t> pages, reads;
+  std::vector<size_t> first;  // pages[k]'s vectors: order[first[k] .. first[k + 1])
+  std::vector<uint8_t*> bufs, read_bufs;
+  for (size_t i = 0; i < order.size();) {
+    pages.clear();
+    first.clear();
+    size_t j = i;
+    while (j < order.size() && pages.size() < kChunkPages) {
+      const uint32_t p = layout_.page(locs[order[j]]);
+      pages.push_back(p);
+      first.push_back(j);
+      while (j < order.size() && layout_.page(locs[order[j]]) == p) ++j;
+    }
+    first.push_back(j);
+    // A page with a vector here already is read back, so that the write keeps it.
+    reads.clear();
+    read_bufs.clear();
+    bufs.resize(pages.size());
+    for (size_t k = 0; k < pages.size(); ++k) {
+      bufs[k] = chunk_ + k * ps;
+      const uint32_t base = pages[k] * vpp;
+      bool held = false;
+      for (uint32_t s = 0; s < vpp && !held; ++s) held = Present(base + s);
+      if (held) {
+        reads.push_back(pages[k]);
+        read_bufs.push_back(bufs[k]);
+      } else {
+        std::memset(bufs[k], 0, ps);
+      }
+    }
+    if (!reads.empty()) io_->Run(false, reads.data(), read_bufs.data(), static_cast<uint32_t>(reads.size()), path_);
+    for (size_t k = 0; k < pages.size(); ++k)
+      for (size_t e = first[k]; e < first[k + 1]; ++e)
+        std::memcpy(bufs[k] + static_cast<size_t>(layout_.slot(locs[order[e]])) * vb, vecs + order[e] * vb, vb);
+    io_->Run(true, pages.data(), bufs.data(), static_cast<uint32_t>(pages.size()), path_);
+    i = j;
+  }
+}
+
+void RawStore::PutBuffered(const uint32_t* locs, const uint8_t* vecs, const std::vector<size_t>& order) {
+  const uint32_t vb = layout_.vec_bytes;
+  std::vector<uint8_t> run;
+  ForEachRun(order, locs, layout_, [&](size_t first, size_t count) {
+    run.resize(count * vb);
+    for (size_t k = 0; k < count; ++k)
+      std::memcpy(run.data() + k * vb, vecs + order[first + k] * vb, vb);
+    PwriteAll(fd_, run.data(), run.size(), layout_.offset(locs[order[first]]), path_);
+  });
+}
+
+uint64_t RawStore::CountAbsent(const std::vector<uint64_t>& mask) const {
+  const uint64_t words = CeilDiv(layout_.locations(), 64);
+  FUSION_CHECK(mask.size() == words, "location mask has %zu words, want %llu", mask.size(),
+               static_cast<unsigned long long>(words));
+  uint64_t n = 0;
+  for (uint64_t w = 0; w < words; ++w)
+    if (mask[w]) n += static_cast<uint64_t>(__builtin_popcountll(mask[w] & ~bits_[w].load(std::memory_order_acquire)));
+  return n;
 }
 
 void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {

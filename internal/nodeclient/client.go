@@ -20,6 +20,7 @@ import (
 const (
 	opPing           uint8 = 0x01
 	opInfo           uint8 = 0x02
+	infoSettle       uint8 = 1 // INFO flags
 	opLoadGraph      uint8 = 0x10
 	opLoadPartition  uint8 = 0x11
 	opEvictPartition uint8 = 0x12
@@ -129,10 +130,11 @@ type RawStats struct {
 	VecBytes  int    `json:"vec_bytes"`
 	Locations uint64 `json:"locations"`
 	Present   uint64 `json:"present"`
+	Cached    uint64 `json:"cached"` // fetched, in memory until the node's writer installs them
 	Pending   uint64 `json:"pending"`
 	FromIndex uint64 `json:"from_index"`
 	Streamed  uint64 `json:"streamed"`
-	Fetched   uint64 `json:"fetched"`
+	Fetched   uint64 `json:"fetched"` // installed after an on-demand fetch (Cached not yet)
 	Fetches   uint64 `json:"fetches"`
 	Skipped   uint64 `json:"skipped"`
 	Served    uint64 `json:"served"`
@@ -283,9 +285,20 @@ func (c *Client) Ping(ctx context.Context) error {
 	return err
 }
 
-// Info returns the node's description and counters.
-func (c *Client) Info(ctx context.Context) (*Info, error) {
-	b, err := c.do(ctx, opInfo, 0, nil)
+// Info returns the node's description and counters, without waiting for anything.
+func (c *Client) Info(ctx context.Context) (*Info, error) { return c.info(ctx, nil) }
+
+// InfoSettled is Info taken once the raw vectors the node fetched before the call are on its
+// SSD: with no query fetching, Raw.Cached is 0 and every fetched vector counts as present.
+func (c *Client) InfoSettled(ctx context.Context) (*Info, error) {
+	return c.info(ctx, []byte{infoSettle})
+}
+
+// FetchedOnDemand: raw vectors the node has fetched on demand, installed or still cached.
+func (r RawStats) FetchedOnDemand() uint64 { return r.Fetched + r.Cached }
+
+func (c *Client) info(ctx context.Context, body []byte) (*Info, error) {
+	b, err := c.do(ctx, opInfo, 0, body)
 	if err != nil {
 		return nil, err
 	}

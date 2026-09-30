@@ -19,7 +19,9 @@
 // Bodies of the data-node operations (u32 = uint32 little endian; "query" = dim elements of
 // the index dtype; "str" = u32 length + bytes; error responses carry a UTF-8 message instead):
 //   PING            -                                         -> -
-//   INFO            -                                         -> JSON text
+//   INFO            [u8 flags]                                -> JSON text
+//                   flags bit 0 (kInfoSettle): wait until the raw vectors fetched before the
+//                   request are on the SSD (tests); without it INFO waits for nothing
 //   LOAD_GRAPH      path                                      -> -
 //   LOAD_PARTITION  u32 partition, u8 pq_source, str raw_peer, -> -
 //                   path
@@ -70,6 +72,7 @@ constexpr uint32_t kMagicEnd = 0x444E4546;    // "FEND"
 constexpr uint32_t kHeaderBytes = 28;         // through epoch
 constexpr uint32_t kMaxFrameBytes = 256u << 20;
 constexpr uint8_t kFlagResponse = 1;
+constexpr uint8_t kInfoSettle = 1;  // INFO flags
 constexpr uint32_t kMaxPQBatch = 1u << 22;  // IDs per PQ_GET / PQ_PUT
 constexpr uint32_t kMaxRawBatch = 1u << 20;  // locations per RAW_GET / RAW_PUT (also bytes / 2)
 

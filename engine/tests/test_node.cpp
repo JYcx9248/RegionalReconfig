@@ -483,7 +483,7 @@ void TestPQMigration() {
     threw = true;
   }
   CHECK(threw && dst->ResidentPartitions().empty() && dst->pq_stats().resident == 0 &&
-        dst->raw_stats().pending == 0);
+        dst->raw_stats(true).pending == 0);
 
   // Two sources: the needs are split so that no code is fetched twice.
   const auto miss = dst->PQMissing({{seg(1)}, {seg(2)}});
@@ -689,12 +689,15 @@ void TestPQEvictUnderLoad() {
   CHECK(st.resident <= o.pq_capacity && st.evicted > 0);  // the budget forced cached codes out
 }
 
-void TestRawStore() {
+// direct: installs write whole pages with O_DIRECT (reading back a page that already holds
+// vectors); otherwise buffered writes of the vectors alone.
+void RawStoreCase(bool direct) {
   RawLayout L;
   L.vec_bytes = 1000;  // 4 per 4 KB page, 96 bytes unused at the end of each
   L.vectors_per_page = 4;
   L.num_pages = 5;  // 20 locations
-  RawStore s("", L, false);
+  RawStore s("", L, direct);
+  if (direct && !s.pages().direct()) std::printf("    no O_DIRECT in TMPDIR: buffered installs only\n");
   auto vec = [](uint32_t loc) {
     std::vector<uint8_t> v(1000);
     for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<uint8_t>(loc * 7 + i);
@@ -748,6 +751,25 @@ void TestRawStore() {
   reader->Read(&one, bufs, 1);
   for (uint32_t loc : {4u, 5u, 6u})
     CHECK(std::memcmp(page.get() + (loc - 4) * 1000, vec(loc).data(), 1000) == 0);
+  // Installs one at a time into pages that already hold vectors keep those (a direct install
+  // rewrites the whole page), and fill a page completely.
+  for (uint32_t loc : {7u, 0u, 2u, 1u, 12u}) CHECK(s.Put(&loc, 1, vec(loc).data(), RawOrigin::kFetched) == 1);
+  const std::vector<uint32_t> all = {0, 1, 2, 3, 4, 5, 6, 7, 9, 12, 13};
+  std::vector<uint8_t> back(all.size() * 1000);
+  s.Get(all.data(), all.size(), back.data());
+  CHECK(back == vecs(all) && s.Stats().present == all.size());
+  const uint32_t first = 0;
+  reader->Read(&first, bufs, 1);
+  for (uint32_t loc = 0; loc < 4; ++loc) CHECK(std::memcmp(page.get() + loc * 1000, vec(loc).data(), 1000) == 0);
+  // CountAbsent: of 3, 7, 8, 11 and 19, the last three are not here.
+  std::vector<uint64_t> mask(1, 0);
+  for (uint32_t loc : {3u, 7u, 8u, 11u, 19u}) mask[0] |= uint64_t{1} << loc;
+  CHECK(s.CountAbsent(mask) == 3);
+}
+
+void TestRawStore() {
+  RawStoreCase(false);
+  RawStoreCase(true);
 }
 
 // Stages partitions on `to` the way an agent does after a migration: the PQ codes it lacks from
@@ -796,14 +818,14 @@ void TestRawMigration() {
   auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
   auto src = OpenNode(f, {0, 1, 2, 3}, true);
   const auto locs_all = Named(f, {0, 1, 2, 3}).second;
-  CHECK(src->raw_stats().present == locs_all.size() &&
-        src->raw_stats().from_index == locs_all.size());
+  CHECK(src->raw_stats(true).present == locs_all.size() &&
+        src->raw_stats(true).from_index == locs_all.size());
 
   auto dst = OpenNode(f, {}, false, f.index_nopages);
   LinkPeers(dst.get(), {{"src", src.get()}});
   StageFrom(f, dst.get(), src.get(), {2, 3}, "src");
   const auto locs23 = Named(f, {2, 3}).second;
-  RawStats rs = dst->raw_stats();
+  RawStats rs = dst->raw_stats(true);
   CHECK(rs.present == 0 && rs.pending == locs23.size() && rs.from_index == 0);
 
   // Bootstrapping needs the index's pages, which this index does not have.
@@ -820,7 +842,7 @@ void TestRawMigration() {
   bool same = true;
   for (uint32_t qi = 0; qi < f.nq / 2; ++qi) same = SameRerank(f, qi, dst.get(), src.get(), {2, 3}) && same;
   CHECK(same);
-  rs = dst->raw_stats();
+  rs = dst->raw_stats(true);
   CHECK(rs.fetched > 0 && rs.fetches > 0 && rs.present == rs.fetched &&
         rs.pending == locs23.size() - rs.present);
 
@@ -829,15 +851,15 @@ void TestRawMigration() {
   auto third = OpenNode(f, {}, false, f.index_nopages);
   LinkPeers(third.get(), {{"dst", dst.get()}});
   StageFrom(f, third.get(), dst.get(), {3}, "dst");
-  const uint64_t dst_fetched = dst->raw_stats().fetched;
+  const uint64_t dst_fetched = dst->raw_stats(true).fetched;
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, third.get(), src.get(), {3}) && same;
-  CHECK(same && third->raw_stats().fetched > 0 && dst->raw_stats().fetched > dst_fetched);
+  CHECK(same && third->raw_stats(true).fetched > 0 && dst->raw_stats(true).fetched > dst_fetched);
 
   // What nothing needed stays missing (the lazy protocol stops here); a stream brings the rest:
   // exactly the vectors still missing, once, each with a list that names it.
   const auto miss = dst->RawMissing({{seg(2)}, {seg(3)}});
-  rs = dst->raw_stats();
+  rs = dst->raw_stats(true);
   CHECK(rs.pending > 0);
   CHECK(miss.size() == 2 && miss[0].locs.size() + miss[1].locs.size() == locs23.size() - rs.present &&
         miss[1].locs.size() + miss[0].locs.size() == rs.pending);
@@ -850,20 +872,20 @@ void TestRawMigration() {
     const RawPutResult pr = dst->RawPut(m.locs.data(), m.locs.size(), v.data());
     CHECK(pr.installed == m.locs.size() && pr.skipped == 0);
   }
-  rs = dst->raw_stats();
+  rs = dst->raw_stats(true);
   CHECK(rs.present == locs23.size() && rs.pending == 0 &&
         rs.streamed == miss[0].locs.size() + miss[1].locs.size());
   CHECK(dst->RawMissing({{seg(2), seg(3)}})[0].locs.empty());
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, dst.get(), src.get(), {2, 3}) && same;
-  CHECK(same && dst->raw_stats().fetched == rs.fetched);  // nothing left to fetch
+  CHECK(same && dst->raw_stats(true).fetched == rs.fetched);  // nothing left to fetch
 
   // A partition that moves away leaves its vectors (a cache, like its PQ codes): it comes back
   // with nothing to transfer, and no source is needed.
   CHECK(dst->EvictPartition(2));
-  CHECK(dst->raw_stats().present == locs23.size() && dst->RawMissing({{seg(2)}})[0].locs.empty());
+  CHECK(dst->raw_stats(true).present == locs23.size() && dst->RawMissing({{seg(2)}})[0].locs.empty());
   dst->LoadPartition(2, seg(2), PQSource::kPresent);
-  CHECK(dst->ResidentPartitions().size() == 2 && dst->raw_stats().pending == 0);
+  CHECK(dst->ResidentPartitions().size() == 2 && dst->raw_stats(true).pending == 0);
 
   // The whole pipeline on a node that holds every partition but no vector yet: SearchLocal
   // fetches before re-ranking and returns the single-node answer.
@@ -885,7 +907,7 @@ void TestRawMigration() {
     const uint32_t nb = src->SearchLocal(1, q, sp, ib.data(), db.data(), &qb);
     same = same && na == nb && ia == ib && da == db;
   }
-  CHECK(same && whole->raw_stats().fetched > 0 && whole->raw_stats().fetched == whole->raw_stats().present);
+  CHECK(same && whole->raw_stats(true).fetched > 0 && whole->raw_stats(true).fetched == whole->raw_stats(true).present);
 }
 
 // Minimal blocking client for the wire test.
@@ -1048,7 +1070,7 @@ void TestWire() {
   const auto want = rerank(fd, 70, &fetched1);
   const auto got = rerank(fd2, 71, &fetched2);
   CHECK(want == got && fetched1 == 0 && fetched2 > 0 && fetched2 <= 64);
-  CHECK(fresh->raw_stats().fetches == 1 && e->raw_stats().served >= fetched2);
+  CHECK(fresh->raw_stats(true).fetches == 1 && e->raw_stats(true).served >= fetched2);
   CHECK(rerank(fd2, 72, &fetched3) == want && fetched3 == 0);
 
   // The stream: RAW_MISSING lists what is still missing, RAW_GET reads it from the first node,
@@ -1085,7 +1107,7 @@ void TestWire() {
   CHECK(r.status == rtier::kOk && r.body.size() == 8);
   rtier::BodyReader pr2(r.body.data(), r.body.size());
   CHECK(pr2.Get<uint32_t>() == nraw && pr2.Get<uint32_t>() == 0);
-  const RawStats raw = fresh->raw_stats();
+  const RawStats raw = fresh->raw_stats(true);
   CHECK(raw.present == locs0.size() && raw.pending == 0 && raw.streamed == nraw);
   // A vector nobody told this node about cannot be had here.
   const std::vector<uint32_t> locs3 = Named(f, {3}).second;

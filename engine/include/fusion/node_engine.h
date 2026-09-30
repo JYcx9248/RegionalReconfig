@@ -189,7 +189,9 @@ class NodeEngine {
   virtual void RawGet(const uint32_t* locs, const uint32_t* lists, size_t n, uint8_t* out) = 0;
   // Installs vectors streamed from a peer.
   virtual RawPutResult RawPut(const uint32_t* locs, size_t n, const uint8_t* vecs) = 0;
-  virtual RawStats raw_stats() const = 0;
+  // A snapshot that waits for nothing, or (settle) one taken once the vectors fetched before
+  // the call are on the SSD: with no query fetching, cached is then 0.
+  virtual RawStats raw_stats(bool settle) const = 0;
   virtual FetchStats fetch_stats() const = 0;
   // How the node fetches raw vectors on demand (without one it cannot).
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;

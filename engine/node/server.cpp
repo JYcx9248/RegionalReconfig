@@ -412,7 +412,8 @@ Frame NodeServer::Handle(const Frame& req) {
       case kPing:
         break;
       case kInfo: {
-        const std::string s = InfoJson();
+        const bool settle = r.remaining() >= 1 && (r.Get<uint8_t>() & kInfoSettle) != 0;
+        const std::string s = InfoJson(settle);
         w.PutBytes(s.data(), s.size());
         break;
       }
@@ -634,7 +635,7 @@ Frame NodeServer::Handle(const Frame& req) {
   return resp;
 }
 
-std::string NodeServer::InfoJson() const {
+std::string NodeServer::InfoJson(bool settle) const {
   const fusion::NodeEngine& e = *engine_;
   const auto& o = e.options();
   std::string s = "{";
@@ -657,12 +658,12 @@ std::string NodeServer::InfoJson() const {
       "\"freed\":%llu,\"served\":%llu}",
       pq.m, u(pq.capacity), u(pq.resident), u(pq.live), u(pq.staged), u(pq.cached),
       u(pq.received), u(pq.from_index), u(pq.skipped), u(pq.evicted), u(pq.freed), u(pq.served));
-  const fusion::RawStats raw = e.raw_stats();
+  const fusion::RawStats raw = e.raw_stats(settle);
   s += fusion::StrFormat(
-      ",\"raw\":{\"vec_bytes\":%u,\"locations\":%llu,\"present\":%llu,\"pending\":%llu,"
-      "\"from_index\":%llu,\"streamed\":%llu,\"fetched\":%llu,\"fetches\":%llu,"
+      ",\"raw\":{\"vec_bytes\":%u,\"locations\":%llu,\"present\":%llu,\"cached\":%llu,"
+      "\"pending\":%llu,\"from_index\":%llu,\"streamed\":%llu,\"fetched\":%llu,\"fetches\":%llu,"
       "\"skipped\":%llu,\"served\":%llu}",
-      raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.pending), u(raw.from_index),
+      raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.cached), u(raw.pending), u(raw.from_index),
       u(raw.streamed), u(raw.fetched), u(raw.fetches), u(raw.skipped), u(raw.served));
   s += ",\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
   return s;

@@ -224,7 +224,7 @@ class NodeEngineImpl : public NodeEngine {
       std::lock_guard<std::mutex> l(cache_mu_);
       stop_writer_ = true;
     }
-    cache_cv_.notify_all();
+    writer_cv_.notify_all();
     if (writer_.joinable()) writer_.join();  // installs what is still queued first
   }
 
@@ -281,7 +281,7 @@ class NodeEngineImpl : public NodeEngine {
       old = std::move(segs_[p]);
       segs_[p] = std::move(seg);
     }
-    raw_version_.fetch_add(1);
+    resident_version_.fetch_add(1);
   }
 
   bool EvictPartition(uint32_t p) override {
@@ -297,7 +297,7 @@ class NodeEngineImpl : public NodeEngine {
     // from here may still ask for its vectors.
     old.reset();
     reclaimer_->Flush();
-    raw_version_.fetch_add(1);
+    resident_version_.fetch_add(1);
     return was;
   }
 
@@ -339,7 +339,6 @@ class NodeEngineImpl : public NodeEngine {
     PQPutResult r;
     r.installed = store_->Put(ids, n, codes, PQOrigin::kReceived);
     r.skipped = n - r.installed;
-    if (r.installed) raw_version_.fetch_add(1);
     return r;
   }
 
@@ -351,7 +350,6 @@ class NodeEngineImpl : public NodeEngine {
 
   // ------------------------------------------------------------- raw vectors
   std::vector<RawRefs> RawMissing(const std::vector<std::vector<std::string>>& groups) override {
-    DrainWrites();  // what queries fetched is not listed again
     std::vector<RawRefs> out(groups.size());
     std::vector<uint32_t> taken;  // sorted: listed for an earlier group
     for (size_t g = 0; g < groups.size(); ++g) {
@@ -363,6 +361,13 @@ class NodeEngineImpl : public NodeEngine {
             if (!raw_->Present(seg.locs[j])) refs.emplace_back(seg.locs[j], seg.list_ids[i]);
       }
       std::sort(refs.begin(), refs.end());
+      {
+        // What queries fetched is not listed again: it is in memory, on its way to the SSD.
+        std::lock_guard<std::mutex> l(cache_mu_);
+        refs.erase(std::remove_if(refs.begin(), refs.end(),
+                                  [&](const std::pair<uint32_t, uint32_t>& r) { return cache_.count(r.first) != 0; }),
+                   refs.end());
+      }
       RawRefs& o = out[g];
       for (size_t i = 0; i < refs.size(); ++i) {
         if (i > 0 && refs[i].first == refs[i - 1].first) continue;  // one list per location
@@ -421,14 +426,16 @@ class NodeEngineImpl : public NodeEngine {
     RawPutResult r;
     r.installed = raw_->Put(locs, n, vecs, RawOrigin::kStreamed);
     r.skipped = n - r.installed;
-    if (r.installed) raw_version_.fetch_add(1);
     return r;
   }
 
-  RawStats raw_stats() const override {
-    DrainWrites();  // fetched vectors count once they are on the SSD
+  // Without settle, a snapshot that waits for nothing: INFO is polled for metrics while the
+  // writer may be busy. With settle, first waits for the writer to install what was fetched
+  // before the call, so that (with no query fetching) every fetched vector counts as present.
+  RawStats raw_stats(bool settle) const override {
+    if (settle) DrainWrites();
     RawStats st = raw_->Stats();
-    st.pending = PendingCount(st.locations);
+    CountCachedAndPending(&st);
     return st;
   }
 
@@ -606,7 +613,13 @@ class NodeEngineImpl : public NodeEngine {
     rp.k = p.k;
     st->rerank = RerankStats();
     st->rerank.fetched = static_cast<uint32_t>(EnsureRawInLists(w.locs.data(), nt, w.lists.data(), nl));
-    if (st->rerank.fetched) DrainWrites();  // re-ranked from the SSD below (heuristic order)
+    // Re-ranked from the SSD below (heuristic order): a candidate fetched by this query or an
+    // earlier one may still be in memory only.
+    for (uint32_t i = 0; i < nt; ++i)
+      if (!raw_->Present(w.locs[i])) {
+        DrainWrites();
+        break;
+      }
     const uint32_t cnt = HeuristicRerank<T>(q, dim_, fw->result_ids(), w.locs.data(), nt,
                                             raw_->layout(), w.reader.get(), w.scratch.get(), rp,
                                             ids, dists, &st->rerank);
@@ -653,7 +666,7 @@ class NodeEngineImpl : public NodeEngine {
                    (unsigned long long)pq.resident, pq.resident * pq.m / mb,
                    (unsigned long long)pq.live, (unsigned long long)pq.cached,
                    (unsigned long long)pq.capacity, filter_->code_bytes() / mb);
-    const RawStats raw = raw_stats();
+    const RawStats raw = raw_stats(false);
     s += StrFormat("  SSD tier         : raw vectors of %llu of %llu locations (%.1f MB, %llu pending), "
                    "a sparse copy of the '%s' page file in %s (%s I/O)\n",
                    (unsigned long long)raw.present, (unsigned long long)raw.locations,
@@ -913,33 +926,43 @@ class NodeEngineImpl : public NodeEngine {
     if (full) {
       Timer t;
       const size_t installed = raw_->Put(locs, n, vecs, RawOrigin::kFetched);
-      raw_version_.fetch_add(1);
       fc_.sync_installed.fetch_add(installed, std::memory_order_relaxed);
       fc_.sync_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
       fc_.fetched.fetch_add(installed, std::memory_order_relaxed);
       return installed;
     }
-    if (!fresh.empty()) cache_cv_.notify_all();
+    if (!fresh.empty()) writer_cv_.notify_one();
     fc_.fetched.fetch_add(fresh.size(), std::memory_order_relaxed);
     return fresh.size();
   }
 
-  // The writer: installs queued vectors on the SSD, then drops them from the cache.
+  // The writer: installs queued vectors on the SSD, then drops them from the cache. It takes
+  // everything queued (up to kWriteRound vectors) at once, so that the vectors of one page that
+  // different queries fetched go out in one page write.
   void WriterLoop() {
+    static constexpr size_t kWriteRound = size_t{1} << 16;
     const uint32_t vb = raw_->layout().vec_bytes;
+    std::vector<uint32_t> locs;
+    std::vector<uint8_t> vecs;
     std::unique_lock<std::mutex> l(cache_mu_);
     for (;;) {
-      cache_cv_.wait(l, [&] { return stop_writer_ || !write_queue_.empty(); });
+      writer_cv_.wait(l, [&] { return stop_writer_ || !write_queue_.empty(); });
       if (write_queue_.empty()) return;  // stopping, and nothing left to install
-      std::vector<uint32_t> batch = std::move(write_queue_.front());
-      write_queue_.pop_front();
-      std::vector<uint8_t> vecs(batch.size() * vb);
-      for (size_t i = 0; i < batch.size(); ++i) std::memcpy(vecs.data() + i * vb, cache_[batch[i]].data(), vb);
+      locs.clear();
+      uint64_t batches = 0;
+      while (!write_queue_.empty() &&
+             (locs.empty() || locs.size() + write_queue_.front().size() <= kWriteRound)) {
+        locs.insert(locs.end(), write_queue_.front().begin(), write_queue_.front().end());
+        write_queue_.pop_front();
+        ++batches;
+      }
+      vecs.resize(locs.size() * vb);
+      for (size_t i = 0; i < locs.size(); ++i) std::memcpy(vecs.data() + i * vb, cache_.at(locs[i]).data(), vb);
       l.unlock();
       bool ok = true;
       try {
         Timer t;
-        const size_t installed = raw_->Put(batch.data(), batch.size(), vecs.data(), RawOrigin::kFetched);
+        const size_t installed = raw_->Put(locs.data(), locs.size(), vecs.data(), RawOrigin::kFetched);
         fc_.written.fetch_add(installed, std::memory_order_relaxed);
         fc_.write_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
       } catch (const std::exception& e) {
@@ -948,17 +971,16 @@ class NodeEngineImpl : public NodeEngine {
       }
       l.lock();
       if (ok)
-        for (uint32_t loc : batch) cache_.erase(loc);
-      queued_ -= batch.size();
-      ++written_batches_;
-      raw_version_.fetch_add(1);
-      cache_cv_.notify_all();
+        for (uint32_t loc : locs) cache_.erase(loc);
+      queued_ -= locs.size();
+      written_batches_ += batches;
+      drain_cv_.notify_all();
     }
   }
 
-  // Waits until the vectors queued before the call are on the SSD. Not for an empty queue:
-  // queries keep fetching during a warm-up, and INFO (which the controller and the metrics
-  // call) must not wait for the warm-up to end.
+  // Waits until the vectors queued before the call are on the SSD, not for an empty queue:
+  // queries may keep fetching meanwhile. Only for callers that need them there (a settled
+  // raw_stats, SearchLocal); INFO, which the metrics poll, does not wait.
   void DrainWrites() const {
     Timer t;
     fc_.drain_calls.fetch_add(1, std::memory_order_relaxed);
@@ -966,42 +988,45 @@ class NodeEngineImpl : public NodeEngine {
     {
       std::unique_lock<std::mutex> l(cache_mu_);
       const uint64_t mine = queued_batches_;
-      cache_cv_.wait(l, [&] { return written_batches_ >= mine; });
+      drain_cv_.wait(l, [&] { return written_batches_ >= mine; });
     }
     fc_.drain_waiting.fetch_sub(1, std::memory_order_relaxed);
     fc_.drain_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
   }
 
-  // Distinct locations named by resident partitions whose vector is not here: recounted only
-  // after a load, an eviction or new vectors (raw_version_), since the lazy protocol leaves
-  // them missing for as long as no query needs them.
-  uint64_t PendingCount(uint64_t locations) const {
-    const uint64_t v = raw_version_.load();
+  // cached: fetched vectors not on the SSD yet (one the stream installed first is counted as
+  // present only, so that every cached one is later installed as fetched). pending: distinct
+  // locations named by resident partitions whose vector is neither here nor fetched -- what the
+  // lazy protocol leaves with the old owners until a query needs it. The locations the resident
+  // partitions name are collected again only after a load or an eviction (a scan of every
+  // resident posting); the count is a word-wise pass over them and the presence bits.
+  void CountCachedAndPending(RawStats* st) const {
     std::lock_guard<std::mutex> l(pending_mu_);
-    if (v == pending_version_) return pending_count_;
-    Timer t;
-    std::vector<std::shared_ptr<const ResidentSegment>> segs;
-    {
-      std::lock_guard<std::mutex> sl(seg_mu_);
-      for (const auto& seg : segs_)
-        if (seg) segs.push_back(seg);
-    }
-    std::vector<uint64_t> seen((locations + 63) / 64);
-    uint64_t count = 0;
-    for (const auto& seg : segs)
-      for (uint32_t loc : seg->seg.locs) {
-        uint64_t& word = seen[loc >> 6];
-        const uint64_t bit = uint64_t{1} << (loc & 63);
-        if (!(word & bit) && !raw_->Present(loc)) {
-          word |= bit;
-          ++count;
-        }
+    const uint64_t v = resident_version_.load();
+    if (v != named_version_) {
+      Timer t;
+      std::vector<std::shared_ptr<const ResidentSegment>> segs;
+      {
+        std::lock_guard<std::mutex> sl(seg_mu_);
+        for (const auto& seg : segs_)
+          if (seg) segs.push_back(seg);
       }
-    pending_version_ = v;
-    pending_count_ = count;
-    fc_.pending_recounts.fetch_add(1, std::memory_order_relaxed);
-    fc_.pending_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
-    return count;
+      named_.assign(CeilDiv(raw_->layout().locations(), 64), 0);
+      for (const auto& seg : segs)
+        for (uint32_t loc : seg->seg.locs) named_[loc >> 6] |= uint64_t{1} << (loc & 63);
+      named_version_ = v;
+      fc_.pending_recounts.fetch_add(1, std::memory_order_relaxed);
+      fc_.pending_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
+    }
+    uint64_t pending = raw_->CountAbsent(named_), cached = 0;
+    std::lock_guard<std::mutex> cl(cache_mu_);
+    for (const auto& kv : cache_) {
+      if (raw_->Present(kv.first)) continue;
+      ++cached;
+      if (named_[kv.first >> 6] >> (kv.first & 63) & 1) --pending;
+    }
+    st->cached = cached;
+    st->pending = pending;
   }
 
   uint32_t NavigateImpl(const T* q, uint32_t nprobe, uint32_t ef, uint32_t* lists) const {
@@ -1094,14 +1119,15 @@ class NodeEngineImpl : public NodeEngine {
   mutable std::mutex raw_mu_;
   std::vector<uint16_t> list_src_;
   std::vector<std::string> sources_;
-  std::atomic<uint64_t> raw_version_{1};  // bumped when what is resident or present changes
+  std::atomic<uint64_t> resident_version_{1};  // bumped by loads and evictions (PendingCount)
   // Raw vectors fetched on demand that are not on the SSD yet. Queries use them from here and
   // the writer installs them in the background: the query that fetched a vector does not wait
   // for the write, nor for reading it back (a page read right after its vectors were written
   // also pays their write-back). A vector leaves the cache only once it is present, under
   // cache_mu_, so a lookup under the lock finds it in one place or the other.
   mutable std::mutex cache_mu_;
-  mutable std::condition_variable cache_cv_;  // queue not empty (writer) / drained (waiters)
+  mutable std::condition_variable writer_cv_;  // queue not empty, or stopping
+  mutable std::condition_variable drain_cv_;   // batches written (DrainWrites)
   std::unordered_map<uint32_t, std::vector<uint8_t>> cache_;
   std::deque<std::vector<uint32_t>> write_queue_;  // batches of cached locations to install
   size_t queued_ = 0;                              // locations in write_queue_
@@ -1116,8 +1142,8 @@ class NodeEngineImpl : public NodeEngine {
   bool stop_writer_ = false;
   std::thread writer_;
   mutable std::mutex pending_mu_;
-  mutable uint64_t pending_version_ = 0;
-  mutable uint64_t pending_count_ = 0;
+  mutable uint64_t named_version_ = 0;
+  mutable std::vector<uint64_t> named_;  // locations the resident partitions name (a bit each)
   RawFetcher fetcher_;
   std::vector<std::unique_ptr<Worker>> workers_;
 };

@@ -372,7 +372,7 @@ func (a *Agent) reportMetrics(ctx context.Context) {
 				pqCached.Store(info.PQ.Cached)
 				rawPresent.Store(info.Raw.Present)
 				rawPending.Store(info.Raw.Pending)
-				rawFetched.Store(info.Raw.Fetched)
+				rawFetched.Store(info.Raw.FetchedOnDemand())
 				rawStreamed.Store(info.Raw.Streamed)
 			}
 			cancel()

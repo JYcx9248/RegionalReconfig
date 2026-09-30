@@ -539,8 +539,8 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 	sort.Ints(st.Resident)
 	if info, err := a.local.Info(ctx); err == nil {
 		st.GraphLoaded = info.GraphLoaded
-		st.RawFetched = info.Raw.Fetched
-		st.RawFetchedBytes = info.Raw.Fetched * uint64(info.Raw.VecBytes)
+		st.RawFetched = info.Raw.FetchedOnDemand()
+		st.RawFetchedBytes = st.RawFetched * uint64(info.Raw.VecBytes)
 	}
 	return st, nil
 }

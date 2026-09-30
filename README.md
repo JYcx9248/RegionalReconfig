@@ -48,14 +48,15 @@ lists and PQ codes only -- all it needs to filter -- and gets a raw vector only 
 needs it (`"protocol": "lazy"`, the default): the point of being lazy is that queries touch a
 small working set of what moved, and the rest never has to. From the flip on, a RERANK that meets
 a vector not there fetches it from the partition's old owner, data node to data node, and waits
-for it. The data node keeps one source per posting list -- the old owner of the list's partition
+for it -- for the fetch only: fetched vectors are re-ranked from memory, and a background writer
+installs them on the SSD with whole-page direct writes, off the query path. The data node keeps one source per posting list -- the old owner of the list's partition
 -- so any list that names a missing vector says where to fetch it: lists overlap, no per-vector
 table. RERANK requests carry the query's lists on that owner for this, and a peer's RAW_GET
 names the list of every vector, so a node asked for one it lacks fetches it from its own source
 of that list first (chains of migrations). Nothing else moves and the rescale does not wait for
 raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it ran, and
-each node reports `raw.fetched`, `raw.pending` (named by its partitions, not needed so far) and
-`raw.present` in its metrics. That old owners stay sources rests on three invariants: no node
+each node reports `raw.fetched` (installed or still in memory), `raw.pending` (named by its
+partitions, not needed so far) and `raw.present` in its metrics. That old owners stay sources rests on three invariants: no node
 drops a raw vector it has held, the nodes that leave are the ones that joined last, and a
 scale-in returns partitions to nodes that held them (U3); a disk budget or another leave order
 would need a hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip

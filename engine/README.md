@@ -102,7 +102,18 @@ query first needs it and only then (`RAW_GET`, through the server's `PeerPool`).
 carry the query's lists on the node: the engine finds each missing candidate in one of them and
 fetches it from that list's source (lists overlap, so a per-list source is enough). A peer's
 `RAW_GET` names the list of every vector, so a node asked for one it lacks itself fetches it from
-its own source of that list first: chains of migrations work. The lazy-stream baseline also
+its own source of that list first: chains of migrations work. A fetched vector is re-ranked from
+memory: it stays in a node-level fetch cache, served to queries and peers from there, until a
+background writer has installed it. The writer takes everything queued at once and writes whole
+pages with `O_DIRECT`, reading back first only the pages that already hold vectors (batched,
+Linux AIO), so its installs never touch the page cache: buffered writes of single vectors made
+the kernel read each uncached page synchronously under the file's inode lock, which the queries'
+direct reads of the same file then waited for, and left dirty pages that a direct read had to
+write back first (with a slow writer a lazy scale-out ran below capacity for minutes after its
+warm-up; `results/bigann10m-spatial-scaleout/lazy-diag`). Bulk installs -- bootstrap and
+streams, sorted batches that fill a page over several requests -- stay buffered: the page cache
+combines them per page, where whole-page writes made a 64 KB stream request take 3.5-4.6 ms and
+bootstrap three times longer. The lazy-stream baseline also
 streams the rest in (`RAW_MISSING` with a list per location, a peer's `RAW_GET` over the bulk
 channel, `RAW_PUT`; before each batch `RAW_CHECK` drops what queries fetched meanwhile). Nothing
 is dropped: the vectors of partitions that move away stay, like cached PQ codes, so the old owner
@@ -144,15 +155,20 @@ Known limits of the raw-vector path:
 - Sources are kept per posting list (2 B per list, sized by the number of lists: 200 KB at 1M
   vectors, 200 MB at 1B with a centroid ratio of 0.1). A missing vector is found by scanning the
   postings of the request's lists, only when something is missing.
-- `raw.pending` (named by resident partitions, not here) is recounted by INFO after a change: one
-  pass over the resident postings with a bitmap of the page file's locations.
+- `raw.pending` (named by resident partitions, neither here nor fetched): the locations the
+  resident partitions name are collected into a bitmap after a load or an eviction (one pass
+  over the resident postings); INFO counts with a word-wise pass over it and the presence bits.
+  INFO waits for nothing: fetched vectors still in memory count as `cached`, and the settle flag
+  (tests) first waits for the writer.
 - A re-ranking that must fetch holds its engine worker for the round trip, and two queries that
   miss the same vector both fetch it (the second write is a no-op; nothing coalesces them). With
   the lazy protocol this lasts for as long as queries meet vectors that have not moved.
-- Vectors are written through the page cache and pages read with `O_DIRECT`: correct (a direct
-  read writes back the dirty range it covers first) but a page read right after its vectors
-  arrived pays that write-back. Writing whole pages directly would need a read-modify-write,
-  since list tails share pages.
+- Installing a vector on a page that already holds vectors reads that page back first (list
+  tails share pages, and the slots of other vectors must be written back unchanged): one read per
+  such page, from the node's own read IOPS. The writer's rounds let the vectors of one page that
+  different queries fetched share it. One installer at a time (bootstrap, stream, writer).
+- The fetch cache holds at most 64 MB of vectors waiting for the writer; past that, the fetching
+  query installs its vectors itself (backpressure on the query path).
 - There is no disk budget: a node keeps every vector it has held (the counterpart of the PQ
   budget does not exist yet), and the local file has the page file's full logical size, sparse.
 - `RAW_MISSING` answers in one frame, like `PQ_MISSING`.

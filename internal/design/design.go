@@ -147,7 +147,9 @@ var Open = map[string]Question{
 			"query first needs it (protocol \"lazy\", the default) -- the point of being lazy " +
 			"is that queries touch a small working set of what moved. A RERANK that meets a " +
 			"vector not there fetches it from the partition's old owner, data node to data node " +
-			"(RAW_GET; the RERANK waits for it). Sources are kept per posting list (the old owner " +
+			"(RAW_GET; the RERANK waits for the fetch only: fetched vectors are re-ranked from " +
+			"memory and a background writer installs them with whole-page direct writes). " +
+			"Sources are kept per posting list (the old owner " +
 			"of its partition; lists overlap, so no per-vector table): RERANK requests carry the " +
 			"query's lists on that owner, and RAW_GET names the list of every vector, so a node " +
 			"asked for one it lacks fetches it from its own source of that list (chains of " +
