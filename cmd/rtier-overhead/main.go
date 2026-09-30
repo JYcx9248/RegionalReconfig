@@ -96,6 +96,9 @@ func main() {
 	split := flag.String("split", "lowest", "who re-ranks a candidate several owners reported: lowest (as in internal/query) | hash")
 	cmp := flag.Bool("compare", false, "compare where re-ranking happens (two-phase, local, local-quota) instead")
 	ownersOnly := flag.Bool("owners", false, "only report how many owners each query's lists fall on")
+	rescales := flag.String("rescale", "", "with -owners, also after scale-outs from:to[:to...] (e.g. \"2:3,2:4,2:3:4\"): "+
+		"the table -placement makes from an even start, as the controller's rescales would")
+	policyName := flag.String("placement", "even-reversible", "placement policy for -rescale")
 	gtPath := flag.String("gt", "", "ground truth (.ibin) for recall in -compare")
 	var cost Costs
 	flag.Float64Var(&cost.RPC, "cost-rpc", 66.5, "model: us per RPC")
@@ -145,7 +148,7 @@ func main() {
 		sizes = append(sizes, v)
 	}
 	if *ownersOnly {
-		owners(m, lists, sizes)
+		owners(m, lists, sizes, *rescales, *policyName)
 		return
 	}
 	if *cmp {
@@ -416,18 +419,21 @@ func check(err error) {
 
 // owners reports, per cluster size, how the probed lists of a query spread over owners: the
 // share of queries whose lists sit on one node, the mean number of owners, and the chance that
-// the entry (uniform over the nodes) is itself one of them.
-func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int) {
+// the entry (uniform over the nodes) is itself one of them. rescales ("2:3,2:4") adds the
+// tables a scale-out under policyName leaves: which partitions the new nodes get decides how
+// many queries straddle them (e.g. donors' tails handed out round-robin vs. whole blocks).
+func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int, rescales, policyName string) {
 	fmt.Printf("%d queries; owners per query under an even placement of %d partitions\n\n", len(lists), m.NumPartitions)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', tabwriter.AlignRight)
 	fmt.Fprintln(w, "N\tmean owners\tone owner\t<= 2 owners\tentry is an owner\t")
-	for _, size := range sizes {
-		nodes := make([]placement.NodeID, size)
+	ids := func(n int) []placement.NodeID {
+		nodes := make([]placement.NodeID, n)
 		for i := range nodes {
 			nodes[i] = placement.NodeID(i + 1)
 		}
-		tbl, err := placement.EvenPolicy{}.Initial(m.NumPartitions, nodes)
-		check(err)
+		return nodes
+	}
+	row := func(label string, tbl placement.Table, size int) {
 		var sum, one, two, entry float64
 		for _, l := range lists {
 			o, _ := group(l, m, tbl)
@@ -442,7 +448,39 @@ func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int) {
 			entry += f / float64(size)
 		}
 		q := float64(len(lists))
-		fmt.Fprintf(w, "%d\t%.2f\t%.1f%%\t%.1f%%\t%.1f%%\t\n", size, sum/q, 100*one/q, 100*two/q, 100*entry/q)
+		fmt.Fprintf(w, "%s\t%.2f\t%.1f%%\t%.1f%%\t%.1f%%\t\n", label, sum/q, 100*one/q, 100*two/q, 100*entry/q)
+	}
+	for _, size := range sizes {
+		tbl, err := placement.EvenPolicy{}.Initial(m.NumPartitions, ids(size))
+		check(err)
+		row(strconv.Itoa(size), tbl, size)
+	}
+	for _, r := range strings.Split(rescales, ",") {
+		if r = strings.TrimSpace(r); r == "" {
+			continue
+		}
+		var steps []int // a chain "2:3:4" is two rescales, the second from the first's table
+		for _, f := range strings.Split(r, ":") {
+			v, err := strconv.Atoi(f)
+			if err != nil {
+				log.Fatalf("-rescale wants from:to[:to...], not %q", r)
+			}
+			steps = append(steps, v)
+		}
+		if len(steps) < 2 {
+			log.Fatalf("-rescale wants from:to[:to...], not %q", r)
+		}
+		pol, err := placement.NewPolicy(policyName)
+		check(err)
+		tbl, err := pol.Initial(m.NumPartitions, ids(steps[0]))
+		check(err)
+		hist := placement.NewHistory(tbl)
+		for _, b := range steps[1:] {
+			tbl, _, err = pol.Repartition(tbl, ids(b), hist)
+			check(err)
+			hist.Record(tbl)
+		}
+		row(fmt.Sprintf("%s (%s)", strings.ReplaceAll(r, ":", "->"), pol.Name()), tbl, steps[len(steps)-1])
 	}
 	w.Flush()
 }
