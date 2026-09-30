@@ -21,6 +21,19 @@ Two things a capacity-driven scale-out run needs:
   "Load": {"Rate": 200, "RateSteps": "30:600"} raises the offered load during the run (here to
       600 q/s at 30 s), which is the situation a scale-out answers.
 
+"Load": {"Users": 8, "UserSteps": "30:24,70:8"} replaces the arrival rate with closed-loop
+users: 8 concurrent users, 24 from 30 s, 8 again from 70 s, each sending its next query when
+the last one returned.
+
+"Load": {"WarmupSeconds": 15} marks the first 15 s of load as warm-up: scripts/compare_runs.py
+leaves those queries out of its figures and numbers.
+
+"Load": {"RetryForSeconds": 30} makes the clients wait for their answers: a query refused as
+unavailable (an entry that left, admission paused by stop-and-copy) is retried for up to 30 s
+after its scheduled time, and the wait counts in its latency. Without it a refused query is
+retried three times and then fails, so it is missing from the mean latency; comparing
+protocols by their mean latency needs it (scripts/compare_runs.py).
+
     python3 scripts/run_local.py configs/experiment.example.json results/run1
 
 Open design questions this script depends on (see `bin/rtier-client design`):
@@ -104,6 +117,53 @@ class Procs:
                 p.kill()
 
 
+def isolation(cfg: dict, i: int, work: str, nodes: int) -> list:
+    """The systemd-run prefix that gives node i (1-based) its own share of the machine.
+
+    On one machine every node reads the same SSD and runs on the same cores, so adding a node
+    adds no capacity: the cluster stops at what the disk serves (the two-phase RERANK reads
+    ~150 pages per query). "NodeResources" emulates a node per machine instead -- each node,
+    with its agent, gets its own CPUs and its own read IOPS on the disk of WorkDir (cgroup v2
+    cpuset and io controllers), so the total stays below what the disk serves:
+
+      "NodeResources": {"CPUsPerNode": 4, "IOReadIOPSMax": 40000, "MemoryMax": "2G"}
+
+    Node i gets CPUs [FirstCPU + (i-1)*CPUsPerNode, ...); the controller and the load
+    generator get the CPUs after the last node's (see rest_cpus)."""
+    res = cfg.get("NodeResources")
+    if not res:
+        return []
+    if not shutil.which("systemd-run"):
+        raise RuntimeError('"NodeResources" needs systemd-run (cgroup v2 cpuset and io controllers)')
+    props = []
+    if res.get("CPUsPerNode"):
+        c, first = res["CPUsPerNode"], res.get("FirstCPU", 0)
+        if first + nodes * c > (os.cpu_count() or 0):
+            raise RuntimeError(f"{nodes} nodes x {c} CPUs from CPU {first} do not fit in {os.cpu_count()} CPUs")
+        lo = first + (i - 1) * c
+        props += ["-p", f"AllowedCPUs={lo}-{lo + c - 1}"]
+    for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
+        if res.get(key):
+            dev = subprocess.run(["df", "--output=source", work], capture_output=True, text=True,
+                                 check=True).stdout.split()[-1]
+            props += ["-p", f"{key}={dev} {res[key]}"]
+    if res.get("MemoryMax"):
+        props += ["-p", f"MemoryMax={res['MemoryMax']}"]
+    return ["systemd-run", "--quiet", "--scope", "--collect"] + props
+
+
+def rest_cpus(cfg: dict, nodes: int) -> list:
+    """The prefix that keeps the controller and the load generator off the nodes' CPUs."""
+    res = cfg.get("NodeResources") or {}
+    if not res.get("CPUsPerNode"):
+        return []
+    lo = res.get("FirstCPU", 0) + nodes * res["CPUsPerNode"]
+    hi = (os.cpu_count() or 1) - 1
+    if lo > hi:
+        return []
+    return ["systemd-run", "--quiet", "--scope", "--collect", "-p", f"AllowedCPUs={lo}-{hi}"]
+
+
 def main(cfg_path: str, out_dir: str) -> None:
     cfg = json.load(open(cfg_path))
     work = os.path.abspath(cfg.get("WorkDir", "/tmp/rtier-run"))
@@ -135,6 +195,7 @@ def main(cfg_path: str, out_dir: str) -> None:
     netns_sh = os.path.join(ROOT, "scripts/emulation/netns.sh")
 
     procs = Procs(out_dir)
+    results = []
     try:
         if netns:
             env = dict(os.environ, DELAY=emu.get("Delay", "100us"), RATE=emu.get("Rate", "10gbit"))
@@ -153,12 +214,12 @@ def main(cfg_path: str, out_dir: str) -> None:
             "placement": cfg.get("Placement", "even"),
             "metrics_path": os.path.join(out_dir, "metrics.jsonl"),
         }, open(ctl_cfg, "w"), indent=2)
-        procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg])
+        procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg], prefix=rest_cpus(cfg, nodes))
         time.sleep(0.5)
 
         for i in range(1, nodes + 1):
             name = f"n{i}"
-            prefix = ["ip", "netns", "exec", f"rtier-{name}"] if netns else []
+            prefix = isolation(cfg, i, work, nodes) + (["ip", "netns", "exec", f"rtier-{name}"] if netns else [])
             host = f"10.10.0.{10 + i}" if netns else "127.0.0.1"
             # Each node keeps its raw vectors in its own sparse file (a subset of the index's
             # page file); the ones it gets by migration arrive after the flip (U9).
@@ -181,8 +242,12 @@ def main(cfg_path: str, out_dir: str) -> None:
 
         # 4. initial deployment, then load
         api = Controller(api_addr)
-        st = api.call("WaitReady", {"timeout_seconds": 600})
-        log(f"epoch {st['table']['epoch']} ready on {len(st['table']['placement']['owners'])} partitions")
+        # Bootstrapping copies every partition's PQ codes and raw vectors from the index: minutes
+        # on a 10M-vector index ("ReadyTimeoutSeconds").
+        deploy_start = time.monotonic()
+        st = api.call("WaitReady", {"timeout_seconds": cfg.get("ReadyTimeoutSeconds", 600)})
+        log(f"epoch {st['table']['epoch']} ready on {len(st['table']['placement']['owners'])} partitions "
+            f"after {time.monotonic() - deploy_start:.0f} s")
         load = cfg.get("Load", {})
         dur = load.get("DurationSeconds", 60)
 
@@ -193,6 +258,12 @@ def main(cfg_path: str, out_dir: str) -> None:
                    "-arrivals", load.get("Arrivals", "poisson"), "-out", out_csv]
             if steps:
                 cmd += ["-rate-steps", steps]
+            if load.get("Users"):  # closed loop: concurrent users instead of an arrival rate
+                cmd += ["-users", str(load["Users"])]
+                if load.get("UserSteps"):
+                    cmd += ["-users-steps", rate_steps(load["UserSteps"])]
+            if load.get("RetryForSeconds"):
+                cmd += ["-retry-for", f"{load['RetryForSeconds']}s"]
             if gt:
                 cmd += ["-gt", gt]
             return cmd
@@ -205,12 +276,13 @@ def main(cfg_path: str, out_dir: str) -> None:
             for rate in calib.get("Rates", [50, 100, 200, 400]):
                 path = os.path.join(out_dir, f"calib-{rate:g}.csv")
                 with open(os.path.join(out_dir, "calibration.log"), "a") as logf:
-                    run(loadgen(rate, calib.get("SecondsPerRate", 15), path), stdout=logf, stderr=logf)
+                    run(rest_cpus(cfg, nodes) + loadgen(rate, calib.get("SecondsPerRate", 15), path),
+                        stdout=logf, stderr=logf)
                 s = summarize(read_latency(path))
                 s["offered_per_s"] = rate
                 table.append(s)
-                log(f"offered {rate:g}/s: answered {s['answered_per_s']}/s, p50 {s['p50_us']} us, "
-                    f"p99 {s['p99_us']} us, {s['status']}")
+                log(f"offered {rate:g}/s: answered {s['answered_per_s']}/s, mean {s['mean_us']} us, "
+                    f"p50 {s['p50_us']} us, p99 {s['p99_us']} us, {s['status']}")
             json.dump(table, open(os.path.join(out_dir, "calibration.json"), "w"), indent=2)
             kept = [s["offered_per_s"] for s in table
                     if s["answered_per_s"] >= 0.95 * s["offered_per_s"] and s["status"].get("ok") == s["queries"]]
@@ -220,24 +292,25 @@ def main(cfg_path: str, out_dir: str) -> None:
 
         procs.start("loadgen", loadgen(load.get("Rate", 100), dur,
                                        os.path.join(out_dir, "latency.csv"),
-                                       rate_steps(load.get("RateSteps"))))
+                                       rate_steps(load.get("RateSteps"))), prefix=rest_cpus(cfg, nodes))
 
         # 5. timed reconfigurations (Koala: "Reconfigurations" with TriggerTimeSeconds)
-        t0 = time.time()
-        results = []
+        # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
+        # seconds), and the load generator's times are monotonic too.
+        t0 = time.monotonic()
         for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
-            while time.time() - t0 < rc["TriggerTimeSeconds"]:
+            while time.monotonic() - t0 < rc["TriggerTimeSeconds"]:
                 procs.check()
                 time.sleep(0.2)
             log(f"rescale to {rc['DataNodes']} data nodes")
-            started = time.time()
+            started = time.monotonic()
             reply = api.call("Rescale", {"data_nodes": rc["DataNodes"]})
             results.append({"data_nodes": rc["DataNodes"], "trigger_seconds": round(started - t0, 3),
-                            "elapsed_seconds": round(time.time() - started, 3), "reply": reply})
+                            "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
             log(json.dumps(results[-1]))
         json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
 
-        while time.time() - t0 < dur + 5 and procs.procs[-1][1].poll() is None:
+        while time.monotonic() - t0 < dur + 5 and procs.procs[-1][1].poll() is None:
             time.sleep(0.5)
     finally:
         # 7. clean up, then 6. results

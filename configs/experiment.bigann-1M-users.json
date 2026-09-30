@@ -1,0 +1,49 @@
+{
+  "WorkDir": "/tmp/rtier-bigann1m",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "data/bigann-1M.u8bin",
+  "Queries": "data/bigann-query.u8bin",
+  "GroundTruth": "data/bigann-1M-gt100.ibin",
+  "BuildArgs": [
+    "--pq-m",
+    "32"
+  ],
+  "Assignment": "data/bigann-1M-assign.bin",
+  "Nodes": 3,
+  "InitialNodes": 2,
+  "Backend": "cpu",
+  "NodeArgs": [
+    "--workers",
+    "4",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Protocol": "lazy",
+  "Placement": "even-reversible",
+  "Strategy": "two-phase",
+  "TransferRateBytesPerSec": 20000000,
+  "MetricsInterval": "500ms",
+  "Load": {
+    "Users": 8,
+    "UserSteps": "30:24,110:8",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 150,
+    "WarmupSeconds": 15,
+    "K": 10,
+    "NProbe": 64,
+    "N": 200
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 40,
+      "DataNodes": 3
+    },
+    {
+      "TriggerTimeSeconds": 120,
+      "DataNodes": 2
+    }
+  ]
+}

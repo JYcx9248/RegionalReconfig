@@ -3,17 +3,19 @@
 
     python3 scripts/plot_run.py results/run1              # -> timeline.svg, timeline.csv, summary
     python3 scripts/plot_run.py results/run1 --window 0.2
+    python3 scripts/plot_run.py results/run1 --latency tail   # p50 and p99 instead of the mean
 
 Reads what run_local.py leaves in the results directory:
 
-  latency.csv            one row per query: sched_ms, latency_us, status, epoch, recall
+  latency.csv            one row per query: sched_ms, latency_us, status, epoch, recall,
+                         attempts (older runs have no attempts column)
   reconfigurations.json  one entry per rescale: when it was triggered, how long it took, what
                          it moved (written by run_local.py; older runs hold the bare replies)
 
 and writes, over the same time axis:
 
-  timeline.svg   two panels -- queries per second (offered and answered) and latency (p50, p99)
-                 -- with the epochs marked, so a flip is visible as a line and a reconfiguration
+  timeline.svg   two panels -- queries per second (offered and answered) and latency (the mean
+                 of the answered queries, or p50 and p99) -- with the epochs marked, so a flip is visible as a line and a reconfiguration
                  as a band. The dashed "offered" line hides under "answered" exactly while the
                  cluster keeps up: where it appears, the load is past what the nodes serve
   timeline.csv   the same windows as numbers, for your own plotting
@@ -21,8 +23,13 @@ and writes, over the same time axis:
 No dependencies: the SVG is written here, in light and dark.
 
 What to read off it: time-to-online (trigger to the epoch line), the latency cost of the
-transition (how far p99 rises above its level before the trigger, and for how long), and
-whether throughput actually follows the load after the new node joins.
+transition (how far the latency rises above its level before the trigger, and for how long),
+and whether throughput actually follows the load after the new node joins.
+
+The mean covers answered queries only. A query that failed (e.g. refused while a
+stop-and-copy paused admission) is missing from it and shows up as "failed" in the top
+panel instead; run the load generator with -retry-for ("RetryForSeconds" in the experiment)
+so such a query waits for its answer and its wait counts in the mean.
 """
 
 import argparse
@@ -47,6 +54,8 @@ def read_latency(path):
                 "status": r["status"],
                 "epoch": int(r["epoch"]),
                 "recall": float(r.get("recall") or 0.0),
+                "attempts": int(r.get("attempts") or 1),
+                "users": int(r.get("users") or 0),
             })
     rows.sort(key=lambda r: r["t"])
     return rows
@@ -60,7 +69,8 @@ def pctl(sorted_values, q):
 
 
 def windows(rows, width):
-    """Per window of `width` seconds: offered and answered rate, latency percentiles."""
+    """Per window of `width` seconds (by scheduled time): offered and answered rate, the mean
+    and percentiles of the answered queries' latency."""
     if not rows:
         return []
     out = []
@@ -77,6 +87,7 @@ def windows(rows, width):
             "offered": len(b) / width,
             "answered": len(lat) / width,
             "failed": bad / width,
+            "mean_us": sum(lat) / len(lat) if lat else None,
             "p50_us": pctl(lat, 0.5),
             "p99_us": pctl(lat, 0.99),
         })
@@ -112,6 +123,8 @@ def summarize(rows):
         "epochs": epochs,
         "seconds": round(span, 3),
         "answered_per_s": round(len(lat) / span, 1) if span else 0.0,
+        "retried": sum(1 for r in rows if r["attempts"] > 1),
+        "mean_us": round(sum(lat) / len(lat), 1) if lat else None,
         "p50_us": pctl(lat, 0.5), "p99_us": pctl(lat, 0.99),
         "p999_us": pctl(lat, 0.999), "max_us": pctl(lat, 1.0),
         "recall": round(sum(recalls) / len(recalls), 4) if recalls else None,
@@ -163,8 +176,9 @@ def esc(s):
 
 
 def panel(svg, y0, title, series, span, marks, bands, unit):
-    """One panel: series = [(name, [(t, v), ...]), ...] (at most two), values in `unit`."""
-    values = [v for _, pts in series for _, v in pts if v is not None]
+    """One panel: series = [(name, [(t, v), ...], css class), ...] (at most two), values in
+    `unit`. One series gets no legend: the title names it."""
+    values = [v for _, pts, _ in series for _, v in pts if v is not None]
     hi = max(values) if values else 1.0
     ticks = nice_ticks(hi)
     top, bot = ticks[-1] or 1.0, 0.0
@@ -172,11 +186,11 @@ def panel(svg, y0, title, series, span, marks, bands, unit):
     y = lambda v: y0 + PANEL_H - PANEL_H * ((v - bot) / (top - bot))
 
     svg.append('<text class="title" x="%d" y="%d">%s</text>' % (LEFT, y0 - 12, esc(title)))
-    for i, (name, _) in enumerate(series):  # legend: identity is never colour alone
+    for i, (name, _, cls) in enumerate(series if len(series) > 1 else []):  # identity never colour alone
         lx = W - RIGHT + 8
         ly = y0 + 14 + i * 16
-        svg.append('<line class="s%d line" x1="%d" y1="%d" x2="%d" y2="%d"/>'
-                   % (i + 1, lx, ly - 4, lx + 16, ly - 4))
+        svg.append('<line class="%s line" x1="%d" y1="%d" x2="%d" y2="%d"/>'
+                   % (cls, lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(name)))
 
     for v in ticks:  # recessive grid, labels in ink
@@ -193,17 +207,17 @@ def panel(svg, y0, title, series, span, marks, bands, unit):
         svg.append('<line class="event" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>'
                    % (x(t), y0, x(t), y0 + PANEL_H))
 
-    for i, (name, pts) in enumerate(series):
+    for name, pts, cls in series:
         run = []
         for t, v in pts:
             if v is None:
                 if len(run) > 1:
-                    svg.append('<polyline class="s%d line" points="%s"/>' % (i + 1, " ".join(run)))
+                    svg.append('<polyline class="%s line" points="%s"/>' % (cls, " ".join(run)))
                 run = []
                 continue
             run.append("%.1f,%.1f" % (x(t), y(v)))
         if len(run) > 1:
-            svg.append('<polyline class="s%d line" points="%s"/>' % (i + 1, " ".join(run)))
+            svg.append('<polyline class="%s line" points="%s"/>' % (cls, " ".join(run)))
 
 
 def fmt(v):
@@ -216,7 +230,7 @@ def fmt(v):
     return "%.2f" % v
 
 
-def svg_document(win, marks, bands, span, title):
+def svg_document(win, marks, bands, span, title, latency="mean"):
     top1 = TOP
     top2 = TOP + PANEL_H + GAP
     h = top2 + PANEL_H + BOTTOM
@@ -234,20 +248,26 @@ def svg_document(win, marks, bands, span, title):
   .event { stroke: var(--ink2); stroke-width: 1; stroke-dasharray: 3 3; opacity: .7; }
   .band { fill: var(--ink2); opacity: .10; }
   .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-  /* series 1 is dashed: when the two series coincide exactly -- every query answered,
-     which is the good case -- it must still be visible under series 2. */
-  .s1 { stroke: var(--s1); fill: none; stroke-dasharray: 5 3; }
+  .s1 { stroke: var(--s1); fill: none; }
   .s2 { stroke: var(--s2); fill: none; }
+  /* the first of two series is dashed: when they coincide exactly -- every query answered,
+     which is the good case -- it must still be visible under the second. */
+  .dashed { stroke-dasharray: 5 3; }
 </style>""" % (SERIES[0][0], SERIES[1][0], SERIES[0][1], SERIES[1][1]))
     svg.append('<rect class="bg" x="0" y="0" width="%d" height="%d"/>' % (W, h))
     svg.append('<text class="title" x="%d" y="18">%s</text>' % (LEFT, esc(title)))
 
-    thr = [("offered", [(w["t"], w["offered"]) for w in win]),
-           ("answered", [(w["t"], w["answered"]) for w in win])]
-    lat = [("p50", [(w["t"], (w["p50_us"] or 0) / 1000.0 if w["p50_us"] else None) for w in win]),
-           ("p99", [(w["t"], (w["p99_us"] or 0) / 1000.0 if w["p99_us"] else None) for w in win])]
+    ms = lambda v: v / 1000.0 if v else None
+    thr = [("offered", [(w["t"], w["offered"]) for w in win], "s1 dashed"),
+           ("answered", [(w["t"], w["answered"]) for w in win], "s2")]
     panel(svg, top1, "queries per second", thr, span, marks, bands, "q/s")
-    panel(svg, top2, "latency", lat, span, marks, bands, "ms")
+    if latency == "tail":
+        lat = [("p50", [(w["t"], ms(w["p50_us"])) for w in win], "s1 dashed"),
+               ("p99", [(w["t"], ms(w["p99_us"])) for w in win], "s2")]
+        panel(svg, top2, "latency", lat, span, marks, bands, "ms")
+    else:
+        lat = [("mean", [(w["t"], ms(w["mean_us"])) for w in win], "s1")]
+        panel(svg, top2, "mean latency of the answered queries", lat, span, marks, bands, "ms")
 
     at = lambda t: LEFT + (W - LEFT - RIGHT) * (t / span if span else 0)
     for t in nice_ticks(span, 8):
@@ -270,6 +290,8 @@ def main():
     ap.add_argument("results", help="results directory (run_local.py's output)")
     ap.add_argument("--window", type=float, default=0.5, help="window in seconds (default 0.5)")
     ap.add_argument("--out", default="timeline.svg", help="SVG name inside the results directory")
+    ap.add_argument("--latency", choices=("mean", "tail"), default="mean",
+                    help="latency panel: the mean (default) or p50 and p99")
     args = ap.parse_args()
 
     lat_path = os.path.join(args.results, "latency.csv")
@@ -284,16 +306,18 @@ def main():
     bands = [(t0, dur, label) for t0, dur, label, _ in rcs]
     span = rows[-1]["t"]
 
-    svg = svg_document(win, marks, bands, span, os.path.basename(os.path.abspath(args.results)))
+    svg = svg_document(win, marks, bands, span, os.path.basename(os.path.abspath(args.results)),
+                       args.latency)
     out = os.path.join(args.results, args.out)
     with open(out, "w") as f:
         f.write(svg)
     with open(os.path.join(args.results, "timeline.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s", "offered_qps", "answered_qps", "failed_qps", "p50_us", "p99_us"])
+        w.writerow(["t_s", "offered_qps", "answered_qps", "failed_qps", "p50_us", "p99_us", "mean_us"])
         for x in win:
             w.writerow(["%.3f" % x["t"], "%.1f" % x["offered"], "%.1f" % x["answered"],
-                        "%.1f" % x["failed"], x["p50_us"] or "", x["p99_us"] or ""])
+                        "%.1f" % x["failed"], x["p50_us"] or "", x["p99_us"] or "",
+                        "%.1f" % x["mean_us"] if x["mean_us"] else ""])
 
     s = summarize(rows)
     print(json.dumps(s, indent=2, sort_keys=True))
@@ -302,14 +326,16 @@ def main():
     for t0, dur, label, reply in rcs:
         print("%s: triggered at %.3f s, took %.3f s, %s bytes, %s PQ codes, phases %s"
               % (label, t0, dur, reply.get("bytes"), reply.get("pq_codes"), reply.get("phases")))
-    # The transition's cost: the highest windowed p99 while an epoch was changing.
+    # The transition's cost: the highest windowed mean and p99 while an epoch was changing.
     if bands and win:
-        during = [w["p99_us"] for w in win
-                  for t0, dur, _ in bands if t0 <= w["t"] <= t0 + dur + 1 and w["p99_us"]]
-        before = [w["p99_us"] for w in win if w["p99_us"] and w["t"] < bands[0][0]]
-        if during and before:
-            print("p99 during the reconfigurations: %.0f us (before: %.0f us)"
-                  % (max(during), pctl(sorted(before), 0.99)))
+        for key, name in (("mean_us", "mean"), ("p99_us", "p99")):
+            during = [w[key] for w in win
+                      for t0, dur, _ in bands if t0 <= w["t"] <= t0 + dur + 1 and w[key]]
+            before = [w[key] for w in win if w[key] and w["t"] < bands[0][0]]
+            if during and before:
+                print("%s during the reconfigurations: up to %.0f us per %g s window (before: %.0f us)"
+                      % (name, max(during), args.window, sum(before) / len(before) if key == "mean_us"
+                         else pctl(sorted(before), 0.99)))
     print("wrote %s and timeline.csv" % out)
 
 
