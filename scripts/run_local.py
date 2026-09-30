@@ -30,6 +30,9 @@ the last one returned.
 "Load": {"WarmupSeconds": 15} marks the first 15 s of load as warm-up: scripts/compare_runs.py
 leaves those queries out of its figures and numbers.
 
+"Load": {"DrainSeconds": 300} (the default) is how long a run waits after the load ended for
+the answers still due: an open-loop run that ends with a backlog drains it without new arrivals.
+
 "Load": {"RetryForSeconds": 30} makes the clients wait for their answers: a query refused as
 unavailable (an entry that left, admission paused by stop-and-copy) is retried for up to 30 s
 after its scheduled time, and the wait counts in its latency. Without it a refused query is
@@ -165,22 +168,33 @@ def data_disk(path: str) -> str:
 
 
 class CgroupSampler:
-    """With "NodeResources", every node runs in its own cgroup: samples each one's CPU time, I/O
-    on the data disk, dirty and writeback page cache and pressure stall times once a second into
-    cgroups.jsonl, stamped with time.monotonic() (clock.json has the load's start on that clock).
-    Counters are cumulative; take differences between samples."""
+    """With "NodeResources", every node and every agent runs in its own cgroup ("n1",
+    "n1-agent", ...): samples each one's CPU time, I/O on the data disk, dirty and writeback page
+    cache and pressure stall times once a second into cgroups.jsonl, stamped with
+    time.monotonic() (clock.json has the load's start on that clock). Counters are cumulative;
+    take differences between samples."""
 
     def __init__(self, path: str, disk: str):
         self.out = open(path, "w")
         self.disk = disk
-        self.nodes = []  # (name, cgroup directory)
+        self.nodes = []  # (name, pid)
         self.stop_ = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def add(self, name: str, pid: int) -> None:
-        for line in open(f"/proc/{pid}/cgroup"):
-            if line.startswith("0::"):
-                self.nodes.append((name, "/sys/fs/cgroup" + line[3:].strip()))
+        # The cgroup is looked up at every sample: right after Popen, systemd-run may not have
+        # moved the process into its scope yet (it would read as run_local's own cgroup).
+        self.nodes.append((name, pid))
+
+    @staticmethod
+    def cgroup(pid: int):
+        try:
+            for line in open(f"/proc/{pid}/cgroup"):
+                if line.startswith("0::"):
+                    return "/sys/fs/cgroup" + line[3:].strip()
+        except OSError:
+            pass
+        return None
 
     @staticmethod
     def keyed(path: str) -> dict:
@@ -217,8 +231,11 @@ class CgroupSampler:
 
     def loop(self) -> None:
         while not self.stop_.wait(1.0 - time.monotonic() % 1.0):
-            for name, cg in self.nodes:
-                self.out.write(json.dumps(self.sample(name, cg)) + "\n")
+            mine = self.cgroup(os.getpid())
+            for name, pid in self.nodes:
+                cg = self.cgroup(pid)
+                if cg and cg != mine:
+                    self.out.write(json.dumps(self.sample(name, cg)) + "\n")
             self.out.flush()
 
     def start(self) -> None:
@@ -244,11 +261,25 @@ def rest_cpus(cfg: dict, nodes: int) -> list:
     return ["systemd-run", "--quiet", "--scope", "--collect", "-p", f"AllowedCPUs={lo}-{hi}"]
 
 
+def check_fresh(gbin: str) -> None:
+    """Refuses to run Go binaries older than the Go sources: `go test` (and so `make test`
+    before it built bin/ too) compiles the code under test without touching bin/, and an
+    experiment on a stale agent measures code that is no longer there."""
+    built = min((os.path.getmtime(os.path.join(gbin, f)) for f in os.listdir(gbin)), default=0) \
+        if os.path.isdir(gbin) else 0
+    for top in ("cmd", "internal"):
+        for d, _, files in os.walk(os.path.join(ROOT, top)):
+            for f in files:
+                if f.endswith(".go") and not f.endswith("_test.go") and os.path.getmtime(os.path.join(d, f)) > built:
+                    sys.exit(f"{os.path.join(d, f)} is newer than the binaries in {gbin}: run `make` first")
+
+
 def main(cfg_path: str, out_dir: str) -> None:
     cfg = json.load(open(cfg_path))
     work = os.path.abspath(cfg.get("WorkDir", "/tmp/rtier-run"))
     ebin = os.path.join(ROOT, cfg.get("EngineBin", "engine/build"))
     gbin = os.path.join(ROOT, cfg.get("GoBin", "bin"))
+    check_fresh(gbin)
     os.makedirs(work, exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
     shutil.copy(cfg_path, os.path.join(out_dir, "experiment.json"))
@@ -324,6 +355,8 @@ def main(cfg_path: str, out_dir: str) -> None:
                 "metrics_interval": cfg.get("MetricsInterval", "1s"),
             }, open(agent_cfg, "w"), indent=2)
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
+            if sampler:
+                sampler.add(f"{name}-agent", procs.procs[-1][1].pid)
 
         if sampler:
             sampler.start()
@@ -399,8 +432,15 @@ def main(cfg_path: str, out_dir: str) -> None:
             log(json.dumps(results[-1]))
         json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
 
-        while time.monotonic() - t0 < dur + 5 and procs.procs[-1][1].poll() is None:
+        # The load generator stops sending at the duration and exits once every query it sent is
+        # answered, writing latency.csv only then: an open-loop run that ends with a backlog
+        # needs the time to drain it, or its queries are lost ("DrainSeconds").
+        drain = load.get("DrainSeconds", 300)
+        while time.monotonic() - t0 < dur + drain and procs.procs[-1][1].poll() is None:
             time.sleep(0.5)
+        if procs.procs[-1][1].poll() is None:
+            log(f"load generator still waiting for answers {drain} s after the load ended: stopped, "
+                "no latency.csv")
     finally:
         # 7. clean up, then 6. results
         procs.stop()

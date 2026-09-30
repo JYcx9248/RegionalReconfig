@@ -20,6 +20,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 ```
 
 - The Makefile exports `GOTOOLCHAIN=local`: never download a Go toolchain.
+- Experiments run `bin/`, which `go test` does not rebuild: `make test` builds it too, and
+  `run_local.py` refuses to start when `bin/` is older than the Go sources (run `make`).
 - `-march=native` is on by default (`FUSION_NATIVE`). Rebuild the engine on each machine: a build
   copied from another CPU can die with SIGILL. Use `-DFUSION_NATIVE=OFF` for a portable build.
 - Sanitizers: build the engine with `-fsanitize=address,undefined` into another directory and

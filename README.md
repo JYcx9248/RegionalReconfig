@@ -153,9 +153,9 @@ throughput (measured: 2 and 3 nodes both at ~130-140K reads/s, ~920 q/s on BIGAN
 cgroup of their own (`systemd-run --scope`): their own CPUs and their own read IOPS on the disk
 of `WorkDir`, as if each node had its machine; keep the sum below what the disk serves. The
 controller and the load generator get the CPUs after the nodes'. `"MemoryMax"` and
-`"IOReadBandwidthMax"` work the same way. Each node's cgroup is then sampled once a second into
-`cgroups.jsonl` (CPU time, reads and writes on the data disk, dirty and writeback page cache,
-pressure stall times), and every run writes each data node's stats log, `stats-<node>.jsonl`
+`"IOReadBandwidthMax"` work the same way. Each node's and each agent's cgroup is then sampled
+once a second into `cgroups.jsonl` (CPU time, reads and writes on the data disk, dirty and
+writeback page cache, pressure stall times), and every run writes each data node's stats log, `stats-<node>.jsonl`
 (`rtier_node --stats-file`: operation counts and times, time spent waiting for an engine
 worker, the fetch cache and its writer); both are stamped with the monotonic clock of
 `clock.json`, whose `load_start` is the load's time 0.

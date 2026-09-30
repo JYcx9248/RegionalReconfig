@@ -29,7 +29,8 @@ test-engine: engine
 	$(ENGINE_BUILD)/fusion_tests
 	$(ENGINE_BUILD)/rtier_node_tests
 
-test-go: engine
+# go too: experiments (scripts/run_local.py) run bin/, which go test does not rebuild.
+test-go: engine go
 	RTIER_ENGINE_BIN=$(abspath $(ENGINE_BUILD)) $(GO) test -race ./...
 
 e2e: engine

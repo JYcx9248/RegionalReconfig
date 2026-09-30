@@ -22,8 +22,15 @@ reconfigurations start within about a window of each other). Writes:
             queries each run sent while its own reconfiguration ran), after the last one and
             over the whole run; pooled over the runs, with the lowest and highest run
 
-A query counts in the window of the time it was sent: its scheduled time with the open-loop
-load generator, its first attempt in the closed-loop test. --skip drops the queries sent in the
+A query's latency counts in the window of the time it was sent: its scheduled time with the
+open-loop load generator, its first attempt in the closed-loop test; answered queries per second
+count in the window of their answer. With the open-loop load (no "users" in latency.csv) the
+figure shows the offered rate instead of the users, and the backlog: queries sent and not
+answered yet. It grows whenever the offered rate exceeds what the cluster answers, and after a
+scale-out it drains only with the capacity left over -- what a closed loop hides, since its
+users just wait. OUT.json then also has the peak backlog, when it drained, and the queries
+answered later than --slo-ms (failed ones included) among those sent from the first
+reconfiguration on. --skip drops the queries sent in the
 first seconds of each run (warm-up: the end-to-end test's first queries meet a cold start that
 has nothing to do with reconfiguration). Means cover answered queries only,
 so they compare runs only when no query failed: a refused query that gave up is missing from
@@ -81,6 +88,77 @@ def ticks_to(hi):
 def tick_label(v, step):
     """v with as many decimals as the tick step needs, the same on every tick of an axis."""
     return "%.*f" % (max(0, -int(math.floor(math.log10(step) + 1e-9))), v)
+
+
+def offered_schedule(d):
+    """The open-loop rate schedule of a run as [(from_s, rate)] ("Rate", "RateSteps" in its
+    experiment.json), or None."""
+    try:
+        load = json.load(open(os.path.join(d, "experiment.json"))).get("Load", {})
+    except (OSError, ValueError):
+        return None
+    if load.get("Users") or "Rate" not in load:
+        return None
+    steps = load.get("RateSteps") or []
+    if isinstance(steps, str):
+        steps = [x.split(":") for x in steps.split(",") if x]
+    return [(0.0, float(load["Rate"]))] + sorted((float(t), float(r)) for t, r in steps)
+
+
+def rate_at(sched, t):
+    r = sched[0][1]
+    for t0, v in sched:
+        if t >= t0:
+            r = v
+    return r
+
+
+def flow(rows, width, n, runs):
+    """Per window, averaged over pooled runs: queries answered in it (by the time of the
+    answer), and at its end the backlog -- sent but not answered yet (a query that failed
+    leaves it when it fails)."""
+    done, sent, left = [0] * n, [0] * n, [0] * n
+    for r in rows:
+        k = int((r["t"] + r["us"] / 1e6) / width)
+        if k < n:
+            left[k] += 1
+            done[k] += r["status"] == "ok"
+        sent[min(n - 1, int(r["t"] / width))] += 1
+    out, backlog = [], 0
+    for k in range(n):
+        backlog += sent[k] - left[k]
+        out.append({"t": k * width, "answered": done[k] / width / runs, "backlog": backlog / runs})
+    return out
+
+
+def openloop_summary(rows, fl, width, trigger, runs, slo_us):
+    """Peak backlog after the first reconfiguration's trigger, when it drained (from then on
+    within twice the backlog of the run's last fifth, plus 10: the queries in flight; a run
+    whose last fifth still holds over 100 has not drained), and the queries sent from the
+    trigger on that were answered later than slo_us or failed."""
+    after = [w for w in fl if w["t"] + width > trigger]
+    if not after:
+        return {}
+    tail = sorted(w["backlog"] for w in fl[-max(1, len(fl) // 5):])
+    floor = tail[len(tail) // 2]
+    limit = 2 * floor + 10
+    peak = max(after, key=lambda w: w["backlog"])
+    drained = None
+    if floor > 100:
+        pass  # still draining at the end
+    elif peak["backlog"] <= limit:
+        drained = trigger  # never behind
+    else:
+        for w in reversed(after):
+            if w["backlog"] > limit:
+                break
+            drained = w["t"] + width
+    late = [r for r in rows if r["t"] >= trigger]
+    miss = sum(1 for r in late if r["status"] != "ok" or r["us"] > slo_us)
+    return {"peak_backlog": round(peak["backlog"]), "peak_backlog_at_s": round(peak["t"] + width, 3),
+            "backlog_drained_at_s": round(drained, 3) if drained is not None else None,
+            "slo_ms": slo_us / 1000.0, "slo_misses": round(miss / runs),
+            "slo_miss_fraction": round(miss / len(late), 5) if late else None}
 
 
 def mean_of(rows, t0, t1):
@@ -199,19 +277,27 @@ def mb(v):
     return "%.1f MB" % (v / 1e6) if v >= 1e5 else "%.0f KB" % (v / 1e3)
 
 
-def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_latency=False):
+def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_latency=False,
+                 flows=None, offered=None):
     """lines: [(label, slot, pooled windows, [reconfigurations of each run], runs)]; users:
-    [(t, n)] per window or None; moved: {label: bytes by component, mean over its runs} or {}.
-    One time axis (t_min to span) for every panel."""
+    [(t, n)] per window or None; moved: {label: bytes by component, mean over its runs} or {};
+    flows: {label: flow()}; offered: [(t, rate)] per window with the open-loop load, else None
+    (then no backlog panel). One time axis (t_min to span) for every panel."""
     plot_w = W - LEFT - RIGHT
     x = lambda t: LEFT + plot_w * ((t - t_min) / (span - t_min) if span > t_min else 0)
     panels = []  # (title, unit, height, series [(slot or None, [(t, v)])], dashed legend)
     if users:
         panels.append(("concurrent users", "users", 70, [(None, users)]))
+    if offered:
+        panels.append(("offered load (open loop)", "q/s", 70, [(None, offered)]))
     panels.append(("answered queries per second", "q/s", 150,
-                   [(slot, [(w["t"] + width / 2, w["answered"] / n if w["offered"] else None)
-                            for w in win if w["t"] + width <= span])  # the last window is partial
-                    for _, slot, win, _, n in lines]))
+                   [(slot, [(w["t"] + width / 2, w["answered"])
+                            for w in flows[label] if w["t"] + width <= span])  # the last window is partial
+                    for label, slot, _, _, _ in lines]))
+    if offered:
+        panels.append(("backlog: queries sent, not answered yet", "queries", 120,
+                       [(slot, [(w["t"] + width, w["backlog"]) for w in flows[label] if w["t"] + width <= span])
+                        for label, slot, _, _, _ in lines]))
     panels.append(("mean latency of the answered queries" + (" (log scale)" if log_latency else ""), "ms", 210,
                    [(slot, [(w["t"] + width / 2, w["mean_us"] / 1000.0 if w["mean_us"] else None) for w in win])
                     for _, slot, win, _, _ in lines]))
@@ -318,7 +404,7 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">seconds since the load started</text>'
                % (LEFT + plot_w / 2, axis_y + 36))
 
-    ly0 = tops[1 if users else 0]  # legend beside the first panel with one line per run
+    ly0 = tops[1 if users or offered else 0]  # legend beside the first panel with one line per run
     for i, (label, slot, _, _, _) in enumerate(lines):
         lx, ly = W - RIGHT + 16, ly0 + 10 + i * 18
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ly - 4, lx + 16, ly - 4))
@@ -373,10 +459,14 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         text = ["%.2f–%.2f s" % (t, t + width)]
         if users and k < len(users) and users[k][1] is not None:
             text.append("users: %d" % users[k][1])
+        if offered and k < len(offered):
+            text.append("offered: %.0f q/s" % offered[k][1])
         for label, _, win, _, runs in lines:
             w = win[k] if k < len(win) else None
-            text.append("%s: %s, %s" % (label, "%.0f q/s" % (w["answered"] / runs) if w else "–",
-                                        "%.2f ms" % (w["mean_us"] / 1000.0) if w and w["mean_us"] else "–"))
+            f = flows[label][k] if k < len(flows[label]) else None
+            text.append("%s: %s, %s%s" % (label, "%.0f q/s" % f["answered"] if f else "–",
+                                          "%.2f ms" % (w["mean_us"] / 1000.0) if w and w["mean_us"] else "–",
+                                          ", backlog %.0f" % f["backlog"] if f and offered else ""))
         x0, x1 = x(max(t, t_min)), x(min(t + width, span))
         svg.append('<g class="hit"><title>%s</title><rect x="%.1f" y="%d" width="%.1f" height="%d"/>'
                    '<line x1="%.1f" y1="%d" x2="%.1f" y2="%d"/></g>'
@@ -395,6 +485,8 @@ def main():
     ap.add_argument("--out", help="output path without extension (default: latency-mean next to the runs)")
     ap.add_argument("--title", default="Mean latency over time")
     ap.add_argument("--log-latency", action="store_true", help="latency panel on a log scale")
+    ap.add_argument("--slo-ms", type=float, default=200.0,
+                    help="open loop: count the queries answered later than this (default 200 ms)")
     ap.add_argument("--skip", type=float, default=None,
                     help="leave out the queries sent in the first SKIP seconds of each run (warm-up; "
                     "default: \"WarmupSeconds\" in the first run's experiment.json, else 0)")
@@ -417,13 +509,19 @@ def main():
                                    if len(groups[labels[0]]) > 1 else
                                    os.path.dirname(os.path.abspath(args.runs[0])), "latency-mean")
 
-    lines, summary, span, users, moved = [], [], 0.0, None, {}
+    lines, summary, span, users, moved, flows = [], [], 0.0, None, {}, {}
+    sched = offered_schedule(args.runs[0])
     for label, slot in zip(labels, slots(labels)):
         runs = load(label, groups[label], args.skip)
         merged = sorted((r for rows, _ in runs for r in rows), key=lambda r: r["t"])
         win = windows(merged, args.window)
+        flows[label] = flow(merged, args.window, len(win), len(runs))
         lines.append((label, slot, win, [rcs for _, rcs in runs], len(runs)))
         s = summarize(label, runs, win, args.window, args.skip)
+        if sched and runs[0][1]:
+            trigger = sum(rcs[0][0] for _, rcs in runs) / len(runs)
+            s["open_loop"] = openloop_summary(merged, flows[label], args.window, trigger, len(runs),
+                                              args.slo_ms * 1000)
         per_run = [t for t in (transfers(d) for d in groups[label]) if t]
         if per_run:
             moved[label] = {k: sum(t[k] for t in per_run) / len(per_run) for k, _ in PARTS}
@@ -437,26 +535,33 @@ def main():
                 us = [r["users"] for r in merged if w * args.window <= r["t"] < (w + 1) * args.window]
                 users.append((w * args.window, max(us) if us else None))
 
+    offered = None
+    if sched and not users:
+        n = max(len(win) for _, _, win, _, _ in lines)
+        offered = [(k * args.window, rate_at(sched, k * args.window)) for k in range(n)]
     counts = {len(groups[l]) for l in labels}
-    subtitle = "mean latency of the answered queries per %s ms window, by send time" % fmt(args.window * 1000)
+    subtitle = "per %s ms window: answers when they came, latency by send time" % fmt(args.window * 1000)
     if counts != {1}:
         subtitle += ", pooled over %s runs per line" % (counts.pop() if len(counts) == 1 else "the")
     if args.skip:
-        subtitle += "; first %s ms of each run left out (warm-up)" % fmt(args.skip * 1000)
+        subtitle += "; first %s ms left out (warm-up)" % fmt(args.skip * 1000)
     with open(out + ".svg", "w") as f:
         f.write(svg_document(lines, args.skip, span, args.window, args.title, subtitle, users, moved,
-                             args.log_latency))
+                             args.log_latency, flows, offered))
     with open(out + ".csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s"] + [c for l in labels for c in (l + " mean_us", l + " queries")])
+        w.writerow(["t_s"] + [c for l in labels for c in (l + " mean_us", l + " queries sent",
+                                                          l + " answered_per_s", l + " backlog")])
         for k in range(max(len(win) for _, _, win, _, _ in lines)):
             if (k + 1) * args.window <= args.skip:
                 continue
             row = ["%.3f" % (k * args.window)]
-            for _, _, win, _, _ in lines:
+            for label, _, win, _, runs in lines:
                 x = win[k] if k < len(win) else None
+                f = flows[label][k] if k < len(flows[label]) else None
                 row += ["%.1f" % x["mean_us"] if x and x["mean_us"] else "",
-                        "%d" % round(x["answered"] * args.window) if x else ""]
+                        "%d" % round(x["offered"] * args.window / runs) if x else "",
+                        "%.1f" % f["answered"] if f else "", "%.1f" % f["backlog"] if f else ""]
             w.writerow(row)
     with open(out + ".json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -476,6 +581,12 @@ def main():
                      ms({"mean_us": r["peak_window_mean_us"]})))
         if "after" in s:
             print("  after the last rescale: %s" % ms(s["after"]))
+        o = s.get("open_loop")
+        if o:
+            print("  backlog: peak %d queries at %.1f s, drained %s; %d queries (%.2f%%) over %g ms from the trigger on"
+                  % (o["peak_backlog"], o["peak_backlog_at_s"],
+                     "at %.1f s" % o["backlog_drained_at_s"] if o["backlog_drained_at_s"] is not None else "never",
+                     o["slo_misses"], 100 * (o["slo_miss_fraction"] or 0), o["slo_ms"]))
         if "transferred_bytes" in s:
             tb = s["transferred_bytes"]
             print("  transferred per run: %s (%s)" % (mb(tb["total"]), ", ".join(
