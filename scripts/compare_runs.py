@@ -132,16 +132,17 @@ def flow(rows, width, n, runs):
 
 
 def openloop_summary(rows, fl, width, trigger, runs, slo_us):
-    """Peak backlog after the first reconfiguration's trigger, when it drained (from then on
-    within twice the backlog of the run's last fifth, plus 10: the queries in flight; a run
-    whose last fifth still holds over 100 has not drained), and the queries sent from the
-    trigger on that were answered later than slo_us or failed."""
+    """Peak backlog after the first reconfiguration's trigger, when it drained (the first
+    window after the peak back within the queries in flight: twice the backlog of the run's
+    last fifth plus 10, at least 50 -- a later blip of a few dozen is not a backlog; a run whose
+    last fifth still holds over 100 has not drained), and the queries sent from the trigger on
+    that were answered later than slo_us or failed."""
     after = [w for w in fl if w["t"] + width > trigger]
     if not after:
         return {}
     tail = sorted(w["backlog"] for w in fl[-max(1, len(fl) // 5):])
     floor = tail[len(tail) // 2]
-    limit = 2 * floor + 10
+    limit = max(2 * floor + 10, 50)
     peak = max(after, key=lambda w: w["backlog"])
     drained = None
     if floor > 100:
@@ -149,10 +150,7 @@ def openloop_summary(rows, fl, width, trigger, runs, slo_us):
     elif peak["backlog"] <= limit:
         drained = trigger  # never behind
     else:
-        for w in reversed(after):
-            if w["backlog"] > limit:
-                break
-            drained = w["t"] + width
+        drained = next((w["t"] + width for w in after if w["t"] > peak["t"] and w["backlog"] <= limit), None)
     late = [r for r in rows if r["t"] >= trigger]
     miss = sum(1 for r in late if r["status"] != "ok" or r["us"] > slo_us)
     return {"peak_backlog": round(peak["backlog"]), "peak_backlog_at_s": round(peak["t"] + width, 3),
