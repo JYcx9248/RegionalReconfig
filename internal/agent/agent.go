@@ -70,7 +70,13 @@ type Agent struct {
 	limiter  *transfer.TokenBucket
 	bulk     *transfer.Server
 	reg      *metrics.Registry
-	local    *nodeclient.Client
+	// The local data node, twice. Queries (NAVIGATE, and FILTER/RERANK through peer) use local;
+	// everything else -- serving peers' pulls, installing what arrives, loads, evictions, INFO --
+	// uses localBulk, so that it never waits for one of local's connections behind a backlog of
+	// queries (a raw-vector stream served through local crawled at a few MB/s under an
+	// open-loop overload while the data node answered each request in under a millisecond).
+	local     *nodeclient.Client
+	localBulk *nodeclient.Client
 
 	beforeInstall func(epoch uint64) // test hooks (Options)
 	beforeGraph   func() error
@@ -179,6 +185,8 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.local = nodeclient.New(a.cfg.NodeAddr, a.cfg.NodeConns)
 	defer a.local.Close()
+	a.localBulk = nodeclient.New(a.cfg.NodeAddr, a.cfg.NodeConns)
+	defer a.localBulk.Close()
 	info, err := a.waitForNode(ctx)
 	if err != nil {
 		return err
@@ -205,10 +213,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		BulkAddr:  a.advertise(bln.Addr()),
 	}
 	a.bulk.PQ = func(ctx context.Context, ids []uint32) (int, []byte, error) {
-		return a.local.PQGet(ctx, ids) // peers staging our partitions pull their PQ codes
+		return a.localBulk.PQGet(ctx, ids) // peers staging our partitions pull their PQ codes
 	}
 	a.bulk.Raw = func(ctx context.Context, locs, lists []uint32) (int, []byte, error) {
-		return a.local.RawGet(ctx, locs, lists) // ... and stream their raw vectors
+		return a.localBulk.RawGet(ctx, locs, lists) // ... and stream their raw vectors
 	}
 	go a.bulk.Serve(bln)
 	go a.serveQueries(ctx, qln)
@@ -254,7 +262,7 @@ func (a *Agent) waitForNode(ctx context.Context) (*nodeclient.Info, error) {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		info, err := a.local.Info(cctx)
+		info, err := a.localBulk.Info(cctx)
 		cancel()
 		if err == nil {
 			return info, nil
@@ -367,7 +375,7 @@ func (a *Agent) reportMetrics(ctx context.Context) {
 			return
 		case now := <-tk.C:
 			ictx, cancel := context.WithTimeout(ctx, iv)
-			if info, err := a.local.Info(ictx); err == nil {
+			if info, err := a.localBulk.Info(ictx); err == nil {
 				pqResident.Store(info.PQ.Resident)
 				pqCached.Store(info.PQ.Cached)
 				rawPresent.Store(info.Raw.Present)

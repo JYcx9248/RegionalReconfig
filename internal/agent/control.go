@@ -107,7 +107,7 @@ func (a *Agent) handleStagePartitions(ctx context.Context, body json.RawMessage)
 		// staging protected to the cache. (Every PQ_PUT has been answered by now: they are not
 		// cancelled with ctx.)
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		if freed, rerr := a.local.PQRelease(rctx); rerr != nil {
+		if freed, rerr := a.localBulk.PQRelease(rctx); rerr != nil {
 			log.Printf("agent %s: releasing staged PQ codes: %v", a.cfg.Name, rerr)
 		} else if freed > 0 {
 			log.Printf("agent %s: staging failed; released %d staged PQ codes", a.cfg.Name, freed)
@@ -255,7 +255,7 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 			groups[i] = append(groups[i], a.segmentPath(p))
 		}
 	}
-	missing, err := a.local.PQMissing(ctx, groups)
+	missing, err := a.localBulk.PQMissing(ctx, groups)
 	if err != nil {
 		return fmt.Errorf("listing the PQ codes to fetch: %w", err)
 	}
@@ -266,7 +266,7 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 			// a cleanup that follows a failure sees all installed codes.
 			pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 			defer cancel()
-			_, _, err := a.local.PQPut(pctx, ids, m, codes)
+			_, _, err := a.localBulk.PQPut(pctx, ids, m, codes)
 			return err
 		})
 		mu.Lock()
@@ -281,7 +281,7 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 }
 
 func (a *Agent) loadPartition(ctx context.Context, p int, fromIndex bool, rawPeer string) error {
-	if err := a.local.LoadPartition(ctx, p, a.segmentPath(p), fromIndex, rawPeer); err != nil {
+	if err := a.localBulk.LoadPartition(ctx, p, a.segmentPath(p), fromIndex, rawPeer); err != nil {
 		return fmt.Errorf("load partition %d: %w", p, err)
 	}
 	a.mu.Lock()
@@ -357,7 +357,7 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 			groups[i] = append(groups[i], a.segmentPath(p))
 		}
 	}
-	missing, err := a.local.RawMissing(ctx, groups)
+	missing, err := a.localBulk.RawMissing(ctx, groups)
 	if err != nil {
 		return nil, fmt.Errorf("listing the raw vectors to fetch: %w", err)
 	}
@@ -365,7 +365,7 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	// flight comes twice, so the batch is kept to a fraction of a second at the paced rates,
 	// and still large enough to amortize the round trip and the RAW_CHECK before it.
 	batch := 0
-	if info, err := a.local.Info(ctx); err == nil && info.Raw.VecBytes > 0 {
+	if info, err := a.localBulk.Info(ctx); err == nil && info.Raw.VecBytes > 0 {
 		batch = max(64, rawBatchBytes/info.Raw.VecBytes)
 	}
 	var (
@@ -373,11 +373,11 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 		reply protocol.StageReply
 	)
 	err = parallel(ctx, len(req.Sources), func(ctx context.Context, i int) error {
-		still := func(locs []uint32) ([]uint32, error) { return a.local.RawAbsent(ctx, locs) }
+		still := func(locs []uint32) ([]uint32, error) { return a.localBulk.RawAbsent(ctx, locs) }
 		st, err := transfer.PullRaw(ctx, req.Sources[i].Addr, missing[i].Locs, missing[i].Lists, batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
-			_, _, err := a.local.RawPut(pctx, locs, vb, vecs)
+			_, _, err := a.localBulk.RawPut(pctx, locs, vb, vecs)
 			return err
 		})
 		mu.Lock()
@@ -432,7 +432,7 @@ func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any
 		return nil, err
 	}
 	path, _ := filepath.Abs(filepath.Join(a.graphDir(), name))
-	if err := a.local.LoadGraph(ctx, path); err != nil {
+	if err := a.localBulk.LoadGraph(ctx, path); err != nil {
 		return nil, err
 	}
 	a.setReady(config.RoleEntry)
@@ -484,7 +484,7 @@ func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, err
 		}
 	}
 	for _, p := range req.Partitions {
-		if _, err := a.local.EvictPartition(ctx, p); err != nil {
+		if _, err := a.localBulk.EvictPartition(ctx, p); err != nil {
 			return nil, err
 		}
 		files, err := partitioning.Files(a.manifest, p)
@@ -501,7 +501,7 @@ func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, err
 		a.mu.Unlock()
 	}
 	if req.ReleaseStagedPQ {
-		if _, err := a.local.PQRelease(ctx); err != nil {
+		if _, err := a.localBulk.PQRelease(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -537,7 +537,7 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 	}
 	a.mu.Unlock()
 	sort.Ints(st.Resident)
-	if info, err := a.local.Info(ctx); err == nil {
+	if info, err := a.localBulk.Info(ctx); err == nil {
 		st.GraphLoaded = info.GraphLoaded
 		st.RawFetched = info.Raw.FetchedOnDemand()
 		st.RawFetchedBytes = st.RawFetched * uint64(info.Raw.VecBytes)
