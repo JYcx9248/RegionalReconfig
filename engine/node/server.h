@@ -37,7 +37,8 @@ class PeerPool {
 
   // Fetches n raw vectors (vec_bytes each, in the order of locs) from the data node at addr
   // ("host:port") into out. Throws std::runtime_error on failure.
-  void RawGet(const std::string& addr, const uint32_t* locs, size_t n, uint32_t vec_bytes,
+  void RawGet(const std::string& addr, const uint32_t* locs, const uint32_t* lists, size_t n,
+              uint32_t vec_bytes,
               uint8_t* out);
 
  private:

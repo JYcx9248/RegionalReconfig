@@ -25,7 +25,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 - Sanitizers: build the engine with `-fsanitize=address,undefined` into another directory and
   point `RTIER_ENGINE_BIN` at it; the end-to-end tests fail on any sanitizer report.
 - The end-to-end tests start real `rtier_node` processes on a small synthetic fixture
-  (8000 vectors, 8 partitions) and take about 10 s. Nodes that join after the initial
+  (8000 vectors, 8 partitions) and take about 10 s. `RTIER_E2E_TIMELINE=<dir>` makes
+  `TestReconfigUnderLoad` write each protocol's per-query latency and rescale times for
+  `scripts/compare_runs.py` (README, "Mean latency over time"); measure without `-race`.
+  `RTIER_E2E_BACKEND=gpu` (with a CUDA build in `RTIER_ENGINE_BIN`) runs the cluster's nodes on
+  the GPU backend against the CPU oracle. Nodes that join after the initial
   deployment run on a copy of the index without its page file (`indexNoPages`): they can only
   get raw vectors from peers.
 
@@ -44,7 +48,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `internal/design` | registry of open design questions (U1–U17) |
 | `engine/` | FusionANNS engine, `NodeEngine`, `rtier_node`, `rtier_segment` (see `engine/README.md`) |
 | `test/e2e` | end-to-end tests |
-| `scripts/` | `run_local.py` experiments, `plot_run.py`, `emulation/netns.sh`, test placeholders |
+| `scripts/` | `run_local.py` experiments, `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `emulation/netns.sh`, test placeholders |
 
 ## Conventions
 
@@ -76,18 +80,22 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   sources round-robin over entries) → flip (CAS + install) → grace (drain the old epoch) →
   reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
   Alongside grace and reclaim, `promoteEntries` flips every `entry_flip_interval` to make
-  entries of the new nodes whose graph has loaded, and `StageRaw` streams the raw vectors in
-  (`raw_priority`, background); the rescale waits for both. `copy-then-flip` and
-  `stop-and-copy` stream the raw vectors before the flip (eager baselines).
+  entries of the new nodes whose graph has loaded; the rescale waits for it. Raw vectors do
+  not move with the rescale: `lazy` fetches one only when a query needs it (below). Baselines:
+  `lazy-stream` also streams the rest in after the flip (`StageRaw`, `raw_priority`; the rescale
+  waits for it), `copy-then-flip` and `stop-and-copy` stream them before the flip (eager).
 - **PQ codes** are stored per node, once per vector, with a cache of codes of partitions that
   moved away (`engine/include/fusion/pq_store.h`); placement `even-reversible` returns
   partitions to former owners so a scale-in moves no PQ code (and no raw vector).
 - **Raw vectors**: every posting carries its vector's canonical location in the index's page
   file (segment v2); a node keeps a sparse local copy of that file with a presence bit per
   location (`engine/include/fusion/raw_store.h`) and looks locations up through its PQ store.
-  After a migration, RERANK fetches missing vectors from the old owner's data node on demand
-  (`EnsureRaw`, `PeerPool`, `RAW_GET`) until the stream has brought them. Only bootstrap reads
-  the index's page file.
+  After a migration, RERANK fetches a missing vector from the old owner's data node when a
+  query first needs it, and only then: each posting list has a source (the old owner of its
+  partition), RERANK requests carry the query's lists on that owner, and RAW_GET names the list
+  of every vector so a source that lacks one fetches it from its own source (chains)
+  (`EnsureRawInLists`, `FetchRaw`, `PeerPool`). What no query needs stays with the old owner,
+  which keeps every vector it has held. Only bootstrap reads the index's page file.
 
 ## Docs
 
@@ -103,8 +111,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 Recently done: owner-based aggregator selection (U6); one epoch per query (fixes the flip races);
 new nodes become entries in batched flips as their graphs load; graph transfer at background
 priority from round-robin sources (U16); no global replica of the raw vectors: canonical
-locations in the segments (U1) and lazy fetch after the flip -- on demand plus a background
-stream -- as the default protocol (U9).
+locations in the segments (U1) and lazy fetch after the flip as the default protocol (U9) --
+since 2026-09-28 on demand only, with sources per posting list (the full background stream is
+the `lazy-stream` baseline).
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current
@@ -116,9 +125,10 @@ Next:
    page); exact kNN ground truth.
 3. Local experiments: data-dependent counts with `rtier-overhead` (owners per query, PQ
    redundancy, bytes and heat per partition, recall vs nprobe and n, PQ code size via
-   `fusion_build --pq-m`); protocol comparisons on one machine; a 1→2 scale-out demo with each
-   node pinned to its own cores (wire `systemd-run -p AllowedCPUs=… -p MemoryMax=…` into
-   `run_local.py`). Scaling curves need a multi-node GPU testbed.
+   `fusion_build --pq-m`); protocol comparisons on one machine. Nodes on one machine share its
+   SSD, which caps the cluster: give each node its own CPUs and read IOPS with
+   `"NodeResources"` in `run_local.py` (README) before reading anything into throughput.
+   Scaling curves need a multi-node GPU testbed.
 4. Small code items: fill the whole connection pool during pre-connect and let entries
    pre-connect to aggregators; heap merge in `MergeTopK`; raw path (see `engine/README.md`,
    known limits): compact pending-source map, coalescing concurrent fetches of one vector.

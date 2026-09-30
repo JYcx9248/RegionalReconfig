@@ -189,11 +189,38 @@ using Result = std::vector<std::pair<float, uint32_t>>;
 // In-process stand-in for the node server's peer pool: raw vectors are fetched by calling the
 // named peer's RawGet directly.
 void LinkPeers(NodeEngine* node, std::map<std::string, NodeEngine*> peers) {
-  node->SetRawFetcher([peers](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+  node->SetRawFetcher([peers](const std::string& peer, const uint32_t* locs, const uint32_t* lists,
+                              size_t n, uint8_t* out) {
     auto it = peers.find(peer);
     if (it == peers.end()) throw std::runtime_error("unknown peer " + peer);
-    it->second->RawGet(locs, n, out);
+    it->second->RawGet(locs, lists, n, out);
   });
+}
+
+// For each of `ids`, the first list of partition `part` that names it (deduplicated): the lists
+// a FILTER over that partition would have gathered those candidates from.
+std::vector<uint32_t> ListsNaming(const Fixture& f, uint32_t part, const std::vector<uint32_t>& ids) {
+  const ListSegment s = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(part)));
+  std::vector<uint32_t> out;
+  for (uint32_t id : ids)
+    for (size_t i = 0; i < s.list_ids.size(); ++i)
+      if (std::find(s.ids.begin() + s.offsets[i], s.ids.begin() + s.offsets[i + 1], id) !=
+          s.ids.begin() + s.offsets[i + 1]) {
+        out.push_back(s.list_ids[i]);
+        break;
+      }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+// A list of partition `part` that names location `loc` (kInvalidId if none).
+uint32_t ListNamingLoc(const Fixture& f, uint32_t part, uint32_t loc) {
+  const ListSegment s = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(part)));
+  for (size_t i = 0; i < s.list_ids.size(); ++i)
+    for (uint64_t j = s.offsets[i]; j < s.offsets[i + 1]; ++j)
+      if (s.locs[j] == loc) return s.list_ids[i];
+  return kInvalidId;
 }
 
 // Distinct IDs and locations named by the given partitions' segments.
@@ -254,7 +281,8 @@ void TestNodePrimitives() {
       std::vector<uint32_t> rid(k);
       std::vector<float> rd(k);
       RerankStats rs;
-      const uint32_t nr = e->Rerank(1, q, cand.data(), nc, k, rid.data(), rd.data(), &rs);
+      const uint32_t nr = e->Rerank(1, q, cand.data(), nc, k, ls.data(),
+                                    static_cast<uint32_t>(ls.size()), rid.data(), rd.data(), &rs);
       for (uint32_t i = 0; i < nr; ++i) merged[rid[i]] = rd[i];
     }
     Result dist;
@@ -753,14 +781,16 @@ bool SameRerank(const Fixture& f, uint32_t qi, NodeEngine* at, NodeEngine* ref,
   const uint32_t nc = at->Filter(0, q, mine.data(), static_cast<uint32_t>(mine.size()), 200,
                                  cand.data(), pqd.data(), &fs);
   RerankStats ra, rb;
-  const uint32_t na = at->Rerank(0, q, cand.data(), nc, 10, ia.data(), da.data(), &ra);
-  const uint32_t nb = ref->Rerank(0, q, cand.data(), nc, 10, ib.data(), db.data(), &rb);
+  const uint32_t nm = static_cast<uint32_t>(mine.size());
+  const uint32_t na = at->Rerank(0, q, cand.data(), nc, 10, mine.data(), nm, ia.data(), da.data(), &ra);
+  const uint32_t nb = ref->Rerank(0, q, cand.data(), nc, 10, mine.data(), nm, ib.data(), db.data(), &rb);
   return na == nb && ia == ib && da == db;
 }
 
 // Raw vectors after a migration (U9): the new owner goes online without them, re-ranking fetches
-// the ones it needs from the old owner on demand, the stream installs the rest, and the answers
-// are the old owner's throughout. The new nodes' index has no page file at all.
+// the ones it needs from the old owner on demand -- through the source of the query's lists --
+// and only those; a stream (the lazy-stream baseline) can install the rest; the answers are the
+// old owner's throughout. The new nodes' index has no page file at all.
 void TestRawMigration() {
   Fixture& f = GetFixture();
   auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
@@ -804,21 +834,26 @@ void TestRawMigration() {
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, third.get(), src.get(), {3}) && same;
   CHECK(same && third->raw_stats().fetched > 0 && dst->raw_stats().fetched > dst_fetched);
 
-  // The stream brings the rest: exactly the vectors still missing, once.
+  // What nothing needed stays missing (the lazy protocol stops here); a stream brings the rest:
+  // exactly the vectors still missing, once, each with a list that names it.
   const auto miss = dst->RawMissing({{seg(2)}, {seg(3)}});
   rs = dst->raw_stats();
-  CHECK(miss.size() == 2 && miss[0].size() + miss[1].size() == locs23.size() - rs.present &&
-        miss[1].size() + miss[0].size() == rs.pending);
+  CHECK(rs.pending > 0);
+  CHECK(miss.size() == 2 && miss[0].locs.size() + miss[1].locs.size() == locs23.size() - rs.present &&
+        miss[1].locs.size() + miss[0].locs.size() == rs.pending);
+  for (size_t g = 0; g < miss.size(); ++g)
+    for (size_t i = 0; i < miss[g].locs.size(); ++i)
+      CHECK(ListNamingLoc(f, g == 0 ? 2 : 3, miss[g].locs[i]) != kInvalidId);
   for (const auto& m : miss) {
-    std::vector<uint8_t> v(m.size() * dst->vec_bytes());
-    src->RawGet(m.data(), m.size(), v.data());
-    const RawPutResult pr = dst->RawPut(m.data(), m.size(), v.data());
-    CHECK(pr.installed == m.size() && pr.skipped == 0);
+    std::vector<uint8_t> v(m.locs.size() * dst->vec_bytes());
+    src->RawGet(m.locs.data(), m.lists.data(), m.locs.size(), v.data());
+    const RawPutResult pr = dst->RawPut(m.locs.data(), m.locs.size(), v.data());
+    CHECK(pr.installed == m.locs.size() && pr.skipped == 0);
   }
   rs = dst->raw_stats();
   CHECK(rs.present == locs23.size() && rs.pending == 0 &&
-        rs.streamed == miss[0].size() + miss[1].size());
-  CHECK(dst->RawMissing({{seg(2), seg(3)}})[0].empty());
+        rs.streamed == miss[0].locs.size() + miss[1].locs.size());
+  CHECK(dst->RawMissing({{seg(2), seg(3)}})[0].locs.empty());
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, dst.get(), src.get(), {2, 3}) && same;
   CHECK(same && dst->raw_stats().fetched == rs.fetched);  // nothing left to fetch
@@ -826,7 +861,7 @@ void TestRawMigration() {
   // A partition that moves away leaves its vectors (a cache, like its PQ codes): it comes back
   // with nothing to transfer, and no source is needed.
   CHECK(dst->EvictPartition(2));
-  CHECK(dst->raw_stats().present == locs23.size() && dst->RawMissing({{seg(2)}})[0].empty());
+  CHECK(dst->raw_stats().present == locs23.size() && dst->RawMissing({{seg(2)}})[0].locs.empty());
   dst->LoadPartition(2, seg(2), PQSource::kPresent);
   CHECK(dst->ResidentPartitions().size() == 2 && dst->raw_stats().pending == 0);
 
@@ -992,11 +1027,15 @@ void TestWire() {
 
   // RERANK on the new node fetches the vectors it lacks from the first node over the wire
   // (the node server's peer pool) and answers like the first node.
+  const std::vector<uint32_t> first64(ids0.begin(), ids0.begin() + 64);
+  const std::vector<uint32_t> lists64 = ListsNaming(f, 0, first64);
   auto rerank = [&](int conn, uint64_t id, uint32_t* fetched) {
     rtier::BodyWriter w;
     w.Put<uint32_t>(10);
     w.Put<uint32_t>(64);
     w.PutBytes(ids0.data(), 64 * 4);
+    w.Put<uint32_t>(static_cast<uint32_t>(lists64.size()));
+    w.PutBytes(lists64.data(), lists64.size() * 4);
     w.PutBytes(&f.queries[0], f.dim * sizeof(float));
     rtier::Frame resp = Call(conn, rtier::kRerank, w, id);
     CHECK(resp.status == rtier::kOk && resp.body.size() == 4 + 10 * 8 + 8);
@@ -1025,12 +1064,15 @@ void TestWire() {
   rtier::BodyReader rr(r.body.data(), r.body.size());
   CHECK(rr.Get<uint32_t>() == 1);
   const uint32_t nraw = rr.Get<uint32_t>();
-  CHECK(nraw == locs0.size() - fetched2 && rr.remaining() == nraw * 4u);
-  std::vector<uint32_t> rlocs(nraw);
+  CHECK(nraw == locs0.size() - fetched2 && rr.remaining() == nraw * 8u);
+  std::vector<uint32_t> rlocs(nraw), rlists(nraw);
   std::memcpy(rlocs.data(), rr.Bytes(nraw * 4u), nraw * 4u);
+  std::memcpy(rlists.data(), rr.Bytes(nraw * 4u), nraw * 4u);
+  for (uint32_t i = 0; i < nraw; i += 97) CHECK(ListNamingLoc(f, 0, rlocs[i]) != kInvalidId);
   rtier::BodyWriter rget;
   rget.Put<uint32_t>(nraw);
   rget.PutBytes(rlocs.data(), nraw * 4u);
+  rget.PutBytes(rlists.data(), nraw * 4u);
   r = Call(fd, rtier::kRawGet, rget, 74);
   const uint32_t vb = fresh->vec_bytes();
   CHECK(r.status == rtier::kOk && r.body.size() == 4 + static_cast<size_t>(nraw) * vb);
@@ -1050,9 +1092,10 @@ void TestWire() {
   uint32_t other = kInvalidId;
   for (uint32_t l : locs3)
     if (!std::binary_search(locs0.begin(), locs0.end(), l)) other = l;
-  rtier::BodyWriter rget2;
+  rtier::BodyWriter rget2;  // its list's partition never loaded here: the list has no source
   rget2.Put<uint32_t>(1);
   rget2.Put<uint32_t>(other);
+  rget2.Put<uint32_t>(ListNamingLoc(f, 3, other));
   r = Call(fd2, rtier::kRawGet, rget2, 76);
   CHECK(other != kInvalidId && r.status == rtier::kRawAbsent);
   // RAW_CHECK: of these, the ones not here.

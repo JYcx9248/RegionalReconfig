@@ -143,25 +143,30 @@ var Open = map[string]Question{
 		"internal/transfer/adapter.go, internal/transfer/tokenbucket.go (classes)"},
 	"U9": {"U9", "Lazy fetch of raw vectors (and chunks) after a new node is online",
 		"Decided: a node goes online (the flip) only once it holds every posting list and PQ " +
-			"code of its partitions, so it can filter at once; raw vectors come after (protocol " +
-			"\"lazy\", the default). The new owner re-ranks from the flip on: a vector a query " +
-			"needs that has not arrived is fetched on demand from the partition's old owner, data " +
-			"node to data node (RAW_GET; the RERANK waits for it), while the agent streams the rest " +
-			"in behind (StageRaw right after the flip, at raw_priority = background: RAW_MISSING " +
-			"lists each missing vector once, under one source, and before each batch RAW_CHECK " +
-			"drops what queries fetched meanwhile). Old owners keep the vectors as a cache (static " +
-			"dataset), so they remain valid sources after the reclaim, a node asked for a vector " +
-			"it is itself still waiting for fetches it first (chains of migrations), and a " +
-			"partition that returns moves nothing. The rescale ends when every stream has ended, " +
-			"and nodes that leave stay up as sources until then. Baselines: \"copy-then-flip\" " +
-			"streams the raw vectors before the flip (eager), \"stop-and-copy\" does so while " +
-			"paused. Open: re-ranking at the old owner during the warm-up instead (fits two-phase, " +
-			"U5: no fetch on the query path, but the old owner keeps that load until the stream " +
-			"ends); starting the stream before the flip at background priority; coalescing " +
-			"concurrent fetches of one vector, or fetching whole pages; the stream's rate (U8); " +
-			"chunks (U12)",
+			"code of its partitions, so it can filter at once; a raw vector moves only when a " +
+			"query first needs it (protocol \"lazy\", the default) -- the point of being lazy " +
+			"is that queries touch a small working set of what moved. A RERANK that meets a " +
+			"vector not there fetches it from the partition's old owner, data node to data node " +
+			"(RAW_GET; the RERANK waits for it). Sources are kept per posting list (the old owner " +
+			"of its partition; lists overlap, so no per-vector table): RERANK requests carry the " +
+			"query's lists on that owner, and RAW_GET names the list of every vector, so a node " +
+			"asked for one it lacks fetches it from its own source of that list (chains of " +
+			"migrations). The rescale does not wait for raw vectors. The old owners stay valid " +
+			"sources because no node drops a raw vector it has held (static dataset), the nodes " +
+			"that leave are the ones that joined last and a scale-in returns partitions to nodes " +
+			"that held them (U3): a disk budget or another leave order would need a hand-off of " +
+			"what only a leaving node holds. Baselines: \"lazy-stream\" also streams the rest in " +
+			"after the flip (StageRaw at raw_priority; RAW_MISSING lists each missing vector once " +
+			"with a list naming it, RAW_CHECK drops what queries fetched meanwhile; the rescale " +
+			"waits for it) -- also the building block for handing data off before a node leaves " +
+			"or after a failure; \"copy-then-flip\" streams before the flip, \"stop-and-copy\" " +
+			"while paused. Open: taking the fetch off the query path (re-rank the missing " +
+			"candidates at the old owner, which has them, and fetch the ones used in the " +
+			"background); coalescing concurrent fetches of one vector; the workload that decides " +
+			"the working set (U11); chunks (U12)",
 		"internal/controller/reconfig.go (copyThenFlip, stageRaw), internal/agent/control.go " +
-			"(StageRaw), engine/src/node_engine.cpp (EnsureRaw), engine/node/server.cpp (PeerPool)"},
+			"(StageRaw), engine/src/node_engine.cpp (EnsureRawInLists, FetchRaw, SetListSources), " +
+			"engine/node/server.cpp (PeerPool)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
 			"single-machine prototype uses; also what happens when the controller fails mid-flip",

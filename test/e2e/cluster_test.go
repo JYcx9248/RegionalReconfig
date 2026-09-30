@@ -296,16 +296,18 @@ func (h heldTracker) partitions(n placement.NodeID) []int {
 }
 
 type cluster struct {
-	t       *testing.T
-	f       *fixture
-	initial int // nodes of the initial deployment: the first ones added
-	ctx     context.Context
-	cancel  context.CancelFunc
-	ctl     *controller.Controller
-	agents  []*agent.Agent
-	stops   []func() error
-	wg      sync.WaitGroup
-	held    heldTracker // partitions each node has owned (see observe)
+	t        *testing.T
+	f        *fixture
+	initial  int    // nodes of the initial deployment: the first ones added
+	protocol string // the controller's reconfiguration protocol
+	ctx      context.Context
+	cancel   context.CancelFunc
+	ctl      *controller.Controller
+	agents   []*agent.Agent
+	stops    []func() error
+	wg       sync.WaitGroup
+	held     heldTracker   // partitions each node has owned (see observe)
+	rescales []rescaleSpan // every Rescale call of rescale(), in order (timeline_test.go)
 }
 
 // observe records the current placement in cl.held.
@@ -317,7 +319,7 @@ func (cl *cluster) observe() {
 
 func newCluster(t *testing.T, f *fixture, protocol string, initial int, opts ...func(*config.Controller)) *cluster {
 	ctx, cancel := context.WithCancel(context.Background())
-	cl := &cluster{t: t, f: f, initial: initial, ctx: ctx, cancel: cancel, held: heldTracker{}}
+	cl := &cluster{t: t, f: f, initial: initial, protocol: protocol, ctx: ctx, cancel: cancel, held: heldTracker{}}
 	t.Cleanup(cl.close)
 	cfg := config.DefaultController()
 	cfg.Listen, cfg.APIListen = "127.0.0.1:0", "127.0.0.1:0"
@@ -352,6 +354,11 @@ func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...stri
 	index := cl.f.index
 	if len(cl.agents) >= cl.initial {
 		index = cl.f.indexNoPages
+	}
+	// RTIER_E2E_BACKEND=gpu runs the cluster's data nodes on the GPU filter backend; the
+	// single-node oracle stays on the CPU, so every answer also checks GPU against CPU.
+	if b := os.Getenv("RTIER_E2E_BACKEND"); b != "" {
+		nodeArgs = append([]string{"--backend", b}, nodeArgs...)
 	}
 	addr, stop, err := startNodeOn(cl.f, index, nodeArgs...)
 	if err != nil {

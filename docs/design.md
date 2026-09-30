@@ -14,7 +14,7 @@ rtier 是区域层（regional tier）非中断重配原型的代码骨架。Go �
 
 代码分成三类：
 
-- **已实现**：讨论中已经定下的机制，以及可以直接复用的 Koala 代码。机制包括 epoch 表、原子切换加 grace period、按角色分阶段 ready、独立的批量传输通道加令牌桶、单机网络仿真，固定 n 全局 top-n 需要的检索原语，节点级的 PQ 码存储（每个向量在每个节点只存一份，迁移时只拉缺的，这是 U1 中已定的部分），以及节点级的原始向量存储（按全局规范偏移寻址的本地稀疏文件；迁移后的向量在切换之后按需拉取、后台补齐，这是 U1 和 U9 中已定的部分）。
+- **已实现**：讨论中已经定下的机制，以及可以直接复用的 Koala 代码。机制包括 epoch 表、原子切换加 grace period、按角色分阶段 ready、独立的批量传输通道加令牌桶、单机网络仿真，固定 n 全局 top-n 需要的检索原语，节点级的 PQ 码存储（每个向量在每个节点只存一份，迁移时只拉缺的，这是 U1 中已定的部分），以及节点级的原始向量存储（按全局规范偏移寻址的本地稀疏文件；迁移后的向量只在查询第一次用到时按需拉取，不再后台补齐，这是 U1 和 U9 中已定的部分）。
 - **占位符**：还没讨论完的设计决策。代码里统一标成 `TODO(design)`，走到这些地方时返回 `ErrUndecided`，不替你做选择；少数还没有代码路径的问题只在登记表里记录。
 - **测试替身**：为了让协议流程能端到端跑通，测试里放了最简单的 fake，比如按区间切分 partition。它们只出现在测试代码和 `scripts/testing/` 里，不代表设计选择。
 
@@ -71,12 +71,12 @@ Go 部分没有用 gRPC。原因是这次的构建环境访问不到 Go 模块�
 
 ## 控制面与重配协议
 
-重配分四步：先拷贝数据，再原子切换 epoch，等所有用旧 epoch 路由的查询结束，最后回收旧副本。切换前只拷新节点做过滤必需的东西：posting list 和它缺的 PQ 码。原始向量在切换之后才到（默认协议 `lazy`，U9）：RERANK 缺哪个向量，就由数据节点直接向旧 owner 按需拉取，同时 agent 在后台按批补齐，和 grace period、回收并行。新节点的 entry 角色也不等第二次切换：谁的导航图先加载好，谁就在下一次 entry 切换里成为 entry（每 1 s 合并一次，同样并行）。
+重配分四步：先拷贝数据，再原子切换 epoch，等所有用旧 epoch 路由的查询结束，最后回收旧副本。切换前只拷新节点做过滤必需的东西：posting list 和它缺的 PQ 码。原始向量不随重配搬（默认协议 `lazy`，U9）：切换之后，RERANK 第一次用到哪个本地没有的向量，就由数据节点直接向旧 owner 拉取，只拉用到的；没被用到的一直留在旧 owner 那里。lazy 的前提就是查询只碰迁走数据里的一小部分工作集。对照组 `lazy-stream` 另外让 agent 在切换后按批补齐其余的向量，和 grace period、回收并行。新节点的 entry 角色也不等第二次切换：谁的导航图先加载好，谁就在下一次 entry 切换里成为 entry（每 1 s 合并一次，同样并行）。
 
 | 角色 | ready 的条件 | 对应命令 |
 | --- | --- | --- |
 | aggregator | 连上下一个 epoch 的所有数据节点 | `StageAggregator` |
-| data | 分到的 partition 拷完、缺的 PQ 码从原 owner 拉完，再加载进 `rtier_node`（原始向量不是前提，切换后再到） | `StagePartitions`；切换后 `StageRaw` |
+| data | 分到的 partition 拷完、缺的 PQ 码从原 owner 拉完，再加载进 `rtier_node`（原始向量不是前提，查询用到时再拉） | `StagePartitions`；lazy-stream 切换后另有 `StageRaw` |
 | entry | 导航图拷完并加载 | `StageGraph` |
 
 ```mermaid
@@ -89,10 +89,10 @@ flowchart TD
   E --> F["Evict moved posting lists"]
   D --> H["Entry flips e+2, ...<br/>every 1 s, as graphs load"]
   G --> H
-  D --> R["StageRaw<br/>stream raw vectors, background<br/>RERANK fetches on demand meanwhile"]
+  D --> R["RERANK fetches raw vectors on demand<br/>only those queries need<br/>(lazy-stream: StageRaw streams the rest)"]
 ```
 
-图是 `internal/controller/reconfig.go` 里 `copyThenFlip` 的执行顺序；导航图很大，所以在后台和数据拷贝并行传。每个新节点的图加载完就单独汇报；数据切换之后，controller 每隔 `entry_flip_interval`（默认 1 s）把就绪的新节点合并成一次 entry 切换（`promoteEntries`），不等最慢的图，也不等 grace period。某个节点的图没加载成功，它仍是 owner 和聚合器，其他节点照常成为 entry，rescale 返回的错误里会点名。重配要等所有拉图和原始向量流都结束才返回，所以不会和下一次重配重叠；离开的节点在此之前一直可以作为原始向量的来源。`copy-then-flip` 和 `stop-and-copy` 保留为对照组：它们在切换前（后者在暂停期间）就把原始向量拷完，切换后不再按需拉取。
+图是 `internal/controller/reconfig.go` 里 `copyThenFlip` 的执行顺序；导航图很大，所以在后台和数据拷贝并行传。每个新节点的图加载完就单独汇报；数据切换之后，controller 每隔 `entry_flip_interval`（默认 1 s）把就绪的新节点合并成一次 entry 切换（`promoteEntries`），不等最慢的图，也不等 grace period。某个节点的图没加载成功，它仍是 owner 和聚合器，其他节点照常成为 entry，rescale 返回的错误里会点名。重配要等所有拉图都结束才返回，所以不会和下一次重配重叠；lazy 下原始向量不在其中，查询在重配返回之后仍会继续按需拉取。旧 owner 能一直当来源，靠三条不变量：节点从不删除自己持有过的原始向量，离开的总是最后加入的节点，缩容时分区回到持有过它的节点（U3）。以后如果有磁盘预算或别的离开顺序，就要先把只有离开节点才有的向量交接出去。`lazy-stream`、`copy-then-flip` 和 `stop-and-copy` 保留为对照组：第一个在切换后把其余向量流完（重配等它结束，离开的节点在此之前保持在线），后两个在切换前（后者在暂停期间）就把原始向量拷完，切换后不再按需拉取。
 
 查询在重配期间保持正确，靠的是两点：
 
@@ -113,7 +113,7 @@ flowchart TD
 | copy-then-flip | 6296 | 0 | 0 | 10.4 ms |
 | stop-and-copy | 5792 | 0 | 72 | 37.0 ms |
 
-lazy 下第一次扩容（2→3）新节点要 3977 个向量：3935 个由后台流补齐，42 个被查询按需拉取；缩回和再次扩出都是 0 个，分区回到了持有过它们的节点。
+当时 lazy 还带后台流（现在的 `lazy-stream`）：第一次扩容（2→3）新节点要 3977 个向量，3935 个由后台流补齐，42 个被查询按需拉取；缩回和再次扩出都是 0 个，分区回到了持有过它们的节点。现在的 lazy 在同样的测试里只按需拉取几百个（例如 4223 个中的 340 个），其余不搬。
 
 ## 数据面与 C++ 节点服务
 
@@ -129,8 +129,8 @@ lazy 下第一次扩容（2→3）新节点要 3977 个向量：3935 个由后�
 | PQ\_MISSING | 按来源分组的 segment 路径 | 每组缺的向量 id | 迁移前列出要拉的 PQ 码 |
 | PQ\_GET / PQ\_PUT | id 列表 / id 和 PQ 码 | PQ 码 / 装入数 | 原 owner 读出、目标节点装入 |
 | PQ\_RELEASE | 无 | 释放数 | 清理没被引用的 PQ 码 |
-| RAW\_MISSING / RAW\_CHECK | 按来源分组的 segment 路径 / location 列表 | 每组缺的 location / 其中仍缺的 | 切换后列出要流入的原始向量；每批之前再查一次 |
-| RAW\_GET / RAW\_PUT | location 列表 / location 和向量 | 向量 / 装入数 | 旧 owner 读出（自己也还在等的先去上游拉）、目标节点装入；按需拉取也走 RAW\_GET，数据节点之间直连 |
+| RAW\_MISSING / RAW\_CHECK | 按来源分组的 segment 路径 / location 列表 | 每组缺的 location 及各自所在的一个 list / 其中仍缺的 | 流式传输（对照组）列出要流入的原始向量；每批之前再查一次 |
+| RAW\_GET / RAW\_PUT | location 及各自所在的 list / location 和向量 | 向量 / 装入数 | 旧 owner 读出（自己也缺的，按那个 list 的来源先去上游拉）、目标节点装入；按需拉取也走 RAW\_GET，数据节点之间直连 |
 | NAVIGATE | nprobe、ef、查询向量 | list ID，近的在前 | entry 的第一步 |
 | FILTER | top-n、list ID、查询 | (id, PQ 距离)，按 (距离, id) 排序 | 数据节点上做 PQ 过滤 |
 | RERANK | k、id 列表、查询 | (id, 精确距离) | 读本地页精排，缺的原始向量先向旧 owner 拉；固定 n，不提前停止 |
@@ -233,8 +233,8 @@ location 放进 posting 条目（vector ID 4 B + 页号和槽位打包成的 u32
 | U5 | 固定 n 下的全局 top-n | 两阶段已实现：每个 owner 返回自己的 top-n，聚合器合并出全局 top-n，再回到报告它的 owner 精排，和单机答案严格一致，代价是第二次往返。待定：值不值得这次往返，还是给每个 owner n × 份额的配额、一次往返（答案可能与全局 top-n 不同） | `internal/query/query.go` | two-phase 可用，e2e 用它逐条核对单机答案；proportional-quota 报 undecided，没配置策略时查询报错 |
 | U6 | 聚合器外包 | 已定适用范围：只有扩容中新节点的 graph 还在传的那个窗口里，能聚合的节点才多于能接客户端查询的节点；warmup 策略把扇出和合并交给它们。待定：值不值得——聚合器自己的活只是扇出和合并，贵的 navigate 留在 entry，而那正是没 graph 做不了的（CPU 上实测：445 µs 服务端查询里 navigate 占 160 µs）；以及按负载选聚合器的策略。外包聚合和让新节点接查询并转发 navigate（U16 的 stream）分工完全一样，只是发起方向相反 已定（常态）：entry 先 NAVIGATE，算出查询要碰到的 owner，再在其中选聚合器（selector `owner`，默认）。自己是 owner 就自己聚合；单一 owner 时转发给它，少一次网络往返，PQ 候选也不出节点；其余情况自己聚合，因为转发只是多一跳换掉并行子查询中的一个，还会把聚合压到热分区的 owner 上。局部性分组下，2 / 8 / 16 个节点时 entry 是 owner 的查询占 90% / 62% / 47%，单一 owner 占 20% / 5% / 5%（`rtier-overhead -owners`）。 | `internal/query/selector.go`、`internal/agent/serve.go` | 默认 owner：按 owner 集合选聚合器，e2e 核对转发次数和答案；warmup 已实现（只在 graph 窗口外包）；local 是基线；按负载的 outsource 报 undecided |
 | U7 | 带着过期 epoch 的子查询 | 数据还在就本地服务、转发给新 owner、或拒绝让聚合器重试 | `internal/query/query.go`（`Aggregator.Run`） | 按协议不会发生；真发生时报 undecided |
-| U8 | 后台传输限速如何自适应 | 独立连接加令牌桶（已实现，固定速率），发送端分两个优先级（已实现）：data 是 segment 和 PQ 码，节点拥有分区所需；background 是导航图和切换后的原始向量流（U9），只拿没有 data 发送方在等的令牌。待定：怎样跟前台延迟联动；图（entry 角色要）和原始向量流（缩短预热期的按需拉取）同在 background 里平分，要不要一方优先或按权重分享 | `internal/transfer/adapter.go`、`tokenbucket.go` | 固定速率；图和原始向量流默认走 background（`graph_priority`、`raw_priority`）；选 adaptive 启动即报错 |
-| U9 | 新节点上线后懒取原始向量（和 chunk） | 已定：新节点拿全 posting list 和 PQ 才上线，上线即可过滤；原始向量在切换之后才到（协议 `lazy`，默认）。新 owner 从切换起就精排：缺的向量由它的数据节点直接向旧 owner 按需拉取（RAW\_GET，精排等它回来）；agent 同时在后台补齐（切换后的 StageRaw，`raw_priority` 默认 background；RAW\_MISSING 让每个缺的向量只列在一个来源下，每批之前 RAW\_CHECK 去掉查询已经拉到的）。旧 owner 把向量留作缓存，所以回收之后仍是有效来源；被问到自己也还在等的向量时先去上游拉（连续迁移也成立）；分区回到老主人时一个向量都不用搬。重配等所有流结束才返回，离开的节点在此之前保持在线。对照组：copy-then-flip 在切换前拷完，stop-and-copy 在暂停期间拷完。待定：预热期间改由旧 owner 精排（配合 U5 的 two-phase：查询路径上没有拉取，但旧 owner 的负载要等流结束才卸下）；切换前就以 background 优先级开始流；合并并发的按需拉取、改为按页拉；流的速率（U8）；chunk（U12） | `internal/controller/reconfig.go`（copyThenFlip、stageRaw）、`internal/agent/control.go`（StageRaw）、`engine/src/node_engine.cpp`（EnsureRaw）、`engine/node/server.cpp`（PeerPool） | 已实现；e2e 断言每个新增向量恰好装入一次，并有一例卡住后台流、查询全靠按需拉取 |
+| U8 | 后台传输限速如何自适应 | 独立连接加令牌桶（已实现，固定速率），发送端分两个优先级（已实现）：data 是 segment 和 PQ 码，节点拥有分区所需；background 是导航图和 lazy-stream 切换后的原始向量流（U9），只拿没有 data 发送方在等的令牌。待定：怎样跟前台延迟联动；lazy-stream 下图（entry 角色要）和原始向量流同在 background 里平分，要不要一方优先或按权重分享 | `internal/transfer/adapter.go`、`tokenbucket.go` | 固定速率；图和原始向量流默认走 background（`graph_priority`、`raw_priority`）；选 adaptive 启动即报错 |
+| U9 | 新节点上线后懒取原始向量（和 chunk） | 已定：新节点拿全 posting list 和 PQ 才上线，上线即可过滤；原始向量只在查询第一次用到时才搬（协议 `lazy`，默认），lazy 的前提是查询只碰迁走数据里的一小部分工作集。RERANK 遇到本地没有的向量，由数据节点直接向该分区的旧 owner 拉取（RAW\_GET，精排等它回来）。来源按 posting list 记（该 list 所在分区的旧 owner；list 互相重叠，不需要按向量的表）：RERANK 请求带上这次查询在该 owner 上的 list，RAW\_GET 给每个向量带上它所在的 list，被问到自己也缺的向量时按那个 list 的来源先去上游拉（连续迁移也成立）。重配不等原始向量。旧 owner 一直是有效来源，因为节点从不删除持有过的原始向量（静态数据集）、离开的是最后加入的节点、缩容时分区回到持有过它的节点（U3）；有了磁盘预算或别的离开顺序，就要先交接只有离开节点才有的向量。对照组：`lazy-stream` 切换后另外把其余向量流完（StageRaw，`raw_priority`；RAW\_MISSING 让每个缺的向量只列一次并带一个 list，每批之前 RAW\_CHECK 去掉查询已经拉到的；重配等它结束），也是以后节点下线、故障后补副本的基础；copy-then-flip 在切换前拷完，stop-and-copy 在暂停期间拷完。待定：把拉取移出查询路径（缺的候选改由旧 owner 精排，再在后台只拉用到的）；合并并发的按需拉取；决定工作集大小的负载模型（U11）；chunk（U12） | `internal/controller/reconfig.go`（copyThenFlip、stageRaw）、`internal/agent/control.go`（StageRaw）、`engine/src/node_engine.cpp`（EnsureRawInLists、FetchRaw、SetListSources）、`engine/node/server.cpp`（PeerPool） | 已实现；e2e 断言 lazy 只拉用到的、每个最多一次、答案精确（含一例无负载扩容不搬任何原始向量、经中间节点的链式拉取、重复查询不再拉取），对照组断言每个新增向量恰好装入一次 |
 | U10 | 原子切换用的 epoch store | etcd 事务（讨论过）vs 单机原型用的 controller 本地 CAS；controller 切换到一半故障怎么办 | `internal/epoch/store.go` | 本地 CAS；选 etcd 报 undecided |
 | U11 | 负载模型 | Poisson open-loop（已实现）vs 回放 SemDN 式的突发、任务相关查询流（SCDN 的 experiments/locality/workload.py 已经把这类 trace 的参数测出来了） | `cmd/rtier-loadgen/arrivals.go` | semdn 报 undecided |
 | U12 | 向量 ID → RAG chunk ID | chunk 存储和取回路径还没设计 | `internal/query/query.go`（`Result`） | 返回向量 ID；还没有代码路径做映射 |
@@ -258,7 +258,7 @@ make test CUDA=OFF   # C++ 单测 + Go 单测（-race）+ 端到端测试
 make e2e             # 只跑端到端测试，带日志
 ```
 
-测试覆盖：C++ 端 `fusion_tests` 8 项、`rtier_node_tests` 9 项（包括：把 partition 拆到两个节点后结果和单节点完全一致、PQ 存储的引用计数和容量、两节点间的 PQ 迁移、查询并发下驱逐和槽位复用、原始向量存储，以及节点间的原始向量迁移——按需拉取、连续迁移时的转拉、后台补齐，节点的索引里没有页文件）；Go 端 9 个包的单测，加上 `test/e2e` 的 12 个测试：三种协议下边压测边扩缩容、从单节点扩到两节点、PQ 预算不够时 staging 干净地失败、占位符确实会报错、压测中关停数据节点，以及 owner 规则选聚合器、图源 round-robin、新节点按图就绪分批成为 entry、可逆放置扩出再缩回，flip 前后跨 epoch 的两种竞争（新节点比 entry 晚装上新 epoch、离开的节点收尾已接下的查询），以及卡住原始向量流时查询全靠按需拉取、答案仍与单节点一致。把引擎用 `-fsanitize=address,undefined` 编译并让 `RTIER_ENGINE_BIN` 指向它，节点日志里出现 sanitizer 报告时端到端测试会失败；目前是干净的。用 CUDA 编译时，如果 nvcc 不支持系统默认的 gcc，给 cmake 加 `-DCMAKE_CUDA_HOST_COMPILER=g++-12`。
+测试覆盖：C++ 端 `fusion_tests` 8 项、`rtier_node_tests` 9 项（包括：把 partition 拆到两个节点后结果和单节点完全一致、PQ 存储的引用计数和容量、两节点间的 PQ 迁移、查询并发下驱逐和槽位复用、原始向量存储，以及节点间的原始向量迁移——按需拉取、连续迁移时按 list 来源的转拉、对照组的流式补齐，节点的索引里没有页文件）；Go 端 9 个包的单测，加上 `test/e2e` 的 13 个测试：四种协议下边压测边扩缩容、lazy 只搬查询用到的原始向量（无负载扩容一个都不搬、经中间节点的链式拉取、重复查询不再拉取）、从单节点扩到两节点、PQ 预算不够时 staging 干净地失败、占位符确实会报错、压测中关停数据节点，以及 owner 规则选聚合器、图源 round-robin、新节点按图就绪分批成为 entry、可逆放置扩出再缩回，flip 前后跨 epoch 的两种竞争（新节点比 entry 晚装上新 epoch、离开的节点收尾已接下的查询），以及卡住原始向量流时查询全靠按需拉取、答案仍与单节点一致。把引擎用 `-fsanitize=address,undefined` 编译并让 `RTIER_ENGINE_BIN` 指向它，节点日志里出现 sanitizer 报告时端到端测试会失败；目前是干净的。用 CUDA 编译时，如果 nvcc 不支持系统默认的 gcc，给 cmake 加 `-DCMAKE_CUDA_HOST_COMPILER=g++-12`。
 
 单机跑一次完整实验：
 
@@ -296,7 +296,7 @@ bin/rtier-client rescale 3
 | --- | --- | --- | --- | --- |
 | 重配期间的查询正确性 | CPU 单机 | mismatch、retry、status 与 epoch（`latency.csv`） | U5 | e2e 已覆盖，含 1→2 |
 | 三种协议对比：lazy、copy-then-flip、stop-and-copy | CPU 单机 | 不可用窗口、retry、p99 峰值、各阶段耗时（`phases`，含 `stage_raw`） | U9、U13 | 已有数据，见上文 e2e 表 |
-| 懒取的预热代价 | CPU 单机 | 切换后的 p99 曲线、按需拉取数和往返数（metrics.jsonl 的 raw.fetched、raw.pending）、流补齐用时（`raw_seconds`）、重复传输（`raw_vectors` 减去节点的 raw.streamed）；`raw_priority` 取 background 对 data | U9、U8 | 工具已就绪；3 万条合成向量冒烟跑过一次 |
+| 懒取的预热代价 | CPU 单机 | 切换后的延迟曲线、按需拉取数和往返数（metrics.jsonl 的 raw.fetched、raw.pending）、工作集随负载局部性的变化；对照 lazy-stream 的流补齐用时（`raw_seconds`）和 `raw_priority` | U9、U8、U11 | 工具已就绪；BIGANN-1M 上跑过一次均匀负载（对 lazy 最不利） |
 | PQ 去重省下多少 | CPU 单机 | `pq_codes`、`pq_bytes`，对比按分区各自拷贝 | U1 | 已有数据 |
 | 保留旧码与放置策略的配合 | CPU 单机 | 二次扩容拉取的码数、`pq.codes_cached` 与 `pq.codes_resident` | U3 | 已测，见保留旧码表；e2e 已断言 even-reversible 下缩容拉取 0 个码 |
 | 分区方式对边界复制的影响 | CPU 单机 | 每节点 resident 占全量的比例、每节点字节、查询 fan-out | U2、U3 | 待做，先要 U2 的真实划分 |
@@ -339,7 +339,7 @@ SCDN 是组里的语义 CDN 原型：Edge 先在本地语义状态里搜，不�
 先定 U5、U2、U1 这三个：它们决定系统能不能真正跑查询。其余的可以边做实验边定。
 
 1. U5：在 `internal/query/query.go` 里实现一种全局 top-n 策略。FILTER、RERANK 和 `MergeTopK` 都已经有了，two-phase 可以直接拼出来。实现后把 e2e 里的 `exhaustiveStrategy` 换成它，验证结果和单节点固定 n 的答案一致。已完成：two-phase 在 internal/query/query.go，e2e 全部改用它，并加了一个 1→2 的用例。
-2. U2 和 U1：在 BigANN、DEEP、SPACEV 的子集上统计 r(P)、每个 partition 的字节数、查询扇出和每个节点的 residency，决定 list 怎么分组——同一组数据也直接给出 `slot_of_` 要不要换成排序数组的答案（见「每节点的内存账」）。U1 的原始向量部分和 U9 已经实现（posting entry 带 location、节点本地稀疏文件、切换后按需拉取加后台补齐）；U1 剩下的是 chunk（和 U12 一起）以及原始向量的磁盘预算。U3 里的「优先还给原主人」已经做了（even-reversible）。
+2. U2 和 U1：在 BigANN、DEEP、SPACEV 的子集上统计 r(P)、每个 partition 的字节数、查询扇出和每个节点的 residency，决定 list 怎么分组——同一组数据也直接给出 `slot_of_` 要不要换成排序数组的答案（见「每节点的内存账」）。U1 的原始向量部分和 U9 已经实现（posting entry 带 location、节点本地稀疏文件、按 list 记来源、只在查询用到时按需拉取）；U1 剩下的是 chunk（和 U12 一起）以及原始向量的磁盘预算。U3 里的「优先还给原主人」已经做了（even-reversible）。
 3. 在有 GPU 的机器上跑 `fusion_selftest`，确认 GPU 排序改动和按槽位取码的路径都和 CPU 结果一致。
 4. 用 `run_local.py` 加 netns 做第一轮实验，比较后台传输限速和不限速对前台 p99 的影响，给 U8 提供数据。
 5. 故障处理（U13）和 etcd（U10）等到多机部署时再做。

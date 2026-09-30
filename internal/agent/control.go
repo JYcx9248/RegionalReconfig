@@ -374,7 +374,7 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	)
 	err = parallel(ctx, len(req.Sources), func(ctx context.Context, i int) error {
 		still := func(locs []uint32) ([]uint32, error) { return a.local.RawAbsent(ctx, locs) }
-		st, err := transfer.PullRaw(ctx, req.Sources[i].Addr, missing[i], batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
+		st, err := transfer.PullRaw(ctx, req.Sources[i].Addr, missing[i].Locs, missing[i].Lists, batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
 			_, _, err := a.local.RawPut(pctx, locs, vb, vecs)
@@ -539,6 +539,8 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 	sort.Ints(st.Resident)
 	if info, err := a.local.Info(ctx); err == nil {
 		st.GraphLoaded = info.GraphLoaded
+		st.RawFetched = info.Raw.Fetched
+		st.RawFetchedBytes = info.Raw.Fetched * uint64(info.Raw.VecBytes)
 	}
 	return st, nil
 }

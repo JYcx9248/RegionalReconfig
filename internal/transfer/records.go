@@ -20,7 +20,9 @@ import (
 // them from its own data node and streams them back through the same token bucket as files.
 //
 //	client -> server  PULL_PQ   u32 n, u32 ids[n]                (always the data class)
-//	client -> server  PULL_RAW  u8 class, u32 n, u32 locs[n]
+//	client -> server  PULL_RAW  u8 class, u32 n, u32 locs[n], u32 lists[n]
+//	                            (lists[i]: a posting list naming locs[i], for a source that
+//	                            lacks the vector itself and fetches it from that list's source)
 //	server -> client  *_DATA    u32 size, u32 first, records of keys[first..] (whole records)
 //	server -> client  *_DONE    u32 size, u32 n, u32 crc32 of all records in order
 //	server -> client  ERROR     message
@@ -55,8 +57,8 @@ type RecordSource func(ctx context.Context, keys []uint32) (size int, data []byt
 // PQSource reads PQ codes (m bytes per vector ID).
 type PQSource = RecordSource
 
-// RawSource reads raw vectors (vec_bytes per location).
-type RawSource = RecordSource
+// RawSource reads raw vectors (vec_bytes per location); lists[i] names locs[i] (see RAW_GET).
+type RawSource func(ctx context.Context, locs, lists []uint32) (size int, data []byte, err error)
 
 type recordKind struct {
 	what             string // for messages
@@ -90,11 +92,18 @@ func (s *Server) sendRaw(bw *bufio.Writer, body []byte) error {
 	}
 	r := frame.NewReader(body)
 	c := Class(r.U8())
-	locs := r.U32s(int(r.U32()))
+	n := int(r.U32())
+	locs, lists := r.U32s(n), r.U32s(n)
 	if r.Err != nil || r.Remaining() != 0 || (c != Data && c != Background) {
 		return errors.New("transfer: bad PULL_RAW request")
 	}
-	return s.sendRecords(bw, rawRecords, s.Raw, c, locs)
+	off := 0 // sendRecords asks for the keys in order, batch after batch
+	src := func(ctx context.Context, batch []uint32) (int, []byte, error) {
+		ls := lists[off : off+len(batch)]
+		off += len(batch)
+		return s.Raw(ctx, batch, ls)
+	}
+	return s.sendRecords(bw, rawRecords, src, c, locs)
 }
 
 func (s *Server) sendRecords(bw *bufio.Writer, k recordKind, src RecordSource, class Class, keys []uint32) error {
@@ -153,23 +162,28 @@ func (s *Server) sendRecords(bw *bufio.Writer, k recordKind, src RecordSource, c
 // before requesting the next one. Stats.Codes counts the codes.
 func PullPQ(ctx context.Context, addr string, ids []uint32, batch int,
 	sink func(ids []uint32, m int, codes []byte) error) (Stats, error) {
-	st, err := pullRecords(ctx, addr, pqRecords, Data, ids, batch, nil, sink)
+	st, err := pullRecords(ctx, addr, pqRecords, Data, ids, nil, batch, nil, sink)
 	st.Codes, st.Vectors = st.Vectors, 0
 	return st, err
 }
 
-// PullRaw fetches the raw vectors at locs from the server at addr at priority class on the
-// server's bucket, batch locations per request (0 = DefaultRawBatch), and hands every verified
-// batch to sink (the agent: its data node's RAW_PUT). Before each request, still (if not nil)
-// keeps only the locations the destination still lacks: queries fetch vectors on demand while
-// the stream runs, and those need not come twice. Stats.Vectors counts the vectors received.
-func PullRaw(ctx context.Context, addr string, locs []uint32, batch int, class Class,
+// PullRaw fetches the raw vectors at locs (unique; lists[i] a posting list naming locs[i]) from
+// the server at addr at priority class on the server's bucket, batch locations per request
+// (0 = DefaultRawBatch), and hands every verified batch to sink (the agent: its data node's
+// RAW_PUT). Before each request, still (if not nil) keeps only the locations the destination
+// still lacks: queries fetch vectors on demand while the stream runs, and those need not come
+// twice. Stats.Vectors counts the vectors received.
+func PullRaw(ctx context.Context, addr string, locs, lists []uint32, batch int, class Class,
 	still func(locs []uint32) ([]uint32, error),
 	sink func(locs []uint32, vecBytes int, vecs []byte) error) (Stats, error) {
-	return pullRecords(ctx, addr, rawRecords, class, locs, batch, still, sink)
+	if len(lists) != len(locs) {
+		return Stats{}, fmt.Errorf("transfer: %d raw-vector locations with %d lists", len(locs), len(lists))
+	}
+	return pullRecords(ctx, addr, rawRecords, class, locs, lists, batch, still, sink)
 }
 
-func pullRecords(ctx context.Context, addr string, k recordKind, class Class, keys []uint32, batch int,
+// pullRecords pulls keys in batches; aux (raw vectors: the lists) goes along with each key.
+func pullRecords(ctx context.Context, addr string, k recordKind, class Class, keys, aux []uint32, batch int,
 	still func(keys []uint32) ([]uint32, error), sink func(keys []uint32, size int, data []byte) error) (Stats, error) {
 	start := time.Now()
 	if len(keys) == 0 {
@@ -189,11 +203,28 @@ func pullRecords(ctx context.Context, addr string, k recordKind, class Class, ke
 	br := bufio.NewReaderSize(c, 256<<10)
 	var st Stats
 	for first := 0; first < len(keys); first += batch {
-		part := keys[first:min(first+batch, len(keys))]
+		end := min(first+batch, len(keys))
+		part := keys[first:end]
+		var partAux []uint32
+		if aux != nil {
+			partAux = aux[first:end]
+		}
 		if still != nil {
-			if part, err = still(part); err != nil {
+			kept, err := still(part)
+			if err != nil {
 				return st, err
 			}
+			if aux != nil && len(kept) != len(part) { // keep each kept key's aux value
+				at := make(map[uint32]uint32, len(part))
+				for i, key := range part {
+					at[key] = partAux[i]
+				}
+				partAux = make([]uint32, len(kept))
+				for i, key := range kept {
+					partAux[i] = at[key]
+				}
+			}
+			part = kept
 			if len(part) == 0 {
 				continue
 			}
@@ -204,6 +235,9 @@ func pullRecords(ctx context.Context, addr string, k recordKind, class Class, ke
 		}
 		w.U32(uint32(len(part)))
 		w.U32s(part)
+		if aux != nil {
+			w.U32s(partAux)
+		}
 		err := frame.Write(c, &frame.Frame{Type: k.pull, Body: w.B})
 		var size int
 		var data []byte

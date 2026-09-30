@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -27,6 +30,33 @@ type loadStats struct {
 	epochs                             map[uint64]int64
 	maxLatency                         time.Duration
 	firstProblem                       string
+	start                              time.Time     // when the load started
+	records                            []queryRecord // every query, in completion order
+}
+
+// queryRecord is one query of startLoad, for the latency timeline (see writeTimeline).
+type queryRecord struct {
+	sent     time.Duration // first attempt, since the load started
+	latency  time.Duration // until the answer, retries included
+	epoch    uint64
+	attempts int
+	ok       bool
+}
+
+// meanLatency is the mean latency of the answered queries sent in [from, to).
+func meanLatency(recs []queryRecord, from, to time.Duration) (time.Duration, int) {
+	var sum time.Duration
+	n := 0
+	for _, r := range recs {
+		if r.ok && r.sent >= from && r.sent < to {
+			sum += r.latency
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, 0
+	}
+	return sum / time.Duration(n), n
 }
 
 // unavailableReason classifies an "unavailable" answer by the check that refused the query.
@@ -46,7 +76,7 @@ func startLoad(cl *cluster, workers int) func() loadStats {
 	ctx, cancel := context.WithCancel(cl.ctx)
 	var (
 		mu      sync.Mutex
-		st      = loadStats{epochs: map[uint64]int64{}, retryWhy: map[string]int64{}}
+		st      = loadStats{epochs: map[uint64]int64{}, retryWhy: map[string]int64{}, start: time.Now()}
 		wg      sync.WaitGroup
 		clients = map[string]*query.Client{}
 	)
@@ -93,6 +123,8 @@ func startLoad(cl *cluster, workers int) func() loadStats {
 				}
 				lat := time.Since(start)
 				mu.Lock()
+				st.records = append(st.records, queryRecord{sent: start.Sub(st.start), latency: lat,
+					epoch: res.Epoch, attempts: len(why) + 1, ok: err == nil})
 				st.total++
 				st.retries += int64(len(why))
 				for _, w := range why {
@@ -167,13 +199,24 @@ func checkResidency(t *testing.T, cl *cluster) {
 			t.Errorf("node %d (%s) PQ store %+v: want %d live codes (its partitions), %d in all "+
 				"(every partition it has owned) and no eviction", ns.ID, ns.Name, pq, live, all)
 		}
-		if raw := info.Raw; raw.Present != all || raw.Pending != 0 ||
-			raw.Present != raw.FromIndex+raw.Streamed+raw.Fetched {
+		raw := info.Raw
+		switch {
+		case raw.Present != raw.FromIndex+raw.Streamed+raw.Fetched:
+			t.Errorf("node %d (%s) raw vectors %+v: want each installed once", ns.ID, ns.Name, raw)
+		case rawComplete(cl.protocol) && (raw.Present != all || raw.Pending != 0):
 			t.Errorf("node %d (%s) raw vectors %+v: want the %d vectors of every partition it has owned, "+
-				"each installed once, none pending", ns.ID, ns.Name, raw, all)
+				"none pending", ns.ID, ns.Name, raw, all)
+		case !rawComplete(cl.protocol) &&
+			(raw.Streamed != 0 || raw.Present > all || raw.Pending > live || raw.Present+raw.Pending < live):
+			t.Errorf("node %d (%s) raw vectors %+v: lazy: want none streamed, at most the %d of the partitions "+
+				"it has owned, and every one of the %d its partitions name here or pending", ns.ID, ns.Name, raw, all, live)
 		}
 	}
 }
+
+// rawComplete: whether a protocol leaves every node with all the raw vectors of its partitions.
+// The lazy protocol moves one only when a query needs it (U9); the rest stay with the old owner.
+func rawComplete(protocol string) bool { return protocol != "lazy" }
 
 // pqExpected is the number of PQ codes a reconfiguration from old to next has to pull: for each
 // node, the vectors named by its new partitions that no partition it has ever owned named (it
@@ -220,31 +263,49 @@ func rescale(t *testing.T, cl *cluster, dataNodes int) *protocol.RescaleReply {
 	cl.observe()
 	before := cl.ctl.Status().Table.Placement
 	rawBefore := rawStats(t, cl)
+	t0 := time.Now()
 	out, err := cl.ctl.Rescale(cl.ctx, dataNodes)
+	cl.rescales = append(cl.rescales, rescaleSpan{dataNodes: dataNodes, start: t0, end: time.Now(), reply: out})
 	if err != nil {
 		t.Fatalf("rescale to %d data nodes: %v", dataNodes, err)
 	}
 	want, naive := pqExpected(cl.f, cl.held, before, cl.ctl.Status().Table.Placement)
 	cl.observe()
-	var streamed, fetched uint64
+	var streamed, fetched, fetches, vecBytes uint64
 	for id, r := range rawStats(t, cl) {
 		streamed += r.Streamed - rawBefore[id].Streamed
 		fetched += r.Fetched - rawBefore[id].Fetched
+		fetches += r.Fetches - rawBefore[id].Fetches
+		vecBytes = uint64(r.VecBytes)
 	}
+	// The reply counts the fetches until its last look at the nodes; with lazy, queries go on
+	// fetching after that.
+	if uint64(out.RawFetched) > fetched || uint64(out.RawFetchedBytes) != uint64(out.RawFetched)*vecBytes {
+		t.Errorf("rescale to %d: reply counts %d raw vectors fetched on demand (%d bytes), the nodes %d",
+			dataNodes, out.RawFetched, out.RawFetchedBytes, fetched)
+	}
+	span := &cl.rescales[len(cl.rescales)-1]
+	span.fetched, span.fetches, span.fetchedBytes = fetched, fetches, fetched*vecBytes
 	t.Logf("rescale to %d: epoch %d -> %d, moved %v, %d bytes, %d PQ codes (per-partition copies: %d), "+
-		"raw vectors %d streamed + %d fetched on demand, phases %v, raw stream %.3f s after the flip",
-		dataNodes, out.FromEpoch, out.ToEpoch, out.Moved, out.Bytes, out.PQCodes, naive, streamed, fetched,
+		"raw vectors %d streamed + %d fetched on demand in %d round trips, phases %v, raw stream %.3f s after the flip",
+		dataNodes, out.FromEpoch, out.ToEpoch, out.Moved, out.Bytes, out.PQCodes, naive, streamed, fetched, fetches,
 		out.Phases, out.RawSeconds)
 	if out.PQCodes != want {
 		t.Errorf("rescale to %d pulled %d PQ codes, want %d (the vectors new to each destination)", dataNodes, out.PQCodes, want)
 	}
-	// A vector new to a destination needs its code and its raw vector: the same count. The
-	// stream may bring one that a query fetched while its batch was in flight (installed once).
-	if streamed+fetched != uint64(want) || uint64(out.RawVectors) < streamed {
+	// A vector new to a destination needs its code and its raw vector: the same count -- except
+	// with lazy, which moves only the raw vectors queries need. The stream may bring one that a
+	// query fetched while its batch was in flight (installed once).
+	if !rawComplete(out.Protocol) {
+		if streamed != 0 || out.RawVectors != 0 || fetched > uint64(want) {
+			t.Errorf("rescale to %d (lazy) streamed %d raw vectors (reply %d) and fetched %d: want none "+
+				"streamed and at most the %d new to the destinations fetched", dataNodes, streamed, out.RawVectors, fetched, want)
+		}
+	} else if streamed+fetched != uint64(want) || uint64(out.RawVectors) < streamed {
 		t.Errorf("rescale to %d installed %d raw vectors (%d streamed, reply received %d; %d fetched), want %d",
 			dataNodes, streamed+fetched, streamed, out.RawVectors, fetched, want)
 	}
-	if out.Protocol != "lazy" && (fetched != 0 || uint64(out.RawVectors) != streamed) {
+	if out.Protocol != "lazy" && out.Protocol != "lazy-stream" && (fetched != 0 || uint64(out.RawVectors) != streamed) {
 		t.Errorf("protocol %s: %d raw vectors fetched on demand, %d of %d streamed installed: want every one "+
 			"copied before the flip, once", out.Protocol, fetched, streamed, out.RawVectors)
 	}
@@ -265,7 +326,7 @@ func rescale(t *testing.T, cl *cluster, dataNodes int) *protocol.RescaleReply {
 
 func TestReconfigUnderLoad(t *testing.T) {
 	f := getFixture(t)
-	for _, protocol := range []string{"lazy", "copy-then-flip", "stop-and-copy"} {
+	for _, protocol := range []string{"lazy", "lazy-stream", "copy-then-flip", "stop-and-copy"} {
 		t.Run(protocol, func(t *testing.T) {
 			cl := newCluster(t, f, protocol, 2)
 			cl.addNode("n1", query.TwoPhase{})
@@ -296,8 +357,11 @@ func TestReconfigUnderLoad(t *testing.T) {
 			if pq := newInfo.PQ; pq.FromIndex != 0 || pq.Received != pq.Resident || pq.Skipped != 0 {
 				t.Errorf("new node's PQ store %+v: want every code received from peers exactly once", pq)
 			}
-			if raw := newInfo.Raw; raw.FromIndex != 0 || raw.Present != newInfo.PQ.Resident {
-				t.Errorf("new node's raw vectors %+v: want one per PQ code, all from peers", raw)
+			if raw := newInfo.Raw; raw.FromIndex != 0 || raw.Present != raw.Streamed+raw.Fetched ||
+				(rawComplete(protocol) && raw.Present != newInfo.PQ.Resident) ||
+				(!rawComplete(protocol) && (raw.Streamed != 0 || raw.Present > newInfo.PQ.Resident)) {
+				t.Errorf("new node's raw vectors %+v: want them all from peers -- one per PQ code, or with "+
+					"lazy only those queries needed", raw)
 			}
 
 			rescale(t, cl, 2) // scale-in: remaining nodes pull only codes they do not have
@@ -320,8 +384,23 @@ func TestReconfigUnderLoad(t *testing.T) {
 			st := stop()
 			checkResidency(t, cl)
 
-			t.Logf("%d queries, %d retries (unavailable: %v), max latency %v, per epoch %v",
-				st.total, st.retries, st.retryWhy, st.maxLatency, st.epochs)
+			mean, _ := meanLatency(st.records, 0, time.Duration(math.MaxInt64))
+			var during time.Duration
+			var nDuring int
+			for _, s := range cl.rescales {
+				m, n := meanLatency(st.records, s.start.Sub(st.start), s.end.Sub(st.start))
+				during += m * time.Duration(n)
+				nDuring += n
+			}
+			if nDuring > 0 {
+				during /= time.Duration(nDuring)
+			}
+			t.Logf("%d queries, %d retries (unavailable: %v), mean latency %v (%v over the %d queries sent "+
+				"during a rescale), max latency %v, per epoch %v",
+				st.total, st.retries, st.retryWhy, mean, during, nDuring, st.maxLatency, st.epochs)
+			if dir := os.Getenv("RTIER_E2E_TIMELINE"); dir != "" {
+				writeTimeline(t, filepath.Join(dir, protocol), st, cl.rescales)
+			}
 			if st.mismatches > 0 || st.errors > 0 {
 				t.Fatalf("%d mismatches, %d errors; first: %s", st.mismatches, st.errors, st.firstProblem)
 			}
@@ -375,8 +454,9 @@ func TestScaleOutFromOneNode(t *testing.T) {
 	if pq := info.PQ; pq.FromIndex != 0 || pq.Received != pq.Resident || pq.Skipped != 0 {
 		t.Errorf("new node's PQ store %+v: want every code received from the first node exactly once", pq)
 	}
-	if raw := info.Raw; raw.FromIndex != 0 || raw.Present != info.PQ.Resident || raw.Streamed+raw.Fetched != raw.Present {
-		t.Errorf("new node's raw vectors %+v: want one per PQ code, streamed or fetched from the first node", raw)
+	if raw := info.Raw; raw.FromIndex != 0 || raw.Streamed != 0 || raw.Fetched == 0 || raw.Present != raw.Fetched ||
+		raw.Present > info.PQ.Resident {
+		t.Errorf("new node's raw vectors %+v: want only those queries needed, fetched from the first node", raw)
 	}
 	t.Logf("1 -> 2 under load: %d queries, %d retries (%v), max latency %v, per epoch %v",
 		st.total, st.retries, st.retryWhy, st.maxLatency, st.epochs)
@@ -619,13 +699,13 @@ func TestPlaceholdersFailLoudly(t *testing.T) {
 	}
 }
 
-// TestRawVectorsFetchedOnDemand: with the lazy protocol a new node owns its partitions from the
-// flip on without their raw vectors (U9). Its stream is held back, so every candidate it
+// TestRawVectorsFetchedOnDemand: with the lazy-stream baseline a new node owns its partitions from
+// the flip on without their raw vectors (U9). Its stream is held back, so every candidate it
 // re-ranks must first be fetched from the old owner -- and the answers stay exact. Once the
 // stream is released the node holds every vector, and the rescale reports what it streamed.
 func TestRawVectorsFetchedOnDemand(t *testing.T) {
 	f := getFixture(t)
-	cl := newCluster(t, f, "lazy", 1)
+	cl := newCluster(t, f, "lazy-stream", 1)
 	old := cl.addNode("n1", query.TwoPhase{})
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
 		t.Fatalf("initial deployment: %v (%s)", err, cl.ctl.LastError())
@@ -687,6 +767,97 @@ func TestRawVectorsFetchedOnDemand(t *testing.T) {
 	if st.mismatches > 0 || st.errors > 0 || st.total == 0 {
 		t.Fatalf("%d queries, %d mismatches, %d errors; first: %s", st.total, st.mismatches, st.errors, st.firstProblem)
 	}
+}
+
+// TestLazyMovesOnlyWhatQueriesNeed: with the lazy protocol a reconfiguration moves posting lists
+// and PQ codes, and a raw vector only when a query first needs it (U9). Two scale-outs without
+// load move no raw vector at all. The third node takes a partition from the second, which never
+// fetched its vectors, so the third node's misses go to the second, which gets them from the
+// first (a chain, resolved through the lists' sources). Every answer is exact, a second pass
+// over the same queries fetches nothing, and what no query needed is still where it was.
+func TestLazyMovesOnlyWhatQueriesNeed(t *testing.T) {
+	f := getFixture(t)
+	cl := newCluster(t, f, "lazy", 1)
+	first := cl.addNode("n1", query.TwoPhase{})
+	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
+		t.Fatalf("initial deployment: %v (%s)", err, cl.ctl.LastError())
+	}
+	second := cl.addNode("n2", query.TwoPhase{})
+	third := cl.addNode("n3", query.TwoPhase{})
+	raw := func(a *agent.Agent) nodeclient.RawStats {
+		in, err := nodeclient.New(a.Info().NodeAddr, 1).Info(cl.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in.Raw
+	}
+
+	var before placement.Table
+	for _, n := range []int{2, 3} {
+		before = cl.ctl.Status().Table.Placement
+		out := rescale(t, cl, n)
+		if out.RawVectors != 0 || out.RawFetched != 0 {
+			t.Errorf("scale-out to %d without load moved raw vectors: %d streamed, %d fetched", n, out.RawVectors, out.RawFetched)
+		}
+	}
+	after := cl.ctl.Status().Table.Placement
+	fromSecond := false
+	for p, owner := range after.Owners {
+		fromSecond = fromSecond || (owner == third.ID() && before.Owners[p] == second.ID())
+	}
+	if !fromSecond {
+		t.Fatalf("placement %v after %v: the third node took no partition from the second, no chain to test", after.Owners, before.Owners)
+	}
+	for _, a := range []*agent.Agent{second, third} {
+		if r := raw(a); r.Present != 0 || r.Pending == 0 {
+			t.Errorf("%s before any query: raw vectors %+v, want none here and all pending", a.Info().Name, r)
+		}
+	}
+
+	clients := map[string]*query.Client{}
+	pass := func() {
+		tbl := cl.ctl.Status().Table
+		for qi := 0; qi < numQueries; qi++ {
+			addr := tbl.Nodes[tbl.Entries[qi%len(tbl.Entries)]].QueryAddr
+			c, ok := clients[addr]
+			if !ok {
+				c = query.NewClient(addr, 1)
+				clients[addr] = c
+			}
+			res, err := c.Query(cl.ctx, &query.Request{Vec: f.queries.Row(qi),
+				Params: query.Params{K: testK, NProbe: testNProbe, N: maxRerank}})
+			if err != nil {
+				t.Fatalf("query %d at %s: %v", qi, addr, err)
+			}
+			if !equal(res.Candidates, f.oracle[qi]) {
+				t.Fatalf("query %d at %s: got %v, want %v", qi, addr, res.Candidates, f.oracle[qi])
+			}
+		}
+	}
+	pass()
+	s2, s3 := raw(second), raw(third)
+	if s3.Fetched == 0 || s2.Served == 0 {
+		t.Errorf("third node fetched %d raw vectors, the second served %d: want the third's misses of the "+
+			"second's former partition served by the second", s3.Fetched, s2.Served)
+	}
+	if s2.Pending == 0 && s3.Pending == 0 {
+		t.Errorf("every raw vector moved (%+v, %+v): want some that no query needed still pending", s2, s3)
+	}
+	s1 := raw(first)
+	pass()
+	for _, c := range []struct {
+		a      *agent.Agent
+		before nodeclient.RawStats
+	}{{first, s1}, {second, s2}, {third, s3}} {
+		if now := raw(c.a); now.Fetched != c.before.Fetched {
+			t.Errorf("%s fetched %d raw vectors on the second pass: want none, the first brought all it needs",
+				c.a.Info().Name, now.Fetched-c.before.Fetched)
+		}
+	}
+	checkResidency(t, cl)
+	t.Logf("lazy 1 -> 2 -> 3: second node holds %d of %d (%d pending), third %d of %d (%d pending); the "+
+		"second served %d to the third", s2.Present, s2.Present+s2.Pending, s2.Pending, s3.Present,
+		s3.Present+s3.Pending, s3.Pending, s2.Served)
 }
 
 // TestNodeShutdownUnderLoad interrupts rtier_node while requests are in flight. The node must

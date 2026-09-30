@@ -48,7 +48,7 @@ type Controller struct {
 	InitialEntries int      `json:"initial_entries"` // entries among them; 0 = all
 	NewNodeRoles   []string `json:"new_node_roles"`  // roles of nodes added by scale-out
 	Placement      string   `json:"placement"`       // "even" | "even-reversible" | "weighted" (U3)
-	Protocol       string   `json:"protocol"`        // "lazy" | "copy-then-flip" | "stop-and-copy" (U9)
+	Protocol       string   `json:"protocol"`        // "lazy" | "lazy-stream" | "copy-then-flip" | "stop-and-copy" (U9)
 	EpochStore     string   `json:"epoch_store"`     // "memory" | "etcd" (U10)
 	MetricsPath    string   `json:"metrics_path"`    // JSON-lines sink
 	CallTimeout    Duration `json:"call_timeout"`    // short control calls
@@ -57,10 +57,10 @@ type Controller struct {
 	// (default: only bandwidth the segment and PQ transfers leave unused) or "data" (share it
 	// equally -- the baseline to compare against).
 	GraphPriority string `json:"graph_priority"`
-	// RawPriority is the class of the raw-vector stream that follows the flip in the lazy
-	// protocol: "background" (default: queries fetch the vectors they need on demand
-	// meanwhile, so the stream only takes bandwidth nothing else wants) or "data". The eager
-	// protocols stream raw vectors before the flip, as data.
+	// RawPriority is the class of the raw-vector stream that follows the flip in the
+	// lazy-stream baseline: "background" (default: queries fetch the vectors they need on
+	// demand meanwhile, so the stream only takes bandwidth nothing else wants) or "data". The
+	// lazy protocol has no stream; the eager ones stream raw vectors before the flip, as data.
 	RawPriority string `json:"raw_priority"`
 	// EntryFlipInterval: while new nodes are fetching the navigation graph, every interval one
 	// flip makes entries of all those whose graph loaded since the previous flip (and when the

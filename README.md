@@ -44,16 +44,24 @@ budget, versioning under U14, and where RAG chunks live. Partition directories w
 locations existed (payload `lists-only`) are refused: rerun `rtier_segment`.
 
 **Raw vectors after a migration (decided part of U9):** a new owner goes online with posting
-lists and PQ codes only -- all it needs to filter -- and gets the raw vectors afterwards
-(`"protocol": "lazy"`, the default). From the flip on, a RERANK that needs a vector not there yet
-fetches it from the partition's old owner, data node to data node, and waits for it; meanwhile
-the agent streams the rest in (`StageRaw`, at `"raw_priority": "background"` by default, so it
-only takes bandwidth nothing else wants), asking its data node before each batch what queries
-have not fetched already. The rescale returns when every stream has ended, so a node that leaves
-stays a source until then, and `raw_vectors` / `raw_seconds` in the rescale reply say what was
-streamed and how long after the flip it ended; each node reports `raw.fetched`,
-`raw.streamed`, `raw.pending` and `raw.present` in its metrics. `"copy-then-flip"` streams the
-raw vectors before the flip instead (the eager baseline), `"stop-and-copy"` while paused.
+lists and PQ codes only -- all it needs to filter -- and gets a raw vector only when a query first
+needs it (`"protocol": "lazy"`, the default): the point of being lazy is that queries touch a
+small working set of what moved, and the rest never has to. From the flip on, a RERANK that meets
+a vector not there fetches it from the partition's old owner, data node to data node, and waits
+for it. The data node keeps one source per posting list -- the old owner of the list's partition
+-- so any list that names a missing vector says where to fetch it: lists overlap, no per-vector
+table. RERANK requests carry the query's lists on that owner for this, and a peer's RAW_GET
+names the list of every vector, so a node asked for one it lacks fetches it from its own source
+of that list first (chains of migrations). Nothing else moves and the rescale does not wait for
+raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it ran, and
+each node reports `raw.fetched`, `raw.pending` (named by its partitions, not needed so far) and
+`raw.present` in its metrics. That old owners stay sources rests on three invariants: no node
+drops a raw vector it has held, the nodes that leave are the ones that joined last, and a
+scale-in returns partitions to nodes that held them (U3); a disk budget or another leave order
+would need a hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
+(`StageRaw`, `"raw_priority": "background"` by default; the rescale waits for it and reports
+`raw_vectors` / `raw_seconds`), `"copy-then-flip"` streams them before the flip, `"stop-and-copy"`
+while paused.
 
 **Placement (decided part of U3):** `"placement": "even-reversible"` (the default) sends a
 partition back to a node that has owned it before when the cluster scales in, so scaling out and
@@ -106,7 +114,7 @@ before the flip (`test/e2e/flip_race_test.go` holds an install or a query to rep
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |
 | `test/e2e` | real `rtier_node` processes; scale-out and scale-in under query load |
-| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales), `plot_run.py` timeline, `emulation/netns.sh`, metrics → SQLite, Python API client |
+| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales), `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `emulation/netns.sh`, metrics → SQLite, Python API client |
 
 ## Build and test
 
@@ -137,15 +145,25 @@ python3 scripts/run_local.py configs/experiment.synthetic.json results/run1
 `"Emulation": {"Netns": true}` (root), each node runs in its own network namespace with its
 link shaped by `tc` (`scripts/emulation/netns.sh`; delay needs the `netem` qdisc).
 
+On one machine every node reads the same SSD, and the two-phase RERANK reads ~150 pages per
+query, so without more the cluster stops at what that disk serves and a scale-out adds no
+throughput (measured: 2 and 3 nodes both at ~130-140K reads/s, ~920 q/s on BIGANN-1M). With
+`"NodeResources": {"CPUsPerNode": 4, "IOReadIOPSMax": 40000}` each node and its agent run in a
+cgroup of their own (`systemd-run --scope`): their own CPUs and their own read IOPS on the disk
+of `WorkDir`, as if each node had its machine; keep the sum below what the disk serves. The
+controller and the load generator get the CPUs after the nodes'. `"MemoryMax"` and
+`"IOReadBandwidthMax"` work the same way.
+
 Queries run through the two-phase strategy (`"Strategy": "two-phase"`, the implemented half of
 U5): every owner filters for its own top-n, the aggregator merges the global top-n and re-ranks
 each candidate at the owner that reported it, which is exactly the single-node answer.
 `test/e2e` checks that equality query by query while the cluster scales out and in, and that
-every vector new to a node arrives exactly once, streamed or fetched on demand.
+a vector new to a node arrives at most once: with `lazy` only when a query needs it, with the
+baselines all of them, streamed or fetched on demand.
 
 `"Protocol"` in an experiment config picks the reconfiguration protocol (`lazy`, the default;
-`copy-then-flip` and `stop-and-copy` as eager baselines) and `"RawPriority"` the class of the
-raw-vector stream; each node keeps its raw vectors in `<WorkDir>/<node>/raw.pages`.
+`lazy-stream`, `copy-then-flip` and `stop-and-copy` as baselines) and `"RawPriority"` the class of
+the lazy-stream raw-vector stream; each node keeps its raw vectors in `<WorkDir>/<node>/raw.pages`.
 
 ## The smallest experiment: one node, then two
 
@@ -179,6 +197,30 @@ node would need for the whole dataset. Pick the number from a first run: each no
 `pq.codes_resident` in `metrics.jsonl`, and with the range-assignment placeholder a node holds
 far more than its share of the codes (boundary vectors are replicated into up to 8 lists), so a
 budget much below ~90% of all codes will fail the staging on purpose.
+
+## Mean latency over time, per protocol
+
+`scripts/compare_runs.py` overlays the mean latency of the answered queries per window for
+several runs, one line per run, with each run's reconfigurations in a strip under the time
+axis. Runs that share a directory name are pooled. The end-to-end test gives the smallest
+version: with `RTIER_E2E_TIMELINE` set, `TestReconfigUnderLoad` writes each protocol's
+queries and rescales (2 → 3 → 2 → 3 under closed-loop load) in the formats of the load
+generator and `run_local.py`. Run each protocol in its own process, so that none of them
+inherits another's warm-up, and leave out the first queries, which meet a cold start:
+
+```sh
+for p in lazy lazy-stream copy-then-flip stop-and-copy; do
+  RTIER_ENGINE_BIN=$PWD/engine/build RTIER_E2E_TIMELINE=$PWD/results/e2e/rep1 \
+    go test -count=1 -run "TestReconfigUnderLoad\$/^$p\$" ./test/e2e/
+done
+python3 scripts/compare_runs.py results/e2e/rep*/lazy results/e2e/rep*/lazy-stream results/e2e/rep*/copy-then-flip \
+  results/e2e/rep*/stop-and-copy --window 0.02 --skip 0.1 --out results/e2e/latency-mean
+```
+
+Leave out `-race` when measuring: the agents run inside the test process. A mean covers
+answered queries only, so it compares protocols only if no query gave up. The test's clients
+wait for their answers. With `run_local.py`, set `"RetryForSeconds"` in `"Load"` so that a
+query refused while stop-and-copy pauses admission waits too (`rtier-loadgen -retry-for`).
 
 ## Provenance
 

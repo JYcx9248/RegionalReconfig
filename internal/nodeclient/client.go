@@ -332,13 +332,47 @@ func (c *Client) PQMissing(ctx context.Context, groups [][]string) ([][]uint32, 
 	return c.missing(ctx, opPQMissing, groups)
 }
 
+// RawRefs are raw-vector locations and, for each, a posting list that names it (parallel).
+// A node asked for a vector it lacks looks up that list's source (chained migrations).
+type RawRefs struct {
+	Locs, Lists []uint32
+}
+
 // RawMissing returns, for each group of segment files, the raw-vector locations they name whose
-// vector the node lacks and that no earlier group lists.
-func (c *Client) RawMissing(ctx context.Context, groups [][]string) ([][]uint32, error) {
-	return c.missing(ctx, opRawMissing, groups)
+// vector the node lacks and that no earlier group lists, each with a list that names it.
+func (c *Client) RawMissing(ctx context.Context, groups [][]string) ([]RawRefs, error) {
+	r, err := c.missingReply(ctx, opRawMissing, groups)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RawRefs, len(groups))
+	for i := range out {
+		n := int(r.U32())
+		out[i] = RawRefs{Locs: r.U32s(n), Lists: r.U32s(n)}
+	}
+	if r.Err == nil && r.Remaining() != 0 {
+		return nil, fmt.Errorf("nodeclient: trailing bytes in the RAW_MISSING reply from %s", c.addr)
+	}
+	return out, r.Err
 }
 
 func (c *Client) missing(ctx context.Context, op uint8, groups [][]string) ([][]uint32, error) {
+	r, err := c.missingReply(ctx, op, groups)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]uint32, len(groups))
+	for i := range out {
+		out[i] = r.U32s(int(r.U32()))
+	}
+	if r.Err == nil && r.Remaining() != 0 {
+		return nil, fmt.Errorf("nodeclient: trailing bytes in the reply to op 0x%02x from %s", op, c.addr)
+	}
+	return out, r.Err
+}
+
+// missingReply sends a *_MISSING request and returns the reply positioned after its group count.
+func (c *Client) missingReply(ctx context.Context, op uint8, groups [][]string) (*frame.Reader, error) {
 	var w frame.Writer
 	w.U32(uint32(len(groups)))
 	for _, g := range groups {
@@ -353,26 +387,22 @@ func (c *Client) missing(ctx context.Context, op uint8, groups [][]string) ([][]
 		return nil, err
 	}
 	r := frame.NewReader(b)
-	n := int(r.U32())
-	if r.Err != nil || n != len(groups) {
+	if n := int(r.U32()); r.Err != nil || n != len(groups) {
 		return nil, fmt.Errorf("nodeclient: bad reply to op 0x%02x from %s", op, c.addr)
 	}
-	out := make([][]uint32, n)
-	for i := range out {
-		out[i] = r.U32s(int(r.U32()))
-	}
-	if r.Err == nil && r.Remaining() != 0 {
-		return nil, fmt.Errorf("nodeclient: trailing bytes in the reply to op 0x%02x from %s", op, c.addr)
-	}
-	return out, r.Err
+	return r, nil
 }
 
-// RawGet returns the raw vectors at locs (vecBytes each, in order). The node fetches the ones
-// it is itself still waiting for from its own source first.
-func (c *Client) RawGet(ctx context.Context, locs []uint32) (int, []byte, error) {
+// RawGet returns the raw vectors at locs (vecBytes each, in order); lists[i] is a posting list
+// that names locs[i]. The node fetches a vector it lacks itself from that list's source first.
+func (c *Client) RawGet(ctx context.Context, locs, lists []uint32) (int, []byte, error) {
+	if len(lists) != len(locs) {
+		return 0, nil, fmt.Errorf("nodeclient: RAW_GET of %d locations with %d lists", len(locs), len(lists))
+	}
 	var w frame.Writer
 	w.U32(uint32(len(locs)))
 	w.U32s(locs)
+	w.U32s(lists)
 	b, err := c.do(ctx, opRawGet, 0, w.B)
 	if err != nil {
 		return 0, nil, err
@@ -518,13 +548,16 @@ func (c *Client) Filter(ctx context.Context, epoch uint64, q []byte, lists []uin
 }
 
 // Rerank computes exact distances for every given ID and returns the k best, ordered by
-// (distance, ID), and the pages it read. The node fetches the raw vectors it lacks first (the
-// reply's last field counts them; see Info's Raw.Fetched).
-func (c *Client) Rerank(ctx context.Context, epoch uint64, q []byte, ids []uint32, k int) ([]Candidate, uint32, error) {
+// (distance, ID), and the pages it read. lists are the query's lists on this node (the ones its
+// FILTER got): the node fetches a raw vector it lacks first, from the source of a list among
+// them that names it (the reply's last field counts them; see Info's Raw.Fetched).
+func (c *Client) Rerank(ctx context.Context, epoch uint64, q []byte, ids, lists []uint32, k int) ([]Candidate, uint32, error) {
 	var w frame.Writer
 	w.U32(uint32(k))
 	w.U32(uint32(len(ids)))
 	w.U32s(ids)
+	w.U32(uint32(len(lists)))
+	w.U32s(lists)
 	w.Bytes(q)
 	b, err := c.do(ctx, opRerank, epoch, w.B)
 	if err != nil {

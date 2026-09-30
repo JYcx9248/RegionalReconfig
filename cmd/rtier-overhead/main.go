@@ -219,7 +219,7 @@ func main() {
 					continue
 				}
 				t := time.Now()
-				cands, pages, err := c.Rerank(ctx, 0, vec, byOwner[i], *k)
+				cands, pages, err := c.Rerank(ctx, 0, vec, byOwner[i], groups[i], *k)
 				check(err)
 				d := us(time.Since(t))
 				o := &r.Owners[owners[i]-1]

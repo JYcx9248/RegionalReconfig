@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"os"
@@ -197,20 +198,25 @@ func TestPullRaw(t *testing.T) {
 	defer ln.Close()
 	srv := &Server{ChunkBytes: 1000, Limiter: NewTokenBucket(0, 0)}
 	srv.PQ = func(context.Context, []uint32) (int, []byte, error) { return 0, nil, errors.New("not PQ") }
-	srv.Raw = func(_ context.Context, locs []uint32) (int, []byte, error) {
+	srv.Raw = func(_ context.Context, locs, lists []uint32) (int, []byte, error) {
 		var out []byte
-		for _, l := range locs {
+		for i, l := range locs {
+			if lists[i] != l+1 { // every location travels with its own list
+				return 0, nil, fmt.Errorf("location %d came with list %d", l, lists[i])
+			}
 			out = append(out, vec(l)...)
 		}
 		return vb, out, nil
 	}
 	go srv.Serve(ln)
 	locs := make([]uint32, 10000)
+	lists := make([]uint32, len(locs))
 	for i := range locs {
 		locs[i] = uint32(i * 2)
+		lists[i] = locs[i] + 1
 	}
 	n := 0
-	st, err := PullRaw(context.Background(), ln.Addr().String(), locs, 3000, Background, nil, func(b []uint32, size int, vecs []byte) error {
+	st, err := PullRaw(context.Background(), ln.Addr().String(), locs, lists, 3000, Background, nil, func(b []uint32, size int, vecs []byte) error {
 		for i, l := range b {
 			if size != vb || string(vecs[i*vb:(i+1)*vb]) != string(vec(l)) {
 				t.Fatalf("location %d: wrong vector", l)
@@ -225,7 +231,7 @@ func TestPullRaw(t *testing.T) {
 	// Before each batch the destination says what it still lacks: here, every other location
 	// arrived meanwhile.
 	n = 0
-	st, err = PullRaw(context.Background(), ln.Addr().String(), locs, 3000, Data, func(b []uint32) ([]uint32, error) {
+	st, err = PullRaw(context.Background(), ln.Addr().String(), locs, lists, 3000, Data, func(b []uint32) ([]uint32, error) {
 		var keep []uint32
 		for i, l := range b {
 			if i%2 == 0 {
@@ -243,7 +249,7 @@ func TestPullRaw(t *testing.T) {
 	ln2, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer ln2.Close()
 	go (&Server{}).Serve(ln2)
-	if _, err := PullRaw(context.Background(), ln2.Addr().String(), locs[:3], 0, Data, nil,
+	if _, err := PullRaw(context.Background(), ln2.Addr().String(), locs[:3], lists[:3], 0, Data, nil,
 		func([]uint32, int, []byte) error { return nil }); err == nil || !strings.Contains(err.Error(), "does not serve raw vectors") {
 		t.Fatalf("no source: %v", err)
 	}

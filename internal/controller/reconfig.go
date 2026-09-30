@@ -167,23 +167,40 @@ func (c *Controller) rescale(ctx context.Context, target int) (*protocol.Rescale
 	}
 	switch c.cfg.Protocol {
 	case "lazy":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, true)
+		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, rawOnDemand)
+	case "lazy-stream":
+		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, rawStreamAfterFlip)
 	case "copy-then-flip":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, false)
+		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, rawBeforeFlip)
 	case "stop-and-copy":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, true, false)
+		return c.copyThenFlip(ctx, cur, next, changes, added, removed, true, rawBeforeFlip)
 	}
 	return nil, fmt.Errorf("controller: unknown protocol %q", c.cfg.Protocol)
 }
 
-// copyThenFlip is the reconfiguration protocol. With lazyRaw it is the protocol "lazy" (the
-// default); without, "copy-then-flip", and with stopTheWorld too the stop-and-copy baseline
-// (Koala's stop-and-restart):
+// rawMode says when the raw vectors of moved partitions reach their new owner (U9).
+type rawMode int
+
+const (
+	// rawOnDemand (protocol "lazy", the default): only the ones queries need, fetched by RERANK
+	// from the old owner when it first needs them; the rest stay with the old owner, which keeps
+	// every vector it has held.
+	rawOnDemand rawMode = iota
+	// rawStreamAfterFlip ("lazy-stream", a baseline): on demand, and a stream brings the rest
+	// after the flip.
+	rawStreamAfterFlip
+	// rawBeforeFlip ("copy-then-flip", "stop-and-copy"): all of them before the flip.
+	rawBeforeFlip
+)
+
+// copyThenFlip is the reconfiguration protocol: "lazy" (the default) with rawOnDemand,
+// "lazy-stream" with rawStreamAfterFlip, "copy-then-flip" with rawBeforeFlip, and with
+// stopTheWorld too the stop-and-copy baseline (Koala's stop-and-restart):
 //
 //  1. PREPARE  aggregators of the next epoch pre-connect to its data nodes; destinations
 //     pull the moved partitions' posting lists and the PQ codes they lack from the current
 //     owners (separate bulk connections, paced by the senders' token buckets) -- what a node
-//     needs to filter, so it can go online; without lazyRaw, the raw vectors they lack too;
+//     needs to filter, so it can go online; with rawBeforeFlip, the raw vectors they lack too;
 //     new entry nodes stage the graph in the background.
 //  2. FLIP     compare-and-swap epoch e -> e+1 in the store, install e+1 everywhere.
 //  3. GRACE    every node waits until no query pinned to epoch e is running.
@@ -192,16 +209,21 @@ func (c *Controller) rescale(ctx context.Context, target int) (*protocol.Rescale
 //  5. ENTRY    alongside 3 and 4, new nodes become entries as their graphs load: every
 //     entry_flip_interval, one more flip adds those whose graph loaded since the previous
 //     one (promoteEntries). A node whose graph fails to load stays a data node and aggregator.
-//  6. RAW      with lazyRaw, alongside 3-5: the destinations stream in the raw vectors they
-//     lack from the old owners (raw_priority, background by default), while their data nodes
-//     fetch the ones a query needs on demand from the same old owners (U9). The old owners --
-//     removed nodes included -- stay up as sources until this ends; the rescale waits for it.
+//  6. RAW      from the flip on, a new owner's data node fetches the raw vectors a query needs
+//     from the old owners on demand (every posting list knows the source of its partition),
+//     and with rawOnDemand nothing else: what no query needs never moves, and the rescale
+//     does not wait for any of it. That the old owners stay sources rests on invariants of
+//     the design (U9): no node drops a raw vector it has held, the nodes that leave are the
+//     ones that joined last, and a scale-in returns partitions to nodes that held them. With
+//     rawStreamAfterFlip, alongside 3-5, the destinations also stream in the rest from the old
+//     owners (raw_priority, background by default); the old owners -- removed nodes included
+//     -- stay up as sources until it ends, and the rescale waits for it.
 //
 // Failures: before the flip, partitions already copied to destinations are dropped again and
 // the old epoch stays in force. After the flip, the protocol stops and keeps every old copy
 // (always safe, possibly wasteful); retrying or rolling back is open question U13.
 func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next placement.Table,
-	changes placement.Changes, added, removed []*ManagedNode, stopTheWorld, lazyRaw bool) (*protocol.RescaleReply, error) {
+	changes placement.Changes, added, removed []*ManagedNode, stopTheWorld bool, raw rawMode) (*protocol.RescaleReply, error) {
 
 	reply := &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
 		Added: ids(added), Removed: ids(removed), Moved: changes.Moved(), Phases: map[string]float64{}}
@@ -254,6 +276,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	if err != nil {
 		return reply, err
 	}
+	fetchedBefore, fetchedBytesBefore := c.rawFetched(ctx, allNodes)
 	plan := placement.MakePlan(changes)
 	dests := make([]placement.NodeID, 0, len(plan))
 	for d := range plan {
@@ -317,13 +340,16 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	// node whose graph loads early does not wait for the others (promoteEntries).
 	graphs := make(chan graphDone, len(entryAdds))
 	var graphWG sync.WaitGroup
+	var graphBytes atomic.Int64
 	defer graphWG.Wait()
 	for _, n := range entryAdds {
 		graphWG.Add(1)
 		go func(n *ManagedNode) {
 			defer graphWG.Done()
+			var st protocol.StageReply
 			err := n.call(ctx, c.stageTimeout(), protocol.StageGraphM,
-				protocol.StageGraphReq{Source: graphSrcs[n.ID], Priority: c.cfg.GraphPriority}, nil)
+				protocol.StageGraphReq{Source: graphSrcs[n.ID], Priority: c.cfg.GraphPriority}, &st)
+			graphBytes.Add(st.Bytes)
 			graphs <- graphDone{n, err}
 		}(n)
 	}
@@ -378,7 +404,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	}
 	reply.Bytes, reply.PQCodes, reply.PQBytes = moved.Load(), pqCodes.Load(), pqBytes.Load()
 	phase("stage_data")
-	if !lazyRaw { // eager: the raw vectors too, before the flip
+	if raw == rawBeforeFlip { // eager: the raw vectors too, before the flip
 		st, err := c.stageRaw(ctx, destNodes, sources, "data")
 		reply.RawVectors, reply.RawBytes = st.RawVectors, st.RawBytes
 		if err != nil {
@@ -409,12 +435,12 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		}
 	}
 
-	// 6. RAW (lazy), alongside everything that follows: the new owners serve their partitions
-	// already, fetching the raw vectors a query needs on demand; the stream brings the rest.
-	// Every return waits for it, so the old owners stay sources until it has ended.
+	// 6. RAW: the new owners serve their partitions already, fetching the raw vectors a query
+	// needs on demand. With rawStreamAfterFlip a stream brings the rest, alongside everything
+	// that follows; every return waits for it, so the old owners stay sources until it ends.
 	rawDone := make(chan struct{})
 	var rawErr error
-	if lazyRaw {
+	if raw == rawStreamAfterFlip {
 		go func() {
 			defer close(rawDone)
 			var st protocol.StageReply
@@ -446,6 +472,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	entries := func() {
 		<-entryDone
 		reply.ToEpoch, reply.EntryFlips = entryLast.Epoch, entryFlips
+		reply.GraphBytes = graphBytes.Load() // every pull has reported: promoteEntries read them all
 		for id, err := range entryFail {
 			if reply.EntryFailed == nil {
 				reply.EntryFailed = map[placement.NodeID]string{}
@@ -499,6 +526,11 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	if rawErr != nil {
 		return reply, afterFlip(rawErr)
 	}
+	// What queries fetched on demand while the reconfiguration ran. Without a stream they go on
+	// fetching afterwards, as they meet vectors that have not moved yet: the nodes' raw.fetched
+	// counts those.
+	fetched, fetchedBytes := c.rawFetched(ctx, allNodes)
+	reply.RawFetched, reply.RawFetchedBytes = fetched-fetchedBefore, fetchedBytes-fetchedBytesBefore
 	log.Printf("controller: reconfiguration done: epoch %d -> %d, %.1f MB moved (%d PQ codes), %d raw vectors "+
 		"streamed (%.1f MB, %.2f s after the flip), phases %v, entry flips %v",
 		reply.FromEpoch, reply.ToEpoch, float64(reply.Bytes)/1e6, reply.PQCodes, reply.RawVectors,
@@ -512,6 +544,21 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 			"their graph did not load: %w", sortedKeys(entryFail), reply.ToEpoch, errors.Join(errs...))
 	}
 	return reply, nil
+}
+
+// rawFetched adds up the raw vectors the nodes' data nodes fetched on demand so far (and their
+// bytes). A node that does not answer counts as zero: the numbers are for the reply only.
+func (c *Controller) rawFetched(ctx context.Context, nodes []*ManagedNode) (int64, int64) {
+	var n, b atomic.Int64
+	forEach(nodes, func(m *ManagedNode) error {
+		var st protocol.NodeStatus
+		if err := m.call(ctx, c.callTimeout(), protocol.NodeStatusM, struct{}{}, &st); err == nil {
+			n.Add(int64(st.RawFetched))
+			b.Add(int64(st.RawFetchedBytes))
+		}
+		return nil
+	})
+	return n.Load(), b.Load()
 }
 
 // stageRaw has every destination stream in the raw vectors its new partitions lack from their

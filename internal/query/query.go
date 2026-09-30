@@ -153,7 +153,9 @@ func (TwoPhase) Execute(ctx context.Context, env *Env, req *Request, groups []Gr
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			reranked[i], _, errs[i] = clients[i].Rerank(ctx, env.Epoch, req.Vec, byOwner[i], req.Params.K)
+			// The owner's lists go along: they name every candidate, so the owner knows where to
+			// fetch a raw vector it lacks (U9).
+			reranked[i], _, errs[i] = clients[i].Rerank(ctx, env.Epoch, req.Vec, byOwner[i], groups[i].Lists, req.Params.K)
 		}(i)
 	}
 	wg.Wait()

@@ -109,7 +109,7 @@ func compare(ctx context.Context, c *nodeclient.Client, m *partitioning.Manifest
 					if len(ids) == 0 {
 						continue
 					}
-					cands, pages, err := c.Rerank(ctx, 0, vec, ids, k)
+					cands, pages, err := c.Rerank(ctx, 0, vec, ids, groups[i], k)
 					check(err)
 					reranked = append(reranked, cands)
 					ownerRerank[i] = cost.RerankCall + cost.Page*float64(pages)

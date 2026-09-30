@@ -5,9 +5,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <mutex>
 #include <thread>
@@ -163,6 +165,7 @@ class NodeEngineImpl : public NodeEngine {
     FUSION_CHECK(o.max_nprobe >= 1 && o.max_rerank >= 1, "max_nprobe and max_rerank must be >= 1");
     space_ = MakeL2Space(DTypeOf<T>(), dim_);
     segs_.resize(man_.num_partitions);
+    list_src_.assign(man_.num_lists, 0);
     index_pages_path_ = path(files::LayoutVectors(man_.layout));
     const uint64_t max_cand =
         static_cast<uint64_t>(std::min<uint32_t>(o.max_nprobe, man_.num_lists)) *
@@ -213,6 +216,16 @@ class NodeEngineImpl : public NodeEngine {
       w->locs.resize(o.max_rerank);
       workers_.push_back(std::move(w));
     }
+    writer_ = std::thread([this] { WriterLoop(); });
+  }
+
+  ~NodeEngineImpl() override {
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      stop_writer_ = true;
+    }
+    cache_cv_.notify_all();
+    if (writer_.joinable()) writer_.join();  // installs what is still queued first
   }
 
   // ------------------------------------------------------------------ staging
@@ -256,7 +269,7 @@ class NodeEngineImpl : public NodeEngine {
     rs->slots.resize(ids.size());
     // PQMissingError: nothing changed. The locations are recorded with the codes.
     store_->Ref(ids.data(), ids.size(), rs->slots.data(), locs.data());
-    if (!raw_miss.empty()) NotePending(raw_miss, raw_peer);
+    SetListSources(rs->seg.list_ids, raw_miss.empty() ? std::string() : raw_peer);
     // The references are dropped (by the reclaimer) once the last holder -- the table below,
     // or a query that pinned the segment -- lets go of it.
     Reclaimer* reclaimer = reclaimer_.get();
@@ -268,6 +281,7 @@ class NodeEngineImpl : public NodeEngine {
       old = std::move(segs_[p]);
       segs_[p] = std::move(seg);
     }
+    raw_version_.fetch_add(1);
   }
 
   bool EvictPartition(uint32_t p) override {
@@ -279,9 +293,11 @@ class NodeEngineImpl : public NodeEngine {
     }
     const bool was = old != nullptr;
     // Unless a request still holds the partition, its references are dropped (its codes are
-    // cached) before we return.
+    // cached) before we return. The source of its lists stays: a peer that got the partition
+    // from here may still ask for its vectors.
     old.reset();
     reclaimer_->Flush();
+    raw_version_.fetch_add(1);
     return was;
   }
 
@@ -323,6 +339,7 @@ class NodeEngineImpl : public NodeEngine {
     PQPutResult r;
     r.installed = store_->Put(ids, n, codes, PQOrigin::kReceived);
     r.skipped = n - r.installed;
+    if (r.installed) raw_version_.fetch_add(1);
     return r;
   }
 
@@ -333,50 +350,85 @@ class NodeEngineImpl : public NodeEngine {
   PQStats pq_stats() const override { return store_->Stats(); }
 
   // ------------------------------------------------------------- raw vectors
-  std::vector<std::vector<uint32_t>> RawMissing(
-      const std::vector<std::vector<std::string>>& groups) override {
-    std::vector<std::vector<uint32_t>> out(groups.size());
+  std::vector<RawRefs> RawMissing(const std::vector<std::vector<std::string>>& groups) override {
+    DrainWrites();  // what queries fetched is not listed again
+    std::vector<RawRefs> out(groups.size());
     std::vector<uint32_t> taken;  // sorted: listed for an earlier group
     for (size_t g = 0; g < groups.size(); ++g) {
-      std::vector<uint32_t> locs;
+      std::vector<std::pair<uint32_t, uint32_t>> refs;  // (location, a list naming it)
       for (const std::string& path : groups[g]) {
-        const ListSegment s = LoadSegment(path);
-        locs.insert(locs.end(), s.locs.begin(), s.locs.end());
+        const ListSegment seg = LoadSegment(path);
+        for (size_t i = 0; i < seg.list_ids.size(); ++i)
+          for (uint64_t j = seg.offsets[i]; j < seg.offsets[i + 1]; ++j)
+            if (!raw_->Present(seg.locs[j])) refs.emplace_back(seg.locs[j], seg.list_ids[i]);
       }
-      const std::vector<uint32_t> miss = raw_->Missing(locs.data(), locs.size());
-      std::vector<uint32_t> fresh;
-      std::set_difference(miss.begin(), miss.end(), taken.begin(), taken.end(),
-                          std::back_inserter(fresh));
+      std::sort(refs.begin(), refs.end());
+      RawRefs& o = out[g];
+      for (size_t i = 0; i < refs.size(); ++i) {
+        if (i > 0 && refs[i].first == refs[i - 1].first) continue;  // one list per location
+        if (std::binary_search(taken.begin(), taken.end(), refs[i].first)) continue;
+        o.locs.push_back(refs[i].first);
+        o.lists.push_back(refs[i].second);
+      }
       std::vector<uint32_t> merged;
-      merged.reserve(taken.size() + fresh.size());
-      std::merge(taken.begin(), taken.end(), fresh.begin(), fresh.end(), std::back_inserter(merged));
+      merged.reserve(taken.size() + o.locs.size());
+      std::merge(taken.begin(), taken.end(), o.locs.begin(), o.locs.end(), std::back_inserter(merged));
       taken.swap(merged);
-      out[g] = std::move(fresh);
     }
     return out;
   }
 
   std::vector<uint32_t> RawAbsent(const uint32_t* locs, size_t n) const override {
-    return raw_->Missing(locs, n);
+    std::vector<uint32_t> miss = raw_->Missing(locs, n);
+    std::lock_guard<std::mutex> l(cache_mu_);
+    miss.erase(std::remove_if(miss.begin(), miss.end(), [&](uint32_t loc) { return cache_.count(loc) != 0; }),
+               miss.end());
+    return miss;
   }
 
-  void RawGet(const uint32_t* locs, size_t n, uint8_t* out) override {
-    EnsureRaw(locs, n);  // a vector this node is itself still waiting for comes through it
-    raw_->Get(locs, n, out);
+  void RawGet(const uint32_t* locs, const uint32_t* lists, size_t n, uint8_t* out) override {
+    EnsureRawVia(locs, lists, n);  // a vector this node lacks itself comes through it (chains)
+    const uint32_t vb = raw_->layout().vec_bytes;
+    std::vector<uint32_t> disk;
+    std::vector<size_t> at;
+    size_t from_cache = 0;
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      for (size_t i = 0; i < n; ++i) {
+        if (raw_->Present(locs[i])) {
+          disk.push_back(locs[i]);
+          at.push_back(i);
+          continue;
+        }
+        const auto it = cache_.find(locs[i]);
+        if (it == cache_.end())
+          throw RawMissingError(StrFormat("raw vector at location %u is not on this node", locs[i]));
+        std::memcpy(out + i * vb, it->second.data(), vb);
+        ++from_cache;
+      }
+    }
+    if (from_cache) raw_->CountServed(from_cache);
+    if (disk.size() == n) {
+      raw_->Get(locs, n, out);
+      return;
+    }
+    std::vector<uint8_t> buf(disk.size() * vb);
+    if (!disk.empty()) raw_->Get(disk.data(), disk.size(), buf.data());
+    for (size_t j = 0; j < disk.size(); ++j) std::memcpy(out + at[j] * vb, buf.data() + j * vb, vb);
   }
 
   RawPutResult RawPut(const uint32_t* locs, size_t n, const uint8_t* vecs) override {
     RawPutResult r;
     r.installed = raw_->Put(locs, n, vecs, RawOrigin::kStreamed);
     r.skipped = n - r.installed;
-    ForgetPending(locs, n);
+    if (r.installed) raw_version_.fetch_add(1);
     return r;
   }
 
   RawStats raw_stats() const override {
+    DrainWrites();  // fetched vectors count once they are on the SSD
     RawStats st = raw_->Stats();
-    std::lock_guard<std::mutex> l(raw_mu_);
-    st.pending = pending_.size();
+    st.pending = PendingCount(st.locations);
     return st;
   }
 
@@ -410,9 +462,12 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   uint32_t Rerank(int wi, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
-                  uint32_t* out_ids, float* out_dists, RerankStats* st) override {
+                  const uint32_t* lists, uint32_t nlists, uint32_t* out_ids, float* out_dists,
+                  RerankStats* st) override {
     FUSION_CHECK(n <= opts_.max_rerank, "rerank input %u exceeds max_rerank %u", n,
                  opts_.max_rerank);
+    FUSION_CHECK(nlists <= opts_.max_nprobe, "%u lists exceed max_nprobe %u", nlists,
+                 opts_.max_nprobe);
     FUSION_CHECK(k >= 1, "k must be >= 1");
     for (uint32_t i = 0; i < n; ++i)
       FUSION_CHECK(ids[i] < n_, "vector ID %u out of range", ids[i]);
@@ -433,10 +488,49 @@ class NodeEngineImpl : public NodeEngine {
           StrFormat("vector %u is not named by any partition loaded on this node", ids[i]));
     }
     Timer t;
-    st->fetched = static_cast<uint32_t>(EnsureRaw(locs, n));
+    st->fetched = static_cast<uint32_t>(EnsureRawInLists(locs, n, lists, nlists));
     st->fetch_us = t.Us();
-    return HeuristicRerank<T>(static_cast<const T*>(query), dim_, ids, locs, n, raw_->layout(),
-                              w.reader.get(), w.scratch.get(), rp, out_ids, out_dists, st);
+    // Candidates whose vector is on the SSD are re-ranked from it; the others were fetched and
+    // are re-ranked from memory, before (or while) the writer installs them. Fixed n and the
+    // (distance, ID) order make the merged top-k the one a single pass would keep.
+    const T* q = static_cast<const T*>(query);
+    const uint32_t vb = raw_->layout().vec_bytes;
+    w.disk_ids.clear();
+    w.disk_locs.clear();
+    w.mem_ids.clear();
+    w.mem_vecs.clear();
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      for (uint32_t i = 0; i < n; ++i) {
+        if (raw_->Present(locs[i])) {
+          w.disk_ids.push_back(ids[i]);
+          w.disk_locs.push_back(locs[i]);
+          continue;
+        }
+        const auto it = cache_.find(locs[i]);
+        if (it == cache_.end())
+          throw RawMissingError(StrFormat("raw vector %u (location %u) is neither here nor fetched", ids[i], locs[i]));
+        w.mem_ids.push_back(ids[i]);
+        w.mem_vecs.insert(w.mem_vecs.end(), it->second.begin(), it->second.end());
+      }
+    }
+    const uint32_t nd = static_cast<uint32_t>(w.disk_ids.size());
+    const uint32_t cnt = nd == 0 ? 0 : HeuristicRerank<T>(q, dim_, w.disk_ids.data(), w.disk_locs.data(), nd,
+                                                          raw_->layout(), w.reader.get(), w.scratch.get(), rp,
+                                                          out_ids, out_dists, st);
+    if (w.mem_ids.empty()) return cnt;
+    w.merged.clear();
+    for (uint32_t i = 0; i < cnt; ++i) w.merged.emplace_back(out_dists[i], out_ids[i]);
+    for (size_t i = 0; i < w.mem_ids.size(); ++i)
+      w.merged.emplace_back(L2Sqr(q, reinterpret_cast<const T*>(w.mem_vecs.data() + i * vb), dim_), w.mem_ids[i]);
+    st->reranked += static_cast<uint32_t>(w.mem_ids.size());
+    const size_t keep = std::min<size_t>(k, w.merged.size());
+    std::partial_sort(w.merged.begin(), w.merged.begin() + keep, w.merged.end());
+    for (size_t i = 0; i < keep; ++i) {
+      out_dists[i] = w.merged[i].first;
+      out_ids[i] = w.merged[i].second;
+    }
+    return static_cast<uint32_t>(keep);
   }
 
   uint32_t SearchLocal(int wi, const void* query, const SearchParams& p, uint32_t* ids,
@@ -481,7 +575,8 @@ class NodeEngineImpl : public NodeEngine {
     RerankParams rp = p.rr;
     rp.k = p.k;
     st->rerank = RerankStats();
-    st->rerank.fetched = static_cast<uint32_t>(EnsureRaw(w.locs.data(), nt));
+    st->rerank.fetched = static_cast<uint32_t>(EnsureRawInLists(w.locs.data(), nt, w.lists.data(), nl));
+    if (st->rerank.fetched) DrainWrites();  // re-ranked from the SSD below (heuristic order)
     const uint32_t cnt = HeuristicRerank<T>(q, dim_, fw->result_ids(), w.locs.data(), nt,
                                             raw_->layout(), w.reader.get(), w.scratch.get(), rp,
                                             ids, dists, &st->rerank);
@@ -548,6 +643,10 @@ class NodeEngineImpl : public NodeEngine {
     std::vector<uint32_t> lists;
     std::vector<uint32_t> locs;  // raw-vector locations of the candidates being re-ranked
     std::vector<std::shared_ptr<const ResidentSegment>> held;  // pinned by Gather
+    // Re-ranking split between the SSD and the fetch cache (see Rerank).
+    std::vector<uint32_t> disk_ids, disk_locs, mem_ids;
+    std::vector<uint8_t> mem_vecs;
+    std::vector<std::pair<float, uint32_t>> merged;
   };
 
   // Unpins the segments a request gathered from when it finishes, normally or not.
@@ -625,75 +724,226 @@ class NodeEngineImpl : public NodeEngine {
     return *index_pages_;
   }
 
-  // Records where the raw vectors at `locs` (not on this node) are to be fetched from.
-  void NotePending(const std::vector<uint32_t>& locs, const std::string& peer) {
+  // Makes `peer` the raw-vector source of `lists` ("": none, their vectors are all here).
+  void SetListSources(const std::vector<uint32_t>& lists, const std::string& peer) {
     std::lock_guard<std::mutex> l(raw_mu_);
-    size_t src = 0;
-    while (src < sources_.size() && sources_[src] != peer) ++src;
-    if (src == sources_.size()) {
-      FUSION_CHECK(sources_.size() < 0xFFFF, "too many raw-vector sources");
-      sources_.push_back(peer);
+    uint16_t src = 0;
+    if (!peer.empty()) {
+      size_t i = 0;
+      while (i < sources_.size() && sources_[i] != peer) ++i;
+      if (i == sources_.size()) {
+        FUSION_CHECK(sources_.size() < 0xFFFF, "too many raw-vector sources");
+        sources_.push_back(peer);
+      }
+      src = static_cast<uint16_t>(i + 1);
     }
-    // Checked under the lock that RawPut and EnsureRaw take to forget arrived vectors, after
-    // their bits are set: a vector cannot arrive in between and stay listed.
-    for (uint32_t loc : locs)
-      if (!raw_->Present(loc)) pending_[loc] = static_cast<uint16_t>(src);  // latest source wins
+    for (uint32_t c : lists) list_src_[c] = src;
   }
 
-  void ForgetPending(const uint32_t* locs, size_t n) {
-    std::lock_guard<std::mutex> l(raw_mu_);
-    if (pending_.empty()) return;
-    for (size_t i = 0; i < n; ++i)
-      if (raw_->Present(locs[i])) pending_.erase(locs[i]);
-  }
-
-  // Makes the raw vectors at locs[0..n) present, fetching the missing ones from their sources
-  // (one request per source); returns how many were fetched. RawMissingError if one has no
-  // known source or its fetch fails. Two queries that miss the same vector may both fetch it;
-  // the second write is a no-op.
-  size_t EnsureRaw(const uint32_t* locs, size_t n) {
-    const std::vector<uint32_t> miss = raw_->Missing(locs, n);
+  // Makes the raw vectors at locs[0..n) present, the missing ones fetched through the query's
+  // lists: the lists a query probed name all its candidates, so one of them names each missing
+  // vector and knows its source. Only the missing ones are scanned for, and only then.
+  size_t EnsureRawInLists(const uint32_t* locs, size_t n, const uint32_t* lists, uint32_t nlists) {
+    const std::vector<uint32_t> miss = RawAbsent(locs, n);  // sorted, unique; cached is not missing
     if (miss.empty()) return 0;
-    std::vector<std::vector<uint32_t>> by_src;
+    std::vector<uint32_t> via(miss.size(), kInvalidId);
+    std::vector<std::shared_ptr<const ResidentSegment>> segs(nlists);
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (uint32_t i = 0; i < nlists; ++i) {
+        FUSION_CHECK(lists[i] < man_.num_lists, "list %u out of range", lists[i]);
+        segs[i] = segs_[man_.list_part[lists[i]]];
+      }
+    }
+    size_t left = miss.size();
+    for (uint32_t i = 0; i < nlists && left; ++i) {
+      if (!segs[i]) continue;
+      uint32_t len = 0;
+      const uint32_t* v = segs[i]->seg.Find(lists[i], &len);
+      if (!v) continue;
+      const uint32_t* ls = segs[i]->seg.locs.data() + (v - segs[i]->seg.ids.data());
+      for (uint32_t j = 0; j < len && left; ++j) {
+        const auto it = std::lower_bound(miss.begin(), miss.end(), ls[j]);
+        if (it != miss.end() && *it == ls[j] && via[it - miss.begin()] == kInvalidId) {
+          via[it - miss.begin()] = lists[i];
+          --left;
+        }
+      }
+    }
+    return FetchRaw(miss, via);
+  }
+
+  // The same for a peer's request, which names the list of every location (RAW_GET).
+  size_t EnsureRawVia(const uint32_t* locs, const uint32_t* lists, size_t n) {
+    std::vector<std::pair<uint32_t, uint32_t>> refs;
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      for (size_t i = 0; i < n; ++i)
+        if (!raw_->Present(locs[i]) && !cache_.count(locs[i])) refs.emplace_back(locs[i], lists[i]);
+    }
+    if (refs.empty()) return 0;
+    std::sort(refs.begin(), refs.end());
+    std::vector<uint32_t> miss, via;
+    for (size_t i = 0; i < refs.size(); ++i) {
+      if (i > 0 && refs[i].first == refs[i - 1].first) continue;
+      FUSION_CHECK(refs[i].second < man_.num_lists, "list %u out of range", refs[i].second);
+      miss.push_back(refs[i].first);
+      via.push_back(refs[i].second);
+    }
+    return FetchRaw(miss, via);
+  }
+
+  // Fetches miss[i] from the source of list via[i] (kInvalidId: no list named it), one request
+  // per source; returns how many were installed. RawMissingError if one has no source or its
+  // fetch fails. Two queries that miss the same vector may both fetch it; the second write is
+  // a no-op.
+  size_t FetchRaw(const std::vector<uint32_t>& miss, const std::vector<uint32_t>& via) {
+    std::vector<std::vector<uint32_t>> locs_by, lists_by;
     std::vector<std::string> peers;
     RawFetcher fetch;
     {
       std::lock_guard<std::mutex> l(raw_mu_);
-      by_src.resize(sources_.size());
+      locs_by.resize(sources_.size());
+      lists_by.resize(sources_.size());
       size_t unknown = 0;
       uint32_t first = 0;
-      for (uint32_t loc : miss) {
-        const auto it = pending_.find(loc);
-        if (it != pending_.end()) {
-          by_src[it->second].push_back(loc);
-        } else if (!raw_->Present(loc) && unknown++ == 0) {  // it may have arrived meanwhile
-          first = loc;
+      for (size_t i = 0; i < miss.size(); ++i) {
+        const uint16_t src = via[i] == kInvalidId ? 0 : list_src_[via[i]];
+        if (src) {
+          locs_by[src - 1].push_back(miss[i]);
+          lists_by[src - 1].push_back(via[i]);
+        } else if (!raw_->Present(miss[i]) && !Cached(miss[i]) && unknown++ == 0) {  // it may have arrived
+          first = miss[i];
         }
       }
       if (unknown)
-        throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no source is "
-                                        "known for them (first: location %u)", unknown, first));
+        throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no list naming "
+                                        "them has a source (first: location %u)", unknown, first));
       peers = sources_;
       fetch = fetcher_;
     }
     size_t fetched = 0;
     std::vector<uint8_t> buf;
-    for (size_t src = 0; src < by_src.size(); ++src) {
-      const std::vector<uint32_t>& ls = by_src[src];
+    for (size_t src = 0; src < locs_by.size(); ++src) {
+      const std::vector<uint32_t>& ls = locs_by[src];
       if (ls.empty()) continue;
       if (!fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
       buf.resize(ls.size() * raw_->layout().vec_bytes);
       try {
-        fetch(peers[src], ls.data(), ls.size(), buf.data());
+        fetch(peers[src], ls.data(), lists_by[src].data(), ls.size(), buf.data());
       } catch (const std::exception& e) {
         throw RawMissingError(StrFormat("fetching %zu raw vectors from %s: %s", ls.size(),
                                         peers[src].c_str(), e.what()));
       }
       raw_->CountFetch();
-      fetched += raw_->Put(ls.data(), ls.size(), buf.data(), RawOrigin::kFetched);
-      ForgetPending(ls.data(), ls.size());
+      fetched += Cache(ls.data(), ls.size(), buf.data());
     }
     return fetched;
+  }
+
+  bool Cached(uint32_t loc) const {
+    std::lock_guard<std::mutex> l(cache_mu_);
+    return cache_.count(loc) != 0;
+  }
+
+  // Keeps fetched vectors for the queries and queues them for the SSD; returns how many were
+  // new. Past kMaxQueuedBytes of queued vectors the fetching query installs them itself:
+  // backpressure, so that a slow disk cannot grow the cache without bound.
+  size_t Cache(const uint32_t* locs, size_t n, const uint8_t* vecs) {
+    static constexpr size_t kMaxQueuedBytes = 64u << 20;
+    const uint32_t vb = raw_->layout().vec_bytes;
+    std::vector<uint32_t> fresh;
+    bool full = false;
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      full = (queued_ + n) * vb > kMaxQueuedBytes;
+      if (!full) {
+        for (size_t i = 0; i < n; ++i) {
+          if (raw_->Present(locs[i]) || cache_.count(locs[i])) continue;  // fetched twice: once is enough
+          cache_.emplace(locs[i], std::vector<uint8_t>(vecs + i * vb, vecs + (i + 1) * vb));
+          fresh.push_back(locs[i]);
+        }
+        if (!fresh.empty()) {
+          queued_ += fresh.size();
+          ++queued_batches_;
+          write_queue_.push_back(fresh);
+        }
+      }
+    }
+    if (full) {
+      const size_t installed = raw_->Put(locs, n, vecs, RawOrigin::kFetched);
+      raw_version_.fetch_add(1);
+      return installed;
+    }
+    if (!fresh.empty()) cache_cv_.notify_all();
+    return fresh.size();
+  }
+
+  // The writer: installs queued vectors on the SSD, then drops them from the cache.
+  void WriterLoop() {
+    const uint32_t vb = raw_->layout().vec_bytes;
+    std::unique_lock<std::mutex> l(cache_mu_);
+    for (;;) {
+      cache_cv_.wait(l, [&] { return stop_writer_ || !write_queue_.empty(); });
+      if (write_queue_.empty()) return;  // stopping, and nothing left to install
+      std::vector<uint32_t> batch = std::move(write_queue_.front());
+      write_queue_.pop_front();
+      std::vector<uint8_t> vecs(batch.size() * vb);
+      for (size_t i = 0; i < batch.size(); ++i) std::memcpy(vecs.data() + i * vb, cache_[batch[i]].data(), vb);
+      l.unlock();
+      bool ok = true;
+      try {
+        raw_->Put(batch.data(), batch.size(), vecs.data(), RawOrigin::kFetched);
+      } catch (const std::exception& e) {
+        ok = false;  // they stay in the cache, still served from memory
+        Log("raw-vector writer: %s", e.what());
+      }
+      l.lock();
+      if (ok)
+        for (uint32_t loc : batch) cache_.erase(loc);
+      queued_ -= batch.size();
+      ++written_batches_;
+      raw_version_.fetch_add(1);
+      cache_cv_.notify_all();
+    }
+  }
+
+  // Waits until the vectors queued before the call are on the SSD. Not for an empty queue:
+  // queries keep fetching during a warm-up, and INFO (which the controller and the metrics
+  // call) must not wait for the warm-up to end.
+  void DrainWrites() const {
+    std::unique_lock<std::mutex> l(cache_mu_);
+    const uint64_t mine = queued_batches_;
+    cache_cv_.wait(l, [&] { return written_batches_ >= mine; });
+  }
+
+  // Distinct locations named by resident partitions whose vector is not here: recounted only
+  // after a load, an eviction or new vectors (raw_version_), since the lazy protocol leaves
+  // them missing for as long as no query needs them.
+  uint64_t PendingCount(uint64_t locations) const {
+    const uint64_t v = raw_version_.load();
+    std::lock_guard<std::mutex> l(pending_mu_);
+    if (v == pending_version_) return pending_count_;
+    std::vector<std::shared_ptr<const ResidentSegment>> segs;
+    {
+      std::lock_guard<std::mutex> sl(seg_mu_);
+      for (const auto& seg : segs_)
+        if (seg) segs.push_back(seg);
+    }
+    std::vector<uint64_t> seen((locations + 63) / 64);
+    uint64_t count = 0;
+    for (const auto& seg : segs)
+      for (uint32_t loc : seg->seg.locs) {
+        uint64_t& word = seen[loc >> 6];
+        const uint64_t bit = uint64_t{1} << (loc & 63);
+        if (!(word & bit) && !raw_->Present(loc)) {
+          word |= bit;
+          ++count;
+        }
+      }
+    pending_version_ = v;
+    pending_count_ = count;
+    return count;
   }
 
   uint32_t NavigateImpl(const T* q, uint32_t nprobe, uint32_t ef, uint32_t* lists) const {
@@ -779,11 +1029,30 @@ class NodeEngineImpl : public NodeEngine {
   std::string index_pages_path_;
   std::mutex index_pages_mu_;
   std::unique_ptr<ReadOnlyFile> index_pages_;  // bootstrap only (IndexPages)
-  // Raw vectors named by loaded partitions that have not arrived yet: location -> index into
-  // sources_ (the data node to fetch it from). Empty in the steady state.
+  // Where to fetch a raw vector this node lacks: the source of any posting list that names it
+  // (1 + an index into sources_, 0 for none), set when the list's partition loads from a
+  // peer. Lists overlap, so no per-vector table is needed, and a list keeps its source after
+  // its partition leaves, for peers that got the partition from here.
   mutable std::mutex raw_mu_;
-  std::unordered_map<uint32_t, uint16_t> pending_;
+  std::vector<uint16_t> list_src_;
   std::vector<std::string> sources_;
+  std::atomic<uint64_t> raw_version_{1};  // bumped when what is resident or present changes
+  // Raw vectors fetched on demand that are not on the SSD yet. Queries use them from here and
+  // the writer installs them in the background: the query that fetched a vector does not wait
+  // for the write, nor for reading it back (a page read right after its vectors were written
+  // also pays their write-back). A vector leaves the cache only once it is present, under
+  // cache_mu_, so a lookup under the lock finds it in one place or the other.
+  mutable std::mutex cache_mu_;
+  mutable std::condition_variable cache_cv_;  // queue not empty (writer) / drained (waiters)
+  std::unordered_map<uint32_t, std::vector<uint8_t>> cache_;
+  std::deque<std::vector<uint32_t>> write_queue_;  // batches of cached locations to install
+  size_t queued_ = 0;                              // locations in write_queue_
+  uint64_t queued_batches_ = 0, written_batches_ = 0;  // tickets: DrainWrites waits for its own
+  bool stop_writer_ = false;
+  std::thread writer_;
+  mutable std::mutex pending_mu_;
+  mutable uint64_t pending_version_ = 0;
+  mutable uint64_t pending_count_ = 0;
   RawFetcher fetcher_;
   std::vector<std::unique_ptr<Worker>> workers_;
 };

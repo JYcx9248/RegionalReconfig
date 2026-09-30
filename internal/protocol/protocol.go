@@ -10,8 +10,9 @@
 //	3 waitAllInboundPeersToConnect                     StageAggregator (pre-connect) everywhere
 //	  (state that must be there first)                 StagePartitions: lists + PQ codes before the flip
 //	4 notifyUpstreamTasks + InflightBarrier            store CAS + InstallEpoch everywhere
-//	  (lazy state fetch during processing)             raw vectors: fetched on demand by RERANK, and
-//	                                                   StageRaw streams the rest after the flip
+//	  (lazy state fetch during processing)             raw vectors: fetched on demand by RERANK, only
+//	                                                   those queries need (lazy-stream: StageRaw
+//	                                                   streams the rest after the flip)
 //	5 waitAllTasksReconfigDone                         WaitDrained(old epoch) everywhere
 //	6 terminateTasks                                   Evict on old owners
 //	  (none)                                           StageGraph; entry flips add new nodes as graphs load
@@ -141,6 +142,9 @@ type NodeStatus struct {
 	Resident    []int            `json:"resident"`
 	Paused      bool             `json:"paused"`
 	GraphLoaded bool             `json:"graph_loaded"`
+	// Raw vectors the data node fetched on demand since it started, and their bytes.
+	RawFetched      uint64 `json:"raw_fetched"`
+	RawFetchedBytes uint64 `json:"raw_fetched_bytes"`
 }
 
 // RescaleReq changes the number of data nodes.
@@ -159,14 +163,22 @@ type RescaleReply struct {
 	Bytes     int64              `json:"bytes"`    // segment files + PQ codes received by destinations
 	PQCodes   int64              `json:"pq_codes"` // PQ codes pulled (deduplicated per destination)
 	PQBytes   int64              `json:"pq_bytes"`
-	// Raw vectors streamed to the destinations (deduplicated per destination). With the lazy
-	// protocol the stream runs after the flip and RawSeconds is how long after the flip it
-	// ended; the vectors that queries fetched on demand before it are not counted here (see
-	// the data nodes' raw.fetched).
-	RawVectors int64              `json:"raw_vectors"`
-	RawBytes   int64              `json:"raw_bytes"`
-	RawSeconds float64            `json:"raw_seconds,omitempty"`
-	Phases     map[string]float64 `json:"phases"` // seconds per phase
+	// Raw vectors streamed to the destinations (deduplicated per destination): none with the
+	// lazy protocol; with lazy-stream the stream runs after the flip and RawSeconds is how long
+	// after the flip it ended. The vectors queries fetch on demand are not counted here (see
+	// RawFetched and the data nodes' raw.fetched).
+	RawVectors int64   `json:"raw_vectors"`
+	RawBytes   int64   `json:"raw_bytes"`
+	RawSeconds float64 `json:"raw_seconds,omitempty"`
+	// GraphBytes: navigation graphs copied to the new entries (in the background, see
+	// EntryFlips), counted once every pull has ended.
+	GraphBytes int64 `json:"graph_bytes,omitempty"`
+	// RawFetched: raw vectors that queries fetched on demand while the reconfiguration ran
+	// (lazy protocols), from every node's counter before and after. With lazy the fetches go
+	// on after the rescale returns, for as long as queries meet vectors that have not moved.
+	RawFetched      int64              `json:"raw_fetched,omitempty"`
+	RawFetchedBytes int64              `json:"raw_fetched_bytes,omitempty"`
+	Phases          map[string]float64 `json:"phases"` // seconds per phase
 	// GraphSources: which existing entry each new entry copies the graph from, assigned when
 	// the reconfiguration starts (absent: copied from the build output).
 	GraphSources map[placement.NodeID]placement.NodeID `json:"graph_sources,omitempty"`

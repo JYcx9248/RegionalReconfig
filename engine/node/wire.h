@@ -24,8 +24,9 @@
 //   LOAD_PARTITION  u32 partition, u8 pq_source, str raw_peer, -> -
 //                   path
 //                   pq_source 0: every PQ code must already be on the node (PQ_PUT); raw
-//                                vectors not here yet are fetched from raw_peer (a data node,
-//                                "host:port") when a query needs them
+//                                vectors not here are fetched from raw_peer (a data node,
+//                                "host:port", the source of the partition's lists) when a
+//                                query needs them
 //                             1: bootstrap: copy the missing codes and raw vectors from the index
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident
 //   PQ_MISSING      u32 groups, per group: u32 paths,         -> u32 groups, per group:
@@ -36,9 +37,11 @@
 //   PQ_RELEASE      -                                         -> u64 freed (a staging that did
 //                                                                not load: its new codes)
 //   RAW_MISSING     u32 groups, per group: u32 paths,         -> u32 groups, per group:
-//                   str path[paths] (segment files)              u32 n, u32 locs[n]
-//   RAW_GET         u32 n, u32 locs[n]                        -> u32 vec_bytes, u8 vecs[n * vb]
-//                   (vectors not here yet are fetched from this node's own source first)
+//                   str path[paths] (segment files)              u32 n, u32 locs[n], u32 lists[n]
+//                                                                (a list naming each location)
+//   RAW_GET         u32 n, u32 locs[n], u32 lists[n]          -> u32 vec_bytes, u8 vecs[n * vb]
+//                   (lists[i] names locs[i]; a vector not here is fetched from that list's
+//                   source on this node first: chained migrations)
 //   RAW_PUT         u32 n, u32 vec_bytes, u32 locs[n],        -> u32 installed, u32 skipped
 //                   u8 vecs[n * vec_bytes]
 //   RAW_CHECK       u32 n, u32 locs[n]                        -> u32 m, u32 locs[m] (those not
@@ -46,8 +49,10 @@
 //   NAVIGATE        u32 nprobe, u32 ef, query                 -> u32 n, u32 lists[n]
 //   FILTER          u32 topn, u32 nlists, u32 lists[], query  -> u32 n, u32 ids[n], f32 dists[n],
 //                                                                u32 gathered, u32 unique
-//   RERANK          u32 k, u32 n, u32 ids[n], query           -> u32 n, u32 ids[n], f32 dists[n],
-//                                                                u32 pages_read, u32 fetched
+//   RERANK          u32 k, u32 n, u32 ids[n], u32 nlists,     -> u32 n, u32 ids[n], f32 dists[n],
+//                   u32 lists[nlists], query                     u32 pages_read, u32 fetched
+//                   (lists: the query's lists on this node; a missing raw vector is fetched
+//                   from the source of one of them that names it)
 //   SEARCH_LOCAL    u32 k, u32 nprobe, u32 rerank, u32 ef,    -> u32 n, u32 ids[n], f32 dists[n]
 //                   u8 heuristic, u8[3] pad, query
 #pragma once

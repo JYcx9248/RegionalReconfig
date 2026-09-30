@@ -217,8 +217,8 @@ void PeerPool::Give(const std::string& addr, int fd) {
   idle_[addr].push_back(fd);
 }
 
-void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, uint32_t vec_bytes,
-                      uint8_t* out) {
+void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, const uint32_t* lists,
+                      size_t n, uint32_t vec_bytes, uint8_t* out) {
   for (size_t done = 0; done < n;) {  // frames stay far below kMaxFrameBytes
     const size_t batch = std::min<size_t>(
         {n - done, kMaxRawBatch, std::max<size_t>(1, (kMaxFrameBytes / 4) / vec_bytes)});
@@ -228,6 +228,7 @@ void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, u
     BodyWriter w;
     w.Put<uint32_t>(static_cast<uint32_t>(batch));
     w.PutBytes(locs + done, batch * 4);
+    w.PutBytes(lists + done, batch * 4);
     req.body = std::move(w.buf);
     const int fd = Take(addr);
     Frame resp;
@@ -260,8 +261,10 @@ void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, u
 NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
   for (int i = engine->num_workers() - 1; i >= 0; --i) free_workers_.push_back(i);
   const uint32_t vb = engine->vec_bytes();
-  engine->SetRawFetcher([this, vb](const std::string& peer, const uint32_t* locs, size_t n,
-                                   uint8_t* out) { peers_.RawGet(peer, locs, n, vb, out); });
+  engine->SetRawFetcher([this, vb](const std::string& peer, const uint32_t* locs,
+                                   const uint32_t* lists, size_t n, uint8_t* out) {
+    peers_.RawGet(peer, locs, lists, n, vb, out);
+  });
 }
 
 NodeServer::~NodeServer() {
@@ -474,13 +477,14 @@ Frame NodeServer::Handle(const Frame& req) {
         const auto groups = TakeGroups(&r);
         const auto miss = e.RawMissing(groups);
         uint64_t bytes = 4;
-        for (const auto& m : miss) bytes += 4 + 4 * static_cast<uint64_t>(m.size());
+        for (const auto& m : miss) bytes += 4 + 8 * static_cast<uint64_t>(m.locs.size());
         Require(bytes + 64 <= kMaxFrameBytes,
                 "the missing locations do not fit in one frame; ask for fewer partitions per call");
         w.Put<uint32_t>(static_cast<uint32_t>(groups.size()));
         for (const auto& m : miss) {
-          w.Put<uint32_t>(static_cast<uint32_t>(m.size()));
-          w.PutBytes(m.data(), m.size() * 4);
+          w.Put<uint32_t>(static_cast<uint32_t>(m.locs.size()));
+          w.PutBytes(m.locs.data(), m.locs.size() * 4);
+          w.PutBytes(m.lists.data(), m.lists.size() * 4);
         }
         break;
       }
@@ -490,9 +494,10 @@ Frame NodeServer::Handle(const Frame& req) {
         Require(n <= kMaxRawBatch && static_cast<uint64_t>(n) * vb <= kMaxFrameBytes / 2,
                 "RAW_GET batch too large");
         const auto locs = TakeArray<uint32_t>(&r, n);
+        const auto lists = TakeArray<uint32_t>(&r, n);
         Require(r.remaining() == 0, "trailing bytes in RAW_GET");
         std::vector<uint8_t> vecs(static_cast<size_t>(n) * vb);
-        e.RawGet(locs.data(), n, vecs.data());
+        e.RawGet(locs.data(), lists.data(), n, vecs.data());
         w.Put<uint32_t>(vb);
         w.PutBytes(vecs.data(), vecs.size());
         break;
@@ -557,13 +562,16 @@ Frame NodeServer::Handle(const Frame& req) {
         Require(k >= 1 && k <= o.max_rerank, "k out of range");
         Require(n <= o.max_rerank, "too many rerank candidates");
         const auto ids = TakeArray<uint32_t>(&r, n);
+        const uint32_t nlists = r.Get<uint32_t>();
+        Require(nlists <= o.max_nprobe, "too many lists");
+        const auto lists = TakeArray<uint32_t>(&r, nlists);
         const auto q = TakeQuery(&r, e);
         std::vector<uint32_t> out_ids(k);
         std::vector<float> out_d(k);
         fusion::RerankStats rs;
         worker = AcquireWorker();
-        const uint32_t cnt =
-            e.Rerank(worker, q.data(), ids.data(), n, k, out_ids.data(), out_d.data(), &rs);
+        const uint32_t cnt = e.Rerank(worker, q.data(), ids.data(), n, k, lists.data(), nlists,
+                                      out_ids.data(), out_d.data(), &rs);
         w.Put(cnt);
         w.PutBytes(out_ids.data(), cnt * 4);
         w.PutBytes(out_d.data(), cnt * 4);

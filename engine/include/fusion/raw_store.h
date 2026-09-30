@@ -45,7 +45,8 @@ struct RawStats {
   uint32_t vec_bytes = 0;
   uint64_t locations = 0;   // the page file's address space: num_pages x vectors_per_page
   uint64_t present = 0;     // vectors held now
-  uint64_t pending = 0;     // named by loaded partitions, not here yet (NodeEngine)
+  uint64_t pending = 0;     // named by resident partitions, not here (NodeEngine; with the
+                            // lazy protocol, what queries have not needed so far)
   uint64_t from_index = 0;  // cumulative: copied from the index's page file (bootstrap)
   uint64_t streamed = 0;    // cumulative: installed by the agent's stream (RAW_PUT)
   uint64_t fetched = 0;     // cumulative: fetched on demand from a peer
@@ -80,6 +81,8 @@ class RawStore {
   // copied nothing, if one is not here.
   void Get(const uint32_t* locs, size_t n, uint8_t* out);
   void CountFetch() { fetches_.fetch_add(1, std::memory_order_relaxed); }
+  // Vectors a node served to peers from memory (fetched, not on the SSD yet), counted like Get's.
+  void CountServed(size_t n) { served_.fetch_add(n, std::memory_order_relaxed); }
 
   RawStats Stats() const;
 

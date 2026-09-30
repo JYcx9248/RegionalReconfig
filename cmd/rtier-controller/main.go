@@ -20,7 +20,7 @@ func main() {
 	listen := flag.String("listen", "", "override: control-plane address")
 	api := flag.String("api", "", "override: API address")
 	initial := flag.Int("initial-nodes", 0, "override: data nodes of the first epoch")
-	protocol := flag.String("protocol", "", "override: lazy | copy-then-flip | stop-and-copy")
+	protocol := flag.String("protocol", "", "override: lazy | lazy-stream | copy-then-flip | stop-and-copy")
 	flag.Parse()
 
 	cfg := config.DefaultController()

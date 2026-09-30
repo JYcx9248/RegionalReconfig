@@ -207,8 +207,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.bulk.PQ = func(ctx context.Context, ids []uint32) (int, []byte, error) {
 		return a.local.PQGet(ctx, ids) // peers staging our partitions pull their PQ codes
 	}
-	a.bulk.Raw = func(ctx context.Context, locs []uint32) (int, []byte, error) {
-		return a.local.RawGet(ctx, locs) // ... and stream their raw vectors
+	a.bulk.Raw = func(ctx context.Context, locs, lists []uint32) (int, []byte, error) {
+		return a.local.RawGet(ctx, locs, lists) // ... and stream their raw vectors
 	}
 	go a.bulk.Serve(bln)
 	go a.serveQueries(ctx, qln)

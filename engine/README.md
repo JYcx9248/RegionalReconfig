@@ -13,11 +13,18 @@ description. Where the paper leaves details open, the choice made is listed unde
 
 - The CPU pipeline is covered by unit tests and end-to-end runs, and is clean under
   AddressSanitizer and UBSan.
-- **The GPU backend compiles (CUDA 12.0, sm_70 and sm_80) but has never run.** It was written
-  without access to a GPU. Run `fusion_selftest` first: it checks the GPU results against the
-  CPU backend.
-- So far the code has only been tested on synthetic data. Use `scripts/download_subset.py` for
-  SIFT1B, SPACEV1B or DEEP1B prefixes.
+- The GPU backend has run on one GPU so far (RTX 3060 Laptop, sm_86, CUDA 12.6, under WSL2):
+  `fusion_selftest` matches the CPU backend on synthetic codes and on 1000 BIGANN-1M queries,
+  `fusion_search` gives the same recall on both backends, and the end-to-end tests pass with the
+  cluster's nodes on the GPU (`RTIER_E2E_BACKEND=gpu`). On a new GPU, run `fusion_selftest` first.
+- The GPU filter does not scale with concurrent queries there: on BIGANN-1M (nprobe 64, n 200)
+  its time per query grows from 0.38 ms at 1 thread to 3.4 ms at 8, while the CPU filter stays
+  near 0.6 ms up to 8 threads. Each query issues its own small transfers and kernels (LUT,
+  dedup + ADC, a 64-bit radix sort) on its own stream, with no lock on the path, so the
+  submissions serialize somewhere below: WSL2's GPU paravirtualization is the first suspect.
+  Not yet measured on native Linux.
+- Real data so far: a 1M prefix of BIGANN (`scripts/download_subset.py` also fetches SPACEV1B
+  and DEEP1B prefixes).
 
 ## What is implemented
 
@@ -64,8 +71,8 @@ Behavior changes to the original engine, both for deterministic results across n
 - `HeuristicRerank` keeps the k best by (distance, id); before, a candidate tying the current
   k-th distance was dropped, so the kept set depended on candidate order.
 - The GPU filter sorts one 64-bit key (distance bits << 32 | id) with `cub::DeviceRadixSort::SortKeys`
-  instead of `SortPairs` on distances, so ties break by ID exactly like the CPU backend.
-  **Compiled (CUDA 12.0, sm_70/sm_80) but not run on a GPU: run `fusion_selftest` first.**
+  instead of `SortPairs` on distances, so ties break by ID exactly like the CPU backend
+  (`fusion_selftest` checks it).
 
 PQ codes are node-level (`include/fusion/pq_store.h`, `src/pq_store.cpp`; the decided part of
 U1): a data node holds one code per vector named by its resident posting lists, in slots of a
@@ -89,13 +96,18 @@ store, which records it with the code when a partition loads -- so no node has a
 map, and the index's page file is read only to bootstrap (`PQSource::kIndex`, `--load`). Pages
 may have empty slots (the bucket layout packs tails of other lists into them); only present
 slots are read. After a migration a partition loads without its raw vectors (U9): `LOAD_PARTITION`
-names the old owner's data node, and `Rerank` / `SearchLocal` fetch the vectors a query needs
-from it before reading pages (`RAW_GET`, through the server's `PeerPool`); meanwhile the agent
-streams the rest in (`RAW_MISSING`, a peer's `RAW_GET` over the bulk channel, `RAW_PUT`; before
-each batch `RAW_CHECK` drops what queries fetched meanwhile). A node asked for a vector it is
-itself still waiting for fetches it first, so a chain of migrations works. Nothing is dropped:
-the vectors of partitions that move away stay, like cached PQ codes, so the old owner can serve
-them and a partition that comes back needs no transfer.
+names the old owner's data node, which becomes the source of every list of the partition, and
+`Rerank` / `SearchLocal` fetch a vector a query needs from it before reading pages, when the
+query first needs it and only then (`RAW_GET`, through the server's `PeerPool`). RERANK requests
+carry the query's lists on the node: the engine finds each missing candidate in one of them and
+fetches it from that list's source (lists overlap, so a per-list source is enough). A peer's
+`RAW_GET` names the list of every vector, so a node asked for one it lacks itself fetches it from
+its own source of that list first: chains of migrations work. The lazy-stream baseline also
+streams the rest in (`RAW_MISSING` with a list per location, a peer's `RAW_GET` over the bulk
+channel, `RAW_PUT`; before each batch `RAW_CHECK` drops what queries fetched meanwhile). Nothing
+is dropped: the vectors of partitions that move away stay, like cached PQ codes, so the old owner
+can serve them and a partition that comes back needs no transfer; a list keeps its source after
+its partition leaves, for the peers that took it.
 
 Known limits of the PQ path:
 - `PQ_MISSING` answers in one frame (256 MiB, about 67M IDs). At billion scale a staging has to
@@ -129,11 +141,14 @@ Known limits of the PQ path:
   running before a rollback releases.
 
 Known limits of the raw-vector path:
-- The sources of the vectors still missing after a migration are kept in a hash map (location ->
-  source), about 40 B per entry: transient and sized by what the node is receiving, but 4 GB for
-  a node that receives 100M vectors at once. A per-source sorted array would take 4 B per entry.
+- Sources are kept per posting list (2 B per list, sized by the number of lists: 200 KB at 1M
+  vectors, 200 MB at 1B with a centroid ratio of 0.1). A missing vector is found by scanning the
+  postings of the request's lists, only when something is missing.
+- `raw.pending` (named by resident partitions, not here) is recounted by INFO after a change: one
+  pass over the resident postings with a bitmap of the page file's locations.
 - A re-ranking that must fetch holds its engine worker for the round trip, and two queries that
-  miss the same vector both fetch it (the second write is a no-op; nothing coalesces them).
+  miss the same vector both fetch it (the second write is a no-op; nothing coalesces them). With
+  the lazy protocol this lasts for as long as queries meet vectors that have not moved.
 - Vectors are written through the page cache and pages read with `O_DIRECT`: correct (a direct
   read writes back the dirty range it covers first) but a page read right after its vectors
   arrived pays that write-back. Writing whole pages directly would need a read-modify-write,
