@@ -73,3 +73,21 @@ func TestSemdnStillUndecided(t *testing.T) {
 		t.Fatalf("semdn: %v", err)
 	}
 }
+
+func TestUserSchedule(t *testing.T) {
+	steps, err := parseSteps("30:16,60:4", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		at   time.Duration
+		want float64
+	}{{0, 8}, {29 * time.Second, 8}, {30 * time.Second, 16}, {59 * time.Second, 16}, {61 * time.Second, 4}} {
+		if got := valueAt(steps, c.at); got != c.want {
+			t.Errorf("users at %v: %v, want %v", c.at, got, c.want)
+		}
+	}
+	if m := maxUsers(steps); m != 16 {
+		t.Errorf("max users %d, want 16", m)
+	}
+}

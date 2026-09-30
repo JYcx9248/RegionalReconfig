@@ -5,6 +5,16 @@
 // queueing during a reconfiguration shows up in the tail instead of hiding it. Entries are
 // discovered from the controller and refreshed, so new entries are used after a scale-out.
 //
+// With -users the load is closed loop instead: a number of concurrent users that follows a
+// schedule (-users-steps), each sending its next query when its last one returned; a query's
+// time is when it was sent, and the offered load adapts to how fast the cluster answers.
+//
+// An "unavailable" answer (an entry that left, or paused admission under stop-and-copy) is
+// retried three times by default, and the query fails after that. With -retry-for the client
+// waits for its answer instead: it keeps retrying until the answer comes or the time is up,
+// so a pause shows up as latency of the answered queries. Averages over answered queries
+// only compare protocols when no query fails, which is what -retry-for is for.
+//
 //	rtier-loadgen -api 127.0.0.1:7101 -queries q.u8bin -gt gt.ibin -rate 200 -duration 60s -out lat.csv
 package main
 
@@ -15,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"sort"
 	"strconv"
@@ -31,11 +42,13 @@ import (
 )
 
 type record struct {
-	sched   time.Duration // scheduled send time since start
-	latency time.Duration // completion - scheduled
-	status  string
-	epoch   uint64
-	recall  float64
+	sched    time.Duration // scheduled send time since start
+	latency  time.Duration // completion - scheduled
+	status   string
+	epoch    uint64
+	recall   float64
+	attempts int // queries sent, retries included
+	users    int // concurrent users when it was sent (closed loop; 0 in open loop)
 }
 
 type entries struct {
@@ -85,8 +98,14 @@ func main() {
 	n := flag.Int("n", 200, "candidates re-ranked (fixed n)")
 	ef := flag.Int("ef", 0, "graph search width (0 = 2*nprobe)")
 	conns := flag.Int("conns", 64, "max in-flight queries per entry")
-	out := flag.String("out", "", "per-query CSV (sched_ms, latency_us, status, epoch, recall)")
+	out := flag.String("out", "", "per-query CSV (sched_ms, latency_us, status, epoch, recall, attempts, users)")
 	seed := flag.Int64("seed", 1, "arrival seed")
+	retryFor := flag.Duration("retry-for", 0, "keep retrying an unavailable answer until this long "+
+		"after the scheduled time (0: three attempts); the wait counts in the latency")
+	users := flag.Int("users", 0, "closed loop with this many concurrent users at the start, each sending "+
+		"its next query when the last one returned (0: open loop at -rate)")
+	userSteps := flag.String("users-steps", "", "user schedule after -users, e.g. \"30:16,60:4\": "+
+		"16 concurrent users from 30 s, 4 from 60 s")
 	flag.Parse()
 
 	qs, err := vecio.ReadBin(*qpath, 0)
@@ -102,6 +121,12 @@ func main() {
 	rateSched, err := parseSteps(*steps, *rate)
 	if err != nil {
 		log.Fatal(err)
+	}
+	var userSched []step
+	if *users > 0 {
+		if userSched, err = parseSteps(*userSteps, float64(*users)); err != nil {
+			log.Fatal(err)
+		}
 	}
 	arr, err := newArrivals(*arrivals, rateSched, qs.N, *seed)
 	if err != nil {
@@ -136,43 +161,77 @@ func main() {
 	var sent, ok, failed atomic.Int64
 	start := time.Now()
 	go report(ctx, start, &sent, &ok, &failed, lat)
-	var sched time.Duration
-	for {
-		gap, qi := arr.Next()
-		sched += gap
-		if sched >= *duration {
-			break
+	// one sends query qi, scheduled (open loop) or sent (closed loop) at sched, and records it.
+	one := func(sched time.Duration, qi, active int) {
+		rec := record{sched: sched, status: "ok", users: active}
+		var until time.Time
+		if *retryFor > 0 {
+			until = start.Add(sched + *retryFor)
 		}
-		if d := time.Until(start.Add(sched)); d > 0 {
-			time.Sleep(d)
-		}
-		sent.Add(1)
-		wg.Add(1)
-		go func(sched time.Duration, qi int) {
-			defer wg.Done()
-			rec := record{sched: sched, status: "ok"}
-			res, err := send(ctx, ents, &query.Request{Vec: qs.Row(qi), Params: params})
-			rec.latency = time.Since(start.Add(sched))
-			rec.epoch = res.Epoch
-			if err != nil {
-				rec.status = statusName(err)
-				failed.Add(1)
-			} else {
-				ok.Add(1)
-				lat.Record(rec.latency)
-				if gt != nil && qi < gt.NQ {
-					ids := make([]uint32, len(res.Candidates))
-					ds := make([]float32, len(res.Candidates))
-					for j, c := range res.Candidates {
-						ids[j], ds[j] = c.ID, c.Dist
-					}
-					rec.recall = gt.Recall(qi, ids, ds, *k)
+		res, attempts, err := send(ctx, ents, &query.Request{Vec: qs.Row(qi), Params: params}, until)
+		rec.latency = time.Since(start.Add(sched))
+		rec.attempts = attempts
+		rec.epoch = res.Epoch
+		if err != nil {
+			rec.status = statusName(err)
+			failed.Add(1)
+		} else {
+			ok.Add(1)
+			lat.Record(rec.latency)
+			if gt != nil && qi < gt.NQ {
+				ids := make([]uint32, len(res.Candidates))
+				ds := make([]float32, len(res.Candidates))
+				for j, c := range res.Candidates {
+					ids[j], ds[j] = c.ID, c.Dist
 				}
+				rec.recall = gt.Recall(qi, ids, ds, *k)
 			}
-			mu.Lock()
-			recs = append(recs, rec)
-			mu.Unlock()
-		}(sched, qi)
+		}
+		mu.Lock()
+		recs = append(recs, rec)
+		mu.Unlock()
+	}
+	if userSched != nil {
+		// Closed loop: user u sends its next query when its last one returned, while the
+		// schedule has more than u users.
+		for u := 0; u < maxUsers(userSched); u++ {
+			wg.Add(1)
+			go func(u int) {
+				defer wg.Done()
+				rng := rand.New(rand.NewSource(*seed + int64(u)))
+				for {
+					now := time.Since(start)
+					if now >= *duration {
+						return
+					}
+					active := int(valueAt(userSched, now))
+					if u >= active {
+						time.Sleep(5 * time.Millisecond)
+						continue
+					}
+					sent.Add(1)
+					one(now, rng.Intn(qs.N), active)
+				}
+			}(u)
+		}
+	} else {
+		var sched time.Duration
+		for {
+			gap, qi := arr.Next()
+			sched += gap
+			if sched >= *duration {
+				break
+			}
+			if d := time.Until(start.Add(sched)); d > 0 {
+				time.Sleep(d)
+			}
+			sent.Add(1)
+			wg.Add(1)
+			go func(sched time.Duration, qi int) {
+				defer wg.Done()
+				one(sched, qi, 0)
+			}(sched, qi)
+		}
 	}
 	wg.Wait()
 	cancel()
@@ -184,23 +243,31 @@ func main() {
 	}
 }
 
+// maxBackoff caps the pause between retries of a waiting client. It bounds how late a
+// client notices that admission resumed, and keeps the retry traffic of a long pause to about
+// 20 per waiting query per second.
+const maxBackoff = 50 * time.Millisecond
+
 // send tries up to three entries: an entry that just left (scale-in) or is paused
-// (stop-and-copy) answers "unavailable".
-func send(ctx context.Context, ents *entries, req *query.Request) (query.Result, error) {
+// (stop-and-copy) answers "unavailable". With until set, it keeps retrying until then.
+// It returns the number of attempts.
+func send(ctx context.Context, ents *entries, req *query.Request, until time.Time) (query.Result, int, error) {
 	var res query.Result
 	var err error
-	for attempt := 0; attempt < 3; attempt++ {
+	attempt := 0
+	for attempt < 3 || time.Now().Before(until) {
 		c := ents.pick()
 		if c == nil {
-			return res, errors.New("no entry nodes")
+			return res, attempt, errors.New("no entry nodes")
 		}
 		res, err = c.Query(ctx, req)
+		attempt++
 		if err == nil || !errors.Is(err, query.ErrUnavailable) {
-			return res, err
+			return res, attempt, err
 		}
-		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		time.Sleep(min(time.Duration(attempt)*5*time.Millisecond, maxBackoff))
 	}
-	return res, err
+	return res, attempt, err
 }
 
 func statusName(err error) string {
@@ -260,12 +327,17 @@ func report(ctx context.Context, start time.Time, sent, ok, failed *atomic.Int64
 
 func summarize(recs []record, withRecall bool) {
 	var lats []float64
-	var recall float64
+	var recall, sum float64
+	retried := 0
 	counts := map[string]int{}
 	for _, r := range recs {
 		counts[r.status]++
+		if r.attempts > 1 {
+			retried++
+		}
 		if r.status == "ok" {
 			lats = append(lats, float64(r.latency.Microseconds()))
+			sum += lats[len(lats)-1]
 			recall += r.recall
 		}
 	}
@@ -276,8 +348,12 @@ func summarize(recs []record, withRecall bool) {
 		}
 		return lats[min(len(lats)-1, int(p*float64(len(lats))))]
 	}
-	fmt.Printf("queries %d: %v\nlatency us: p50 %.0f  p99 %.0f  p99.9 %.0f  max %.0f\n",
-		len(recs), counts, q(0.5), q(0.99), q(0.999), q(1))
+	mean := 0.0
+	if len(lats) > 0 {
+		mean = sum / float64(len(lats))
+	}
+	fmt.Printf("queries %d: %v, %d retried\nlatency us: mean %.0f  p50 %.0f  p99 %.0f  p99.9 %.0f  max %.0f\n",
+		len(recs), counts, retried, mean, q(0.5), q(0.99), q(0.999), q(1))
 	if withRecall && len(lats) > 0 {
 		fmt.Printf("recall %.4f\n", recall/float64(len(lats)))
 	}
@@ -290,12 +366,13 @@ func writeCSV(path string, recs []record) error {
 		return err
 	}
 	w := csv.NewWriter(f)
-	w.Write([]string{"sched_ms", "latency_us", "status", "epoch", "recall"})
+	w.Write([]string{"sched_ms", "latency_us", "status", "epoch", "recall", "attempts", "users"})
 	for _, r := range recs {
 		w.Write([]string{
 			strconv.FormatFloat(float64(r.sched.Microseconds())/1000, 'f', 3, 64),
 			strconv.FormatInt(r.latency.Microseconds(), 10), r.status,
 			strconv.FormatUint(r.epoch, 10), strconv.FormatFloat(r.recall, 'f', 4, 64),
+			strconv.Itoa(r.attempts), strconv.Itoa(r.users),
 		})
 	}
 	w.Flush()

@@ -117,3 +117,23 @@ func newArrivals(kind string, steps []step, nq int, seed int64) (Arrivals, error
 	}
 	return nil, fmt.Errorf("unknown arrival process %q", kind)
 }
+
+// valueAt is the scheduled value (rate or users) at offset d.
+func valueAt(steps []step, d time.Duration) float64 {
+	v := steps[0].rate
+	for _, s := range steps {
+		if s.at <= d {
+			v = s.rate
+		}
+	}
+	return v
+}
+
+// maxUsers is the largest number of users a schedule asks for.
+func maxUsers(steps []step) int {
+	m := 0
+	for _, s := range steps {
+		m = max(m, int(s.rate))
+	}
+	return m
+}
