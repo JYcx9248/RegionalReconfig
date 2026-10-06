@@ -122,39 +122,110 @@ class Procs:
                 p.kill()
 
 
-def isolation(cfg: dict, i: int, work: str, nodes: int) -> list:
-    """The systemd-run prefix that gives node i (1-based) its own share of the machine.
+ROOT_USER = os.geteuid() == 0
+
+
+def cpu_list(cpus: list) -> str:
+    """CPUs as ranges, the way taskset and systemd's AllowedCPUs take them: "0-3,192-195"."""
+    out, i = [], 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(str(cpus[i]) if i == j else f"{cpus[i]}-{cpus[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def core_of(cpu: int) -> int:
+    """The lowest CPU on the same physical core (hyperthread siblings share one)."""
+    try:
+        sib = open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read().strip()
+    except OSError:
+        return cpu
+    return min(int(part.split("-")[0]) for part in sib.split(","))
+
+
+def cpu_groups(cfg: dict, nodes: int) -> tuple:
+    """The CPUs of each node (CPUsPerNode of them, from the FirstCPU-th on) and the ones left for
+    the controller and the load generator. Counted among the CPUs this process may use
+    (sched_getaffinity), not by CPU number -- a machine can have CPUs offline in the middle --
+    and whole cores at a time: siblings are numbered next to each other on some machines
+    (0-1, 2-3, ...) and a socket apart on others (0 and 192), and two nodes on the two threads of
+    one core would share it. With hyperthreads, an even CPUsPerNode gives every node whole
+    cores."""
+    res = cfg.get("NodeResources") or {}
+    avail = sorted(os.sched_getaffinity(0), key=lambda c: (core_of(c), c))
+    c, first = res.get("CPUsPerNode", 0), res.get("FirstCPU", 0)
+    if not c:
+        return [[] for _ in range(nodes)], []
+    if first + nodes * c > len(avail):
+        raise RuntimeError(f"{nodes} nodes x {c} CPUs from the {first}-th do not fit in the "
+                           f"{len(avail)} CPUs available ({cpu_list(avail)})")
+    groups = [sorted(avail[first + k * c:first + (k + 1) * c]) for k in range(nodes)]
+    return groups, sorted(avail[first + nodes * c:])
+
+
+def user_scopes() -> bool:
+    """Whether this user's systemd instance makes scopes (systemd-run --user): without root, the
+    cgroups available -- systemd delegates cpu, memory and pids to users, not cpuset or io."""
+    if not shutil.which("systemd-run"):
+        return False
+    r = subprocess.run(["systemd-run", "--user", "--quiet", "--scope", "--collect", "true"],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
+    """The prefix that gives a node (or its agent) its own share of the machine.
 
     On one machine every node reads the same SSD and runs on the same cores, so adding a node
     adds no capacity: the cluster stops at what the disk serves (the two-phase RERANK reads
     ~150 pages per query). "NodeResources" emulates a node per machine instead -- each node,
-    with its agent, gets its own CPUs and its own read IOPS on the disk of WorkDir (cgroup v2
-    cpuset and io controllers), so the total stays below what the disk serves:
+    with its agent, gets its own CPUs and its own read IOPS on the disk of WorkDir, so the total
+    stays below what the disk serves:
 
       "NodeResources": {"CPUsPerNode": 4, "IOReadIOPSMax": 40000, "MemoryMax": "2G"}
 
-    Node i gets CPUs [FirstCPU + (i-1)*CPUsPerNode, ...); the controller and the load
-    generator get the CPUs after the last node's (see rest_cpus)."""
+    As root these are cgroup limits (systemd scopes: cpuset, io, memory). Without root -- a
+    shared server -- the CPUs are pinned with taskset, MemoryMax is a limit of the user's own
+    scope (systemd-run --user), and the read IOPS come from the data node itself:
+    "ReadIOPSPerNode" (rtier_node --read-iops, fusion/read_budget.h; it works as root too).
+    "IOReadIOPSMax" then fails, since the io controller is not delegated to users. Pinning does
+    not keep other users' processes off a node's CPUs: cgroups.jsonl records how busy they were.
+
+    Node i gets the i-th group of cpu_groups; the controller and the load generator get the
+    CPUs after the last node's (see rest_cpus)."""
     res = cfg.get("NodeResources")
     if not res:
         return []
-    if not shutil.which("systemd-run"):
-        raise RuntimeError('"NodeResources" needs systemd-run (cgroup v2 cpuset and io controllers)')
-    props = []
-    if res.get("CPUsPerNode"):
-        c, first = res["CPUsPerNode"], res.get("FirstCPU", 0)
-        if first + nodes * c > (os.cpu_count() or 0):
-            raise RuntimeError(f"{nodes} nodes x {c} CPUs from CPU {first} do not fit in {os.cpu_count()} CPUs")
-        lo = first + (i - 1) * c
-        props += ["-p", f"AllowedCPUs={lo}-{lo + c - 1}"]
+    if ROOT_USER:
+        if not shutil.which("systemd-run"):
+            raise RuntimeError('"NodeResources" needs systemd-run (cgroup v2 cpuset and io controllers)')
+        props = ["-p", f"AllowedCPUs={cpu_list(cpus)}"] if cpus else []
+        for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
+            if res.get(key):
+                dev = subprocess.run(["df", "--output=source", work], capture_output=True, text=True,
+                                     check=True).stdout.split()[-1]
+                props += ["-p", f"{key}={dev} {res[key]}"]
+        if res.get("MemoryMax"):
+            props += ["-p", f"MemoryMax={res['MemoryMax']}"]
+        return ["systemd-run", "--quiet", "--scope", "--collect"] + props
     for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
         if res.get(key):
-            dev = subprocess.run(["df", "--output=source", work], capture_output=True, text=True,
-                                 check=True).stdout.split()[-1]
-            props += ["-p", f"{key}={dev} {res[key]}"]
-    if res.get("MemoryMax"):
-        props += ["-p", f"MemoryMax={res['MemoryMax']}"]
-    return ["systemd-run", "--quiet", "--scope", "--collect"] + props
+            raise RuntimeError(f'"{key}" needs root (the cgroup io controller is not delegated to '
+                               'users); use "ReadIOPSPerNode", the data node\'s own read budget')
+    prefix = []
+    if scopes:
+        prefix = ["systemd-run", "--user", "--quiet", "--scope", "--collect"]
+        if res.get("MemoryMax"):
+            prefix += ["-p", f"MemoryMax={res['MemoryMax']}"]
+    elif res.get("MemoryMax"):
+        raise RuntimeError('"MemoryMax" without root needs systemd-run --user (a user systemd '
+                           'instance), which does not work here')
+    if cpus:
+        prefix += ["taskset", "-c", cpu_list(cpus)]
+    return prefix
 
 
 def data_disk(path: str) -> str:
@@ -168,23 +239,33 @@ def data_disk(path: str) -> str:
 
 
 class CgroupSampler:
-    """With "NodeResources", every node and every agent runs in its own cgroup ("n1",
-    "n1-agent", ...): samples each one's CPU time, I/O on the data disk, dirty and writeback page
-    cache and pressure stall times once a second into cgroups.jsonl, stamped with
-    time.monotonic() (clock.json has the load's start on that clock). Counters are cumulative;
-    take differences between samples."""
+    """With "NodeResources", samples every node and every agent ("n1", "n1-agent", ...) once a
+    second into cgroups.jsonl, stamped with time.monotonic() (clock.json has the load's start
+    on that clock): CPU time, I/O on the data disk, memory (anon, file, dirty and writeback page
+    cache) and pressure stall times from the process's own cgroup (its systemd scope). A user
+    scope (no root) has no io.stat -- the io controller is not delegated -- so its I/O comes
+    from /proc/<pid>/io ("io_from": "proc": bytes on every device, no I/O counts), and a process
+    without a scope of its own is sampled from /proc alone (CPU time, RSS, I/O bytes).
 
-    def __init__(self, path: str, disk: str):
+    One "host" record per sample has the data disk's counters (/proc/diskstats: everyone's I/O,
+    other users' included), how busy each node's CPUs were (/proc/stat: its processes and anyone
+    else's; compare with the node's and its agent's cpu_usec) and the load average: on a shared
+    machine, what tells a quiet run from a disturbed one. Counters are cumulative; take
+    differences between samples."""
+
+    def __init__(self, path: str, disk: str, groups: dict):
         self.out = open(path, "w")
         self.disk = disk
-        self.nodes = []  # (name, pid)
+        self.groups = {name: set(cpus) for name, cpus in groups.items() if cpus}
+        self.tick = os.sysconf("SC_CLK_TCK")
+        self.nodes = []  # (name, pid, scoped)
         self.stop_ = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
-    def add(self, name: str, pid: int) -> None:
-        # The cgroup is looked up at every sample: right after Popen, systemd-run may not have
-        # moved the process into its scope yet (it would read as run_local's own cgroup).
-        self.nodes.append((name, pid))
+    def add(self, name: str, pid: int, scoped: bool) -> None:
+        # A scoped process's cgroup is looked up at every sample: right after Popen, systemd-run
+        # may not have moved it into its scope yet (it would read as run_local's own cgroup).
+        self.nodes.append((name, pid, scoped))
 
     @staticmethod
     def cgroup(pid: int):
@@ -204,10 +285,31 @@ class CgroupSampler:
             return {}
         return {f[0]: int(f[1]) for f in fields if len(f) == 2 and f[1].isdigit()}
 
-    def sample(self, name: str, cg: str) -> dict:
-        r = {"t": round(time.monotonic(), 3), "node": name}
-        r["cpu_usec"] = self.keyed(f"{cg}/cpu.stat").get("usage_usec", 0)
+    @staticmethod
+    def proc_io(pid: int) -> dict:
         io = {}
+        try:
+            for l in open(f"/proc/{pid}/io"):
+                k, v = l.split(":")
+                io[k] = int(v)
+        except (OSError, ValueError):
+            pass
+        return {"rbytes": io.get("read_bytes", 0), "wbytes": io.get("write_bytes", 0)}
+
+    def sample(self, name: str, pid: int, cg) -> dict:
+        r = {"t": round(time.monotonic(), 3), "node": name}
+        if cg is None:  # no scope of its own: /proc only
+            try:
+                f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+                r["cpu_usec"] = (int(f[11]) + int(f[12])) * 1_000_000 // self.tick  # utime + stime
+                rss = [l for l in open(f"/proc/{pid}/status") if l.startswith("VmRSS:")]
+                r["mem"] = {"rss": int(rss[0].split()[1]) * 1024 if rss else 0}
+            except (OSError, IndexError, ValueError):
+                return None
+            r["io"], r["io_from"] = self.proc_io(pid), "proc"
+            return r
+        r["cpu_usec"] = self.keyed(f"{cg}/cpu.stat").get("usage_usec", 0)
+        io = None
         try:
             for l in open(f"{cg}/io.stat"):
                 f = l.split()
@@ -215,7 +317,11 @@ class CgroupSampler:
                     io = {k: int(v) for k, v in (x.split("=") for x in f[1:])}
         except OSError:
             pass
-        r["io"] = {k: io.get(k, 0) for k in ("rbytes", "wbytes", "rios", "wios")}
+        if io is None and not os.path.exists(f"{cg}/io.stat"):
+            r["io"], r["io_from"] = self.proc_io(pid), "proc"
+        else:
+            r["io"] = {k: (io or {}).get(k, 0) for k in ("rbytes", "wbytes", "rios", "wios")}
+            r["io_from"] = "cgroup"
         mem = self.keyed(f"{cg}/memory.stat")
         r["mem"] = {k: mem.get(k, 0) for k in ("anon", "file", "file_dirty", "file_writeback")}
         psi = {}
@@ -229,13 +335,44 @@ class CgroupSampler:
         r["psi"] = psi
         return r
 
+    def host(self) -> dict:
+        r = {"t": round(time.monotonic(), 3), "node": "host", "load1": os.getloadavg()[0]}
+        try:
+            for l in open("/proc/diskstats"):
+                f = l.split()
+                if f"{f[0]}:{f[1]}" == self.disk:
+                    r["disk"] = {"rios": int(f[3]), "rbytes": int(f[5]) * 512, "wios": int(f[7]),
+                                 "wbytes": int(f[9]) * 512, "busy_ms": int(f[12])}
+        except (OSError, IndexError, ValueError):
+            pass
+        busy = {}
+        try:
+            for l in open("/proc/stat"):
+                f = l.split()
+                if not f[0].startswith("cpu") or f[0] == "cpu":
+                    continue
+                cpu = int(f[0][3:])
+                # user nice system idle iowait irq softirq steal: everything but idle and iowait
+                b = sum(int(x) for x in f[1:4]) + sum(int(x) for x in f[6:9])
+                for name, cpus in self.groups.items():
+                    if cpu in cpus:
+                        busy[name] = busy.get(name, 0) + b
+        except (OSError, ValueError):
+            pass
+        r["cpus_busy_usec"] = {name: b * 1_000_000 // self.tick for name, b in busy.items()}
+        return r
+
     def loop(self) -> None:
         while not self.stop_.wait(1.0 - time.monotonic() % 1.0):
             mine = self.cgroup(os.getpid())
-            for name, pid in self.nodes:
-                cg = self.cgroup(pid)
-                if cg and cg != mine:
-                    self.out.write(json.dumps(self.sample(name, cg)) + "\n")
+            for name, pid, scoped in self.nodes:
+                cg = self.cgroup(pid) if scoped else None
+                if scoped and (not cg or cg == mine):
+                    continue
+                s = self.sample(name, pid, cg)
+                if s:
+                    self.out.write(json.dumps(s) + "\n")
+            self.out.write(json.dumps(self.host()) + "\n")
             self.out.flush()
 
     def start(self) -> None:
@@ -251,14 +388,12 @@ class CgroupSampler:
 
 def rest_cpus(cfg: dict, nodes: int) -> list:
     """The prefix that keeps the controller and the load generator off the nodes' CPUs."""
-    res = cfg.get("NodeResources") or {}
-    if not res.get("CPUsPerNode"):
+    rest = cpu_groups(cfg, nodes)[1]
+    if not rest:
         return []
-    lo = res.get("FirstCPU", 0) + nodes * res["CPUsPerNode"]
-    hi = (os.cpu_count() or 1) - 1
-    if lo > hi:
-        return []
-    return ["systemd-run", "--quiet", "--scope", "--collect", "-p", f"AllowedCPUs={lo}-{hi}"]
+    if ROOT_USER:
+        return ["systemd-run", "--quiet", "--scope", "--collect", "-p", f"AllowedCPUs={cpu_list(rest)}"]
+    return ["taskset", "-c", cpu_list(rest)]
 
 
 def check_fresh(gbin: str) -> None:
@@ -305,10 +440,21 @@ def main(cfg_path: str, out_dir: str) -> None:
     api_addr = cfg.get("APIAddr", f"{ctl_host}:7101")
     netns_sh = os.path.join(ROOT, "scripts/emulation/netns.sh")
 
+    res = cfg.get("NodeResources") or {}
+    groups = cpu_groups(cfg, nodes)[0]
+    scopes = bool(res) and not ROOT_USER and user_scopes()
+    if res and not ROOT_USER:
+        log("not root: CPUs pinned with taskset, " + ("memory limits and sampling in user scopes" if scopes
+                                                      else "no user scopes (sampled from /proc)") +
+            (f", {res['ReadIOPSPerNode']} reads/s per data node" if res.get("ReadIOPSPerNode") else
+             ", no read-IOPS limit"))
+    node_args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
+                                           if res.get("ReadIOPSPerNode") else [])
+
     procs = Procs(out_dir)
     results = []
-    sampler = CgroupSampler(os.path.join(out_dir, "cgroups.jsonl"), data_disk(work)) \
-        if cfg.get("NodeResources") else None
+    sampler = CgroupSampler(os.path.join(out_dir, "cgroups.jsonl"), data_disk(work),
+                            {f"n{i + 1}": g for i, g in enumerate(groups)}) if res else None
     try:
         if netns:
             env = dict(os.environ, DELAY=emu.get("Delay", "100us"), RATE=emu.get("Rate", "10gbit"))
@@ -332,7 +478,9 @@ def main(cfg_path: str, out_dir: str) -> None:
 
         for i in range(1, nodes + 1):
             name = f"n{i}"
-            prefix = isolation(cfg, i, work, nodes) + (["ip", "netns", "exec", f"rtier-{name}"] if netns else [])
+            prefix = isolation(cfg, groups[i - 1], work, scopes) + \
+                (["ip", "netns", "exec", f"rtier-{name}"] if netns else [])
+            scoped = bool(prefix) and prefix[0] == "systemd-run"
             host = f"10.10.0.{10 + i}" if netns else "127.0.0.1"
             # Each node keeps its raw vectors in its own sparse file (a subset of the index's
             # page file); the ones it gets by migration arrive after the flip (U9).
@@ -341,9 +489,9 @@ def main(cfg_path: str, out_dir: str) -> None:
                                                  "--listen", f"{host}:0", "--backend", cfg.get("Backend", "cpu"),
                                                  "--raw-file", os.path.join(work, name, "raw.pages"),
                                                  "--stats-file", os.path.join(out_dir, f"stats-{name}.jsonl")]
-                                + cfg.get("NodeArgs", []), prefix=prefix, wait_line="READY tcp=")
+                                + node_args, prefix=prefix, wait_line="READY tcp=")
             if sampler:
-                sampler.add(name, procs.procs[-1][1].pid)
+                sampler.add(name, procs.procs[-1][1].pid, scoped)
             node_addr = f"{host}:{ready.split('=')[1]}"
             agent_cfg = os.path.join(work, f"agent-{name}.json")
             json.dump({
@@ -356,7 +504,7 @@ def main(cfg_path: str, out_dir: str) -> None:
             }, open(agent_cfg, "w"), indent=2)
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
             if sampler:
-                sampler.add(f"{name}-agent", procs.procs[-1][1].pid)
+                sampler.add(f"{name}-agent", procs.procs[-1][1].pid, scoped)
 
         if sampler:
             sampler.start()
