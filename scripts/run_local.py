@@ -88,6 +88,22 @@ def rate_steps(v) -> str:
     return ",".join(s if isinstance(s, str) else f"{s[0]}:{s[1]}" for s in v)
 
 
+def check_load(cfg: dict) -> None:
+    """Stops a run whose load is not numbers before the deployment, which takes minutes on a large
+    index: rates are filled in by hand from a calibration run ("SET_ME" in a template)."""
+    if cfg.get("Calibrate"):
+        return
+    load = cfg.get("Load", {})
+    try:
+        float(load.get("Rate", 100))
+        for step in filter(None, rate_steps(load.get("RateSteps")).split(",")):
+            t, r = step.split(":")
+            float(t), float(r)
+    except (TypeError, ValueError):
+        sys.exit(f'"Load": "Rate" is {load.get("Rate")!r} and "RateSteps" {load.get("RateSteps")!r}: '
+                 'set them to numbers ("RateSteps": "seconds:rate,...")')
+
+
 class Procs:
     def __init__(self, logdir: str):
         self.logdir = logdir
@@ -411,6 +427,7 @@ def check_fresh(gbin: str) -> None:
 
 def main(cfg_path: str, out_dir: str) -> None:
     cfg = json.load(open(cfg_path))
+    check_load(cfg)
     work = os.path.abspath(cfg.get("WorkDir", "/tmp/rtier-run"))
     ebin = os.path.join(ROOT, cfg.get("EngineBin", "engine/build"))
     gbin = os.path.join(ROOT, cfg.get("GoBin", "bin"))
