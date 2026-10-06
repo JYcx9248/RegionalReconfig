@@ -43,6 +43,8 @@
 
 namespace fusion {
 
+class ReadBudget;  // fusion/read_budget.h
+
 // A raw vector the operation needs is not on this node (and could not be fetched).
 class RawMissingError : public std::runtime_error {
  public:
@@ -96,6 +98,10 @@ class RawStore {
   // Copies n vectors out (vec_bytes each, in the order of locs). Throws RawMissingError, having
   // copied nothing, if one is not here.
   void Get(const uint32_t* locs, size_t n, uint8_t* out);
+  // Charges the reads that reach the device to `budget`: the pages a direct install reads back,
+  // and the Get reads the page cache does not serve (a cached one costs nothing, as with cgroup
+  // io.max). Set before the store is used.
+  void SetReadBudget(ReadBudget* budget) { budget_ = budget; }
   void CountFetch() { fetches_.fetch_add(1, std::memory_order_relaxed); }
   // Vectors a node served to peers from memory (fetched, not on the SSD yet), counted like Get's.
   void CountServed(size_t n) { served_.fetch_add(n, std::memory_order_relaxed); }
@@ -116,6 +122,7 @@ class RawStore {
   class DirectIo;
   std::unique_ptr<DirectIo> io_;  // under put_mu_
   uint8_t* chunk_ = nullptr;      // under put_mu_: kChunkPages page-aligned pages
+  ReadBudget* budget_ = nullptr;
   std::unique_ptr<std::atomic<uint64_t>[]> bits_;  // one bit per location
   std::atomic<uint64_t> present_{0}, from_index_{0}, streamed_{0}, fetched_{0}, fetches_{0},
       skipped_{0}, served_{0};

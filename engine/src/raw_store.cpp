@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <linux/aio_abi.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -10,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+
+#include "fusion/read_budget.h"
 
 namespace fusion {
 namespace {
@@ -38,6 +41,13 @@ void PreadAll(int fd, uint8_t* p, size_t n, uint64_t off, const std::string& pat
                  r == 0 ? "unexpected end of file" : std::strerror(errno));
     done += static_cast<size_t>(r);
   }
+}
+
+// Reads n bytes only if the page cache holds them all (RWF_NOWAIT fails with EAGAIN instead of
+// reading the device): a read budget charges only the reads that miss.
+bool PreadCached(int fd, uint8_t* p, size_t n, uint64_t off) {
+  iovec iov{p, n};
+  return ::preadv2(fd, &iov, 1, static_cast<off_t>(off), RWF_NOWAIT) == static_cast<ssize_t>(n);
 }
 
 // Visits the entries of order (indices into locs, sorted by location) in runs of consecutive
@@ -285,7 +295,10 @@ void RawStore::PutPages(const uint32_t* locs, const uint8_t* vecs, const std::ve
         std::memset(bufs[k], 0, ps);
       }
     }
-    if (!reads.empty()) io_->Run(false, reads.data(), read_bufs.data(), static_cast<uint32_t>(reads.size()), path_);
+    if (!reads.empty()) {
+      if (budget_) budget_->Charge(reads.size());
+      io_->Run(false, reads.data(), read_bufs.data(), static_cast<uint32_t>(reads.size()), path_);
+    }
     for (size_t k = 0; k < pages.size(); ++k)
       for (size_t e = first[k]; e < first[k + 1]; ++e)
         std::memcpy(bufs[k] + static_cast<size_t>(layout_.slot(locs[order[e]])) * vb, vecs + order[e] * vb, vb);
@@ -336,7 +349,11 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
     if (uniq.empty() || locs[uniq.back()] != locs[i]) uniq.push_back(i);
   ForEachRun(uniq, locs, layout_, [&](size_t first_pos, size_t count) {
     run.resize(count * vb);
-    PreadAll(fd_, run.data(), run.size(), layout_.offset(locs[uniq[first_pos]]), path_);
+    const uint64_t off = layout_.offset(locs[uniq[first_pos]]);
+    if (!budget_ || !PreadCached(fd_, run.data(), run.size(), off)) {
+      if (budget_) budget_->Charge(1);  // a run lies on one page: one device read
+      PreadAll(fd_, run.data(), run.size(), off, path_);
+    }
     for (size_t k = 0; k < count; ++k)
       std::memcpy(out + uniq[first_pos + k] * vb, run.data() + k * vb, vb);
   });

@@ -702,7 +702,12 @@ std::string NodeServer::FetchJson() const {
 }
 
 std::string NodeServer::StatsJson() const {
-  return "{\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
+  const fusion::ReadBudgetStats r = engine_->read_budget_stats();
+  return "{\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() +
+         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"charged\":%llu,\"wait_us\":%llu}}",
+                           static_cast<unsigned long long>(r.reads_per_sec),
+                           static_cast<unsigned long long>(r.charged),
+                           static_cast<unsigned long long>(r.wait_us));
 }
 
 }  // namespace rtier

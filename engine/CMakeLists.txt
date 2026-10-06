@@ -73,6 +73,7 @@ add_library(fusion STATIC
   src/node_engine.cpp
   src/pq_store.cpp
   src/raw_store.cpp
+  src/read_budget.cpp
 )
 target_include_directories(fusion PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Vendored hnswlib: SYSTEM so its warnings do not drown ours.

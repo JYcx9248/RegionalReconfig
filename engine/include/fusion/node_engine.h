@@ -44,6 +44,7 @@
 #include "fusion/page_reader.h"
 #include "fusion/pq_store.h"
 #include "fusion/raw_store.h"
+#include "fusion/read_budget.h"
 #include "fusion/rerank.h"
 
 namespace fusion {
@@ -74,6 +75,8 @@ struct NodeOptions {
   bool direct_io = true;
   uint32_t io_depth = 64;
   int gpu_device = 0;
+  uint64_t read_iops = 0;      // device reads per second this node may issue (fusion/read_budget.h,
+                               // for several nodes on one SSD without cgroups); 0 = no budget
 };
 
 // Where LoadPartition takes what the node does not hold yet.
@@ -193,6 +196,7 @@ class NodeEngine {
   // the call are on the SSD: with no query fetching, cached is then 0.
   virtual RawStats raw_stats(bool settle) const = 0;
   virtual FetchStats fetch_stats() const = 0;
+  virtual ReadBudgetStats read_budget_stats() const = 0;  // zeros without --read-iops
   // How the node fetches raw vectors on demand (without one it cannot).
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;
 

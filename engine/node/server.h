@@ -67,9 +67,9 @@ class NodeServer {
   // Handles one request frame (exposed for tests).
   Frame Handle(const Frame& req);
 
-  // One line of the node's stats log (rtier_node --stats-file): per-operation counters and the
-  // fetch path's (fusion::FetchStats), without INFO's raw-vector totals, which wait for the
-  // writer and rescan the resident postings.
+  // One line of the node's stats log (rtier_node --stats-file): per-operation counters, the
+  // fetch path's (fusion::FetchStats) and the read budget's, without INFO's raw-vector totals,
+  // which wait for the writer and rescan the resident postings.
   std::string StatsJson() const;
 
  private:

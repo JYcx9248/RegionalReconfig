@@ -39,9 +39,13 @@ static void Usage() {
   --io B                 auto | uring | aio | pread (default auto)
   --io-depth D           (default 64)
   --no-direct            buffered instead of O_DIRECT reads
+  --read-iops N          device reads per second this node may issue (default 0 = no limit): a
+                         node's own share of an SSD that several nodes use, where no cgroup can
+                         set one (fusion/read_budget.h says what is charged)
   --gpu G                GPU device (default 0)
-  --stats-file PATH      append a stats line (JSON) every --stats-ms: per-operation counters and
-                         the on-demand fetch path's, stamped with CLOCK_MONOTONIC seconds ("t")
+  --stats-file PATH      append a stats line (JSON) every --stats-ms: per-operation counters, the
+                         on-demand fetch path's and the read budget's, stamped with
+                         CLOCK_MONOTONIC seconds ("t")
   --stats-ms MS          (default 1000)
 )");
 }
@@ -69,6 +73,7 @@ int main(int argc, char** argv) {
     o.io = ParseIoBackend(a.Str("io", "auto"));
     o.io_depth = static_cast<uint32_t>(a.U64("io-depth", 64));
     o.direct_io = !a.Flag("no-direct");
+    o.read_iops = a.U64("read-iops", 0);
     o.gpu_device = static_cast<int>(a.U64("gpu", 0));
     const std::string listen = a.Str("listen", "127.0.0.1:0");
     const std::string unix_path = a.Str("unix", "");

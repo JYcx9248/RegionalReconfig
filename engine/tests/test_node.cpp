@@ -1,11 +1,15 @@
 // Tests for the rtier additions: partition files, NodeEngine primitives, the wire protocol.
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <linux/magic.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -169,7 +173,8 @@ Fixture& GetFixture() {
 }
 
 std::unique_ptr<NodeEngine> OpenNode(const Fixture& f, const std::vector<uint32_t>& parts,
-                                     bool graph, const std::string& index_dir = "") {
+                                     bool graph, const std::string& index_dir = "",
+                                     uint64_t read_iops = 0) {
   NodeOptions o;
   o.index_dir = index_dir.empty() ? f.index : index_dir;
   o.partitions_dir = f.parts;
@@ -177,6 +182,7 @@ std::unique_ptr<NodeEngine> OpenNode(const Fixture& f, const std::vector<uint32_
   o.max_nprobe = 64;
   o.max_rerank = 4096;
   o.direct_io = false;
+  o.read_iops = read_iops;
   auto e = NodeEngine::Open(o);
   if (graph) e->LoadGraph(JoinPath(f.index, files::kGraph));
   for (uint32_t p : parts)
@@ -939,6 +945,103 @@ void TestRawMigration() {
   CHECK(same && whole->raw_stats(true).fetched > 0 && whole->raw_stats(true).fetched == whole->raw_stats(true).present);
 }
 
+// Drops a file's pages from the page cache; false where that is not possible (tmpfs keeps a
+// file in its pages).
+bool EvictFromCache(const std::string& path) {
+  struct statfs sf;
+  if (::statfs(path.c_str(), &sf) != 0 || sf.f_type == TMPFS_MAGIC) return false;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const bool ok = ::fdatasync(fd) == 0 && ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+  ::close(fd);
+  return ok;
+}
+
+// The read budget (rtier_node --read-iops): reads are spaced to the rate once a burst is used
+// up, a raw store charges only the reads that reach the device, and a node whose budget binds
+// returns the answers of one without.
+void TestReadBudget() {
+  using Clock = std::chrono::steady_clock;
+  auto since = [](Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); };
+  {
+    const double burst = 1000 * ReadBudget::kBurstSeconds;  // reads an idle budget lets through
+    ReadBudget b(1000);
+    auto t0 = Clock::now();
+    b.Charge(static_cast<uint64_t>(burst / 2));
+    CHECK(since(t0) < 0.01);
+    t0 = Clock::now();
+    b.Charge(static_cast<uint64_t>(burst / 2) + 200);  // 200 reads past the burst: 200 ms
+    CHECK(since(t0) >= 0.19);
+  }
+  {
+    ReadBudget b(20000);  // 12000 reads from 4 threads: (12000 - burst) / 20000 s at least
+    const double least = (12000 - 20000 * ReadBudget::kBurstSeconds) / 20000;
+    const auto t0 = Clock::now();
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 4; ++i)
+      ts.emplace_back([&b] {
+        for (int j = 0; j < 3000; ++j) b.Charge(1);
+      });
+    for (auto& t : ts) t.join();
+    const double s = since(t0);
+    const ReadBudgetStats st = b.Stats();
+    CHECK(s >= least - 0.01 && s < least + 3.0 && st.charged == 12000 && st.wait_us > 0 &&
+          st.reads_per_sec == 20000);
+  }
+  {
+    RawLayout L;
+    L.vec_bytes = 1000;
+    L.vectors_per_page = 4;
+    L.num_pages = 4;
+    const std::string path = TempDir() + "/raw.pages";
+    RawStore s(path, L, true);
+    ReadBudget b(1000000);
+    s.SetReadBudget(&b);
+    std::vector<uint8_t> v(3 * 1000, 7), out(3 * 1000);
+    const std::vector<uint32_t> three = {0, 1, 2};
+    CHECK(s.Put(three.data(), 2, v.data(), RawOrigin::kStreamed) == 2);  // buffered: cached
+    s.Get(three.data(), 2, out.data());
+    CHECK(b.Stats().charged == 0);
+    if (s.pages().direct()) {
+      CHECK(s.Put(&three[2], 1, v.data(), RawOrigin::kFetched) == 1);  // page 0 is read back
+      CHECK(b.Stats().charged == 1);
+    } else {
+      std::printf("    no O_DIRECT in TMPDIR: no read-back to charge\n");
+      CHECK(s.Put(&three[2], 1, v.data(), RawOrigin::kFetched) == 1);
+    }
+    const uint64_t before = b.Stats().charged;
+    if (EvictFromCache(path)) {
+      s.Get(three.data(), 3, out.data());  // one run on one page: one read
+      CHECK(b.Stats().charged == before + 1 && out == v);
+    } else {
+      std::printf("    TMPDIR cannot drop cached pages: cache misses not checked\n");
+    }
+  }
+  {
+    Fixture& f = GetFixture();
+    auto ref = OpenNode(f, {0, 1, 2, 3}, true);
+    auto node = OpenNode(f, {0, 1, 2, 3}, true, "", 2000);  // a burst of 200 reads
+    bool same = true;
+    for (uint32_t qi = 0; qi < f.nq; ++qi) {
+      SearchParams sp;
+      sp.k = 10;
+      sp.nprobe = 16;
+      sp.rerank = 400;
+      sp.rr.heuristic = false;
+      std::vector<uint32_t> ia(10), ib(10);
+      std::vector<float> da(10), db(10);
+      QueryStats qa, qb;
+      const float* q = &f.queries[qi * f.dim];
+      const uint32_t na = node->SearchLocal(0, q, sp, ia.data(), da.data(), &qa);
+      const uint32_t nb = ref->SearchLocal(0, q, sp, ib.data(), db.data(), &qb);
+      same = same && na == nb && ia == ib && da == db;
+    }
+    const ReadBudgetStats rs = node->read_budget_stats();
+    CHECK(same && rs.reads_per_sec == 2000 && rs.charged > 400 && rs.wait_us > 0 &&
+          ref->read_budget_stats().charged == 0 && ref->read_budget_stats().reads_per_sec == 0);
+  }
+}
+
 // Minimal blocking client for the wire test.
 rtier::Frame Call(int fd, rtier::Op op, const rtier::BodyWriter& w, uint64_t id) {
   rtier::Frame req;
@@ -1191,6 +1294,7 @@ int main() {
       {"pq_evict_under_load", TestPQEvictUnderLoad},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
+      {"read_budget", TestReadBudget},
       {"wire", TestWire},
   };
   int failed = 0;

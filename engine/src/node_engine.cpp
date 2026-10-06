@@ -208,9 +208,14 @@ class NodeEngineImpl : public NodeEngine {
     // Raw vectors: node-level too, a sparse copy of the page file filled as partitions arrive
     // (fusion/raw_store.h). The index's page file is only read to bootstrap.
     raw_ = std::make_unique<RawStore>(o.raw_file, man_.raw, o.direct_io);
+    if (o.read_iops) {
+      budget_ = std::make_unique<ReadBudget>(o.read_iops);
+      raw_->SetReadBudget(budget_.get());
+    }
     for (int i = 0; i < o.num_workers; ++i) {
       auto w = std::make_unique<Worker>();
       w->reader = MakePageReader(raw_->pages(), o.io, o.io_depth);
+      if (budget_) w->reader = ChargedPageReader(std::move(w->reader), budget_.get());
       w->scratch = std::make_unique<RerankScratch>(o.max_rerank, man_.raw.page_size);
       w->qf.resize(dim_);
       w->locs.resize(o.max_rerank);
@@ -467,6 +472,10 @@ class NodeEngineImpl : public NodeEngine {
     return f;
   }
 
+  ReadBudgetStats read_budget_stats() const override {
+    return budget_ ? budget_->Stats() : ReadBudgetStats{};
+  }
+
   void SetRawFetcher(RawFetcher fetcher) override {
     std::lock_guard<std::mutex> l(raw_mu_);
     fetcher_ = std::move(fetcher);
@@ -673,6 +682,8 @@ class NodeEngineImpl : public NodeEngine {
                    raw.present * raw.vec_bytes / mb, (unsigned long long)raw.pending,
                    man_.layout.c_str(), raw_->path().c_str(),
                    raw_->pages().direct() ? "direct" : "buffered");
+    if (budget_)
+      s += StrFormat("  read budget      : %llu device reads/s\n", (unsigned long long)opts_.read_iops);
     s += StrFormat("  workers          : %d, max candidates/request %u\n", num_workers(),
                    max_candidates_);
     return s;
@@ -1108,6 +1119,7 @@ class NodeEngineImpl : public NodeEngine {
   std::unique_ptr<Reclaimer> reclaimer_;
   mutable std::mutex seg_mu_;
   std::vector<std::shared_ptr<const ResidentSegment>> segs_;
+  std::unique_ptr<ReadBudget> budget_;  // before raw_ and workers_, which charge it
   std::unique_ptr<RawStore> raw_;
   std::string index_pages_path_;
   std::mutex index_pages_mu_;
