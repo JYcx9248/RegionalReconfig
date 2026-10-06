@@ -767,9 +767,38 @@ void RawStoreCase(bool direct) {
   CHECK(s.CountAbsent(mask) == 3);
 }
 
+// A Get spread over many pages (600), with repeated locations, comes back complete and in order.
+void RawStoreManyPages(bool direct) {
+  RawLayout L;
+  L.vec_bytes = 1000;
+  L.vectors_per_page = 4;
+  L.num_pages = 600;
+  RawStore s("", L, direct);
+  std::vector<uint32_t> all(L.locations());
+  std::iota(all.begin(), all.end(), 0u);
+  auto vec = [](uint32_t loc, uint8_t* out) {
+    for (size_t i = 0; i < 1000; ++i) out[i] = static_cast<uint8_t>(loc * 13 + i);
+  };
+  std::vector<uint8_t> vecs(all.size() * 1000);
+  for (uint32_t l : all) vec(l, vecs.data() + static_cast<size_t>(l) * 1000);
+  CHECK(s.Put(all.data(), all.size(), vecs.data(), RawOrigin::kStreamed) == all.size());
+  std::vector<uint32_t> want;
+  for (uint32_t i = 0; i < 1500; ++i) want.push_back((i * 7919u) % L.locations());  // spread, repeats
+  std::vector<uint8_t> out(want.size() * 1000), ref(1000);
+  s.Get(want.data(), want.size(), out.data());
+  bool same = true;
+  for (size_t i = 0; i < want.size(); ++i) {
+    vec(want[i], ref.data());
+    same = same && std::memcmp(out.data() + i * 1000, ref.data(), 1000) == 0;
+  }
+  CHECK(same);
+}
+
 void TestRawStore() {
   RawStoreCase(false);
   RawStoreCase(true);
+  RawStoreManyPages(false);
+  RawStoreManyPages(true);
 }
 
 // Stages partitions on `to` the way an agent does after a migration: the PQ codes it lacks from

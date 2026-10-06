@@ -163,6 +163,13 @@ Known limits of the raw-vector path:
 - A re-ranking that must fetch holds its engine worker for the round trip, and two queries that
   miss the same vector both fetch it (the second write is a no-op; nothing coalesces them). With
   the lazy protocol this lasts for as long as queries meet vectors that have not moved.
+- A peer's `RAW_GET` reads its vectors one buffered `pread` per run, one after another. Reading
+  the pages with `O_DIRECT` all at once instead (tried 2026-09-30; patch kept outside the repo)
+  made things worse on BIGANN-10M, 2 -> 3: the old owners are at their read-IOPS cap during a
+  scale-out, so their reads queue in the cgroup throttle whatever the queue depth, and `O_DIRECT`
+  loses the page-cache hits and the readahead the buffered reads got -- copy-then-flip's stream
+  took 45 s instead of 31 s, lazy's backlog peaked at 3.8K instead of 2.9K. Concurrent buffered
+  reads (keeping the cache) are untried.
 - Installing a vector on a page that already holds vectors reads that page back first (list
   tails share pages, and the slots of other vectors must be written back unchanged): one read per
   such page, from the node's own read IOPS. The writer's rounds let the vectors of one page that
