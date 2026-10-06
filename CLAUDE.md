@@ -102,8 +102,14 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   for tests). What no query needs stays with the old owner, which keeps every vector it has
   held. Only bootstrap reads the index's page file.
 - **Diagnosing a run**: `stats-<node>.jsonl` (per-node counters, `rtier_node --stats-file`) and,
-  with `"NodeResources"`, `cgroups.jsonl` (CPU, disk, dirty pages, pressure), both on the
-  monotonic clock of `clock.json`.
+  with `"NodeResources"`, `cgroups.jsonl` (CPU, disk, dirty pages, pressure; a `"host"` record
+  with the whole disk's I/O and how busy each node's CPUs were), both on the monotonic clock of
+  `clock.json`.
+- **Without root** (shared servers): `"NodeResources"` pins CPUs with `taskset` and limits memory
+  in user scopes (`systemd-run --user`); per-node read IOPS come from the data node's own read
+  budget (`"ReadIOPSPerNode"` → `rtier_node --read-iops`, `fusion/read_budget.h`), since the
+  cgroup io controller is not delegated; `run_one.sh` evicts only the run's own files
+  (`scripts/evict_cache.py`).
 
 ## Docs
 

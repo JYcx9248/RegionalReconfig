@@ -160,6 +160,23 @@ writeback page cache, pressure stall times), and every run writes each data node
 worker, the fetch cache and its writer); both are stamped with the monotonic clock of
 `clock.json`, whose `load_start` is the load's time 0.
 
+Without root (a shared server), `"NodeResources"` uses what systemd delegates to users: each
+node and its agent are pinned to their CPUs with `taskset` and run in a user scope
+(`systemd-run --user`) that carries `"MemoryMax"`. The io controller is not delegated, so
+`"IOReadIOPSMax"` fails; `"ReadIOPSPerNode": 40000` gives each data node a read budget of its
+own instead (`rtier_node --read-iops`, `engine/include/fusion/read_budget.h`): it charges
+re-ranking's page reads, the pages the fetch writer reads back and the `RAW_GET` reads the page
+cache misses, as io.max would, and works as root too. Checked against io.max on BIGANN-10M
+(lazy, 2 → 3 nodes at 40K reads/s each, open loop 400 → 700 q/s): the same capacity (625 q/s
+on 2 nodes), flip time, latency below capacity and backlog, and the reads it charged matched the
+disk's to 0.2%. Pinning does not keep other users off a
+node's CPUs, so `cgroups.jsonl` also has a `"host"` record per sample: the data disk's counters
+(everyone's I/O), how busy each node's CPUs were and the load average; a user scope has no
+`io.stat`, so a node's I/O comes from `/proc/<pid>/io` there (bytes, no I/O counts: the read
+budget's `"reads"` in `stats-<node>.jsonl` counts reads). `scripts/run_one.sh` drops only the
+run's own files from the page cache without root (`scripts/evict_cache.py`) and leaves
+`vm.swappiness` as it is.
+
 Queries run through the two-phase strategy (`"Strategy": "two-phase"`, the implemented half of
 U5): every owner filters for its own top-n, the aggregator merges the global top-n and re-ranks
 each candidate at the owner that reported it, which is exactly the single-node answer.

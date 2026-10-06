@@ -1,0 +1,45 @@
+{
+  "WorkDir": "/tmp/rtier-small-noroot",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "data/small-base.u8bin",
+  "Queries": "data/small-query.u8bin",
+  "GroundTruth": "data/small-gt100.ibin",
+  "Assignment": "data/small-assign.bin",
+  "Nodes": 2,
+  "InitialNodes": 1,
+  "Backend": "cpu",
+  "NodeArgs": [
+    "--workers",
+    "2",
+    "--max-nprobe",
+    "128",
+    "--max-rerank",
+    "1000"
+  ],
+  "Protocol": "lazy",
+  "Placement": "even",
+  "Strategy": "two-phase",
+  "TransferRateBytesPerSec": 4000000,
+  "MetricsInterval": "500ms",
+  "Load": {
+    "Rate": 100,
+    "RateSteps": "20:400",
+    "DurationSeconds": 60,
+    "K": 10,
+    "NProbe": 64,
+    "N": 200,
+    "Arrivals": "poisson"
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 25,
+      "DataNodes": 2
+    }
+  ],
+  "NodeResources": {
+    "CPUsPerNode": 4,
+    "MemoryMax": "4G",
+    "ReadIOPSPerNode": 40000
+  }
+}
