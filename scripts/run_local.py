@@ -39,6 +39,11 @@ after its scheduled time, and the wait counts in its latency. Without it a refus
 retried three times and then fails, so it is missing from the mean latency; comparing
 protocols by their mean latency needs it (scripts/compare_runs.py).
 
+"Backend": "gpu" runs the data nodes on the GPU filter backend (a CUDA build of the engine);
+"GPUs": [0, 1, 4, 5] gives node i the i-th of those GPUs, numbered as nvidia-smi numbers them,
+and nodes take turns when there are fewer GPUs than nodes. Without "GPUs" every node uses the
+first GPU.
+
     python3 scripts/run_local.py configs/experiment.example.json results/run1
 
 Open design questions this script depends on (see `bin/rtier-client design`):
@@ -265,14 +270,16 @@ class CgroupSampler:
 
     One "host" record per sample has the data disk's counters (/proc/diskstats: everyone's I/O,
     other users' included), how busy each node's CPUs were (/proc/stat: its processes and anyone
-    else's; compare with the node's and its agent's cpu_usec) and the load average: on a shared
-    machine, what tells a quiet run from a disturbed one. Counters are cumulative; take
-    differences between samples."""
+    else's; compare with the node's and its agent's cpu_usec), the load average and, with
+    "GPUs", each of those GPUs' utilization and memory in use (nvidia-smi: other users' jobs on
+    them too): on a shared machine, what tells a quiet run from a disturbed one. Counters are
+    cumulative; take differences between samples."""
 
-    def __init__(self, path: str, disk: str, groups: dict):
+    def __init__(self, path: str, disk: str, groups: dict, gpus=()):
         self.out = open(path, "w")
         self.disk = disk
         self.groups = {name: set(cpus) for name, cpus in groups.items() if cpus}
+        self.gpus = {str(g) for g in gpus}
         self.tick = os.sysconf("SC_CLK_TCK")
         self.nodes = []  # (name, pid, scoped)
         self.stop_ = threading.Event()
@@ -376,6 +383,25 @@ class CgroupSampler:
         except (OSError, ValueError):
             pass
         r["cpus_busy_usec"] = {name: b * 1_000_000 // self.tick for name, b in busy.items()}
+        if self.gpus:
+            r["gpus"] = self.gpu_sample()
+        return r
+
+    def gpu_sample(self) -> dict:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
+                                  "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                                 timeout=2).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        r = {}
+        for line in out.splitlines():
+            f = [x.strip() for x in line.split(",")]
+            if len(f) == 3 and f[0] in self.gpus:
+                try:
+                    r[f[0]] = {"util": int(f[1]), "mem_mib": int(f[2])}
+                except ValueError:  # "[N/A]"
+                    pass
         return r
 
     def loop(self) -> None:
@@ -467,11 +493,15 @@ def main(cfg_path: str, out_dir: str) -> None:
              ", no read-IOPS limit"))
     node_args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
                                            if res.get("ReadIOPSPerNode") else [])
+    gpus = cfg.get("GPUs", []) if cfg.get("Backend") == "gpu" else []
+    if cfg.get("Backend") == "gpu":
+        log("GPUs: " + (", ".join(f"n{i} -> {gpus[(i - 1) % len(gpus)]}" for i in range(1, nodes + 1))
+                        if gpus else 'none given ("GPUs"): every data node uses the first one'))
 
     procs = Procs(out_dir)
     results = []
     sampler = CgroupSampler(os.path.join(out_dir, "cgroups.jsonl"), data_disk(work),
-                            {f"n{i + 1}": g for i, g in enumerate(groups)}) if res else None
+                            {f"n{i + 1}": g for i, g in enumerate(groups)}, gpus) if res else None
     try:
         if netns:
             env = dict(os.environ, DELAY=emu.get("Delay", "100us"), RATE=emu.get("Rate", "10gbit"))
@@ -502,11 +532,16 @@ def main(cfg_path: str, out_dir: str) -> None:
             # Each node keeps its raw vectors in its own sparse file (a subset of the index's
             # page file); the ones it gets by migration arrive after the flip (U9).
             os.makedirs(os.path.join(work, name), exist_ok=True)
+            # A data node sees only its own GPU ("GPUs", numbered as nvidia-smi numbers them:
+            # CUDA's default order puts the fastest first, so on a machine with several kinds of
+            # GPU its device 0 need not be nvidia-smi's GPU 0).
+            gpu = ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={gpus[(i - 1) % len(gpus)]}"] \
+                if gpus else []
             ready = procs.start(f"node-{name}", [f"{ebin}/rtier_node", "--index", index, "--partitions", parts,
                                                  "--listen", f"{host}:0", "--backend", cfg.get("Backend", "cpu"),
                                                  "--raw-file", os.path.join(work, name, "raw.pages"),
                                                  "--stats-file", os.path.join(out_dir, f"stats-{name}.jsonl")]
-                                + node_args, prefix=prefix, wait_line="READY tcp=")
+                                + node_args, prefix=prefix + gpu, wait_line="READY tcp=")
             if sampler:
                 sampler.add(name, procs.procs[-1][1].pid, scoped)
             node_addr = f"{host}:{ready.split('=')[1]}"

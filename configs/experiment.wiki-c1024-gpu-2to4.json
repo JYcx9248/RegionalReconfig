@@ -1,0 +1,61 @@
+{
+  "WorkDir": "/netsys/chenxu/work/wiki-c1024",
+  "IndexDir": "/netsys/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/netsys/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/netsys/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/netsys/chenxu/data/wiki-c1024-gt.ibin",
+  "Assignment": "/netsys/chenxu/data/wiki-c1024-assign.bin",
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Backend": "gpu",
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Protocol": "lazy",
+  "Placement": "even-reversible-blocks",
+  "Strategy": "two-phase",
+  "TransferRateBytesPerSec": 0,
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeResources": {
+    "CPUsPerNode": 8,
+    "MemoryMax": "24G",
+    "ReadIOPSPerNode": 40000
+  },
+  "Nodes": 4,
+  "InitialNodes": 2,
+  "Load": {
+    "K": 10,
+    "NProbe": 64,
+    "N": 200,
+    "Arrivals": "poisson",
+    "Rate": "SET_ME",
+    "RateSteps": "60:SET_ME",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 360,
+    "WarmupSeconds": 30
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "DataNodes": 4
+    }
+  ],
+  "GPUs": [
+    0,
+    1,
+    4,
+    5
+  ]
+}

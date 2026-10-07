@@ -184,6 +184,13 @@ each candidate at the owner that reported it, which is exactly the single-node a
 a vector new to a node arrives at most once: with `lazy` only when a query needs it, with the
 baselines all of them, streamed or fetched on demand.
 
+`"Backend": "gpu"` (a CUDA build of the engine) runs the data nodes on the GPU filter backend, and
+`"GPUs": [0, 1, 4, 5]` gives node i the i-th of those GPUs, numbered as `nvidia-smi` numbers them
+(the node runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID` and only its GPU visible; nodes take turns
+when there are fewer GPUs than nodes). With `"NodeResources"`, the `"host"` records in
+`cgroups.jsonl` then also have those GPUs' utilization and memory in use, other users' jobs
+included.
+
 `"Protocol"` in an experiment config picks the reconfiguration protocol (`lazy`, the default;
 `lazy-stream`, `copy-then-flip` and `stop-and-copy` as baselines) and `"RawPriority"` the class of
 the lazy-stream raw-vector stream; each node keeps its raw vectors in `<WorkDir>/<node>/raw.pages`.
