@@ -38,7 +38,12 @@ def shards(d: str) -> list:
             continue
         out.append((name, a))
     if not out:
-        sys.exit(f"no 2-D .npy shards in {d}")
+        # Not searched recursively on purpose: another 2-D .npy of the same width (centroids, say)
+        # would join the rows unnoticed. Point at the directory that holds the shards instead.
+        below = [f"{s} ({k} .npy)" for s in sorted(os.listdir(d)) if os.path.isdir(os.path.join(d, s))
+                 for k in [sum(n.endswith(".npy") for n in os.listdir(os.path.join(d, s)))] if k]
+        sys.exit(f"no 2-D .npy shards in {d}" +
+                 (f"; subdirectories with .npy files: {', '.join(below)} -- give that directory" if below else ""))
     dims = {a.shape[1] for _, a in out}
     if len(dims) != 1:
         sys.exit(f"shards disagree on the dimension: {sorted(dims)}")
