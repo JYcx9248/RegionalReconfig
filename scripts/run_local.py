@@ -93,6 +93,31 @@ def rate_steps(v) -> str:
     return ",".join(s if isinstance(s, str) else f"{s[0]}:{s[1]}" for s in v)
 
 
+def calibration_step(rows: list, rate: float) -> dict:
+    """One rate of a calibration run. Kept up = answered by the end of the sending window: the
+    load generator waits for every answer before it exits, so counting all of them (summarize's
+    answered_per_s) always comes out at the offered rate, however far behind the cluster fell."""
+    s = summarize(rows)
+    s["offered_per_s"] = rate
+    end = rows[-1]["t"] if rows else 0.0
+    done = sum(1 for r in rows if r["status"] == "ok" and r["t"] + r["us"] / 1e6 <= end)
+    s["answered_in_window_per_s"] = round(done / s["seconds"], 1) if s["seconds"] else 0.0
+    s["behind_at_end"] = len(rows) - done
+    return s
+
+
+def saturation(table: list) -> float:
+    """The highest offered rate kept up with, every lower one too (a noisy pass above a failure
+    does not count). Kept up: at most 2% short by the end of the window -- 5% let a rate 3% above
+    capacity pass, its backlog growing all along."""
+    served = 0
+    for s in sorted(table, key=lambda s: s["offered_per_s"]):
+        if s["answered_in_window_per_s"] < 0.98 * s["offered_per_s"] or s["status"].get("ok") != s["queries"]:
+            break
+        served = s["offered_per_s"]
+    return served
+
+
 def check_load(cfg: dict) -> None:
     """Stops a run whose load is not numbers before the deployment, which takes minutes on a large
     index: rates are filled in by hand from a calibration run ("SET_ME" in a template)."""
@@ -599,15 +624,13 @@ def main(cfg_path: str, out_dir: str) -> None:
                 with open(os.path.join(out_dir, "calibration.log"), "a") as logf:
                     run(rest_cpus(cfg, nodes) + loadgen(rate, calib.get("SecondsPerRate", 15), path),
                         stdout=logf, stderr=logf)
-                s = summarize(read_latency(path))
-                s["offered_per_s"] = rate
+                s = calibration_step(read_latency(path), rate)
                 table.append(s)
-                log(f"offered {rate:g}/s: answered {s['answered_per_s']}/s, mean {s['mean_us']} us, "
+                log(f"offered {rate:g}/s: answered {s['answered_in_window_per_s']}/s while sending "
+                    f"({s['behind_at_end']} behind at the end), mean {s['mean_us']} us, "
                     f"p50 {s['p50_us']} us, p99 {s['p99_us']} us, {s['status']}")
             json.dump(table, open(os.path.join(out_dir, "calibration.json"), "w"), indent=2)
-            kept = [s["offered_per_s"] for s in table
-                    if s["answered_per_s"] >= 0.95 * s["offered_per_s"] and s["status"].get("ok") == s["queries"]]
-            log(f"saturation: served up to {max(kept) if kept else 0}/s without falling behind; "
+            log(f"saturation: served up to {saturation(table):g}/s without falling behind; "
                 f"set the reconfiguration run's rate from this")
             return  # a calibration run measures capacity only: no reconfiguration in it
 
