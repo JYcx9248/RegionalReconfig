@@ -40,8 +40,8 @@
     "NProbe": 64,
     "N": 200,
     "Arrivals": "poisson",
-    "Rate": 200,
-    "RateSteps": "60:390",
+    "Rate": 210,
+    "RateSteps": "60:420",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
     "WarmupSeconds": 30
@@ -53,10 +53,10 @@
     }
   ],
   "GPUs": [
-    0,
-    1,
+    3,
     4,
-    5
+    5,
+    6
   ],
   "Comment": "2 -> 4 with each agent's transfers paced at 400 MB/s (a NIC, scaled). Not paced: lazy's on-demand raw fetches (data node to data node)"
 }

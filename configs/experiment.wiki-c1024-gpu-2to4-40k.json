@@ -31,34 +31,32 @@
   "NodeResources": {
     "CPUsPerNode": 8,
     "MemoryMax": "24G",
-    "ReadIOPSPerNode": 80000
+    "ReadIOPSPerNode": 40000
   },
-  "Nodes": 2,
+  "Nodes": 4,
   "InitialNodes": 2,
   "Load": {
     "K": 10,
     "NProbe": 64,
     "N": 200,
-    "Arrivals": "poisson"
+    "Arrivals": "poisson",
+    "Rate": 210,
+    "RateSteps": "60:420",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 360,
+    "WarmupSeconds": 30
   },
-  "Calibrate": {
-    "Rates": [
-      200,
-      400,
-      500,
-      600,
-      650,
-      700,
-      750,
-      850
-    ],
-    "SecondsPerRate": 30
-  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "DataNodes": 4
+    }
+  ],
   "GPUs": [
     3,
     4,
     5,
     6
   ],
-  "Comment": "2-node capacity at 80K reads/s per node, for experiment.wiki-c1024-gpu-2to4-80k.json"
+  "Comment": "2 -> 4 at 40K reads/s per node on GPUs 3-6 (the 40 GB PCIe cards as numbered on 2026-10-08), the rates of results/wiki-gpu/2to4 (C2 ~330, C4 ~520): for lazy-stream, and a lazy rerun to compare with that run"
 }

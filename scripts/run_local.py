@@ -40,9 +40,11 @@ retried three times and then fails, so it is missing from the mean latency; comp
 protocols by their mean latency needs it (scripts/compare_runs.py).
 
 "Backend": "gpu" runs the data nodes on the GPU filter backend (a CUDA build of the engine);
-"GPUs": [0, 1, 4, 5] gives node i the i-th of those GPUs, numbered as nvidia-smi numbers them,
-and nodes take turns when there are fewer GPUs than nodes. Without "GPUs" every node uses the
-first GPU.
+"GPUs": [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi index, UUID
+("GPU-...") or PCI bus id ("06:00.0"), and nodes take turns when there are fewer GPUs than
+nodes; the log records each node's card (model, bus id, UUID). Indices can change with the
+hardware (they did on the lab server), a bus id stays with a slot, and only a UUID stays with a
+card. Without "GPUs" every node uses the first GPU.
 
     python3 scripts/run_local.py configs/experiment.example.json results/run1
 
@@ -274,6 +276,24 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
     return prefix
 
 
+def gpu_table() -> list:
+    """The machine's GPUs as nvidia-smi lists them, [] without one."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,name,utilization.gpu,memory.used",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    keys = ("index", "uuid", "bus", "name", "util", "mem")
+    return [dict(zip(keys, (x.strip() for x in l.split(",")))) for l in out.splitlines() if l.count(",") == 5]
+
+
+def gpu_matches(g, row: dict) -> bool:
+    """A "GPUs" entry names a GPU by nvidia-smi index, UUID ("GPU-...") or PCI bus id ("06:00.0").
+    Indices are not stable: on the lab server they changed between two days, with the hardware."""
+    g = str(g).lower()
+    return g in (row["index"], row["uuid"].lower()) or (":" in g and row["bus"].lower().endswith(g))
+
+
 def data_disk(path: str) -> str:
     """MAJ:MIN of the disk that holds path, as the cgroup io.stat names it (a partition's
     I/O is accounted to its disk)."""
@@ -413,20 +433,14 @@ class CgroupSampler:
         return r
 
     def gpu_sample(self) -> dict:
-        try:
-            out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
-                                  "--format=csv,noheader,nounits"], capture_output=True, text=True,
-                                 timeout=2).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return {}
         r = {}
-        for line in out.splitlines():
-            f = [x.strip() for x in line.split(",")]
-            if len(f) == 3 and f[0] in self.gpus:
-                try:
-                    r[f[0]] = {"util": int(f[1]), "mem_mib": int(f[2])}
-                except ValueError:  # "[N/A]"
-                    pass
+        for row in gpu_table():
+            for g in self.gpus:
+                if gpu_matches(g, row):
+                    try:
+                        r[g] = {"util": int(row["util"]), "mem_mib": int(row["mem"])}
+                    except ValueError:  # "[N/A]"
+                        pass
         return r
 
     def loop(self) -> None:
@@ -518,10 +532,24 @@ def main(cfg_path: str, out_dir: str) -> None:
              ", no read-IOPS limit"))
     node_args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
                                            if res.get("ReadIOPSPerNode") else [])
-    gpus = cfg.get("GPUs", []) if cfg.get("Backend") == "gpu" else []
+    gpus = [str(g) for g in cfg.get("GPUs", [])] if cfg.get("Backend") == "gpu" else []
+    # Each data node sees only its GPU, named to CUDA by UUID (CUDA does not take bus ids, and an
+    # index can name another card after a hardware change). The log records which card each got.
+    visible = {}
     if cfg.get("Backend") == "gpu":
-        log("GPUs: " + (", ".join(f"n{i} -> {gpus[(i - 1) % len(gpus)]}" for i in range(1, nodes + 1))
-                        if gpus else 'none given ("GPUs"): every data node uses the first one'))
+        table = gpu_table()
+        for i in range(1, nodes + 1):
+            if not gpus:
+                break
+            g = gpus[(i - 1) % len(gpus)]
+            row = next((r for r in table if gpu_matches(g, r)), None)
+            if table and row is None:
+                raise RuntimeError(f'"GPUs" entry {g} is none of the GPUs nvidia-smi lists: '
+                                   + "; ".join(f"{r['index']} {r['name']} {r['bus']} {r['uuid']}" for r in table))
+            visible[i] = row["uuid"] if row else g
+            log(f"GPU of n{i}: {g}" + (f" = {row['name']}, {row['bus']}, {row['uuid']}" if row else ""))
+        if not gpus:
+            log('GPUs: none given ("GPUs"): every data node uses the first one')
 
     procs = Procs(out_dir)
     results = []
@@ -557,11 +585,9 @@ def main(cfg_path: str, out_dir: str) -> None:
             # Each node keeps its raw vectors in its own sparse file (a subset of the index's
             # page file); the ones it gets by migration arrive after the flip (U9).
             os.makedirs(os.path.join(work, name), exist_ok=True)
-            # A data node sees only its own GPU ("GPUs", numbered as nvidia-smi numbers them:
-            # CUDA's default order puts the fastest first, so on a machine with several kinds of
-            # GPU its device 0 need not be nvidia-smi's GPU 0).
-            gpu = ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={gpus[(i - 1) % len(gpus)]}"] \
-                if gpus else []
+            # A data node sees only its own GPU (resolved above; without nvidia-smi, the "GPUs"
+            # entry as given, in PCI bus order: CUDA's default order puts the fastest first).
+            gpu = ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={visible[i]}"] if i in visible else []
             ready = procs.start(f"node-{name}", [f"{ebin}/rtier_node", "--index", index, "--partitions", parts,
                                                  "--listen", f"{host}:0", "--backend", cfg.get("Backend", "cpu"),
                                                  "--raw-file", os.path.join(work, name, "raw.pages"),

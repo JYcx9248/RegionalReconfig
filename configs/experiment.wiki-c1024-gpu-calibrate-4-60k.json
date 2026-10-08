@@ -31,10 +31,10 @@
   "NodeResources": {
     "CPUsPerNode": 8,
     "MemoryMax": "24G",
-    "ReadIOPSPerNode": 80000
+    "ReadIOPSPerNode": 60000
   },
-  "Nodes": 2,
-  "InitialNodes": 2,
+  "Nodes": 4,
+  "InitialNodes": 4,
   "Load": {
     "K": 10,
     "NProbe": 64,
@@ -43,14 +43,14 @@
   },
   "Calibrate": {
     "Rates": [
-      200,
-      400,
-      500,
+      300,
+      450,
       600,
-      650,
       700,
       750,
-      850
+      800,
+      850,
+      900
     ],
     "SecondsPerRate": 30
   },
@@ -60,5 +60,5 @@
     5,
     6
   ],
-  "Comment": "2-node capacity at 80K reads/s per node, for experiment.wiki-c1024-gpu-2to4-80k.json"
+  "Comment": "4-node capacity at 60K reads/s per node, for experiment.wiki-c1024-gpu-2to4-60k.json"
 }

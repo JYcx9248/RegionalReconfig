@@ -40,7 +40,7 @@
     "NProbe": 64,
     "N": 200,
     "Arrivals": "poisson",
-    "Rate": 200,
+    "Rate": 210,
     "RateSteps": "60:265",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
@@ -53,10 +53,10 @@
     }
   ],
   "GPUs": [
-    0,
-    1,
+    3,
     4,
-    5
+    5,
+    6
   ],
   "Comment": "2 -> 4 at 90 s while the load (265/s = 0.8 x C2) is still below the 2-node capacity: the old owners have spare reads for copy-then-flip's copy"
 }
