@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -193,21 +194,58 @@ func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, 
 // maxPQRounds bounds how often stagePQAndLoad lists and pulls missing codes again.
 const maxPQRounds = 3
 
-// A raw-vector stream (StageRaw) pulls each source's vectors over raw_streams connections, each
-// with one request of about raw_batch_bytes in flight. A request costs a RAW_CHECK here, a round
-// trip through both agents, a RAW_GET at the source and a RAW_PUT here, one after the other: with
-// one connection and 64 KB requests a stream ran at ~80 MB/s per source on the lab server (4 KB
-// vectors, ~3.3 ms per request) whatever reads the source had to spare, so copy-then-flip's copy
-// measured the stream rather than the protocol. Larger requests amortize the round trip, and a
-// second connection overlaps the source's reads with the installs here. More do not help: the
-// installs here serialize (RawStore::Put holds one lock, and buffered writes to one file take its
-// inode lock), and on BIGANN-10M locally, with an idle disk, 4 connections moved 40 MB/s against
-// 50 for 1 or 2. The connections split a source's sorted locations into contiguous ranges, each
-// read in order.
+// A raw-vector stream (StageRaw: copy-then-flip's copy, lazy-stream's stream) splits each
+// source's sorted locations into raw_streams contiguous ranges pulled concurrently, each with
+// one request of about raw_batch_bytes in flight. On the lab server (4 KB vectors, 2 sources,
+// light load) the agent path moved 148 MB/s with one 64 KB request per source -- the stream as it
+// was, ~3.3 ms a request whatever reads the sources had to spare -- 162 with one 1 MiB request,
+// 272 with two and 406 with four. On BIGANN's 128-byte vectors locally more than one did not
+// help: there the installs here bound the stream (RawStore::Put holds one lock, and buffered
+// writes to one file take its inode lock).
+//
+// By default the stream runs data node to data node (raw_path "node"): this node's data node
+// pulls each batch from the lists' sources itself, with RAW_GET as RERANK fetches. Through the
+// agents (raw_path "agent", PULL_RAW) every byte also crossed both agents, which cost a source
+// more CPU than the read itself (+0.34-0.46 CPU in its agent against +0.22-0.25 in its data node
+// at ~80 MB/s): a handicap of the baselines that the protocol does not need. Only the agent path
+// is paced by the token bucket, so a paced agent (transfer_rate_bytes_per_sec) keeps its streams
+// there unless raw_path says otherwise.
 const (
-	defaultRawStreams    = 2
+	defaultRawStreams    = 4
 	defaultRawBatchBytes = 1 << 20
 )
+
+// rawViaNode: whether StageRaw streams data node to data node (RAW_PULL) or through the agents.
+func (a *Agent) rawViaNode() bool {
+	switch a.cfg.RawPath {
+	case "node":
+		return true
+	case "agent":
+		return false
+	}
+	return a.cfg.TransferRate <= 0
+}
+
+// pullRawViaNode has the data node pull locs (lists[i] names locs[i]) from the sources of their
+// lists, batch locations a request; Stats counts the vectors it installed (those it held already,
+// fetched by queries meanwhile, are skipped by the node itself).
+func (a *Agent) pullRawViaNode(ctx context.Context, locs, lists []uint32, batch, vecBytes int) (transfer.Stats, error) {
+	start := time.Now()
+	var st transfer.Stats
+	for lo := 0; lo < len(locs); lo += batch {
+		hi := min(lo+batch, len(locs))
+		pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		installed, _, err := a.localBulk.RawPull(pctx, locs[lo:hi], lists[lo:hi])
+		cancel()
+		st.Vectors += int64(installed)
+		st.Bytes += int64(installed) * int64(vecBytes)
+		if err != nil {
+			return st, err
+		}
+	}
+	st.Elapsed = time.Since(start)
+	return st, nil
+}
 
 // rawStripes splits n locations into at most streams contiguous ranges [lo, hi) of whole
 // batches (only the last one ends with a partial batch), as even as whole batches allow.
@@ -362,10 +400,11 @@ func parallel(ctx context.Context, n int, fn func(ctx context.Context, i int) er
 // data node lacks, each from the source listed with it -- the lazy half of a migration (U9).
 // Until a vector arrives, a query that needs it has the data node fetch it from the same source
 // on demand. As for PQ codes, RawMissing lists every missing vector once, under the first
-// source that has it; the pulls run at the requested class on the sources' buckets (background
-// by default: after the flip, the stream takes only the bandwidth nothing else needs), and
-// before each batch the node is asked again what it still lacks, so that a vector a query
-// fetched meanwhile is not sent again (only the batches in flight can still bring one twice).
+// source that has it, and before each batch the node checks again what it still lacks, so that
+// a vector a query fetched meanwhile is not sent again (only the batches in flight can still
+// bring one twice). On the agent path the pulls run at the requested class on the sources'
+// buckets (background by default: after the flip, the stream takes only the bandwidth nothing
+// else needs); the node path has no bucket and no class.
 func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageRawReq](body)
 	if err != nil {
@@ -398,7 +437,7 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	}
 	// Requests of about raw_batch_bytes: a vector that a query fetches while its batch is in
 	// flight comes twice, so a batch is kept to a fraction of a second at the paced rates, and
-	// still large enough to amortize the round trip and the RAW_CHECK before it.
+	// still large enough to amortize the round trip and the check before it.
 	streams, batchBytes := a.cfg.RawStreams, a.cfg.RawBatchBytes
 	if streams <= 0 {
 		streams = defaultRawStreams
@@ -406,9 +445,17 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	if batchBytes <= 0 {
 		batchBytes = defaultRawBatchBytes
 	}
+	vecBytes := 0
+	if info, err := a.localBulk.Info(ctx); err == nil {
+		vecBytes = info.Raw.VecBytes
+	}
 	batch := transfer.DefaultRawBatch
-	if info, err := a.localBulk.Info(ctx); err == nil && info.Raw.VecBytes > 0 {
-		batch = max(64, batchBytes/info.Raw.VecBytes)
+	if vecBytes > 0 {
+		batch = max(64, batchBytes/vecBytes)
+	}
+	viaNode := a.rawViaNode()
+	if viaNode && vecBytes <= 0 {
+		return nil, errors.New("StageRaw: the data node does not report its raw-vector size")
 	}
 	type stripe struct{ src, lo, hi int }
 	var stripes []stripe
@@ -423,20 +470,29 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	)
 	err = parallel(ctx, len(stripes), func(ctx context.Context, j int) error {
 		s := stripes[j]
-		addr, m := req.Sources[s.src].Addr, missing[s.src]
-		still := func(locs []uint32) ([]uint32, error) { return a.localBulk.RawAbsent(ctx, locs) }
-		st, err := transfer.PullRaw(ctx, addr, m.Locs[s.lo:s.hi], m.Lists[s.lo:s.hi], batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
-			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-			defer cancel()
-			_, _, err := a.localBulk.RawPut(pctx, locs, vb, vecs)
-			return err
-		})
+		src, m := req.Sources[s.src], missing[s.src]
+		locs, lists := m.Locs[s.lo:s.hi], m.Lists[s.lo:s.hi]
+		var st transfer.Stats
+		var err error
+		from := src.Addr
+		if viaNode {
+			from = src.NodeAddr // the data node takes each list's source from the partitions it loaded
+			st, err = a.pullRawViaNode(ctx, locs, lists, batch, vecBytes)
+		} else {
+			still := func(locs []uint32) ([]uint32, error) { return a.localBulk.RawAbsent(ctx, locs) }
+			st, err = transfer.PullRaw(ctx, src.Addr, locs, lists, batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
+				pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				defer cancel()
+				_, _, err := a.localBulk.RawPut(pctx, locs, vb, vecs)
+				return err
+			})
+		}
 		mu.Lock()
 		reply.RawVectors += st.Vectors
 		reply.RawBytes += st.Bytes
 		mu.Unlock()
 		if err != nil {
-			return fmt.Errorf("raw vectors from %s: %w", addr, err)
+			return fmt.Errorf("raw vectors from %s: %w", from, err)
 		}
 		return nil
 	})

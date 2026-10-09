@@ -192,6 +192,12 @@ class NodeEngine {
   virtual void RawGet(const uint32_t* locs, const uint32_t* lists, size_t n, uint8_t* out) = 0;
   // Installs vectors streamed from a peer.
   virtual RawPutResult RawPut(const uint32_t* locs, size_t n, const uint8_t* vecs) = 0;
+  // The stream without the agents in its path: of locs[0..n) (lists[i] names locs[i]), fetches
+  // the vectors this node lacks -- not on the SSD and not fetched by a query already -- from the
+  // source of their lists, data node to data node as RERANK does (chains included), and installs
+  // them as RawPut does (counted as streamed, not as fetched on demand). RawMissingError if a
+  // list has no source.
+  virtual RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) = 0;
   // A snapshot that waits for nothing, or (settle) one taken once the vectors fetched before
   // the call are on the SSD: with no query fetching, cached is then 0.
   virtual RawStats raw_stats(bool settle) const = 0;

@@ -32,6 +32,7 @@ const (
 	opRawGet         uint8 = 0x18
 	opRawPut         uint8 = 0x19
 	opRawCheck       uint8 = 0x1A
+	opRawPull        uint8 = 0x1B
 	opNavigate       uint8 = 0x20
 	opFilter         uint8 = 0x21
 	opRerank         uint8 = 0x22
@@ -458,6 +459,26 @@ func (c *Client) RawPut(ctx context.Context, locs []uint32, vecBytes int, vecs [
 	w.U32s(locs)
 	w.Bytes(vecs)
 	b, err := c.do(ctx, opRawPut, 0, w.B)
+	if err != nil {
+		return 0, 0, err
+	}
+	r := frame.NewReader(b)
+	installed, skipped = int(r.U32()), int(r.U32())
+	return installed, skipped, r.Err
+}
+
+// RawPull has the node fetch the vectors at locs that it lacks from the sources of their lists
+// (lists[i] names locs[i]) -- data node to data node, as RERANK fetches -- and install them as
+// RawPut does; vectors it already holds are skipped.
+func (c *Client) RawPull(ctx context.Context, locs, lists []uint32) (installed, skipped int, err error) {
+	if len(lists) != len(locs) {
+		return 0, 0, fmt.Errorf("nodeclient: RAW_PULL of %d locations with %d lists", len(locs), len(lists))
+	}
+	var w frame.Writer
+	w.U32(uint32(len(locs)))
+	w.U32s(locs)
+	w.U32s(lists)
+	b, err := c.do(ctx, opRawPull, 0, w.B)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -109,6 +109,7 @@ const char* OpName(uint8_t op) {
     case kRawGet: return "raw_get";
     case kRawPut: return "raw_put";
     case kRawCheck: return "raw_check";
+    case kRawPull: return "raw_pull";
     case kNavigate: return "navigate";
     case kFilter: return "filter";
     case kRerank: return "rerank";
@@ -524,6 +525,18 @@ Frame NodeServer::Handle(const Frame& req) {
         const auto locs = TakeArray<uint32_t>(&r, n);
         Require(r.remaining() == static_cast<size_t>(n) * vb, "RAW_PUT: vectors do not match the locations");
         const fusion::RawPutResult res = e.RawPut(locs.data(), n, r.Bytes(static_cast<size_t>(n) * vb));
+        w.Put<uint32_t>(static_cast<uint32_t>(res.installed));
+        w.Put<uint32_t>(static_cast<uint32_t>(res.skipped));
+        break;
+      }
+      case kRawPull: {
+        const uint32_t n = r.Get<uint32_t>();
+        Require(n <= kMaxRawBatch && static_cast<uint64_t>(n) * e.vec_bytes() <= kMaxFrameBytes / 2,
+                "RAW_PULL batch too large");  // what it asks a source for must fit a RAW_GET reply
+        const auto locs = TakeArray<uint32_t>(&r, n);
+        const auto lists = TakeArray<uint32_t>(&r, n);
+        Require(r.remaining() == 0, "trailing bytes in RAW_PULL");
+        const fusion::RawPutResult res = e.RawPull(locs.data(), lists.data(), n);
         w.Put<uint32_t>(static_cast<uint32_t>(res.installed));
         w.Put<uint32_t>(static_cast<uint32_t>(res.skipped));
         break;

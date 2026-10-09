@@ -57,5 +57,5 @@
     5,
     6
   ],
-  "Comment": "Raw-stream check (branch raw-stream-parallel): copy-then-flip 2 -> 4 at 30 s under a light load (100 q/s, ~30% of C2 at 40K), so the sources have reads to spare and the copy runs at the stream's own speed. Run it with the overrides {\"RawStreams\": 1, \"RawBatchBytes\": 65536} (the old stream), {\"RawStreams\": 1, \"RawBatchBytes\": 1048576}, the defaults (2 x 1 MiB) and {\"RawStreams\": 4, \"RawBatchBytes\": 1048576}; compare stage_raw in reconfigurations.json"
+  "Comment": "Raw-stream check (branch raw-stream-parallel): copy-then-flip 2 -> 4 at 30 s under a light load (100 q/s, ~30% of C2 at 40K), so the sources have reads to spare and the copy runs at the stream's own speed. Overrides to compare (stage_raw in reconfigurations.json): {\"RawPath\": \"agent\", \"RawStreams\": 1, \"RawBatchBytes\": 65536} (the stream before 2026-10-09), {\"RawPath\": \"agent\"} (4 x 1 MiB through the agents) and the defaults (4 x 1 MiB data node to data node)"
 }

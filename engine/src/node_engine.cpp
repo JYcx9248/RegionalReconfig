@@ -434,6 +434,34 @@ class NodeEngineImpl : public NodeEngine {
     return r;
   }
 
+  // Fetched as RERANK fetches (same sources, same peer requests, chains included), but written
+  // straight to the SSD as a stream's batch: nothing waits for these vectors in memory, and a
+  // copy of a whole partition must not pass through the fetch cache and its writer.
+  RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) override {
+    std::vector<uint32_t> miss, via;
+    Lacking(locs, lists, n, &miss, &via);
+    RawPutResult r;
+    if (!miss.empty()) {
+      BySource g = GroupBySource(miss, via);
+      std::vector<uint8_t> buf;
+      for (size_t src = 0; src < g.locs.size(); ++src) {
+        const std::vector<uint32_t>& ls = g.locs[src];
+        if (ls.empty()) continue;
+        if (!g.fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
+        buf.resize(ls.size() * raw_->layout().vec_bytes);
+        try {
+          g.fetch(g.peers[src], ls.data(), g.lists[src].data(), ls.size(), buf.data());
+        } catch (const std::exception& e) {
+          throw RawMissingError(StrFormat("pulling %zu raw vectors from %s: %s", ls.size(),
+                                          g.peers[src].c_str(), e.what()));
+        }
+        r.installed += raw_->Put(ls.data(), ls.size(), buf.data(), RawOrigin::kStreamed);
+      }
+    }
+    r.skipped = n - r.installed;
+    return r;
+  }
+
   // Without settle, a snapshot that waits for nothing: INFO is polled for metrics while the
   // writer may be busy. With settle, first waits for the writer to install what was fetched
   // before the call, so that (with no query fetching) every fetched vector counts as present.
@@ -829,53 +857,67 @@ class NodeEngineImpl : public NodeEngine {
 
   // The same for a peer's request, which names the list of every location (RAW_GET).
   size_t EnsureRawVia(const uint32_t* locs, const uint32_t* lists, size_t n) {
+    std::vector<uint32_t> miss, via;
+    Lacking(locs, lists, n, &miss, &via);
+    return miss.empty() ? 0 : FetchRaw(miss, via);
+  }
+
+  // Of locs[0..n) (lists[i] names locs[i]): the locations whose vector is neither on the SSD
+  // nor fetched already, sorted, each once with a list that names it.
+  void Lacking(const uint32_t* locs, const uint32_t* lists, size_t n, std::vector<uint32_t>* miss,
+               std::vector<uint32_t>* via) const {
     std::vector<std::pair<uint32_t, uint32_t>> refs;
     {
       std::lock_guard<std::mutex> l(cache_mu_);
       for (size_t i = 0; i < n; ++i)
         if (!raw_->Present(locs[i]) && !cache_.count(locs[i])) refs.emplace_back(locs[i], lists[i]);
     }
-    if (refs.empty()) return 0;
     std::sort(refs.begin(), refs.end());
-    std::vector<uint32_t> miss, via;
     for (size_t i = 0; i < refs.size(); ++i) {
       if (i > 0 && refs[i].first == refs[i - 1].first) continue;
       FUSION_CHECK(refs[i].second < man_.num_lists, "list %u out of range", refs[i].second);
-      miss.push_back(refs[i].first);
-      via.push_back(refs[i].second);
+      miss->push_back(refs[i].first);
+      via->push_back(refs[i].second);
     }
-    return FetchRaw(miss, via);
   }
 
-  // Fetches miss[i] from the source of list via[i] (kInvalidId: no list named it), one request
-  // per source; returns how many were installed. RawMissingError if one has no source or its
-  // fetch fails. Two queries that miss the same vector may both fetch it; the second write is
-  // a no-op.
-  size_t FetchRaw(const std::vector<uint32_t>& miss, const std::vector<uint32_t>& via) {
-    std::vector<std::vector<uint32_t>> locs_by, lists_by;
+  // miss[i] grouped by the source of list via[i] (kInvalidId: no list named it), with the
+  // sources' addresses and the fetcher as of now. RawMissingError if one has no source (and has
+  // not arrived meanwhile).
+  struct BySource {
+    std::vector<std::vector<uint32_t>> locs, lists;  // per source
     std::vector<std::string> peers;
     RawFetcher fetch;
-    {
-      std::lock_guard<std::mutex> l(raw_mu_);
-      locs_by.resize(sources_.size());
-      lists_by.resize(sources_.size());
-      size_t unknown = 0;
-      uint32_t first = 0;
-      for (size_t i = 0; i < miss.size(); ++i) {
-        const uint16_t src = via[i] == kInvalidId ? 0 : list_src_[via[i]];
-        if (src) {
-          locs_by[src - 1].push_back(miss[i]);
-          lists_by[src - 1].push_back(via[i]);
-        } else if (!raw_->Present(miss[i]) && !Cached(miss[i]) && unknown++ == 0) {  // it may have arrived
-          first = miss[i];
-        }
+  };
+  BySource GroupBySource(const std::vector<uint32_t>& miss, const std::vector<uint32_t>& via) const {
+    BySource g;
+    std::lock_guard<std::mutex> l(raw_mu_);
+    g.locs.resize(sources_.size());
+    g.lists.resize(sources_.size());
+    size_t unknown = 0;
+    uint32_t first = 0;
+    for (size_t i = 0; i < miss.size(); ++i) {
+      const uint16_t src = via[i] == kInvalidId ? 0 : list_src_[via[i]];
+      if (src) {
+        g.locs[src - 1].push_back(miss[i]);
+        g.lists[src - 1].push_back(via[i]);
+      } else if (!raw_->Present(miss[i]) && !Cached(miss[i]) && unknown++ == 0) {  // it may have arrived
+        first = miss[i];
       }
-      if (unknown)
-        throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no list naming "
-                                        "them has a source (first: location %u)", unknown, first));
-      peers = sources_;
-      fetch = fetcher_;
     }
+    if (unknown)
+      throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no list naming "
+                                      "them has a source (first: location %u)", unknown, first));
+    g.peers = sources_;
+    g.fetch = fetcher_;
+    return g;
+  }
+
+  // Fetches miss[i] from the source of list via[i], one request per source; returns how many
+  // were installed. RawMissingError if one has no source or its fetch fails. Two queries that
+  // miss the same vector may both fetch it; the second write is a no-op.
+  size_t FetchRaw(const std::vector<uint32_t>& miss, const std::vector<uint32_t>& via) {
+    BySource g = GroupBySource(miss, via);
     size_t fetched = 0;
     std::vector<uint8_t> buf;
     Timer t;
@@ -887,16 +929,16 @@ class NodeEngineImpl : public NodeEngine {
         fc.fetch_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
       }
     } count{fc_, t};
-    for (size_t src = 0; src < locs_by.size(); ++src) {
-      const std::vector<uint32_t>& ls = locs_by[src];
+    for (size_t src = 0; src < g.locs.size(); ++src) {
+      const std::vector<uint32_t>& ls = g.locs[src];
       if (ls.empty()) continue;
-      if (!fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
+      if (!g.fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
       buf.resize(ls.size() * raw_->layout().vec_bytes);
       try {
-        fetch(peers[src], ls.data(), lists_by[src].data(), ls.size(), buf.data());
+        g.fetch(g.peers[src], ls.data(), g.lists[src].data(), ls.size(), buf.data());
       } catch (const std::exception& e) {
         throw RawMissingError(StrFormat("fetching %zu raw vectors from %s: %s", ls.size(),
-                                        peers[src].c_str(), e.what()));
+                                        g.peers[src].c_str(), e.what()));
       }
       raw_->CountFetch();
       fetched += Cache(ls.data(), ls.size(), buf.data());

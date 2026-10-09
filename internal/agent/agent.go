@@ -140,6 +140,11 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	switch cfg.RawPath {
+	case "", "node", "agent":
+	default:
+		return nil, fmt.Errorf("agent: raw_path %q: want \"node\" or \"agent\"", cfg.RawPath)
+	}
 	a := &Agent{
 		cfg:           cfg,
 		manifest:      m,

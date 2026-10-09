@@ -106,7 +106,8 @@ type Agent struct {
 	TransferAdapter string   `json:"transfer_adapter"` // "fixed" | "adaptive" (U8)
 	ChunkBytes      int      `json:"chunk_bytes"`
 	RawStreams      int      `json:"raw_streams"`     // connections a raw-vector stream (StageRaw) pulls from each source over at once
-	RawBatchBytes   int      `json:"raw_batch_bytes"` // raw vectors per PULL_RAW request, in bytes
+	RawBatchBytes   int      `json:"raw_batch_bytes"` // raw vectors per request of such a stream, in bytes
+	RawPath         string   `json:"raw_path"`        // "node" | "agent" | "" (node unless TransferRate paces the agents)
 	MetricsInterval Duration `json:"metrics_interval"`
 }
 

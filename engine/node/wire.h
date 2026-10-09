@@ -48,6 +48,9 @@
 //                   u8 vecs[n * vec_bytes]
 //   RAW_CHECK       u32 n, u32 locs[n]                        -> u32 m, u32 locs[m] (those not
 //                                                                here, sorted, unique)
+//   RAW_PULL        u32 n, u32 locs[n], u32 lists[n]          -> u32 installed, u32 skipped
+//                   (the node fetches what it lacks from the lists' sources with RAW_GET and
+//                   installs it: a stream that does not pass through the agents)
 //   NAVIGATE        u32 nprobe, u32 ef, query                 -> u32 n, u32 lists[n]
 //   FILTER          u32 topn, u32 nlists, u32 lists[], query  -> u32 n, u32 ids[n], f32 dists[n],
 //                                                                u32 gathered, u32 unique
@@ -74,7 +77,7 @@ constexpr uint32_t kMaxFrameBytes = 256u << 20;
 constexpr uint8_t kFlagResponse = 1;
 constexpr uint8_t kInfoSettle = 1;  // INFO flags
 constexpr uint32_t kMaxPQBatch = 1u << 22;  // IDs per PQ_GET / PQ_PUT
-constexpr uint32_t kMaxRawBatch = 1u << 20;  // locations per RAW_GET / RAW_PUT (also bytes / 2)
+constexpr uint32_t kMaxRawBatch = 1u << 20;  // locations per RAW_GET / RAW_PUT / RAW_PULL (also bytes / 2)
 
 enum Op : uint8_t {
   kPing = 0x01,
@@ -90,6 +93,7 @@ enum Op : uint8_t {
   kRawGet = 0x18,
   kRawPut = 0x19,
   kRawCheck = 0x1A,
+  kRawPull = 0x1B,
   kNavigate = 0x20,
   kFilter = 0x21,
   kRerank = 0x22,

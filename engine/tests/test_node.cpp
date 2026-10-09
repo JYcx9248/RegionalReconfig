@@ -915,6 +915,42 @@ void TestRawMigration() {
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, dst.get(), src.get(), {2, 3}) && same;
   CHECK(same && dst->raw_stats(true).fetched == rs.fetched);  // nothing left to fetch
 
+  // The same stream pulled by the node itself (RawPull, data node to data node): exactly the
+  // vectors it lacks, installed as streamed and not as fetched on demand; a second pull brings
+  // nothing.
+  auto pulled = OpenNode(f, {}, false, f.index_nopages);
+  LinkPeers(pulled.get(), {{"src", src.get()}});
+  StageFrom(f, pulled.get(), src.get(), {2, 3}, "src");
+  const auto want = pulled->RawMissing({{seg(2)}, {seg(3)}});
+  uint64_t got = 0;
+  for (const auto& m : want) {
+    const RawPutResult pr = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
+    CHECK(pr.installed + pr.skipped == m.locs.size());
+    got += pr.installed;
+  }
+  RawStats ps = pulled->raw_stats(true);
+  CHECK(got == locs23.size() && ps.present == got && ps.streamed == got && ps.fetched == 0 &&
+        ps.fetches == 0 && ps.pending == 0);
+  for (const auto& m : want) {
+    const RawPutResult pr = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
+    CHECK(pr.installed == 0 && pr.skipped == m.locs.size());
+  }
+  same = true;
+  for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, pulled.get(), src.get(), {2, 3}) && same;
+  CHECK(same && pulled->raw_stats(true).fetched == 0);
+
+  // Chains as RERANK's fetches do: pulling partition 3 from `third`, which holds only the vectors
+  // its queries fetched, brings them all -- third fetches what it lacks from dst on the way.
+  auto fourth = OpenNode(f, {}, false, f.index_nopages);
+  LinkPeers(fourth.get(), {{"third", third.get()}});
+  StageFrom(f, fourth.get(), third.get(), {3}, "third");
+  const auto want3 = fourth->RawMissing({{seg(3)}});
+  const uint64_t third_fetched = third->raw_stats(true).fetched;
+  CHECK(third->raw_stats(true).pending > 0);
+  const RawPutResult p3 = fourth->RawPull(want3[0].locs.data(), want3[0].lists.data(), want3[0].locs.size());
+  CHECK(p3.installed == want3[0].locs.size() && fourth->RawMissing({{seg(3)}})[0].locs.empty() &&
+        third->raw_stats(true).fetched > third_fetched);
+
   // A partition that moves away leaves its vectors (a cache, like its PQ codes): it comes back
   // with nothing to transfer, and no source is needed.
   CHECK(dst->EvictPartition(2));
@@ -1223,24 +1259,40 @@ void TestWire() {
   std::memcpy(rlocs.data(), rr.Bytes(nraw * 4u), nraw * 4u);
   std::memcpy(rlists.data(), rr.Bytes(nraw * 4u), nraw * 4u);
   for (uint32_t i = 0; i < nraw; i += 97) CHECK(ListNamingLoc(f, 0, rlocs[i]) != kInvalidId);
+  // Both ways of streaming: RAW_PULL has this node fetch the first half itself (from the first
+  // node, through its peer pool); RAW_GET from the first node and RAW_PUT bring the rest.
+  const uint32_t half = nraw / 2, rest = nraw - half;
+  rtier::BodyWriter rpull;
+  rpull.Put<uint32_t>(half);
+  rpull.PutBytes(rlocs.data(), half * 4u);
+  rpull.PutBytes(rlists.data(), half * 4u);
+  r = Call(fd2, rtier::kRawPull, rpull, 78);
+  CHECK(r.status == rtier::kOk && r.body.size() == 8);
+  rtier::BodyReader pl(r.body.data(), r.body.size());
+  CHECK(pl.Get<uint32_t>() == half && pl.Get<uint32_t>() == 0);
   rtier::BodyWriter rget;
-  rget.Put<uint32_t>(nraw);
-  rget.PutBytes(rlocs.data(), nraw * 4u);
-  rget.PutBytes(rlists.data(), nraw * 4u);
+  rget.Put<uint32_t>(rest);
+  rget.PutBytes(rlocs.data() + half, rest * 4u);
+  rget.PutBytes(rlists.data() + half, rest * 4u);
   r = Call(fd, rtier::kRawGet, rget, 74);
   const uint32_t vb = fresh->vec_bytes();
-  CHECK(r.status == rtier::kOk && r.body.size() == 4 + static_cast<size_t>(nraw) * vb);
+  CHECK(r.status == rtier::kOk && r.body.size() == 4 + static_cast<size_t>(rest) * vb);
   rtier::BodyWriter rput;
-  rput.Put<uint32_t>(nraw);
+  rput.Put<uint32_t>(rest);
   rput.Put<uint32_t>(vb);
-  rput.PutBytes(rlocs.data(), nraw * 4u);
-  rput.PutBytes(r.body.data() + 4, static_cast<size_t>(nraw) * vb);
+  rput.PutBytes(rlocs.data() + half, rest * 4u);
+  rput.PutBytes(r.body.data() + 4, static_cast<size_t>(rest) * vb);
   r = Call(fd2, rtier::kRawPut, rput, 75);
   CHECK(r.status == rtier::kOk && r.body.size() == 8);
   rtier::BodyReader pr2(r.body.data(), r.body.size());
-  CHECK(pr2.Get<uint32_t>() == nraw && pr2.Get<uint32_t>() == 0);
+  CHECK(pr2.Get<uint32_t>() == rest && pr2.Get<uint32_t>() == 0);
   const RawStats raw = fresh->raw_stats(true);
-  CHECK(raw.present == locs0.size() && raw.pending == 0 && raw.streamed == nraw);
+  CHECK(raw.present == locs0.size() && raw.pending == 0 && raw.streamed == nraw &&
+        raw.fetches == 1);  // what RAW_PULL brought counts as streamed, not as fetched on demand
+  r = Call(fd2, rtier::kRawPull, rpull, 79);  // nothing left to pull
+  CHECK(r.status == rtier::kOk && r.body.size() == 8);
+  rtier::BodyReader pl2(r.body.data(), r.body.size());
+  CHECK(pl2.Get<uint32_t>() == 0 && pl2.Get<uint32_t>() == half);
   // A vector nobody told this node about cannot be had here.
   const std::vector<uint32_t> locs3 = Named(f, {3}).second;
   uint32_t other = kInvalidId;
@@ -1252,6 +1304,8 @@ void TestWire() {
   rget2.Put<uint32_t>(ListNamingLoc(f, 3, other));
   r = Call(fd2, rtier::kRawGet, rget2, 76);
   CHECK(other != kInvalidId && r.status == rtier::kRawAbsent);
+  r = Call(fd2, rtier::kRawPull, rget2, 80);  // nor pulled
+  CHECK(r.status == rtier::kRawAbsent);
   // RAW_CHECK: of these, the ones not here.
   rtier::BodyWriter check;
   check.Put<uint32_t>(3);

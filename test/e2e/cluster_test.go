@@ -373,6 +373,12 @@ func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...stri
 	cfg.TransferRate = 64 << 20 // paced background copies, 64 MB/s
 	cfg.ChunkBytes = 64 << 10
 	cfg.RawBatchBytes = 4 << 10 // 64 vectors per request: a raw stream runs on several connections even here
+	// Raw streams data node to data node (unpaced, unlike the rest at TransferRate);
+	// RTIER_E2E_RAW_PATH=agent runs them through the agents instead.
+	cfg.RawPath = "node"
+	if p := os.Getenv("RTIER_E2E_RAW_PATH"); p != "" {
+		cfg.RawPath = p
+	}
 	cfg.MetricsInterval = config.Duration{Duration: 200 * time.Millisecond}
 	a, err := agent.New(cfg, opts)
 	if err != nil {
