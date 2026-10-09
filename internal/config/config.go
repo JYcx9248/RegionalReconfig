@@ -105,6 +105,8 @@ type Agent struct {
 	TransferRate    float64  `json:"transfer_rate_bytes_per_sec"`
 	TransferAdapter string   `json:"transfer_adapter"` // "fixed" | "adaptive" (U8)
 	ChunkBytes      int      `json:"chunk_bytes"`
+	RawStreams      int      `json:"raw_streams"`     // connections a raw-vector stream (StageRaw) pulls from each source over at once
+	RawBatchBytes   int      `json:"raw_batch_bytes"` // raw vectors per PULL_RAW request, in bytes
 	MetricsInterval Duration `json:"metrics_interval"`
 }
 
@@ -119,6 +121,8 @@ func DefaultAgent() Agent {
 		Selector:        "owner",
 		TransferAdapter: "fixed",
 		ChunkBytes:      1 << 20,
+		RawStreams:      2,
+		RawBatchBytes:   1 << 20,
 		MetricsInterval: Duration{5 * time.Second},
 	}
 }

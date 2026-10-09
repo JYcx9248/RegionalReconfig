@@ -372,6 +372,7 @@ func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...stri
 	cfg.PartitionsDir = cl.f.parts
 	cfg.TransferRate = 64 << 20 // paced background copies, 64 MB/s
 	cfg.ChunkBytes = 64 << 10
+	cfg.RawBatchBytes = 4 << 10 // 64 vectors per request: a raw stream runs on several connections even here
 	cfg.MetricsInterval = config.Duration{Duration: 200 * time.Millisecond}
 	a, err := agent.New(cfg, opts)
 	if err != nil {

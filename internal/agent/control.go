@@ -193,8 +193,43 @@ func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, 
 // maxPQRounds bounds how often stagePQAndLoad lists and pulls missing codes again.
 const maxPQRounds = 3
 
-// rawBatchBytes is the size of one request of a raw-vector stream (StageRaw).
-const rawBatchBytes = 64 << 10
+// A raw-vector stream (StageRaw) pulls each source's vectors over raw_streams connections, each
+// with one request of about raw_batch_bytes in flight. A request costs a RAW_CHECK here, a round
+// trip through both agents, a RAW_GET at the source and a RAW_PUT here, one after the other: with
+// one connection and 64 KB requests a stream ran at ~80 MB/s per source on the lab server (4 KB
+// vectors, ~3.3 ms per request) whatever reads the source had to spare, so copy-then-flip's copy
+// measured the stream rather than the protocol. Larger requests amortize the round trip, and a
+// second connection overlaps the source's reads with the installs here. More do not help: the
+// installs here serialize (RawStore::Put holds one lock, and buffered writes to one file take its
+// inode lock), and on BIGANN-10M locally, with an idle disk, 4 connections moved 40 MB/s against
+// 50 for 1 or 2. The connections split a source's sorted locations into contiguous ranges, each
+// read in order.
+const (
+	defaultRawStreams    = 2
+	defaultRawBatchBytes = 1 << 20
+)
+
+// rawStripes splits n locations into at most streams contiguous ranges [lo, hi) of whole
+// batches (only the last one ends with a partial batch), as even as whole batches allow.
+func rawStripes(n, batch, streams int) [][2]int {
+	if n <= 0 {
+		return nil
+	}
+	batch, streams = max(batch, 1), max(streams, 1)
+	batches := (n + batch - 1) / batch
+	k := min(streams, batches)
+	out := make([][2]int, 0, k)
+	for i, lo := 0, 0; i < k; i++ {
+		nb := batches / k
+		if i < batches%k {
+			nb++
+		}
+		hi := min(lo+nb*batch, n)
+		out = append(out, [2]int{lo, hi})
+		lo = hi
+	}
+	return out
+}
 
 // stagePQAndLoad brings the PQ codes the fetched partitions need, then loads the partitions.
 func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, reply *protocol.StageReply) error {
@@ -330,7 +365,7 @@ func parallel(ctx context.Context, n int, fn func(ctx context.Context, i int) er
 // source that has it; the pulls run at the requested class on the sources' buckets (background
 // by default: after the flip, the stream takes only the bandwidth nothing else needs), and
 // before each batch the node is asked again what it still lacks, so that a vector a query
-// fetched meanwhile is not sent again (only a batch in flight can still bring one twice).
+// fetched meanwhile is not sent again (only the batches in flight can still bring one twice).
 func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageRawReq](body)
 	if err != nil {
@@ -361,20 +396,36 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	if err != nil {
 		return nil, fmt.Errorf("listing the raw vectors to fetch: %w", err)
 	}
-	// Requests of about rawBatchBytes: a vector that a query fetches while its batch is in
-	// flight comes twice, so the batch is kept to a fraction of a second at the paced rates,
-	// and still large enough to amortize the round trip and the RAW_CHECK before it.
-	batch := 0
+	// Requests of about raw_batch_bytes: a vector that a query fetches while its batch is in
+	// flight comes twice, so a batch is kept to a fraction of a second at the paced rates, and
+	// still large enough to amortize the round trip and the RAW_CHECK before it.
+	streams, batchBytes := a.cfg.RawStreams, a.cfg.RawBatchBytes
+	if streams <= 0 {
+		streams = defaultRawStreams
+	}
+	if batchBytes <= 0 {
+		batchBytes = defaultRawBatchBytes
+	}
+	batch := transfer.DefaultRawBatch
 	if info, err := a.localBulk.Info(ctx); err == nil && info.Raw.VecBytes > 0 {
-		batch = max(64, rawBatchBytes/info.Raw.VecBytes)
+		batch = max(64, batchBytes/info.Raw.VecBytes)
+	}
+	type stripe struct{ src, lo, hi int }
+	var stripes []stripe
+	for i := range req.Sources {
+		for _, r := range rawStripes(len(missing[i].Locs), batch, streams) {
+			stripes = append(stripes, stripe{i, r[0], r[1]})
+		}
 	}
 	var (
 		mu    sync.Mutex
 		reply protocol.StageReply
 	)
-	err = parallel(ctx, len(req.Sources), func(ctx context.Context, i int) error {
+	err = parallel(ctx, len(stripes), func(ctx context.Context, j int) error {
+		s := stripes[j]
+		addr, m := req.Sources[s.src].Addr, missing[s.src]
 		still := func(locs []uint32) ([]uint32, error) { return a.localBulk.RawAbsent(ctx, locs) }
-		st, err := transfer.PullRaw(ctx, req.Sources[i].Addr, missing[i].Locs, missing[i].Lists, batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
+		st, err := transfer.PullRaw(ctx, addr, m.Locs[s.lo:s.hi], m.Lists[s.lo:s.hi], batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
 			_, _, err := a.localBulk.RawPut(pctx, locs, vb, vecs)
@@ -385,7 +436,7 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 		reply.RawBytes += st.Bytes
 		mu.Unlock()
 		if err != nil {
-			return fmt.Errorf("raw vectors from %s: %w", req.Sources[i].Addr, err)
+			return fmt.Errorf("raw vectors from %s: %w", addr, err)
 		}
 		return nil
 	})

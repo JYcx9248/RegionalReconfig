@@ -46,6 +46,13 @@ nodes; the log records each node's card (model, bus id, UUID). Indices can chang
 hardware (they did on the lab server), a bus id stays with a slot, and only a UUID stays with a
 card. Without "GPUs" every node uses the first GPU.
 
+"RawStreams": 2 and "RawBatchBytes": 1048576 (the agent's defaults) set how a raw-vector stream
+(copy-then-flip's copy, lazy-stream's stream) pulls from each source: over that many
+connections at once, that many bytes of vectors per request. "RawStreams": 1 with
+"RawBatchBytes": 65536 is the stream as it was before 2026-10-09: one 64 KB request in flight
+per source, which held the copy to ~80 MB/s per source on the lab server. More connections
+than 2 contend for the destination's installs (internal/agent/control.go).
+
     python3 scripts/run_local.py configs/experiment.example.json results/run1
 
 Open design questions this script depends on (see `bin/rtier-client design`):
@@ -604,6 +611,7 @@ def main(cfg_path: str, out_dir: str) -> None:
                 "strategy": cfg.get("Strategy", ""),
                 "transfer_rate_bytes_per_sec": cfg.get("TransferRateBytesPerSec", 0),
                 "metrics_interval": cfg.get("MetricsInterval", "1s"),
+                **{k: cfg[e] for k, e in (("raw_streams", "RawStreams"), ("raw_batch_bytes", "RawBatchBytes")) if e in cfg},
             }, open(agent_cfg, "w"), indent=2)
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
             if sampler:
