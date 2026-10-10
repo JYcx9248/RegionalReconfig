@@ -31,7 +31,7 @@
   "NodeResources": {
     "CPUsPerNode": 4,
     "MemoryMax": "24G",
-    "ReadIOPSPerNode": 40000
+    "ReadIOPSPerNode": 100000
   },
   "Nodes": 4,
   "InitialNodes": 2,
