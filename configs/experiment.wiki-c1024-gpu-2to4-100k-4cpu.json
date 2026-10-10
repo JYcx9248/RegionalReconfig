@@ -37,8 +37,8 @@
   "InitialNodes": 2,
   "Load": {
     "K": 10,
-    "NProbe": 64,
-    "N": 200,
+    "NProbe": 128,
+    "N": 100,
     "Arrivals": "poisson",
     "Rate": 210,
     "RateSteps": "60:420",
