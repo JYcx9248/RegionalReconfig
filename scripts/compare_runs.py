@@ -25,8 +25,8 @@ reconfigurations start within about a window of each other). Writes:
 A query's latency counts in the window of the time it was sent: its scheduled time with the
 open-loop load generator, its first attempt in the closed-loop test; answered queries per second
 count in the window of their answer. With the open-loop load (no "users" in latency.csv) the
-figure shows the offered rate instead of the users, and the backlog: queries sent and not
-answered yet. It grows whenever the offered rate exceeds what the cluster answers, and after a
+figure has no users panel: it draws the offered rate as a bold dashed line over the answered
+queries per second, and adds the backlog: queries sent and not answered yet. It grows whenever the offered rate exceeds what the cluster answers, and after a
 scale-out it drains only with the capacity left over -- what a closed loop hides, since its
 users just wait. OUT.json then also has the peak backlog, when it drained, and the queries
 answered later than --slo-ms (failed ones included) among those sent from the first
@@ -286,12 +286,12 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     panels = []  # (title, unit, height, series [(slot or None, [(t, v)])], dashed legend)
     if users:
         panels.append(("concurrent users", "users", 70, [(None, users)]))
-    if offered:
-        panels.append(("offered load (open loop)", "q/s", 70, [(None, offered)]))
-    panels.append(("answered queries per second", "q/s", 150,
+    # The offered rate goes over the answered ones, on the same axis: the gap between them is how
+    # fast the backlog grows (or drains), which two panels make the reader compare by eye.
+    panels.append(("offered and answered queries per second" if offered else "answered queries per second", "q/s", 170,
                    [(slot, [(w["t"] + width / 2, w["answered"])
                             for w in flows[label] if w["t"] + width <= span])  # the last window is partial
-                    for label, slot, _, _, _ in lines]))
+                    for label, slot, _, _, _ in lines] + ([(None, offered)] if offered else [])))
     if offered:
         panels.append(("backlog: queries sent, not answered yet", "queries", 120,
                        [(slot, [(w["t"] + width, w["backlog"]) for w in flows[label] if w["t"] + width <= span])
@@ -329,6 +329,7 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
   .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .span { stroke: none; }
   .dot { stroke-width: 2; }
+  .sched { stroke-width: 3; stroke-dasharray: 8 5; }
   .hit rect { fill: transparent; }
   .hit line { stroke-width: 1; opacity: 0; }
   .hit:hover line { opacity: .6; }
@@ -368,7 +369,7 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         svg.append('<text class="tick" x="%d" y="%d">%s</text>' % (W - RIGHT + 8, y0 + ph + 4, esc(unit)))
         svg.append('<line class="axis" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (LEFT, y0 + ph, W - RIGHT, y0 + ph))
         for slot, pts in series:
-            cls = "cu" if slot is None else "c%d" % slot
+            cls = ("cu sched" if series[0][0] is not None else "cu") if slot is None else "c%d" % slot
             if slot is None:  # a schedule: steps, not a trend
                 d = []
                 for i, (t, v) in enumerate(pts):
@@ -402,11 +403,15 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">seconds since the load started</text>'
                % (LEFT + plot_w / 2, axis_y + 36))
 
-    ly0 = tops[1 if users or offered else 0]  # legend beside the first panel with one line per run
+    ly0 = tops[1 if users else 0]  # legend beside the first panel with one line per run
     for i, (label, slot, _, _, _) in enumerate(lines):
         lx, ly = W - RIGHT + 16, ly0 + 10 + i * 18
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(label)))
+    if offered:
+        lx, ly = W - RIGHT + 16, ly0 + 10 + len(lines) * 18
+        svg.append('<line class="line cu sched" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
+        svg.append('<text class="legend" x="%d" y="%d">offered</text>' % (lx + 22, ly))
 
     # Reconfigurations: one strip per label, on the same time axis, every run's spans in it.
     svg.append('<text class="sub" x="%d" y="%d">reconfigurations (target data nodes)</text>'
@@ -415,16 +420,22 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         ry = strip_top + i * STRIP_ROW
         svg.append('<line class="grid" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (LEFT, ry + 6, W - RIGHT, ry + 6))
         for j in range(len(runs_rcs[0]) if runs_rcs else 0):
-            end = 0.0
+            end, last = 0.0, 0.0
             for rcs in runs_rcs:
                 t0, dur, name, _ = rcs[j]
-                x0, x1 = x(t0), max(x(t0 + dur), x(t0) + 3)
-                end = max(end, x1)
+                # A reconfiguration can outlast the load (copy-then-flip under overload): the bar
+                # stops at the axis' end and the label says when it ended.
+                x0, x1 = x(t0), min(max(x(t0 + dur), x(t0) + 3), x(span))
+                end, last = max(end, x1), max(last, t0 + dur)
                 svg.append('<rect class="span f%d" x="%.1f" y="%d" width="%.1f" height="8" rx="2">'
                            '<title>%s: %s, %.2f s from %.2f s</title></rect>'
                            % (slot, x0, ry + 2, x1 - x0, esc(label), esc(name), dur, t0))
-            svg.append('<text class="tick" x="%.1f" y="%d">%s</text>'
-                       % (end + 3, ry + 10, esc(runs_rcs[0][j][2].replace("rescale to ", "→"))))
+            name = esc(runs_rcs[0][j][2].replace("rescale to ", "→"))
+            if last > span:
+                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s, ended at %.0f s ▸</text>'
+                           % (end, ry, name, last))
+            else:
+                svg.append('<text class="tick" x="%.1f" y="%d">%s</text>' % (end + 3, ry + 10, name))
         lx = W - RIGHT + 16
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ry + 6, lx + 16, ry + 6))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ry + 10, esc(label)))

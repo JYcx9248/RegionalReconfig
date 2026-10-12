@@ -105,10 +105,17 @@ func (c *Controller) install(ctx context.Context, next *epoch.Table, recipients 
 	return err
 }
 
-// Rescale changes the number of data nodes to target (Koala's Rescale API: one
-// reconfiguration at a time). The reconfiguration runs to completion even if the caller
-// disconnects: a protocol stopped half-way is worse than a late reply.
-func (c *Controller) Rescale(ctx context.Context, target int) (*protocol.RescaleReply, error) {
+// Rescale changes the number of data nodes, placed by the controller's policy.
+func (c *Controller) Rescale(ctx context.Context, dataNodes int) (*protocol.RescaleReply, error) {
+	return c.Reconfigure(ctx, protocol.RescaleReq{DataNodes: dataNodes})
+}
+
+// Reconfigure runs the reconfiguration req asks for -- to req.DataNodes nodes placed by the
+// policy, or to the placement req.Plan names -- or with req.DryRun only works it out (Koala's
+// Rescale API: one reconfiguration at a time). A dry run waits its turn too: a policy reads the
+// history that a running reconfiguration writes. A reconfiguration runs to completion even if
+// the caller disconnects: a protocol stopped half-way is worse than a late reply.
+func (c *Controller) Reconfigure(ctx context.Context, req protocol.RescaleReq) (*protocol.RescaleReply, error) {
 	ctx = context.WithoutCancel(ctx)
 	if c.Ready.IsBlocked() {
 		return nil, fmt.Errorf("controller: initial deployment has not finished (%s)", c.LastError())
@@ -117,42 +124,84 @@ func (c *Controller) Rescale(ctx context.Context, target int) (*protocol.Rescale
 		return nil, fmt.Errorf("controller: another reconfiguration is in progress, retry later")
 	}
 	defer c.reconfigRunning.Store(false)
-	reply, err := c.rescale(ctx, target)
-	c.setErr(err)
+	reply, err := c.reconfigure(ctx, req)
+	if !req.DryRun {
+		c.setErr(err)
+	}
 	return reply, err
 }
 
-func (c *Controller) rescale(ctx context.Context, target int) (*protocol.RescaleReply, error) {
+// target is where a reconfiguration goes: the next placement, the moves that lead there from
+// the current one, and the nodes that join and leave.
+type target struct {
+	next           placement.Table
+	changes        placement.Changes
+	added, removed []*ManagedNode
+}
+
+func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq) (*protocol.RescaleReply, error) {
+	if (req.Plan == nil) == (req.DataNodes == 0) {
+		return nil, fmt.Errorf("controller: a reconfiguration takes a number of data nodes or a plan (one of them)")
+	}
 	cur, err := c.store.Current()
 	if err != nil {
 		return nil, err
 	}
+	var t target
+	if req.Plan != nil {
+		t, err = c.planTarget(cur, req.Plan)
+	} else {
+		t, err = c.policyTarget(cur, req.DataNodes)
+	}
+	if err != nil {
+		return nil, err
+	}
+	plan, warnings := protocol.PlanOf(t.next, cur.Epoch), c.planWarnings(t)
+	if req.DryRun || len(t.changes) == 0 {
+		return &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
+			Added: ids(t.added), Removed: ids(t.removed), Moved: t.changes.Moved(), Plan: plan,
+			DryRun: req.DryRun, Warnings: warnings}, nil
+	}
+	for _, w := range warnings {
+		log.Printf("controller: warning: %s", w)
+	}
+	reply, err := c.run(ctx, cur, t)
+	if reply != nil {
+		reply.Plan, reply.Warnings = plan, warnings
+	}
+	return reply, err
+}
+
+// policyTarget has the policy place the partitions on n data nodes. Which nodes join or leave
+// is part of U3; for now idle nodes join in ID order and the highest IDs leave (a plan names
+// them instead).
+func (c *Controller) policyTarget(cur *epoch.Table, n int) (target, error) {
 	curIDs := cur.Placement.Nodes()
 	sort.Slice(curIDs, func(i, j int) bool { return curIDs[i] < curIDs[j] })
-	// Which nodes join or leave is part of U3; for now idle nodes join in ID order and the
-	// highest IDs leave.
-	var added, removed []*ManagedNode
+	var t target
+	var err error
 	switch {
-	case target > len(curIDs):
+	case n > len(curIDs):
 		idle := c.nodes.Idle(cur)
-		if len(idle) < target-len(curIDs) {
-			return nil, fmt.Errorf("controller: scale-out to %d needs %d idle nodes, %d registered",
-				target, target-len(curIDs), len(idle))
+		if len(idle) < n-len(curIDs) {
+			return target{}, fmt.Errorf("controller: scale-out to %d needs %d idle nodes, %d registered",
+				n, n-len(curIDs), len(idle))
 		}
-		added = idle[:target-len(curIDs)]
-	case target < len(curIDs):
-		if target < 1 {
-			return nil, fmt.Errorf("controller: need at least one data node")
+		t.added = idle[:n-len(curIDs)]
+	case n < len(curIDs):
+		if n < 1 {
+			return target{}, fmt.Errorf("controller: need at least one data node")
 		}
-		if removed, err = c.managed(curIDs[target:]); err != nil {
-			return nil, err
+		if t.removed, err = c.managed(curIDs[n:]); err != nil {
+			return target{}, err
 		}
 	default:
-		// Same node count: nothing to do with the even policy (rebalancing is U3).
-		return &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch}, nil
+		// Same node count: nothing to do with the even policies. Rebalancing takes a plan; how
+		// to compute one is U3.
+		return target{next: cur.Placement.Clone()}, nil
 	}
-	nextIDs := append([]placement.NodeID(nil), curIDs[:min(target, len(curIDs))]...)
-	nextIDs = append(nextIDs, ids(added)...)
+	nextIDs := append([]placement.NodeID(nil), curIDs[:min(n, len(curIDs))]...)
+	nextIDs = append(nextIDs, ids(t.added)...)
 	// Who has owned what, for a policy that sends partitions back where their PQ codes are.
 	// Only a reconfiguration writes the history, and they do not overlap.
 	c.mu.Lock()
@@ -161,19 +210,105 @@ func (c *Controller) rescale(ctx context.Context, target int) (*protocol.Rescale
 		past = c.history
 	}
 	c.mu.Unlock()
-	next, changes, err := c.policy.Repartition(cur.Placement, nextIDs, past)
-	if err != nil {
-		return nil, err
+	if t.next, t.changes, err = c.policy.Repartition(cur.Placement, nextIDs, past); err != nil {
+		return target{}, err
 	}
+	return t, nil
+}
+
+// planTarget resolves a plan against the current epoch. The nodes it names are the next data
+// nodes: one that is not a data node now must be registered, connected and idle, and the
+// current data nodes it leaves out leave.
+func (c *Controller) planTarget(cur *epoch.Table, p *protocol.Plan) (target, error) {
+	if p.FromEpoch != 0 && p.FromEpoch != cur.Epoch {
+		return target{}, fmt.Errorf("controller: the plan is for epoch %d, the current epoch is %d", p.FromEpoch, cur.Epoch)
+	}
+	owned := map[placement.NodeID][]int{}
+	for key, ps := range p.Owners {
+		n, err := c.nodes.Resolve(key)
+		if err != nil {
+			return target{}, err
+		}
+		if _, dup := owned[n.ID]; dup {
+			return target{}, fmt.Errorf("controller: the plan names node %d twice (by ID and by name)", n.ID)
+		}
+		owned[n.ID] = ps
+	}
+	next, err := placement.FromOwners(cur.Placement.NumPartitions(), owned)
+	if err != nil {
+		return target{}, err
+	}
+	t := target{next: next, changes: placement.Diff(cur.Placement, next)}
+	data := map[placement.NodeID]bool{}
+	for _, id := range cur.Placement.Nodes() {
+		data[id] = true
+	}
+	for _, id := range sortedKeys(owned) {
+		if data[id] {
+			continue
+		}
+		n, _ := c.nodes.Get(id)
+		if _, member := cur.Nodes[id]; member || !n.Alive() {
+			return target{}, fmt.Errorf("controller: the plan gives partitions to node %d (%s), which is not "+
+				"a connected idle node", id, n.Name)
+		}
+		t.added = append(t.added, n)
+	}
+	var gone []placement.NodeID
+	for _, id := range sortedKeys(data) {
+		if _, kept := owned[id]; !kept {
+			gone = append(gone, id)
+		}
+	}
+	if t.removed, err = c.managed(gone); err != nil {
+		return target{}, err
+	}
+	return t, nil
+}
+
+// planWarnings names what a placement gives up of the invariants the lazy protocol relies on
+// (copyThenFlip, step 6). With "lazy" a node that leaves stays the raw-vector source of the
+// partitions it hands to nodes that have never owned them -- their raw vectors move only as
+// queries need them -- so it has to keep running. The reversible policies never do that (a
+// scale-in returns partitions to nodes that have held them); a plan may.
+func (c *Controller) planWarnings(t target) []string {
+	if c.cfg.Protocol != "lazy" || len(t.removed) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	h := c.history
+	c.mu.Unlock()
+	var out []string
+	for _, r := range t.removed {
+		var ps []int
+		for dst, l := range t.changes[r.ID] {
+			for _, p := range l {
+				if h == nil || !h.HasOwned(p, dst) {
+					ps = append(ps, p)
+				}
+			}
+		}
+		if len(ps) > 0 {
+			sort.Ints(ps)
+			out = append(out, fmt.Sprintf("node %d (%s) leaves but stays the raw-vector source of partitions %v: "+
+				"their new owners have never held them, and with lazy their raw vectors move only as queries "+
+				"need them -- keep node %d running", r.ID, r.Name, ps, r.ID))
+		}
+	}
+	return out
+}
+
+// run carries out a reconfiguration to t with the configured protocol.
+func (c *Controller) run(ctx context.Context, cur *epoch.Table, t target) (*protocol.RescaleReply, error) {
 	switch c.cfg.Protocol {
 	case "lazy":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, rawOnDemand)
+		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemand)
 	case "lazy-stream":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, rawStreamAfterFlip)
+		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, false, rawStreamAfterFlip)
 	case "copy-then-flip":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, false, rawBeforeFlip)
+		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, false, rawBeforeFlip)
 	case "stop-and-copy":
-		return c.copyThenFlip(ctx, cur, next, changes, added, removed, true, rawBeforeFlip)
+		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, true, rawBeforeFlip)
 	}
 	return nil, fmt.Errorf("controller: unknown protocol %q", c.cfg.Protocol)
 }
@@ -214,7 +349,8 @@ const (
 //     and with rawOnDemand nothing else: what no query needs never moves, and the rescale
 //     does not wait for any of it. That the old owners stay sources rests on invariants of
 //     the design (U9): no node drops a raw vector it has held, the nodes that leave are the
-//     ones that joined last, and a scale-in returns partitions to nodes that held them. With
+//     ones that joined last, and a scale-in returns partitions to nodes that held them. A plan
+//     may break the last two; planWarnings names the nodes that then have to keep running. With
 //     rawStreamAfterFlip, alongside 3-5, the destinations also stream in the rest from the old
 //     owners (raw_priority, background by default); the old owners -- removed nodes included
 //     -- stay up as sources until it ends, and the rescale waits for it.
@@ -262,8 +398,9 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	if len(draft.Entries) == 0 {
 		return reply, fmt.Errorf("controller: the next epoch would have no entry node")
 	}
-	// Who serves the graph to whom is decided now, at the trigger, not when the copy starts.
-	graphSrcs, graphFrom := c.graphSources(cur, entryAdds)
+	// Who serves the graph to whom is decided now, at the trigger, not when the copy starts --
+	// among the entries that stay: a plan may remove nodes while others join.
+	graphSrcs, graphFrom := c.graphSources(draft, entryAdds)
 	if len(graphFrom) > 0 {
 		reply.GraphSources = graphFrom
 		log.Printf("controller: graph sources (new entry <- existing entry): %v", graphFrom)
@@ -645,13 +782,14 @@ func (c *Controller) promoteEntries(ctx context.Context, t *epoch.Table, done <-
 }
 
 // graphSources assigns every new entry the existing entry it copies the graph from:
-// round-robin over the live entries of cur (by node ID), with a cursor that carries over to
-// the next reconfiguration, so k new nodes spread over the entries instead of all pulling from
-// one, and successive one-node scale-outs do not all land on the same entry. With no live
-// entry the nodes copy from the build output (single machine). The second result lists the
-// peer assignments, for the reply.
-func (c *Controller) graphSources(cur *epoch.Table, adds []*ManagedNode) (map[placement.NodeID]protocol.Source, map[placement.NodeID]placement.NodeID) {
-	entries := append([]placement.NodeID(nil), cur.Entries...)
+// round-robin over the live entries of t (by node ID) -- the draft of the next epoch, whose
+// entries are those that stay -- with a cursor that carries over to the next reconfiguration,
+// so k new nodes spread over the entries instead of all pulling from one, and successive
+// one-node scale-outs do not all land on the same entry. With no live entry the nodes copy
+// from the build output (single machine). The second result lists the peer assignments, for
+// the reply.
+func (c *Controller) graphSources(t *epoch.Table, adds []*ManagedNode) (map[placement.NodeID]protocol.Source, map[placement.NodeID]placement.NodeID) {
+	entries := append([]placement.NodeID(nil), t.Entries...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i] < entries[j] })
 	var live []*ManagedNode
 	for _, id := range entries {

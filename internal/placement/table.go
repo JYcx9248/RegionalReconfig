@@ -104,6 +104,48 @@ func FromRanges(n int, rs []Range) (Table, error) {
 	return Table{Owners: owners}, nil
 }
 
+// FromOwners builds a table of n partitions from the partitions each node owns, the form a
+// reconfiguration plan names a placement in. Every partition must be named exactly once, and
+// every node listed must own one at least: a node meant to own none is left out.
+func FromOwners(n int, owned map[NodeID][]int) (Table, error) {
+	nodes := make([]NodeID, 0, len(owned))
+	for id := range owned {
+		nodes = append(nodes, id)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] }) // deterministic errors
+	owners := make([]NodeID, n)
+	set := make([]bool, n)
+	for _, id := range nodes {
+		if len(owned[id]) == 0 {
+			return Table{}, fmt.Errorf("placement: node %d owns no partition (leave it out instead)", id)
+		}
+		for _, p := range owned[id] {
+			if p < 0 || p >= n {
+				return Table{}, fmt.Errorf("placement: node %d: no partition %d (there are %d)", id, p, n)
+			}
+			if set[p] {
+				return Table{}, fmt.Errorf("placement: partition %d is given to both node %d and node %d", p, owners[p], id)
+			}
+			owners[p], set[p] = id, true
+		}
+	}
+	for p, ok := range set {
+		if !ok {
+			return Table{}, fmt.Errorf("placement: partition %d has no owner", p)
+		}
+	}
+	return Table{Owners: owners}, nil
+}
+
+// ByNode lists the partitions of each owner, ascending: the inverse of FromOwners.
+func (t Table) ByNode() map[NodeID][]int {
+	out := map[NodeID][]int{}
+	for p, o := range t.Owners {
+		out[o] = append(out[o], p)
+	}
+	return out
+}
+
 // Changes records partition moves: Changes[src][dst] = partitions moving from src to dst
 // (Koala's bucketOwnerChanges).
 type Changes map[NodeID]map[NodeID][]int

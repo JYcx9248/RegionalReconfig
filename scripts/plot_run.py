@@ -144,6 +144,8 @@ def reconfigurations(path):
             continue
         reply = e.get("reply", {})
         label = "rescale to %s" % e.get("data_nodes", "?")
+        if e.get("plan"):  # a placement of its own, possibly at the same size
+            label += " (plan)"
         out.append((float(e["trigger_seconds"]), float(e.get("elapsed_seconds", 0)), label, reply))
     return out
 

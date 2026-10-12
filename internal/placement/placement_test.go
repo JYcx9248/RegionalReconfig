@@ -146,6 +146,32 @@ func TestRangesPlanHistory(t *testing.T) {
 	}
 }
 
+// TestFromOwners: a plan's "node -> partitions" form round-trips through the table, and a
+// plan that leaves a partition without an owner, gives one to two nodes, names a partition
+// that does not exist or lists a node with nothing is refused.
+func TestFromOwners(t *testing.T) {
+	tb := Table{Owners: []NodeID{1, 1, 2, 2, 2, 1, 3}}
+	byNode := tb.ByNode()
+	if want := map[NodeID][]int{1: {0, 1, 5}, 2: {2, 3, 4}, 3: {6}}; !reflect.DeepEqual(byNode, want) {
+		t.Fatalf("ByNode %v, want %v", byNode, want)
+	}
+	back, err := FromOwners(7, byNode)
+	if err != nil || !reflect.DeepEqual(back, tb) {
+		t.Fatalf("round trip: %v %v", back, err)
+	}
+	for name, owned := range map[string]map[NodeID][]int{
+		"missing":   {1: {0, 1, 5}, 2: {2, 3, 4}},
+		"twice":     {1: {0, 1, 5, 6}, 2: {2, 3, 4}, 3: {6}},
+		"too large": {1: {0, 1, 5}, 2: {2, 3, 4}, 3: {6, 7}},
+		"negative":  {1: {0, 1, 5, -1}, 2: {2, 3, 4}, 3: {6}},
+		"empty":     {1: {0, 1, 5}, 2: {2, 3, 4}, 3: {6}, 4: nil},
+	} {
+		if _, err := FromOwners(7, owned); err == nil {
+			t.Errorf("%s: plan %v accepted", name, owned)
+		}
+	}
+}
+
 func TestWeightedIsPlaceholder(t *testing.T) {
 	p, err := NewPolicy("weighted")
 	if err != nil {

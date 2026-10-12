@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,6 +26,9 @@ type ManagedNode struct {
 
 // Alive reports whether the control connection is up.
 func (n *ManagedNode) Alive() bool {
+	if n.Conn == nil {
+		return false
+	}
 	select {
 	case <-n.Conn.Done():
 		return false
@@ -91,6 +96,38 @@ func (m *NodeManager) Get(id placement.NodeID) (*ManagedNode, bool) {
 	defer m.mu.Unlock()
 	n, ok := m.nodes[id]
 	return n, ok
+}
+
+// Resolve finds the node a plan names: by ID if key is a number, else by name. A name that
+// several registered nodes share (an agent that registered again) resolves to the one that is
+// connected, if exactly one is.
+func (m *NodeManager) Resolve(key string) (*ManagedNode, error) {
+	if id, err := strconv.ParseUint(key, 10, 64); err == nil {
+		if id <= math.MaxUint16 {
+			if n, ok := m.Get(placement.NodeID(id)); ok {
+				return n, nil
+			}
+		}
+		return nil, fmt.Errorf("controller: no node with ID %d", id)
+	}
+	var named, alive []*ManagedNode
+	for _, n := range m.All() {
+		if n.Name == key {
+			named = append(named, n)
+			if n.Alive() {
+				alive = append(alive, n)
+			}
+		}
+	}
+	switch {
+	case len(named) == 1:
+		return named[0], nil
+	case len(alive) == 1:
+		return alive[0], nil
+	case len(named) == 0:
+		return nil, fmt.Errorf("controller: no node named %q", key)
+	}
+	return nil, fmt.Errorf("controller: %d registered nodes are named %q: name it by ID", len(named), key)
 }
 
 // All returns every registered node, by ID.

@@ -157,7 +157,7 @@ func (c *Controller) setupAPIConn(conn *ctrl.Conn) {
 		if err != nil {
 			return nil, err
 		}
-		return c.Rescale(ctx, req.DataNodes)
+		return c.Reconfigure(ctx, req)
 	})
 	conn.Handle(protocol.StatusA, func(ctx context.Context, _ json.RawMessage) (any, error) {
 		return c.Status(), nil

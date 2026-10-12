@@ -19,6 +19,8 @@
 package protocol
 
 import (
+	"strconv"
+
 	"rtier/internal/epoch"
 	"rtier/internal/placement"
 )
@@ -147,9 +149,37 @@ type NodeStatus struct {
 	RawFetchedBytes uint64 `json:"raw_fetched_bytes"`
 }
 
-// RescaleReq changes the number of data nodes.
+// RescaleReq asks for a reconfiguration in one of two forms: DataNodes, a number of data
+// nodes for the controller's placement policy to spread the partitions over, or Plan, the
+// placement itself. With DryRun the controller works out the placement and what would move
+// (the reply's Plan, Added, Removed, Moved) and changes nothing.
 type RescaleReq struct {
-	DataNodes int `json:"data_nodes"`
+	DataNodes int   `json:"data_nodes,omitempty"`
+	Plan      *Plan `json:"plan,omitempty"`
+	DryRun    bool  `json:"dry_run,omitempty"`
+}
+
+// Plan is a reconfiguration plan: the placement a reconfiguration ends in, as the partitions
+// each data node owns afterwards, keyed by node ID or by node name (a key that is a number is
+// an ID). The nodes it names are the data nodes of the next epoch -- a current one it leaves
+// out leaves, a registered idle node it names joins -- so one plan covers a scale-out, a
+// scale-in and a rebalance at the same size. The rest follows from the current epoch as in any
+// reconfiguration: which partitions move and from where (placement.Diff), the roles, and where
+// raw vectors and the graph come from. FromEpoch, if set, is the epoch the plan was made for;
+// the controller refuses the plan under any other, because the moves it implies depend on the
+// placement it starts from.
+type Plan struct {
+	FromEpoch uint64           `json:"from_epoch,omitempty"`
+	Owners    map[string][]int `json:"owners"`
+}
+
+// PlanOf is placement t as a plan made for epoch from, keyed by node ID.
+func PlanOf(t placement.Table, from uint64) *Plan {
+	p := &Plan{FromEpoch: from, Owners: map[string][]int{}}
+	for id, ps := range t.ByNode() {
+		p.Owners[strconv.Itoa(int(id))] = ps
+	}
+	return p
 }
 
 // RescaleReply summarizes a reconfiguration.
@@ -187,6 +217,13 @@ type RescaleReply struct {
 	// EntryFailed: new nodes whose graph did not load (why). They are data nodes and
 	// aggregators of the new epoch, but not entries.
 	EntryFailed map[placement.NodeID]string `json:"entry_failed,omitempty"`
+	// Plan: the placement the reconfiguration went to (with DryRun: would go to), as a plan
+	// for FromEpoch that a RescaleReq can pass back, edited or not.
+	Plan   *Plan `json:"plan,omitempty"`
+	DryRun bool  `json:"dry_run,omitempty"`
+	// Warnings: what this placement gives up of the invariants the protocol relies on
+	// (controller.planWarnings). The reconfiguration runs regardless.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // EntryFlip is one flip of a scale-out that made new nodes entries once their graph loaded.

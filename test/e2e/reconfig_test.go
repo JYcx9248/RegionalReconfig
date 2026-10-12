@@ -255,19 +255,29 @@ func rawStats(t *testing.T, cl *cluster) map[placement.NodeID]nodeclient.RawStat
 	return out
 }
 
-// rescale runs a reconfiguration and checks that exactly the missing PQ codes were pulled, and
-// exactly the missing raw vectors moved -- streamed, or fetched on demand by queries (lazy
-// protocol only).
+// rescale runs a reconfiguration to dataNodes data nodes placed by the policy (see reconfigure).
 func rescale(t *testing.T, cl *cluster, dataNodes int) *protocol.RescaleReply {
 	t.Helper()
+	return reconfigure(t, cl, protocol.RescaleReq{DataNodes: dataNodes})
+}
+
+// reconfigure runs a reconfiguration and checks that exactly the missing PQ codes were pulled,
+// and exactly the missing raw vectors moved -- streamed, or fetched on demand by queries (lazy
+// protocol only).
+func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.RescaleReply {
+	t.Helper()
+	what, dataNodes := fmt.Sprintf("rescale to %d", req.DataNodes), req.DataNodes
+	if req.Plan != nil {
+		what, dataNodes = fmt.Sprintf("plan %v", req.Plan.Owners), len(req.Plan.Owners)
+	}
 	cl.observe()
 	before := cl.ctl.Status().Table.Placement
 	rawBefore := rawStats(t, cl)
 	t0 := time.Now()
-	out, err := cl.ctl.Rescale(cl.ctx, dataNodes)
+	out, err := cl.ctl.Reconfigure(cl.ctx, req)
 	cl.rescales = append(cl.rescales, rescaleSpan{dataNodes: dataNodes, start: t0, end: time.Now(), reply: out})
 	if err != nil {
-		t.Fatalf("rescale to %d data nodes: %v", dataNodes, err)
+		t.Fatalf("%s: %v", what, err)
 	}
 	want, naive := pqExpected(cl.f, cl.held, before, cl.ctl.Status().Table.Placement)
 	cl.observe()
@@ -281,29 +291,29 @@ func rescale(t *testing.T, cl *cluster, dataNodes int) *protocol.RescaleReply {
 	// The reply counts the fetches until its last look at the nodes; with lazy, queries go on
 	// fetching after that.
 	if uint64(out.RawFetched) > fetched || uint64(out.RawFetchedBytes) != uint64(out.RawFetched)*vecBytes {
-		t.Errorf("rescale to %d: reply counts %d raw vectors fetched on demand (%d bytes), the nodes %d",
-			dataNodes, out.RawFetched, out.RawFetchedBytes, fetched)
+		t.Errorf("%s: reply counts %d raw vectors fetched on demand (%d bytes), the nodes %d",
+			what, out.RawFetched, out.RawFetchedBytes, fetched)
 	}
 	span := &cl.rescales[len(cl.rescales)-1]
 	span.fetched, span.fetches, span.fetchedBytes = fetched, fetches, fetched*vecBytes
-	t.Logf("rescale to %d: epoch %d -> %d, moved %v, %d bytes, %d PQ codes (per-partition copies: %d), "+
+	t.Logf("%s: epoch %d -> %d, moved %v, %d bytes, %d PQ codes (per-partition copies: %d), "+
 		"raw vectors %d streamed + %d fetched on demand in %d round trips, phases %v, raw stream %.3f s after the flip",
-		dataNodes, out.FromEpoch, out.ToEpoch, out.Moved, out.Bytes, out.PQCodes, naive, streamed, fetched, fetches,
+		what, out.FromEpoch, out.ToEpoch, out.Moved, out.Bytes, out.PQCodes, naive, streamed, fetched, fetches,
 		out.Phases, out.RawSeconds)
 	if out.PQCodes != want {
-		t.Errorf("rescale to %d pulled %d PQ codes, want %d (the vectors new to each destination)", dataNodes, out.PQCodes, want)
+		t.Errorf("%s pulled %d PQ codes, want %d (the vectors new to each destination)", what, out.PQCodes, want)
 	}
 	// A vector new to a destination needs its code and its raw vector: the same count -- except
 	// with lazy, which moves only the raw vectors queries need. The stream may bring one that a
 	// query fetched while its batch was in flight (installed once).
 	if !rawComplete(out.Protocol) {
 		if streamed != 0 || out.RawVectors != 0 || fetched > uint64(want) {
-			t.Errorf("rescale to %d (lazy) streamed %d raw vectors (reply %d) and fetched %d: want none "+
-				"streamed and at most the %d new to the destinations fetched", dataNodes, streamed, out.RawVectors, fetched, want)
+			t.Errorf("%s (lazy) streamed %d raw vectors (reply %d) and fetched %d: want none "+
+				"streamed and at most the %d new to the destinations fetched", what, streamed, out.RawVectors, fetched, want)
 		}
 	} else if streamed+fetched != uint64(want) || uint64(out.RawVectors) < streamed {
-		t.Errorf("rescale to %d installed %d raw vectors (%d streamed, reply received %d; %d fetched), want %d",
-			dataNodes, streamed+fetched, streamed, out.RawVectors, fetched, want)
+		t.Errorf("%s installed %d raw vectors (%d streamed, reply received %d; %d fetched), want %d",
+			what, streamed+fetched, streamed, out.RawVectors, fetched, want)
 	}
 	if out.Protocol != "lazy" && out.Protocol != "lazy-stream" && (fetched != 0 || uint64(out.RawVectors) != streamed) {
 		t.Errorf("protocol %s: %d raw vectors fetched on demand, %d of %d streamed installed: want every one "+
@@ -318,7 +328,7 @@ func rescale(t *testing.T, cl *cluster, dataNodes int) *protocol.RescaleReply {
 			t.Fatal(err)
 		}
 		if n := uint64(len(cl.f.idsOf(tbl.Placement.PartitionsOf(id)))); info.PQ.Live != n {
-			t.Errorf("after rescale to %d: node %d has %d live PQ codes, its partitions name %d", dataNodes, id, info.PQ.Live, n)
+			t.Errorf("after %s: node %d has %d live PQ codes, its partitions name %d", what, id, info.PQ.Live, n)
 		}
 	}
 	return out

@@ -54,6 +54,15 @@ through both agents, the only path the transfer rate paces. "RawPath": "agent" w
 "RawStreams": 1 and "RawBatchBytes": 65536 is the stream as it was before 2026-10-09: one 64 KB
 request in flight per source, ~80 MB/s per source on the lab server (internal/agent/control.go).
 
+"Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}] rescales to 4 data nodes at
+90 s, placed by the controller's "Placement" policy. {"TriggerTimeSeconds": 90, "Plan": P} goes
+to the placement plan P names instead -- a scale-out, a scale-in or a rebalance at the same size:
+{"owners": {"n1": [0, 1, 2], "n3": [3, 4], ...}} gives each data node of the next epoch its
+partitions, nodes by name (n1, n2, ... as this script starts them) or ID; "from_epoch" is
+optional (protocol.Plan). P is the plan itself or the path of a JSON file with one, relative to
+the experiment file. `bin/rtier-client rescale -dry-run -save-plan plan.json N` writes the plan
+the policy would carry out, to start from.
+
     python3 scripts/run_local.py configs/experiment.example.json results/run1
 
 Open design questions this script depends on (see `bin/rtier-client design`):
@@ -142,6 +151,33 @@ def check_load(cfg: dict) -> None:
     except (TypeError, ValueError):
         sys.exit(f'"Load": "Rate" is {load.get("Rate")!r} and "RateSteps" {load.get("RateSteps")!r}: '
                  'set them to numbers ("RateSteps": "seconds:rate,...")')
+
+
+def reconfig_requests(cfg: dict, cfg_path: str) -> list:
+    """The "Reconfigurations" as Rescale requests, in trigger order. Plan files are read now, so a
+    missing or malformed one stops the run before the deployment."""
+    out = []
+    for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
+        if ("Plan" in rc) == ("DataNodes" in rc):
+            sys.exit(f'"Reconfigurations": {rc}: give "DataNodes" or "Plan", one of them')
+        if "DataNodes" in rc:
+            out.append({"at": rc["TriggerTimeSeconds"], "request": {"data_nodes": rc["DataNodes"]},
+                        "data_nodes": rc["DataNodes"], "what": f"rescale to {rc['DataNodes']} data nodes"})
+            continue
+        plan, name = rc["Plan"], "inline"
+        if isinstance(plan, str):
+            name = plan
+            path = plan if os.path.isabs(plan) else os.path.join(os.path.dirname(os.path.abspath(cfg_path)), plan)
+            try:
+                with open(path) as f:
+                    plan = json.load(f)
+            except (OSError, ValueError) as e:
+                sys.exit(f'"Reconfigurations": plan {path}: {e}')
+        if not isinstance(plan, dict) or not plan.get("owners"):
+            sys.exit(f'"Reconfigurations": plan {name}: want {{"owners": {{"NODE": [partitions], ...}}}}')
+        out.append({"at": rc["TriggerTimeSeconds"], "request": {"plan": plan}, "data_nodes": len(plan["owners"]),
+                    "plan": name, "what": f"reconfigure to plan {name} ({len(plan['owners'])} data nodes)"})
+    return out
 
 
 class Procs:
@@ -501,6 +537,7 @@ def check_fresh(gbin: str) -> None:
 def main(cfg_path: str, out_dir: str) -> None:
     cfg = json.load(open(cfg_path))
     check_load(cfg)
+    reconfigs = reconfig_requests(cfg, cfg_path)
     work = os.path.abspath(cfg.get("WorkDir", "/tmp/rtier-run"))
     ebin = os.path.join(ROOT, cfg.get("EngineBin", "engine/build"))
     gbin = os.path.join(ROOT, cfg.get("GoBin", "bin"))
@@ -679,14 +716,15 @@ def main(cfg_path: str, out_dir: str) -> None:
         # seconds), and the load generator's times are monotonic too.
         t0 = time.monotonic()
         json.dump({"load_start": round(t0, 3)}, open(os.path.join(out_dir, "clock.json"), "w"))
-        for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
-            while time.monotonic() - t0 < rc["TriggerTimeSeconds"]:
+        for rc in reconfigs:
+            while time.monotonic() - t0 < rc["at"]:
                 procs.check()
                 time.sleep(0.2)
-            log(f"rescale to {rc['DataNodes']} data nodes")
+            log(rc["what"])
             started = time.monotonic()
-            reply = api.call("Rescale", {"data_nodes": rc["DataNodes"]})
-            results.append({"data_nodes": rc["DataNodes"], "trigger_seconds": round(started - t0, 3),
+            reply = api.call("Rescale", rc["request"])
+            results.append({"data_nodes": rc["data_nodes"], **({"plan": rc["plan"]} if "plan" in rc else {}),
+                            "trigger_seconds": round(started - t0, 3),
                             "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
             log(json.dumps(results[-1]))
         json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
