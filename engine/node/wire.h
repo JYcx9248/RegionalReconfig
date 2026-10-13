@@ -23,14 +23,16 @@
 //                   flags bit 0 (kInfoSettle): wait until the raw vectors fetched before the
 //                   request are on the SSD (tests); without it INFO waits for nothing
 //   LOAD_GRAPH      path                                      -> -
-//   LOAD_PARTITION  u32 partition, u8 pq_source, str raw_peer, -> -
-//                   path
+//   LOAD_PARTITION  u32 partition, u32 version, u8 pq_source, -> -
+//                   str raw_peer, path
+//                   loads (or replaces) that version of the partition; its other versions stay
 //                   pq_source 0: every PQ code must already be on the node (PQ_PUT); raw
 //                                vectors not here are fetched from raw_peer (a data node,
 //                                "host:port", the source of the partition's lists) when a
 //                                query needs them
 //                             1: bootstrap: copy the missing codes and raw vectors from the index
-//   EVICT_PARTITION u32 partition                             -> u8 was_resident
+//   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
+//                                                                version is evicted)
 //   PQ_MISSING      u32 groups, per group: u32 paths,         -> u32 groups, per group:
 //                   str path[paths] (segment files)              u32 n, u32 ids[n]
 //                   (the codes already here are protected for the staging)
@@ -52,12 +54,15 @@
 //                   (the node fetches what it lacks from the lists' sources with RAW_GET and
 //                   installs it: a stream that does not pass through the agents)
 //   NAVIGATE        u32 nprobe, u32 ef, query                 -> u32 n, u32 lists[n]
-//   FILTER          u32 topn, u32 nlists, u32 lists[], query  -> u32 n, u32 ids[n], f32 dists[n],
-//                                                                u32 gathered, u32 unique
+//   FILTER          u32 topn, u32 nlists, u32 lists[nlists],  -> u32 n, u32 ids[n], f32 dists[n],
+//                   u32 versions[nlists], query                  u32 gathered, u32 unique
+//                   (versions[i]: the version of lists[i]'s partition in the query's epoch;
+//                   NOT_RESIDENT if that version is not here)
 //   RERANK          u32 k, u32 n, u32 ids[n], u32 nlists,     -> u32 n, u32 ids[n], f32 dists[n],
-//                   u32 lists[nlists], query                     u32 pages_read, u32 fetched
-//                   (lists: the query's lists on this node; a missing raw vector is fetched
-//                   from the source of one of them that names it)
+//                   u32 lists[nlists], u32 versions[nlists],     u32 pages_read, u32 fetched
+//                   query
+//                   (lists: the query's lists on this node, at their versions; a missing raw
+//                   vector is fetched from the source of one of them that names it)
 //   SEARCH_LOCAL    u32 k, u32 nprobe, u32 rerank, u32 ef,    -> u32 n, u32 ids[n], f32 dists[n]
 //                   u8 heuristic, u8[3] pad, query
 #pragma once

@@ -84,24 +84,36 @@ var Open = map[string]Question{
 			"partition count follows from bytes per partition and fan-out. Measure r(P), recall and " +
 			"per-node residency together on real datasets",
 		"internal/partitioning/partitioner.go, engine/tools/rtier_segment.cpp"},
-	"U3": {"U3", "Placement objective beyond even partition counts (reversibility is decided)",
-		"Decided: a scale-in returns each partition to a node that has owned it before, so " +
-			"scaling out and back in restores the placement exactly and the cached PQ codes make " +
-			"the scale-in free (placement \"even-reversible\"; Koala's even policy is not " +
-			"reversible -- after 4 -> 8 -> 4 none of the 32 moved partitions is home again). " +
-			"Open: weight by per-tier bytes (HBM is the binding tier) and by access heat of the " +
-			"bursty, task-coherent query streams -- note that heat-driven rebalancing and exact " +
-			"reversibility pull against each other; with node-level PQ codes a node's footprint " +
-			"depends on which partitions it holds together (boundary replication), and staging " +
-			"must fit each node's budget (--pq-capacity); whether a scale-out should pair each " +
-			"new node with one donor (contiguous block, single source) or take from all donors " +
-			"round-robin (Koala's rule, more source parallelism) -- \"even-reversible-blocks\" does the " +
-			"first, for experiments: 2 -> 4 on 64 spatial partitions gives 1.67 owners per query " +
-			"against 1.97 (BIGANN-10M, nprobe 32); rebalance without changing the " +
-			"node count; which nodes leave on scale-in (now: highest IDs) and which idle nodes " +
-			"join (now: lowest IDs) -- the cache invariant in U1 needs the node that left to be " +
-			"the one that comes back, so the join rule is part of that decision",
-		"internal/placement/policy.go (EvenPolicy, ReversiblePolicy, BlockPolicy), internal/placement/weighted.go, " +
+	"U3": {"U3", "Placement objective beyond even partition counts (reversibility and the graph choice are decided)",
+		"Decided: even partition counts; a scale-out moves partitions only from existing to new " +
+			"nodes, each donor giving its excess, and a scale-in returns every partition it can to " +
+			"a node that has owned it before (a matching), so scaling out and back in restores the " +
+			"placement and the cached PQ codes make the scale-in free (Koala's even policy is not " +
+			"reversible -- after 4 -> 8 -> 4 none of the 32 moved partitions is home again). Which " +
+			"partitions a donor gives, and where one that cannot go home goes, follows the " +
+			"partition graph -- navigation-graph edges between the partitions' heads, read off the " +
+			"index, no queries -- so that the nodes cut as little of it as possible (placement " +
+			"\"even-reversible-graph\", the default; \"even-reversible\" and \"even-reversible-blocks\" " +
+			"give every donor's tail). BIGANN-10M, 64 spatial partitions, nprobe 64: 2 -> 3 gives " +
+			"1.71 owners per query against 1.83 for tails, one node at a time to 8 gives 3.31 " +
+			"against 3.81, doubling does as well as whole blocks (2 -> 4: 1.81 both; 2 -> 4 -> 8: " +
+			"2.69 against 2.76); end to end under a per-node read budget the capacity is the same, " +
+			"with 2-7% less CPU per query and 5-8% fewer PQ codes staged (neighboring partitions " +
+			"share replicated vectors). Open: the initial placement is still contiguous ranges, " +
+			"poor at sizes that are not powers of two (3 nodes: 1.82 owners, 4 nodes: 1.81); " +
+			"layouts reached by single-node steps nest -- with no data exchanged between old " +
+			"nodes each node's region only shrinks -- and drift from a fresh even split (3.31 " +
+			"against 2.76 at 8 nodes), which only bigger steps (doubling) avoid; weight by per-tier " +
+			"bytes (HBM is the binding tier; with partitions of unequal size donors send unequal " +
+			"bytes) and by access heat -- skew is left to custom plans (rtier-client rescale " +
+			"-plan), which the controller carries out whatever the policy; with node-level PQ " +
+			"codes a node's footprint depends on which partitions it holds together (boundary " +
+			"replication), and staging must fit each node's budget (--pq-capacity); rebalance " +
+			"without changing the node count; which nodes leave on scale-in (now: highest IDs) and " +
+			"which idle nodes join (now: lowest IDs) -- the cache invariant in U1 needs the node " +
+			"that left to be the one that comes back, so the join rule is part of that decision",
+		"internal/placement/graph.go (GraphPolicy), internal/partitioning/graph.go (PartitionGraph), " +
+			"internal/placement/policy.go (EvenPolicy, ReversiblePolicy, BlockPolicy), internal/placement/weighted.go, " +
 			"internal/controller/reconfig.go (rescale)"},
 	"U5": {"U5", "Global top-n under fixed-n re-ranking",
 		"two-phase is implemented (every owner filters for its own top-n, the aggregator merges " +
@@ -191,8 +203,14 @@ var Open = map[string]Question{
 	"U14": {"U14", "Dataset updates",
 		"the dataset is static for now, so cached PQ codes (and pages) never go stale; with " +
 			"inserts, deletes or re-encoding: versioned codes, invalidating cached copies, and " +
-			"maintaining posting lists and the graph. No code path yet",
-		"engine/include/fusion/pq_store.h (cached codes)"},
+			"maintaining posting lists and the graph. The design under discussion (periodic " +
+			"batches, each a content epoch) is in docs/drafts/dataset-updates-discussion.md. In " +
+			"code so far, only the groundwork: the epoch table names a version of each partition's " +
+			"lists, a data node can hold several versions of a partition and FILTER/RERANK name " +
+			"the one their epoch sees; every partition stays at version 0, and moving a partition " +
+			"at a later version is refused (Undecided) until batches stage their lists",
+		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions), " +
+			"internal/controller/reconfig.go (copyThenFlip), engine/include/fusion/pq_store.h (cached codes)"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
 		"every entry node needs the whole graph over the list heads, and a node that joins " +
 			"starts empty -- pre-staging it on spare nodes is not allowed, because a real " +

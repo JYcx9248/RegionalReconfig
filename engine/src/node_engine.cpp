@@ -34,6 +34,7 @@ constexpr uint64_t kPQFileHeader = 16;  // pq_codes.bin: u64 n, u32 m, u32 reser
 struct ResidentSegment {
   ListSegment seg;
   std::vector<uint32_t> slots;                    // parallel to seg.ids
+  uint32_t version = 0;                           // of the partition (see NodeEngine)
   mutable const ResidentSegment* next = nullptr;  // Reclaimer queue
 };
 
@@ -250,7 +251,7 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq,
-                     const std::string& raw_peer) override {
+                     const std::string& raw_peer, uint32_t version) override {
     FUSION_CHECK(p < man_.num_partitions, "partition %u out of range (%u partitions)", p,
                  man_.num_partitions);
     auto rs = std::make_unique<ResidentSegment>();
@@ -277,30 +278,38 @@ class NodeEngineImpl : public NodeEngine {
     SetListSources(rs->seg.list_ids, raw_miss.empty() ? std::string() : raw_peer);
     // The references are dropped (by the reclaimer) once the last holder -- the table below,
     // or a query that pinned the segment -- lets go of it.
+    rs->version = version;
     Reclaimer* reclaimer = reclaimer_.get();
     std::shared_ptr<const ResidentSegment> seg(
         rs.release(), [reclaimer](const ResidentSegment* r) { reclaimer->Push(r); });
     std::shared_ptr<const ResidentSegment> old;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
-      old = std::move(segs_[p]);
-      segs_[p] = std::move(seg);
+      auto& vs = segs_[p];  // ascending versions
+      auto it = std::find_if(vs.begin(), vs.end(),
+                             [&](const auto& r) { return r->version >= version; });
+      if (it != vs.end() && (*it)->version == version) {
+        old = std::move(*it);
+        *it = std::move(seg);
+      } else {
+        vs.insert(it, std::move(seg));
+      }
     }
     resident_version_.fetch_add(1);
   }
 
   bool EvictPartition(uint32_t p) override {
     FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
-    std::shared_ptr<const ResidentSegment> old;
+    std::vector<std::shared_ptr<const ResidentSegment>> old;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
       old.swap(segs_[p]);
     }
-    const bool was = old != nullptr;
+    const bool was = !old.empty();
     // Unless a request still holds the partition, its references are dropped (its codes are
     // cached) before we return. The source of its lists stays: a peer that got the partition
     // from here may still ask for its vectors.
-    old.reset();
+    old.clear();
     reclaimer_->Flush();
     resident_version_.fetch_add(1);
     return was;
@@ -310,7 +319,15 @@ class NodeEngineImpl : public NodeEngine {
     std::lock_guard<std::mutex> l(seg_mu_);
     std::vector<uint32_t> r;
     for (uint32_t p = 0; p < segs_.size(); ++p)
-      if (segs_[p]) r.push_back(p);
+      if (!segs_[p].empty()) r.push_back(p);
+    return r;
+  }
+
+  std::vector<std::pair<uint32_t, uint32_t>> ResidentVersions() const override {
+    std::lock_guard<std::mutex> l(seg_mu_);
+    std::vector<std::pair<uint32_t, uint32_t>> r;
+    for (uint32_t p = 0; p < segs_.size(); ++p)
+      for (const auto& s : segs_[p]) r.emplace_back(p, s->version);
     return r;
   }
 
@@ -514,8 +531,9 @@ class NodeEngineImpl : public NodeEngine {
     return NavigateImpl(static_cast<const T*>(query), nprobe, ef, lists);
   }
 
-  uint32_t Filter(int wi, const void* query, const uint32_t* lists, uint32_t nlists, uint32_t topn,
-                  uint32_t* ids, float* dists, FilterStats* st) override {
+  uint32_t Filter(int wi, const void* query, const uint32_t* lists, const uint32_t* versions,
+                  uint32_t nlists, uint32_t topn, uint32_t* ids, float* dists,
+                  FilterStats* st) override {
     FUSION_CHECK(topn >= 1 && topn <= opts_.max_rerank, "topn %u outside [1, %u]", topn,
                  opts_.max_rerank);
     Worker& w = *workers_.at(static_cast<size_t>(wi));
@@ -523,7 +541,8 @@ class NodeEngineImpl : public NodeEngine {
     ToFloat(static_cast<const T*>(query), w.qf.data(), dim_);
     fw->BeginQuery(w.qf.data());
     PinScope pins{w};
-    const uint32_t nc = Gather(w, lists, nlists, fw->candidate_buffer(), fw->slot_buffer());
+    const uint32_t nc =
+        Gather(w, lists, versions, nlists, fw->candidate_buffer(), fw->slot_buffer());
     *st = FilterStats();
     st->lists = nlists;
     st->gathered = nc;
@@ -534,8 +553,8 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   uint32_t Rerank(int wi, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
-                  const uint32_t* lists, uint32_t nlists, uint32_t* out_ids, float* out_dists,
-                  RerankStats* st) override {
+                  const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
+                  uint32_t* out_ids, float* out_dists, RerankStats* st) override {
     FUSION_CHECK(n <= opts_.max_rerank, "rerank input %u exceeds max_rerank %u", n,
                  opts_.max_rerank);
     FUSION_CHECK(nlists <= opts_.max_nprobe, "%u lists exceed max_nprobe %u", nlists,
@@ -560,7 +579,7 @@ class NodeEngineImpl : public NodeEngine {
           StrFormat("vector %u is not named by any partition loaded on this node", ids[i]));
     }
     Timer t;
-    st->fetched = static_cast<uint32_t>(EnsureRawInLists(locs, n, lists, nlists));
+    st->fetched = static_cast<uint32_t>(EnsureRawInLists(locs, n, lists, versions, nlists));
     st->fetch_us = t.Us();
     // Candidates whose vector is on the SSD are re-ranked from it; the others were fetched and
     // are re-ranked from memory, before (or while) the writer installs them. Fixed n and the
@@ -630,7 +649,8 @@ class NodeEngineImpl : public NodeEngine {
     {
       PinScope pins{w};  // the codes being scored cannot be freed meanwhile
       t.Reset();
-      const uint32_t nc = Gather(w, w.lists.data(), nl, fw->candidate_buffer(), fw->slot_buffer());
+      const uint32_t nc =
+          Gather(w, w.lists.data(), nullptr, nl, fw->candidate_buffer(), fw->slot_buffer());
       st->candidates = nc;
       st->gather_us = t.Us();
 
@@ -649,7 +669,8 @@ class NodeEngineImpl : public NodeEngine {
     RerankParams rp = p.rr;
     rp.k = p.k;
     st->rerank = RerankStats();
-    st->rerank.fetched = static_cast<uint32_t>(EnsureRawInLists(w.locs.data(), nt, w.lists.data(), nl));
+    st->rerank.fetched =
+        static_cast<uint32_t>(EnsureRawInLists(w.locs.data(), nt, w.lists.data(), nullptr, nl));
     // Re-ranked from the SSD below (heuristic order): a candidate fetched by this query or an
     // earlier one may still be in memory only.
     for (uint32_t i = 0; i < nt; ++i)
@@ -682,10 +703,10 @@ class NodeEngineImpl : public NodeEngine {
     size_t resident = 0;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
-      for (const auto& s : segs_) {
-        if (!s) continue;
+      for (const auto& vs : segs_) {
+        if (vs.empty()) continue;
         ++resident;
-        seg_bytes += s->seg.bytes();
+        for (const auto& s : vs) seg_bytes += s->seg.bytes();
       }
     }
     const PQStats pq = store_->Stats();
@@ -825,7 +846,8 @@ class NodeEngineImpl : public NodeEngine {
   // Makes the raw vectors at locs[0..n) present, the missing ones fetched through the query's
   // lists: the lists a query probed name all its candidates, so one of them names each missing
   // vector and knows its source. Only the missing ones are scanned for, and only then.
-  size_t EnsureRawInLists(const uint32_t* locs, size_t n, const uint32_t* lists, uint32_t nlists) {
+  size_t EnsureRawInLists(const uint32_t* locs, size_t n, const uint32_t* lists,
+                          const uint32_t* versions, uint32_t nlists) {
     const std::vector<uint32_t> miss = RawAbsent(locs, n);  // sorted, unique; cached is not missing
     if (miss.empty()) return 0;
     std::vector<uint32_t> via(miss.size(), kInvalidId);
@@ -834,7 +856,7 @@ class NodeEngineImpl : public NodeEngine {
       std::lock_guard<std::mutex> l(seg_mu_);
       for (uint32_t i = 0; i < nlists; ++i) {
         FUSION_CHECK(lists[i] < man_.num_lists, "list %u out of range", lists[i]);
-        segs[i] = segs_[man_.list_part[lists[i]]];
+        segs[i] = SegmentLocked(man_.list_part[lists[i]], versions ? &versions[i] : nullptr);
       }
     }
     size_t left = miss.size();
@@ -1061,8 +1083,8 @@ class NodeEngineImpl : public NodeEngine {
       std::vector<std::shared_ptr<const ResidentSegment>> segs;
       {
         std::lock_guard<std::mutex> sl(seg_mu_);
-        for (const auto& seg : segs_)
-          if (seg) segs.push_back(seg);
+        for (const auto& vs : segs_)
+          segs.insert(segs.end(), vs.begin(), vs.end());
       }
       named_.assign(CeilDiv(raw_->layout().locations(), 64), 0);
       for (const auto& seg : segs)
@@ -1109,8 +1131,8 @@ class NodeEngineImpl : public NodeEngine {
   // Throws NotResidentError if a list's partition is not resident. The segments stay pinned in
   // w.held (the caller's PinScope releases them) so that their codes cannot be freed while the
   // filter reads them.
-  uint32_t Gather(Worker& w, const uint32_t* lists, uint32_t nlists, uint32_t* out_ids,
-                  uint32_t* out_slots) {
+  uint32_t Gather(Worker& w, const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
+                  uint32_t* out_ids, uint32_t* out_slots) {
     FUSION_CHECK(nlists <= opts_.max_nprobe, "%u lists exceed max_nprobe %u", nlists,
                  opts_.max_nprobe);
     w.held.clear();
@@ -1120,13 +1142,16 @@ class NodeEngineImpl : public NodeEngine {
       for (uint32_t i = 0; i < nlists; ++i) {
         const uint32_t c = lists[i];
         if (c >= man_.num_lists) throw std::runtime_error(StrFormat("list %u out of range", c));
-        w.held[i] = segs_[man_.list_part[c]];
+        w.held[i] = SegmentLocked(man_.list_part[c], versions ? &versions[i] : nullptr);
       }
     }
     uint64_t nc = 0;
     for (uint32_t i = 0; i < nlists; ++i) {
       const uint32_t c = lists[i];
       if (!w.held[i]) {
+        if (versions)
+          throw NotResidentError(StrFormat("list %u: partition %u is not resident at version %u", c,
+                                           man_.list_part[c], versions[i]));
         throw NotResidentError(
             StrFormat("list %u: partition %u is not resident", c, man_.list_part[c]));
       }
@@ -1160,7 +1185,19 @@ class NodeEngineImpl : public NodeEngine {
   std::unique_ptr<PQStore> store_;
   std::unique_ptr<Reclaimer> reclaimer_;
   mutable std::mutex seg_mu_;
-  std::vector<std::shared_ptr<const ResidentSegment>> segs_;
+  // Per partition, its resident versions, ascending (guarded by seg_mu_).
+  std::vector<std::vector<std::shared_ptr<const ResidentSegment>>> segs_;
+
+  // Partition p at *version, or at its newest version if version is null; null if not
+  // resident. seg_mu_ must be held.
+  std::shared_ptr<const ResidentSegment> SegmentLocked(uint32_t p, const uint32_t* version) const {
+    const auto& vs = segs_[p];
+    if (vs.empty()) return nullptr;
+    if (!version) return vs.back();
+    for (const auto& s : vs)
+      if (s->version == *version) return s;
+    return nullptr;
+  }
   std::unique_ptr<ReadBudget> budget_;  // before raw_ and workers_, which charge it
   std::unique_ptr<RawStore> raw_;
   std::string index_pages_path_;

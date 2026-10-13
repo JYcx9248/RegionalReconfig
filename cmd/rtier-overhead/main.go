@@ -201,7 +201,7 @@ func main() {
 			filtered := make([][]nodeclient.Candidate, len(groups))
 			for i, g := range groups {
 				t := time.Now()
-				cands, st, err := c.Filter(ctx, 0, vec, g, *n)
+				cands, st, err := c.Filter(ctx, 0, vec, g, nil, *n)
 				check(err)
 				d := us(time.Since(t))
 				o := &r.Owners[owners[i]-1]
@@ -224,7 +224,7 @@ func main() {
 					continue
 				}
 				t := time.Now()
-				cands, pages, err := c.Rerank(ctx, 0, vec, byOwner[i], groups[i], *k)
+				cands, pages, err := c.Rerank(ctx, 0, vec, byOwner[i], groups[i], nil, *k)
 				check(err)
 				d := us(time.Since(t))
 				o := &r.Owners[owners[i]-1]

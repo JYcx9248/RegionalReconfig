@@ -1,8 +1,9 @@
 // Package epoch holds the versioned routing state of the regional tier and the machinery for
 // switching versions without stopping queries.
 //
-// A Table is immutable once installed: the placement (partition -> node), the node
-// addresses, and which nodes act as entries and aggregators. Reconfiguration copies data
+// A Table is immutable once installed: the placement (partition -> node), the version of
+// each partition's posting lists, the node addresses, and which nodes act as entries and
+// aggregators. Reconfiguration copies data
 // first, then flips the epoch atomically (Store), and reclaims old copies only after every
 // query that routed with the old epoch has finished (Tracker, an RCU-style grace period).
 // Koala has no explicit epoch: it runs one reconfiguration at a time and relies on in-band
@@ -26,8 +27,13 @@ type NodeInfo struct {
 
 // Table is one epoch of routing state.
 type Table struct {
-	Epoch       uint64                        `json:"epoch"`
-	Placement   placement.Table               `json:"placement"`
+	Epoch     uint64          `json:"epoch"`
+	Placement placement.Table `json:"placement"`
+	// Versions[p] is the version of partition p's posting lists that queries of this epoch see:
+	// an update batch (U14) stages the next version on the owner while the current one serves,
+	// and both stay until the old epoch drains. Empty means every partition at version 0, which
+	// is what a dataset without updates keeps.
+	Versions    []uint32                      `json:"versions,omitempty"`
 	Nodes       map[placement.NodeID]NodeInfo `json:"nodes"`
 	Entries     []placement.NodeID            `json:"entries"`     // accept client queries; hold the graph
 	Aggregators []placement.NodeID            `json:"aggregators"` // may run a query's scatter/gather
@@ -35,6 +41,14 @@ type Table struct {
 
 // Owner returns the node serving partition p.
 func (t *Table) Owner(p int) placement.NodeID { return t.Placement.Owners[p] }
+
+// Version returns the version of partition p's posting lists in this epoch.
+func (t *Table) Version(p int) uint32 {
+	if len(t.Versions) == 0 {
+		return 0
+	}
+	return t.Versions[p]
+}
 
 // Node looks up a node's addresses.
 func (t *Table) Node(id placement.NodeID) (NodeInfo, bool) {
@@ -52,6 +66,7 @@ func (t *Table) IsAggregator(id placement.NodeID) bool { return contains(t.Aggre
 func (t *Table) Clone() *Table {
 	c := *t
 	c.Placement = t.Placement.Clone()
+	c.Versions = append([]uint32(nil), t.Versions...)
 	c.Nodes = make(map[placement.NodeID]NodeInfo, len(t.Nodes))
 	for k, v := range t.Nodes {
 		c.Nodes[k] = v
@@ -61,10 +76,15 @@ func (t *Table) Clone() *Table {
 	return &c
 }
 
-// Validate checks that every referenced node has addresses.
+// Validate checks that every referenced node has addresses and that there is a version for
+// every partition, if any.
 func (t *Table) Validate() error {
 	if t.Epoch == 0 {
 		return fmt.Errorf("epoch: epoch 0 is reserved")
+	}
+	if n := len(t.Versions); n != 0 && n != t.Placement.NumPartitions() {
+		return fmt.Errorf("epoch %d: versions for %d partitions, the placement has %d",
+			t.Epoch, n, t.Placement.NumPartitions())
 	}
 	check := func(what string, id placement.NodeID) error {
 		if _, ok := t.Nodes[id]; !ok {

@@ -16,9 +16,16 @@ func TestGroupByOwner(t *testing.T) {
 	m := &partitioning.Manifest{NumLists: 6, NumPartitions: 3, ListPart: []uint32{0, 0, 1, 1, 2, 2}}
 	tb := &epoch.Table{Epoch: 1, Placement: placement.Table{Owners: []placement.NodeID{7, 3, 7}}}
 	gs := GroupByOwner([]uint32{5, 2, 0, 3}, m, tb)
-	want := []Group{{Node: 3, Lists: []uint32{2, 3}}, {Node: 7, Lists: []uint32{5, 0}}}
+	want := []Group{{Node: 3, Lists: []uint32{2, 3}, Versions: []uint32{0, 0}},
+		{Node: 7, Lists: []uint32{5, 0}, Versions: []uint32{0, 0}}}
 	if !reflect.DeepEqual(gs, want) {
 		t.Fatalf("got %+v", gs)
+	}
+	// Each list carries the version of its partition in the table.
+	tb.Versions = []uint32{4, 0, 9}
+	want[1].Versions = []uint32{9, 4}
+	if gs := GroupByOwner([]uint32{5, 2, 0, 3}, m, tb); !reflect.DeepEqual(gs, want) {
+		t.Fatalf("with versions: got %+v", gs)
 	}
 }
 
@@ -149,13 +156,19 @@ func TestOwnerSelector(t *testing.T) {
 // aggregator does not regroup), and malformed groups are refused.
 func TestAggregateWire(t *testing.T) {
 	req := &Request{Vec: []byte{1, 2, 3, 4}, Params: Params{K: 10, NProbe: 4, N: 200}}
-	groups := []Group{{Node: 3, Lists: []uint32{2, 3}}, {Node: 7, Lists: []uint32{5, 0}}}
+	groups := []Group{{Node: 3, Lists: []uint32{2, 3}, Versions: []uint32{0, 1}},
+		{Node: 7, Lists: []uint32{5, 0}, Versions: []uint32{2, 0}}}
 	got, gotGroups, err := DecodeAggregate(EncodeAggregate(req, groups))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(gotGroups, groups) || got.Params != req.Params || string(got.Vec) != string(req.Vec) {
 		t.Fatalf("round trip: %+v %+v", got, gotGroups)
+	}
+	// A group without versions travels at version 0.
+	_, gotGroups, err = DecodeAggregate(EncodeAggregate(req, []Group{{Node: 3, Lists: []uint32{2, 3}}}))
+	if err != nil || !reflect.DeepEqual(gotGroups[0].Versions, []uint32{0, 0}) {
+		t.Fatalf("without versions: %+v %v", gotGroups, err)
 	}
 	for name, gs := range map[string][]Group{
 		"no groups":   nil,

@@ -893,7 +893,7 @@ func TestNodeShutdownUnderLoad(t *testing.T) {
 				if err != nil {
 					return // the node is going away
 				}
-				if _, _, err := nc.Filter(ctx, 1, q, lists, maxRerank); err != nil {
+				if _, _, err := nc.Filter(ctx, 1, q, lists, nil, maxRerank); err != nil {
 					return
 				}
 			}

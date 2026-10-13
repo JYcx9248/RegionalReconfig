@@ -423,11 +423,12 @@ Frame NodeServer::Handle(const Frame& req) {
         break;
       case kLoadPartition: {
         const uint32_t p = r.Get<uint32_t>();
+        const uint32_t version = r.Get<uint32_t>();
         const uint8_t src = r.Get<uint8_t>();
         Require(src <= 1, "unknown PQ source");
         const std::string raw_peer = TakeStr(&r);
         e.LoadPartition(p, r.Rest(), src == 1 ? fusion::PQSource::kIndex : fusion::PQSource::kPresent,
-                        raw_peer);
+                        raw_peer, version);
         break;
       }
       case kEvictPartition:
@@ -558,13 +559,14 @@ Frame NodeServer::Handle(const Frame& req) {
         Require(topn >= 1 && topn <= o.max_rerank, "topn out of range");
         Require(nlists <= o.max_nprobe, "too many lists");
         const auto lists = TakeArray<uint32_t>(&r, nlists);
+        const auto versions = TakeArray<uint32_t>(&r, nlists);
         const auto q = TakeQuery(&r, e);
         std::vector<uint32_t> ids(topn);
         std::vector<float> dists(topn);
         fusion::FilterStats fs;
         worker = AcquireWorker(&st);
-        const uint32_t n =
-            e.Filter(worker, q.data(), lists.data(), nlists, topn, ids.data(), dists.data(), &fs);
+        const uint32_t n = e.Filter(worker, q.data(), lists.data(), versions.data(), nlists, topn,
+                                    ids.data(), dists.data(), &fs);
         w.Put(n);
         w.PutBytes(ids.data(), n * 4);
         w.PutBytes(dists.data(), n * 4);
@@ -581,13 +583,14 @@ Frame NodeServer::Handle(const Frame& req) {
         const uint32_t nlists = r.Get<uint32_t>();
         Require(nlists <= o.max_nprobe, "too many lists");
         const auto lists = TakeArray<uint32_t>(&r, nlists);
+        const auto versions = TakeArray<uint32_t>(&r, nlists);
         const auto q = TakeQuery(&r, e);
         std::vector<uint32_t> out_ids(k);
         std::vector<float> out_d(k);
         fusion::RerankStats rs;
         worker = AcquireWorker(&st);
-        const uint32_t cnt = e.Rerank(worker, q.data(), ids.data(), n, k, lists.data(), nlists,
-                                      out_ids.data(), out_d.data(), &rs);
+        const uint32_t cnt = e.Rerank(worker, q.data(), ids.data(), n, k, lists.data(),
+                                      versions.data(), nlists, out_ids.data(), out_d.data(), &rs);
         w.Put(cnt);
         w.PutBytes(out_ids.data(), cnt * 4);
         w.PutBytes(out_d.data(), cnt * 4);
@@ -663,6 +666,10 @@ std::string NodeServer::InfoJson(bool settle) const {
   s += "\"resident\":[";
   const auto res = e.ResidentPartitions();
   for (size_t i = 0; i < res.size(); ++i) s += (i ? "," : "") + std::to_string(res[i]);
+  s += "],\"versions\":[";
+  const auto vers = e.ResidentVersions();
+  for (size_t i = 0; i < vers.size(); ++i)
+    s += fusion::StrFormat("%s[%u,%u]", i ? "," : "", vers[i].first, vers[i].second);
   const fusion::PQStats pq = e.pq_stats();
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
   s += fusion::StrFormat(

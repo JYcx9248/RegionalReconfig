@@ -99,7 +99,7 @@ func DecodeRequest(body []byte) (*Request, error) {
 }
 
 // EncodeAggregate builds the body of OpAggregate: params, the lists grouped by owner (u32
-// groups, then per group u32 node, u32 n, u32 lists[n]), vector.
+// groups, then per group u32 node, u32 n, u32 lists[n], u32 versions[n]), vector.
 func EncodeAggregate(req *Request, groups []Group) []byte {
 	var w frame.Writer
 	putParams(&w, req.Params)
@@ -108,6 +108,7 @@ func EncodeAggregate(req *Request, groups []Group) []byte {
 		w.U32(uint32(g.Node))
 		w.U32(uint32(len(g.Lists)))
 		w.U32s(g.Lists)
+		w.U32s(versionsOf(g))
 	}
 	w.Bytes(req.Vec)
 	return w.B
@@ -130,7 +131,8 @@ func DecodeAggregate(body []byte) (*Request, []Group, error) {
 			return nil, nil, fmt.Errorf("query: forwarded query with a bad group (node %d, %d lists)", node, n)
 		}
 		total += n
-		groups = append(groups, Group{Node: placement.NodeID(node), Lists: r.U32s(n)})
+		lists := r.U32s(n)
+		groups = append(groups, Group{Node: placement.NodeID(node), Lists: lists, Versions: r.U32s(n)})
 	}
 	req.Vec = r.Rest()
 	if r.Err != nil {
@@ -291,4 +293,12 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) (R
 	}
 	cands, err := DecodeResult(resp.Body)
 	return Result{Epoch: resp.Epoch, Candidates: cands}, err
+}
+
+// versionsOf returns g's versions, all 0 if it has none (a group built without a table).
+func versionsOf(g Group) []uint32 {
+	if len(g.Versions) == len(g.Lists) {
+		return g.Versions
+	}
+	return make([]uint32, len(g.Lists))
 }

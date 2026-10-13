@@ -371,6 +371,13 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		c.event("reconfig."+name+"_s", s)
 		mark = time.Now()
 	}
+	// A move loads the partition from its segment file, which holds version 0 of its lists. A
+	// partition an update batch has changed would need its current lists instead (U14).
+	for _, p := range reply.Moved {
+		if v := cur.Version(p); v != 0 {
+			return reply, design.Undecided("U14", fmt.Sprintf("moving partition %d at version %d (lists changed by updates)", p, v))
+		}
+	}
 	c.event("reconfig.start", float64(cur.Epoch))
 	log.Printf("controller: reconfiguration %s: epoch %d, add %v, remove %v, move %d partitions",
 		c.cfg.Protocol, cur.Epoch, reply.Added, reply.Removed, len(reply.Moved))

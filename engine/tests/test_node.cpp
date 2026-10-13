@@ -279,7 +279,7 @@ void TestNodePrimitives() {
       std::vector<uint32_t> cand(4096);
       std::vector<float> pqd(4096);
       FilterStats fs;
-      const uint32_t nc = e->Filter(0, q, ls.data(), static_cast<uint32_t>(ls.size()), 4096,
+      const uint32_t nc = e->Filter(0, q, ls.data(), nullptr, static_cast<uint32_t>(ls.size()), 4096,
                                     cand.data(), pqd.data(), &fs);
       CHECK(nc == fs.unique);
       for (uint32_t i = 1; i < nc; ++i)
@@ -287,7 +287,7 @@ void TestNodePrimitives() {
       std::vector<uint32_t> rid(k);
       std::vector<float> rd(k);
       RerankStats rs;
-      const uint32_t nr = e->Rerank(1, q, cand.data(), nc, k, ls.data(),
+      const uint32_t nr = e->Rerank(1, q, cand.data(), nc, k, ls.data(), nullptr,
                                     static_cast<uint32_t>(ls.size()), rid.data(), rd.data(), &rs);
       for (uint32_t i = 0; i < nr; ++i) merged[rid[i]] = rd[i];
     }
@@ -309,7 +309,7 @@ void TestNodePrimitives() {
     std::vector<uint32_t> ids(10);
     std::vector<float> d(10);
     FilterStats fs;
-    all->Filter(0, &f.queries[0], lists.data(), nl, 10, ids.data(), d.data(), &fs);
+    all->Filter(0, &f.queries[0], lists.data(), nullptr, nl, 10, ids.data(), d.data(), &fs);
   } catch (const NotResidentError&) {
     not_resident = true;
   }
@@ -321,6 +321,75 @@ void TestNodePrimitives() {
   }
   CHECK(no_graph);
   CHECK(all->ResidentPartitions().size() == 3);
+}
+
+// A partition can be resident at several versions (U14): FILTER and RERANK name the version
+// their query's epoch sees, loading a version replaces only that version, and an eviction drops
+// every version.
+void TestPartitionVersions() {
+  Fixture& f = GetFixture();
+  auto node = OpenNode(f, {0, 1, 2, 3}, true);  // every partition at version 0
+  PartitionManifest man = PartitionManifest::Load(f.parts);
+  const float* q = &f.queries[0];
+  std::vector<uint32_t> lists(8);
+  const uint32_t nl = node->Navigate(q, 8, 0, lists.data());
+  CHECK(nl == 8);
+  const uint32_t p = man.list_part[lists[0]];
+  std::vector<uint32_t> mine;  // the probed lists of partition p
+  for (uint32_t i = 0; i < nl; ++i)
+    if (man.list_part[lists[i]] == p) mine.push_back(lists[i]);
+  const uint32_t nm = static_cast<uint32_t>(mine.size());
+  auto filter = [&](const std::vector<uint32_t>* versions, std::vector<uint32_t>* ids) {
+    ids->assign(200, 0);
+    std::vector<float> d(200);
+    FilterStats fs;
+    const uint32_t n = node->Filter(0, q, mine.data(), versions ? versions->data() : nullptr, nm,
+                                    200, ids->data(), d.data(), &fs);
+    ids->resize(n);
+  };
+  auto versions_of = [&](uint32_t part) {
+    std::vector<uint32_t> vs;
+    for (const auto& [pp, v] : node->ResidentVersions())
+      if (pp == part) vs.push_back(v);
+    return vs;
+  };
+  const std::vector<uint32_t> v0(nm, 0), v1(nm, 1);
+  std::vector<uint32_t> at0, at1, newest;
+  filter(&v0, &at0);
+  CHECK(!at0.empty());
+  bool not_resident = false;
+  try {
+    filter(&v1, &at1);
+  } catch (const NotResidentError&) {
+    not_resident = true;
+  }
+  CHECK(not_resident);
+
+  // Version 1 next to version 0 (the same lists here): both serve, and no version means the
+  // newest one.
+  const std::string seg = JoinPath(f.parts, partfiles::SegmentName(p));
+  node->LoadPartition(p, seg, PQSource::kPresent, "", 1);
+  filter(&v1, &at1);
+  filter(nullptr, &newest);
+  CHECK(at1 == at0 && newest == at0);
+  filter(&v0, &at0);
+  CHECK(at0 == at1);
+  CHECK((versions_of(p) == std::vector<uint32_t>{0, 1}));
+  // Loading a version again replaces it; RERANK takes the versions too.
+  node->LoadPartition(p, seg, PQSource::kPresent, "", 1);
+  CHECK((versions_of(p) == std::vector<uint32_t>{0, 1}));
+  {
+    std::vector<uint32_t> out(10);
+    std::vector<float> d(10);
+    RerankStats rs;
+    CHECK(node->Rerank(0, q, at1.data(), static_cast<uint32_t>(at1.size()), 10, mine.data(),
+                       v1.data(), nm, out.data(), d.data(), &rs) > 0);
+  }
+  // An eviction drops every version.
+  CHECK(node->EvictPartition(p));
+  CHECK(versions_of(p).empty());
+  const auto res = node->ResidentPartitions();
+  CHECK(std::find(res.begin(), res.end(), p) == res.end());
 }
 
 void TestPQStore() {
@@ -524,9 +593,9 @@ void TestPQMigration() {
     std::vector<uint32_t> ia(200), ib(200);
     std::vector<float> da(200), db(200);
     FilterStats fa, fb;
-    const uint32_t na = src->Filter(0, q, mine.data(), static_cast<uint32_t>(mine.size()), 200,
+    const uint32_t na = src->Filter(0, q, mine.data(), nullptr, static_cast<uint32_t>(mine.size()), 200,
                                     ia.data(), da.data(), &fa);
-    const uint32_t nb = dst->Filter(0, q, mine.data(), static_cast<uint32_t>(mine.size()), 200,
+    const uint32_t nb = dst->Filter(0, q, mine.data(), nullptr, static_cast<uint32_t>(mine.size()), 200,
                                     ib.data(), db.data(), &fb);
     CHECK(na == nb && ia == ib && da == db);
   }
@@ -627,7 +696,7 @@ void TestPQEvictUnderLoad() {
       FilterStats fa, fb;
       uint32_t na = 0, nb = 0;
       try {
-        na = node->Filter(wi, &f.queries[qi * f.dim], ls.data(), static_cast<uint32_t>(ls.size()),
+        na = node->Filter(wi, &f.queries[qi * f.dim], ls.data(), nullptr, static_cast<uint32_t>(ls.size()),
                           4096, ia.data(), da.data(), &fa);
       } catch (const NotResidentError&) {
         continue;
@@ -637,7 +706,7 @@ void TestPQEvictUnderLoad() {
       }
       {
         std::lock_guard<std::mutex> l(oracle_mu);
-        nb = oracle->Filter(0, &f.queries[qi * f.dim], ls.data(), static_cast<uint32_t>(ls.size()),
+        nb = oracle->Filter(0, &f.queries[qi * f.dim], ls.data(), nullptr, static_cast<uint32_t>(ls.size()),
                             4096, ib.data(), db.data(), &fb);
       }
       const bool same = na == nb && std::equal(ia.begin(), ia.begin() + na, ib.begin()) &&
@@ -835,12 +904,12 @@ bool SameRerank(const Fixture& f, uint32_t qi, NodeEngine* at, NodeEngine* ref,
   std::vector<uint32_t> cand(200), ia(10), ib(10);
   std::vector<float> pqd(200), da(10), db(10);
   FilterStats fs;
-  const uint32_t nc = at->Filter(0, q, mine.data(), static_cast<uint32_t>(mine.size()), 200,
+  const uint32_t nc = at->Filter(0, q, mine.data(), nullptr, static_cast<uint32_t>(mine.size()), 200,
                                  cand.data(), pqd.data(), &fs);
   RerankStats ra, rb;
   const uint32_t nm = static_cast<uint32_t>(mine.size());
-  const uint32_t na = at->Rerank(0, q, cand.data(), nc, 10, mine.data(), nm, ia.data(), da.data(), &ra);
-  const uint32_t nb = ref->Rerank(0, q, cand.data(), nc, 10, mine.data(), nm, ib.data(), db.data(), &rb);
+  const uint32_t na = at->Rerank(0, q, cand.data(), nc, 10, mine.data(), nullptr, nm, ia.data(), da.data(), &ra);
+  const uint32_t nb = ref->Rerank(0, q, cand.data(), nc, 10, mine.data(), nullptr, nm, ib.data(), db.data(), &rb);
   return na == nb && ia == ib && da == db;
 }
 
@@ -1154,7 +1223,8 @@ void TestWire() {
   ids0.erase(std::unique(ids0.begin(), ids0.end()), ids0.end());
   auto load0 = [&](uint8_t pq_source, const std::string& raw_peer) {
     rtier::BodyWriter w;
-    w.Put<uint32_t>(0);
+    w.Put<uint32_t>(0);  // partition
+    w.Put<uint32_t>(0);  // version
     w.Put<uint8_t>(pq_source);
     w.Put<uint32_t>(static_cast<uint32_t>(raw_peer.size()));
     w.PutBytes(raw_peer.data(), raw_peer.size());
@@ -1226,6 +1296,8 @@ void TestWire() {
     w.PutBytes(ids0.data(), 64 * 4);
     w.Put<uint32_t>(static_cast<uint32_t>(lists64.size()));
     w.PutBytes(lists64.data(), lists64.size() * 4);
+    const std::vector<uint32_t> versions64(lists64.size(), 0);
+    w.PutBytes(versions64.data(), versions64.size() * 4);
     w.PutBytes(&f.queries[0], f.dim * sizeof(float));
     rtier::Frame resp = Call(conn, rtier::kRerank, w, id);
     CHECK(resp.status == rtier::kOk && resp.body.size() == 4 + 10 * 8 + 8);
@@ -1343,6 +1415,7 @@ int main() {
       {"crc32", TestCrc32},
       {"partition_files", TestPartitionFiles},
       {"node_primitives", TestNodePrimitives},
+      {"partition_versions", TestPartitionVersions},
       {"pq_store", TestPQStore},
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},

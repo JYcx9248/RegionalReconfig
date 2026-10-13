@@ -69,7 +69,7 @@ func compare(ctx context.Context, c *nodeclient.Client, m *partitioning.Manifest
 			scored := make([]float64, len(groups))
 			var total float64
 			for i, g := range groups {
-				cands, st, err := c.Filter(ctx, 0, vec, g, n)
+				cands, st, err := c.Filter(ctx, 0, vec, g, nil, n)
 				check(err)
 				filtered[i], scored[i] = cands, float64(st.Unique)
 				total += scored[i]
@@ -109,7 +109,7 @@ func compare(ctx context.Context, c *nodeclient.Client, m *partitioning.Manifest
 					if len(ids) == 0 {
 						continue
 					}
-					cands, pages, err := c.Rerank(ctx, 0, vec, ids, groups[i], k)
+					cands, pages, err := c.Rerank(ctx, 0, vec, ids, groups[i], nil, k)
 					check(err)
 					reranked = append(reranked, cands)
 					ownerRerank[i] = cost.RerankCall + cost.Page*float64(pages)

@@ -156,6 +156,7 @@ type Info struct {
 	GraphLoaded   bool               `json:"graph_loaded"`
 	MaxEpochSeen  uint64             `json:"max_epoch_seen"`
 	Resident      []int              `json:"resident"`
+	Versions      [][2]uint32        `json:"versions"` // every resident (partition, version)
 	PQ            PQStats            `json:"pq"`
 	Raw           RawStats           `json:"raw"`
 	Ops           map[string]OpStats `json:"ops"`
@@ -316,15 +317,17 @@ func (c *Client) LoadGraph(ctx context.Context, path string) error {
 	return err
 }
 
-// LoadPartition makes the node load partition p's segment from path. With fromIndex, the PQ
+// LoadPartition makes the node load version v of partition p from the segment at path,
+// replacing that version if it is resident (the partition's other versions stay). With fromIndex, the PQ
 // codes and raw vectors the node lacks are copied from the index (bootstrap). Otherwise the PQ
 // codes must have been installed with PQPut (or the load fails with StatusPQAbsent), and the
 // raw vectors the node lacks are fetched from rawPeer, a data node's address, when a query
 // needs them -- until RawPut brings them (StatusRawAbsent if some are missing and rawPeer is
 // empty).
-func (c *Client) LoadPartition(ctx context.Context, p int, path string, fromIndex bool, rawPeer string) error {
+func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string, fromIndex bool, rawPeer string) error {
 	var w frame.Writer
 	w.U32(uint32(p))
+	w.U32(v)
 	if fromIndex {
 		w.U8(1)
 	} else {
@@ -564,12 +567,18 @@ func (c *Client) Navigate(ctx context.Context, epoch uint64, q []byte, nprobe, e
 }
 
 // Filter returns the PQ top-n over the given lists (all resident on this node), ordered by
-// (PQ distance, ID).
-func (c *Client) Filter(ctx context.Context, epoch uint64, q []byte, lists []uint32, topn int) ([]Candidate, FilterStats, error) {
+// (PQ distance, ID). versions[i] is the version of lists[i]'s partition in the query's epoch
+// (nil: all 0); StatusNotResident if the node does not hold that version.
+func (c *Client) Filter(ctx context.Context, epoch uint64, q []byte, lists, versions []uint32, topn int) ([]Candidate, FilterStats, error) {
+	vs, err := versionsFor(lists, versions)
+	if err != nil {
+		return nil, FilterStats{}, err
+	}
 	var w frame.Writer
 	w.U32(uint32(topn))
 	w.U32(uint32(len(lists)))
 	w.U32s(lists)
+	w.U32s(vs)
 	w.Bytes(q)
 	b, err := c.do(ctx, opFilter, epoch, w.B)
 	if err != nil {
@@ -583,15 +592,21 @@ func (c *Client) Filter(ctx context.Context, epoch uint64, q []byte, lists []uin
 
 // Rerank computes exact distances for every given ID and returns the k best, ordered by
 // (distance, ID), and the pages it read. lists are the query's lists on this node (the ones its
-// FILTER got): the node fetches a raw vector it lacks first, from the source of a list among
-// them that names it (the reply's last field counts them; see Info's Raw.Fetched).
-func (c *Client) Rerank(ctx context.Context, epoch uint64, q []byte, ids, lists []uint32, k int) ([]Candidate, uint32, error) {
+// FILTER got), at their versions (as in Filter): the node fetches a raw vector it lacks first,
+// from the source of a list among them that names it (the reply's last field counts them; see
+// Info's Raw.Fetched).
+func (c *Client) Rerank(ctx context.Context, epoch uint64, q []byte, ids, lists, versions []uint32, k int) ([]Candidate, uint32, error) {
+	vs, err := versionsFor(lists, versions)
+	if err != nil {
+		return nil, 0, err
+	}
 	var w frame.Writer
 	w.U32(uint32(k))
 	w.U32(uint32(len(ids)))
 	w.U32s(ids)
 	w.U32(uint32(len(lists)))
 	w.U32s(lists)
+	w.U32s(vs)
 	w.Bytes(q)
 	b, err := c.do(ctx, opRerank, epoch, w.B)
 	if err != nil {
@@ -645,4 +660,16 @@ func readCandidates(r *frame.Reader) []Candidate {
 		out[i] = Candidate{ID: ids[i], Dist: ds[i]}
 	}
 	return out
+}
+
+// versionsFor returns the partition version of each of lists: versions itself, or all 0 when
+// it is nil (a caller without an epoch table, on a dataset without updates).
+func versionsFor(lists, versions []uint32) ([]uint32, error) {
+	if versions == nil {
+		return make([]uint32, len(lists)), nil
+	}
+	if len(versions) != len(lists) {
+		return nil, fmt.Errorf("nodeclient: %d versions for %d lists", len(versions), len(lists))
+	}
+	return versions, nil
 }

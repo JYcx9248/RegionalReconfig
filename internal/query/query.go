@@ -50,19 +50,23 @@ type Nodes interface {
 	Client(id placement.NodeID) (*nodeclient.Client, error)
 }
 
-// Group is the lists of one query that one node owns.
+// Group is the lists of one query that one node owns, each with the version of its partition
+// in the query's epoch (Versions parallel to Lists): the owner may hold several versions of a
+// partition while an update batch flips (U14).
 type Group struct {
-	Node  placement.NodeID
-	Lists []uint32
+	Node     placement.NodeID
+	Lists    []uint32
+	Versions []uint32
 }
 
 // GroupByOwner splits lists by the owner of their partition in table t (ascending node IDs;
-// list order preserved within a group).
+// list order preserved within a group), with the partitions' versions in t.
 func GroupByOwner(lists []uint32, m *partitioning.Manifest, t *epoch.Table) []Group {
 	idx := map[placement.NodeID]int{}
 	var gs []Group
 	for _, c := range lists {
-		o := t.Owner(m.PartitionOf(c))
+		p := m.PartitionOf(c)
+		o := t.Owner(p)
 		i, ok := idx[o]
 		if !ok {
 			i = len(gs)
@@ -70,6 +74,7 @@ func GroupByOwner(lists []uint32, m *partitioning.Manifest, t *epoch.Table) []Gr
 			gs = append(gs, Group{Node: o})
 		}
 		gs[i].Lists = append(gs[i].Lists, c)
+		gs[i].Versions = append(gs[i].Versions, t.Version(p))
 	}
 	sort.Slice(gs, func(i, j int) bool { return gs[i].Node < gs[j].Node })
 	return gs
@@ -136,7 +141,7 @@ func (TwoPhase) Execute(ctx context.Context, env *Env, req *Request, groups []Gr
 				return
 			}
 			clients[i] = c
-			filtered[i], _, errs[i] = c.Filter(ctx, env.Epoch, req.Vec, g.Lists, n)
+			filtered[i], _, errs[i] = c.Filter(ctx, env.Epoch, req.Vec, g.Lists, g.Versions, n)
 		}(i, g)
 	}
 	wg.Wait()
@@ -155,7 +160,8 @@ func (TwoPhase) Execute(ctx context.Context, env *Env, req *Request, groups []Gr
 			defer wg.Done()
 			// The owner's lists go along: they name every candidate, so the owner knows where to
 			// fetch a raw vector it lacks (U9).
-			reranked[i], _, errs[i] = clients[i].Rerank(ctx, env.Epoch, req.Vec, byOwner[i], groups[i].Lists, req.Params.K)
+			reranked[i], _, errs[i] = clients[i].Rerank(ctx, env.Epoch, req.Vec, byOwner[i], groups[i].Lists,
+				groups[i].Versions, req.Params.K)
 		}(i)
 	}
 	wg.Wait()

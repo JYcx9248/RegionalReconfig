@@ -353,8 +353,12 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 	})
 }
 
+// segmentVersion is the version of a partition's lists in its segment file: the lists as
+// built. Later versions come from update batches (U14).
+const segmentVersion = 0
+
 func (a *Agent) loadPartition(ctx context.Context, p int, fromIndex bool, rawPeer string) error {
-	if err := a.localBulk.LoadPartition(ctx, p, a.segmentPath(p), fromIndex, rawPeer); err != nil {
+	if err := a.localBulk.LoadPartition(ctx, p, segmentVersion, a.segmentPath(p), fromIndex, rawPeer); err != nil {
 		return fmt.Errorf("load partition %d: %w", p, err)
 	}
 	a.mu.Lock()

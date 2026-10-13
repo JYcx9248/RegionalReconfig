@@ -144,3 +144,21 @@ func TestTrackerPin(t *testing.T) {
 		t.Fatal("Pin must not change the table new queries route with")
 	}
 }
+
+func TestTableVersions(t *testing.T) {
+	tb := &Table{Epoch: 1, Placement: placement.Table{Owners: []placement.NodeID{1, 1, 2}},
+		Nodes: map[placement.NodeID]NodeInfo{1: {ID: 1}, 2: {ID: 2}}}
+	if tb.Version(2) != 0 || tb.Validate() != nil {
+		t.Fatalf("without versions: version %d, %v", tb.Version(2), tb.Validate())
+	}
+	tb.Versions = []uint32{0, 3, 1}
+	c := tb.Clone()
+	c.Versions[1] = 4
+	if tb.Version(1) != 3 || c.Version(1) != 4 {
+		t.Fatalf("clone shares versions: %v %v", tb.Versions, c.Versions)
+	}
+	tb.Versions = []uint32{0, 3}
+	if tb.Validate() == nil {
+		t.Fatal("versions for 2 of 3 partitions accepted")
+	}
+}

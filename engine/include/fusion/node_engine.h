@@ -2,7 +2,11 @@
 //
 // Same three tiers as fusion::Engine, with these differences:
 //   * posting lists are held per partition, and partitions can be loaded and evicted while
-//     queries run (the placement changes during reconfiguration; the lists themselves never do);
+//     queries run (the placement changes during reconfiguration). A partition may be resident
+//     at several versions at once: the epoch table names the version of each partition a query
+//     sees, and FILTER and RERANK say which one they mean, so that an update batch (U14) can
+//     stage a partition's next lists while queries of the current epoch still read the old ones.
+//     Without updates every partition stays at version 0;
 //   * PQ codes (the GPU tier) are node-level: the node holds exactly one copy of the code of
 //     every vector named by its resident posting lists, however many lists or partitions name
 //     it (fusion/pq_store.h; the decided part of design question U1). A partition's codes come
@@ -37,6 +41,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "fusion/common.h"
@@ -147,20 +152,25 @@ class NodeEngine {
   // Staging. LoadGraph/LoadPartition may run concurrently with queries.
   virtual void LoadGraph(const std::string& path) = 0;
   virtual bool has_graph() const = 0;
-  // Loads partition p's posting lists. Every vector they name must end up with a PQ code on
-  // this node (see PQSource); the partition's postings then hold references on those codes.
+  // Loads version `version` of partition p's posting lists, replacing that version if it is
+  // resident; the partition's other versions stay. Every vector they name must end up with a PQ
+  // code on this node (see PQSource); the partition's postings then hold references on those
+  // codes.
   // With kPresent, raw_peer (a data node's address, normally the partition's old owner) becomes
   // the source of the partition's lists: a raw vector not on the node is fetched from it when a
   // query needs it (and only then); without raw_peer they must all be here already
   // (RawMissingError). The source of a list outlives the partition's eviction, so the node can
   // still resolve a peer's request for it (chains).
   virtual void LoadPartition(uint32_t partition, const std::string& segment_path, PQSource pq,
-                             const std::string& raw_peer = "") = 0;
-  // Returns false if the partition was not resident. Queries already holding the partition
-  // finish on the old copy; its PQ references are dropped when the last one lets go of it. Its
-  // codes stay on the node (cached) for a later reconfiguration.
+                             const std::string& raw_peer = "", uint32_t version = 0) = 0;
+  // Evicts every version of the partition; returns false if none was resident. Queries already
+  // holding the partition finish on the old copy; its PQ references are dropped when the last
+  // one lets go of it. Its codes stay on the node (cached) for a later reconfiguration.
   virtual bool EvictPartition(uint32_t partition) = 0;
+  // Partitions with at least one resident version, ascending.
   virtual std::vector<uint32_t> ResidentPartitions() const = 0;
+  // Every resident (partition, version), ascending.
+  virtual std::vector<std::pair<uint32_t, uint32_t>> ResidentVersions() const = 0;
 
   // PQ codes (node-level store). For each group of segment files (one group per source a
   // staging pulls from): the vector IDs they name that have no code on this node and are not
@@ -207,11 +217,15 @@ class NodeEngine {
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;
 
   // Primitives. `query` points to dim() elements of dtype(). Worker `w` must be used by one
-  // thread at a time. ef = 0 means 2 * nprobe (as in fusion::Engine).
+  // thread at a time. ef = 0 means 2 * nprobe (as in fusion::Engine). In Filter and Rerank,
+  // versions[i] is the version of lists[i]'s partition that the query sees (its epoch's);
+  // NotResidentError if that version is not resident. versions = nullptr means each partition's
+  // newest resident version.
   virtual uint32_t Navigate(const void* query, uint32_t nprobe, uint32_t ef,
                             uint32_t* lists) = 0;
-  virtual uint32_t Filter(int w, const void* query, const uint32_t* lists, uint32_t nlists,
-                          uint32_t topn, uint32_t* ids, float* dists, FilterStats* st) = 0;
+  virtual uint32_t Filter(int w, const void* query, const uint32_t* lists, const uint32_t* versions,
+                          uint32_t nlists, uint32_t topn, uint32_t* ids, float* dists,
+                          FilterStats* st) = 0;
   // Exact distances for all `n` IDs (no early stop: fixed-n re-ranking); keeps the k best.
   // Every ID must be named by a partition loaded here (NotResidentError). `lists` are the
   // query's lists on this node (those its FILTER gathered from): a raw vector not on the node
@@ -220,9 +234,10 @@ class NodeEngine {
   // re-ranked from memory, kept for other queries until a background writer has put them on
   // the SSD.
   virtual uint32_t Rerank(int w, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
-                          const uint32_t* lists, uint32_t nlists, uint32_t* out_ids,
-                          float* out_dists, RerankStats* st) = 0;
-  // Navigate + Filter + Rerank on this node; every probed list must be resident.
+                          const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
+                          uint32_t* out_ids, float* out_dists, RerankStats* st) = 0;
+  // Navigate + Filter + Rerank on this node, on each partition's newest version; every probed
+  // list must be resident.
   virtual uint32_t SearchLocal(int w, const void* query, const SearchParams& p, uint32_t* ids,
                                float* dists, QueryStats* st) = 0;
 
