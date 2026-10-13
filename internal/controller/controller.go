@@ -73,9 +73,26 @@ func New(cfg config.Controller) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	policy, err := placement.NewPolicy(cfg.Placement)
+	// The default policy reads the partition graph off the index's navigation graph (U3). The
+	// file is large (one record per head, vector included), so the load starts now and the
+	// first reconfiguration -- which comes after the initial deployment -- waits for it only if
+	// it is still running.
+	graph := sync.OnceValues(func() (placement.Adjacency, error) {
+		start := time.Now()
+		g, err := partitioning.PartitionGraph(cfg.IndexDir, m)
+		if err != nil {
+			log.Printf("controller: partition graph: %v", err)
+			return nil, err
+		}
+		log.Printf("controller: partition graph of %d partitions loaded in %.1f s", len(g), time.Since(start).Seconds())
+		return placement.Adjacency(g), nil
+	})
+	policy, err := placement.NewPolicy(cfg.Placement, graph)
 	if err != nil {
 		return nil, err
+	}
+	if _, ok := policy.(placement.GraphPolicy); ok {
+		go graph()
 	}
 	store, err := epoch.NewStore(cfg.EpochStore)
 	if err != nil {

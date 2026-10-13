@@ -64,13 +64,26 @@ would need a hand-off first. Baselines: `"lazy-stream"` also streams the rest in
 `raw_vectors` / `raw_seconds`), `"copy-then-flip"` streams them before the flip, `"stop-and-copy"`
 while paused.
 
-**Placement (decided part of U3):** `"placement": "even-reversible"` (the default) sends a
-partition back to a node that has owned it before when the cluster scales in, so scaling out and
-back in restores the placement exactly and the scale-in moves *no* PQ code -- the returning
-partitions name vectors their owner kept cached. Koala's policy (`"even"`, kept as the baseline)
-does not: after 4 -> 8 -> 4 none of the partitions that moved is home again. It has no reason to
-care, because its state changes with every input, so a copy left behind is stale; with a static
-dataset the copy stays valid, which is what makes this worth doing.
+**Placement (decided part of U3):** `"placement": "even-reversible-graph"` (the default) keeps
+partition counts even and moves partitions only from existing to new nodes on scale-out -- each
+donor gives its excess -- and from leaving to remaining nodes on scale-in, where it sends every
+partition it can back to a node that has owned it before. So scaling out and back in restores
+the placement exactly and the scale-in moves *no* PQ code: the returning partitions name vectors
+their owner kept cached. Which partitions a donor gives, and where one that cannot go home goes,
+it picks with the partition graph -- navigation-graph edges between the partitions' heads, read
+off the index's `graph.hnsw` when the controller starts -- so that the nodes cut as little of it
+as possible and fewer queries straddle two owners. On BIGANN-10M (64 spatial partitions, nprobe
+64) 2 -> 3 gives 1.71 owners per query against 1.83 when every donor gives its tail
+(`"even-reversible"`, `"even-reversible-blocks"`), one node at a time to 8 gives 3.31 against
+3.81, and doubling does as well as whole blocks (2 -> 4: 1.81 both; 2 -> 4 -> 8: 2.69 against
+2.76); `rtier-overhead -owners -rescale 2:3,2:4 -placement even-reversible-graph -index DIR`
+measures it. End to end under a per-node read budget the capacity is the same, with 2-7% less
+CPU per query and 5-8% fewer PQ codes staged. Layouts reached one node at a time still drift
+from a fresh even split (3.31 against 2.76 at 8 nodes): with no data exchanged between old nodes,
+each node's region only shrinks, and only bigger steps avoid that. Koala's policy (`"even"`,
+kept as the baseline) is not reversible: after 4 -> 8 -> 4 none of the partitions that moved is
+home again. It has no reason to care, because its state changes with every input, so a copy left
+behind is stale; with a static dataset the copy stays valid, which is what makes this worth doing.
 
 **Graph transfer (decided part of U16):** a new node needs posting lists and PQ codes to own
 partitions and answer FILTER and RERANK -- the steps that take load off the old owners -- and

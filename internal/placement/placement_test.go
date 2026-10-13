@@ -173,7 +173,7 @@ func TestFromOwners(t *testing.T) {
 }
 
 func TestWeightedIsPlaceholder(t *testing.T) {
-	p, err := NewPolicy("weighted")
+	p, err := NewPolicy("weighted", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

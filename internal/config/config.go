@@ -47,7 +47,7 @@ type Controller struct {
 	InitialNodes   int      `json:"initial_nodes"`   // data nodes of the first epoch
 	InitialEntries int      `json:"initial_entries"` // entries among them; 0 = all
 	NewNodeRoles   []string `json:"new_node_roles"`  // roles of nodes added by scale-out
-	Placement      string   `json:"placement"`       // "even" | "even-reversible" | "weighted" (U3)
+	Placement      string   `json:"placement"`       // "even-reversible-graph" (default) | "even-reversible" | "even-reversible-blocks" | "even" | "weighted" (U3)
 	Protocol       string   `json:"protocol"`        // "lazy" | "lazy-stream" | "copy-then-flip" | "stop-and-copy" (U9)
 	EpochStore     string   `json:"epoch_store"`     // "memory" | "etcd" (U10)
 	MetricsPath    string   `json:"metrics_path"`    // JSON-lines sink
@@ -76,7 +76,7 @@ func DefaultController() Controller {
 		APIListen:     "127.0.0.1:7101",
 		InitialNodes:  1,
 		NewNodeRoles:  []string{RoleAggregator, RoleData, RoleEntry},
-		Placement:     "even-reversible",
+		Placement:     "even-reversible-graph",
 		Protocol:      "lazy",
 		EpochStore:    "memory",
 		MetricsPath:   "metrics.jsonl",

@@ -277,10 +277,16 @@ func checkNodes(numPartitions int, nodes []NodeID) error {
 	return nil
 }
 
-// NewPolicy returns the policy with the given name.
-func NewPolicy(name string) (Policy, error) {
+// NewPolicy returns the policy with the given name. adjacency supplies the partition graph of
+// "even-reversible-graph"; the other policies ignore it, and it may be nil for them.
+func NewPolicy(name string, adjacency func() (Adjacency, error)) (Policy, error) {
 	switch name {
-	case "", "even-reversible": // the decided design (U3)
+	case "", "even-reversible-graph": // the default (U3)
+		if adjacency == nil {
+			return nil, fmt.Errorf("placement: even-reversible-graph needs the partition graph (the index's navigation graph)")
+		}
+		return GraphPolicy{Adjacency: adjacency}, nil
+	case "even-reversible": // the decided rule without the graph: every donor gives its tail
 		return ReversiblePolicy{}, nil
 	case "even": // Koala's policy unchanged, kept as the baseline to compare against
 		return EvenPolicy{}, nil

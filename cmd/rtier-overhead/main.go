@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -99,6 +100,7 @@ func main() {
 	rescales := flag.String("rescale", "", "with -owners, also after scale-outs from:to[:to...] (e.g. \"2:3,2:4,2:3:4\"): "+
 		"the table -placement makes from an even start, as the controller's rescales would")
 	policyName := flag.String("placement", "even-reversible", "placement policy for -rescale")
+	indexDir := flag.String("index", "", "index directory: its navigation graph gives -placement even-reversible-graph the partition graph")
 	gtPath := flag.String("gt", "", "ground truth (.ibin) for recall in -compare")
 	var cost Costs
 	flag.Float64Var(&cost.RPC, "cost-rpc", 66.5, "model: us per RPC")
@@ -148,7 +150,7 @@ func main() {
 		sizes = append(sizes, v)
 	}
 	if *ownersOnly {
-		owners(m, lists, sizes, *rescales, *policyName)
+		owners(m, lists, sizes, *rescales, *policyName, *indexDir)
 		return
 	}
 	if *cmp {
@@ -422,7 +424,7 @@ func check(err error) {
 // the entry (uniform over the nodes) is itself one of them. rescales ("2:3,2:4") adds the
 // tables a scale-out under policyName leaves: which partitions the new nodes get decides how
 // many queries straddle them (e.g. donors' tails handed out round-robin vs. whole blocks).
-func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int, rescales, policyName string) {
+func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int, rescales, policyName, indexDir string) {
 	fmt.Printf("%d queries; owners per query under an even placement of %d partitions\n\n", len(lists), m.NumPartitions)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', tabwriter.AlignRight)
 	fmt.Fprintln(w, "N\tmean owners\tone owner\t<= 2 owners\tentry is an owner\t")
@@ -455,6 +457,13 @@ func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int, rescales, p
 		check(err)
 		row(strconv.Itoa(size), tbl, size)
 	}
+	var graph func() (placement.Adjacency, error)
+	if indexDir != "" {
+		graph = sync.OnceValues(func() (placement.Adjacency, error) {
+			g, err := partitioning.PartitionGraph(indexDir, m)
+			return placement.Adjacency(g), err
+		})
+	}
 	for _, r := range strings.Split(rescales, ",") {
 		if r = strings.TrimSpace(r); r == "" {
 			continue
@@ -470,7 +479,7 @@ func owners(m *partitioning.Manifest, lists [][]uint32, sizes []int, rescales, p
 		if len(steps) < 2 {
 			log.Fatalf("-rescale wants from:to[:to...], not %q", r)
 		}
-		pol, err := placement.NewPolicy(policyName)
+		pol, err := placement.NewPolicy(policyName, graph)
 		check(err)
 		tbl, err := pol.Initial(m.NumPartitions, ids(steps[0]))
 		check(err)

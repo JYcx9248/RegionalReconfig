@@ -615,7 +615,7 @@ def main(cfg_path: str, out_dir: str) -> None:
             "initial_nodes": cfg.get("InitialNodes", 1),
             "protocol": cfg.get("Protocol", "lazy"),
             "raw_priority": cfg.get("RawPriority", "background"),
-            "placement": cfg.get("Placement", "even"),
+            "placement": cfg.get("Placement", ""),  # "" = the controller's default (U3)
             "metrics_path": os.path.join(out_dir, "metrics.jsonl"),
         }, open(ctl_cfg, "w"), indent=2)
         procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg], prefix=rest_cpus(cfg, nodes))
