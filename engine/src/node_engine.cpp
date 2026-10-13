@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "fusion/assignment.h"
 #include "fusion/dataset.h"
 #include "fusion/distance.h"
 #include "fusion/filter.h"
@@ -149,6 +151,14 @@ class NodeEngineImpl : public NodeEngine {
     auto path = [&](const std::string& f) { return JoinPath(o.index_dir, f); };
     dim_ = static_cast<uint32_t>(meta.GetU64("dim"));
     n_ = meta.GetU64("num_vectors");
+    ids_ = std::max<uint64_t>(n_, o.max_vectors);
+    // Inserted vectors are routed by the build's own rule (U14), so its parameters come from the
+    // index; the two the build did not record are its defaults (fusion_build --assign-*).
+    assign_.replicas = static_cast<uint32_t>(std::stoul(meta.GetOr("replicas", "8")));
+    assign_.closure_eps = std::stof(meta.GetOr("closure_eps", "10"));
+    assign_.rng = meta.GetOr("rng", "0") != "0";
+    assign_.candidates = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_candidates", "64")));
+    assign_.ef = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_ef", "128")));
     FUSION_CHECK(man_.payload == kPayloadListsLocations,
                  "the partition directory %s has payload '%s': its posting lists carry no raw-vector "
                  "locations (rerun rtier_segment)",
@@ -183,10 +193,11 @@ class NodeEngineImpl : public NodeEngine {
     const uint32_t code_m = static_cast<uint32_t>(hdr[1] & 0xFFFFFFFFu);
     FUSION_CHECK(hdr[0] == n_ && code_m == cb.m(), "PQ codes do not match the index");
     FUSION_CHECK(pq_file_.Size() >= kPQFileHeader + n_ * code_m, "PQ code file is truncated");
-    const uint64_t cap = o.pq_capacity ? o.pq_capacity : n_;
-    FUSION_CHECK(cap <= n_, "PQ capacity %llu exceeds the index's %llu vectors",
-                 static_cast<unsigned long long>(cap), static_cast<unsigned long long>(n_));
-    store_ = std::make_unique<PQStore>(n_, cb.m(), cap);
+    const uint64_t cap = o.pq_capacity ? o.pq_capacity : ids_;
+    FUSION_CHECK(cap <= ids_, "PQ capacity %llu exceeds the %llu vector IDs",
+                 static_cast<unsigned long long>(cap), static_cast<unsigned long long>(ids_));
+    store_ = std::make_unique<PQStore>(ids_, cb.m(), cap);
+    codebook_ = std::make_unique<PQCodebook>(cb);
     reclaimer_ = std::make_unique<Reclaimer>(store_.get());
 
     FilterConfig fc;
@@ -208,7 +219,9 @@ class NodeEngineImpl : public NodeEngine {
 
     // Raw vectors: node-level too, a sparse copy of the page file filled as partitions arrive
     // (fusion/raw_store.h). The index's page file is only read to bootstrap.
-    raw_ = std::make_unique<RawStore>(o.raw_file, man_.raw, o.direct_io);
+    RawLayout raw_layout = man_.raw;  // with room for the locations of inserted vectors
+    raw_layout.num_pages = std::max<uint64_t>(raw_layout.num_pages, o.max_pages);
+    raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io);
     if (o.read_iops) {
       budget_ = std::make_unique<ReadBudget>(o.read_iops);
       raw_->SetReadBudget(budget_.get());
@@ -231,6 +244,7 @@ class NodeEngineImpl : public NodeEngine {
       stop_writer_ = true;
     }
     writer_cv_.notify_all();
+    room_cv_.notify_all();
     if (writer_.joinable()) writer_.join();  // installs what is still queued first
   }
 
@@ -451,6 +465,97 @@ class NodeEngineImpl : public NodeEngine {
     return r;
   }
 
+  // Inserted vectors (U14) go where fetched ones go -- the cache, served from memory until the
+  // writer installs them -- but into their own queue, which the writer takes last.
+  RawPutResult RawAdd(const uint32_t* locs, size_t n, const uint8_t* vecs) override {
+    const uint32_t vb = raw_->layout().vec_bytes;
+    const uint64_t space = raw_->layout().locations();
+    for (size_t i = 0; i < n; ++i)
+      FUSION_CHECK(locs[i] < space, "location %u is outside the page file's %llu locations", locs[i],
+                   static_cast<unsigned long long>(space));
+    FUSION_CHECK(n * vb <= opts_.update_buffer_bytes,
+                 "%zu inserted vectors do not fit in the update buffer (%llu bytes)", n,
+                 static_cast<unsigned long long>(opts_.update_buffer_bytes));
+    std::vector<uint32_t> fresh;
+    Timer t;
+    {
+      std::unique_lock<std::mutex> l(cache_mu_);
+      room_cv_.wait(l, [&] {
+        return stop_writer_ || (added_queued_ + n) * vb <= opts_.update_buffer_bytes;
+      });
+      for (size_t i = 0; i < n; ++i) {
+        if (raw_->Present(locs[i]) || cache_.count(locs[i])) continue;
+        cache_.emplace(locs[i], std::vector<uint8_t>(vecs + i * vb, vecs + (i + 1) * vb));
+        fresh.push_back(locs[i]);
+      }
+      if (!fresh.empty()) {
+        added_queued_ += fresh.size();
+        update_queue_.push_back(fresh);
+      }
+    }
+    fc_.added_wait_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
+    fc_.added.fetch_add(fresh.size(), std::memory_order_relaxed);
+    if (!fresh.empty()) writer_cv_.notify_one();
+    RawPutResult r;
+    r.installed = fresh.size();
+    r.skipped = n - r.installed;
+    return r;
+  }
+
+  void PauseUpdateWrites(bool paused) override {
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      update_paused_ = paused;
+    }
+    writer_cv_.notify_all();
+  }
+
+  // The build's rule (AssignVectors in src/assignment.cpp) for one vector at a time. The build
+  // searched with setEf(max(ef, candidates)) and searchKnn(x, candidates); the graph here keeps
+  // ef 1 (see NavigateImpl), so asking for max(ef, candidates) and keeping the best candidates
+  // runs the same search.
+  void Assign(const void* vecs, uint32_t n, uint32_t* lists, uint8_t* codes) override {
+    std::shared_ptr<HnswIndex> g;
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      g = graph_;
+    }
+    if (!g) throw NoGraphError("navigation graph is not loaded on this node");
+    FUSION_CHECK(!assign_.rng, "the index was built with RNG pruning, which Assign does not reproduce");
+    const uint32_t r = assign_.replicas;
+    const float closure = (1.f + assign_.closure_eps) * (1.f + assign_.closure_eps);
+    const uint32_t width = std::max(assign_.ef, assign_.candidates);
+    const T* x = static_cast<const T*>(vecs);
+    std::vector<std::pair<float, uint32_t>> cand;
+    for (uint32_t i = 0; i < n; ++i) {
+      const T* v = x + static_cast<size_t>(i) * dim_;
+      auto res = g->searchKnn(v, width);
+      while (res.size() > assign_.candidates) res.pop();
+      cand.clear();
+      while (!res.empty()) {
+        cand.emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
+        res.pop();
+      }
+      std::reverse(cand.begin(), cand.end());  // ascending distance
+      uint32_t* out = lists + static_cast<size_t>(i) * r;
+      std::fill(out, out + r, kInvalidId);
+      if (!cand.empty()) {
+        uint32_t cnt = 0;
+        const float d1 = cand[0].first;
+        out[cnt++] = cand[0].second;
+        for (size_t j = 1; j < cand.size() && cnt < r; ++j) {
+          if (cand[j].first > closure * d1) break;  // Eq. 2 closure rule (candidates are sorted)
+          out[cnt++] = cand[j].second;
+        }
+      }
+      codebook_->Encode(v, codes + static_cast<size_t>(i) * codebook_->m());
+    }
+  }
+
+  uint32_t assign_replicas() const override { return assign_.replicas; }
+  uint32_t pq_m() const override { return codebook_->m(); }
+  uint64_t id_capacity() const override { return ids_; }
+
   // Fetched as RERANK fetches (same sources, same peer requests, chains included), but written
   // straight to the SSD as a stream's batch: nothing waits for these vectors in memory, and a
   // copy of a whole partition must not pass through the fetch cache and its writer.
@@ -497,6 +602,7 @@ class NodeEngineImpl : public NodeEngine {
       f.queued = queued_;
       f.queued_peak = queued_peak_;
       f.write_batches = written_batches_;
+      f.added_queued = added_queued_;
     }
     f.present = raw_->Stats().present;
     auto get = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
@@ -514,6 +620,9 @@ class NodeEngineImpl : public NodeEngine {
     f.rerank_mem = get(fc_.rerank_mem);
     f.pending_recounts = get(fc_.pending_recounts);
     f.pending_us = get(fc_.pending_us);
+    f.added = get(fc_.added);
+    f.added_written = get(fc_.added_written);
+    f.added_wait_us = get(fc_.added_wait_us);
     return f;
   }
 
@@ -561,7 +670,7 @@ class NodeEngineImpl : public NodeEngine {
                  opts_.max_nprobe);
     FUSION_CHECK(k >= 1, "k must be >= 1");
     for (uint32_t i = 0; i < n; ++i)
-      FUSION_CHECK(ids[i] < n_, "vector ID %u out of range", ids[i]);
+      FUSION_CHECK(ids[i] < ids_, "vector ID %u out of range", ids[i]);
     Worker& w = *workers_.at(static_cast<size_t>(wi));
     RerankParams rp;
     rp.k = k;
@@ -819,7 +928,7 @@ class NodeEngineImpl : public NodeEngine {
     if (!index_pages_) {
       auto f = std::make_unique<ReadOnlyFile>();
       f->Open(index_pages_path_);
-      const RawLayout& L = raw_->layout();
+      const RawLayout& L = man_.raw;  // the index's pages: the local store may have room for more
       FUSION_CHECK(f->Size() >= L.num_pages * L.page_size, "vector page file %s is truncated",
                    index_pages_path_.c_str());
       index_pages_ = std::move(f);
@@ -1021,14 +1130,33 @@ class NodeEngineImpl : public NodeEngine {
     std::vector<uint8_t> vecs;
     std::unique_lock<std::mutex> l(cache_mu_);
     for (;;) {
-      writer_cv_.wait(l, [&] { return stop_writer_ || !write_queue_.empty(); });
-      if (write_queue_.empty()) return;  // stopping, and nothing left to install
+      // Fetched vectors first: the queries that fetched them hold memory until they are written.
+      // Inserted ones (U14) only when no fetched one waits, within update_write_bps and not
+      // while paused -- except when stopping, which writes everything.
+      auto updates_due = [&] {
+        return !update_queue_.empty() &&
+               (stop_writer_ ||
+                (!update_paused_ && std::chrono::steady_clock::now() >= next_update_write_));
+      };
+      while (!stop_writer_ && write_queue_.empty() && !updates_due()) {
+        if (!update_queue_.empty() && !update_paused_)
+          writer_cv_.wait_until(l, next_update_write_);
+        else
+          writer_cv_.wait(l);
+      }
+      std::deque<std::vector<uint32_t>>* q = nullptr;
+      if (!write_queue_.empty())
+        q = &write_queue_;
+      else if (updates_due())
+        q = &update_queue_;
+      else
+        return;  // stopping, and nothing left to install
+      const bool added = q == &update_queue_;
       locs.clear();
       uint64_t batches = 0;
-      while (!write_queue_.empty() &&
-             (locs.empty() || locs.size() + write_queue_.front().size() <= kWriteRound)) {
-        locs.insert(locs.end(), write_queue_.front().begin(), write_queue_.front().end());
-        write_queue_.pop_front();
+      while (!q->empty() && (locs.empty() || locs.size() + q->front().size() <= kWriteRound)) {
+        locs.insert(locs.end(), q->front().begin(), q->front().end());
+        q->pop_front();
         ++batches;
       }
       vecs.resize(locs.size() * vb);
@@ -1037,8 +1165,9 @@ class NodeEngineImpl : public NodeEngine {
       bool ok = true;
       try {
         Timer t;
-        const size_t installed = raw_->Put(locs.data(), locs.size(), vecs.data(), RawOrigin::kFetched);
-        fc_.written.fetch_add(installed, std::memory_order_relaxed);
+        const size_t installed =
+            raw_->Put(locs.data(), locs.size(), vecs.data(), added ? RawOrigin::kAdded : RawOrigin::kFetched);
+        (added ? fc_.added_written : fc_.written).fetch_add(installed, std::memory_order_relaxed);
         fc_.write_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
       } catch (const std::exception& e) {
         ok = false;  // they stay in the cache, still served from memory
@@ -1047,9 +1176,19 @@ class NodeEngineImpl : public NodeEngine {
       l.lock();
       if (ok)
         for (uint32_t loc : locs) cache_.erase(loc);
-      queued_ -= locs.size();
-      written_batches_ += batches;
-      drain_cv_.notify_all();
+      if (added) {
+        added_queued_ -= locs.size();
+        if (opts_.update_write_bps) {
+          const double us = 1e6 * static_cast<double>(locs.size() * vb) / opts_.update_write_bps;
+          next_update_write_ = std::chrono::steady_clock::now() +
+                               std::chrono::microseconds(static_cast<int64_t>(us));
+        }
+        room_cv_.notify_all();
+      } else {
+        queued_ -= locs.size();
+        written_batches_ += batches;
+        drain_cv_.notify_all();
+      }
     }
   }
 
@@ -1175,7 +1314,10 @@ class NodeEngineImpl : public NodeEngine {
   NodeOptions opts_;
   PartitionManifest man_;
   uint32_t dim_ = 0;
-  uint64_t n_ = 0;
+  uint64_t n_ = 0;    // the index's vectors
+  uint64_t ids_ = 0;  // the vector-ID space: n_ and room for inserted vectors
+  AssignParams assign_;  // the build's, for Assign
+  std::unique_ptr<PQCodebook> codebook_;
   uint32_t max_candidates_ = 0;
   std::unique_ptr<hnswlib::SpaceInterface<float>> space_;
   mutable std::mutex graph_mu_;
@@ -1224,10 +1366,17 @@ class NodeEngineImpl : public NodeEngine {
   size_t queued_ = 0;                              // locations in write_queue_
   size_t queued_peak_ = 0;
   uint64_t queued_batches_ = 0, written_batches_ = 0;  // tickets: DrainWrites waits for its own
+  // Inserted vectors (U14): cached like fetched ones, queued apart and written last.
+  mutable std::condition_variable room_cv_;  // inserted vectors written (RawAdd backpressure)
+  std::deque<std::vector<uint32_t>> update_queue_;
+  size_t added_queued_ = 0;  // locations in update_queue_
+  bool update_paused_ = false;
+  std::chrono::steady_clock::time_point next_update_write_{};  // update_write_bps
   struct FetchCounters {  // fetch_stats
     std::atomic<uint64_t> fetched{0}, fetch_calls{0}, fetch_us{0}, written{0}, write_us{0},
         sync_installed{0}, sync_us{0}, drain_calls{0}, drain_waiting{0}, drain_us{0},
-        rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0};
+        rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0}, added{0},
+        added_written{0}, added_wait_us{0};
   };
   mutable FetchCounters fc_;
   bool stop_writer_ = false;

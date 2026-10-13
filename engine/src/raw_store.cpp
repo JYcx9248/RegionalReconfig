@@ -236,12 +236,12 @@ size_t RawStore::Put(const uint32_t* locs, size_t n, const uint8_t* vecs, RawOri
   order.erase(std::unique(order.begin(), order.end(),
                           [&](size_t a, size_t b) { return locs[a] == locs[b]; }),
               order.end());
-  // Fetched vectors -- the engine's writer, a few scattered vectors per page -- go out as whole
-  // pages with O_DIRECT. Bulk installs (bootstrap, streams) come in sorted batches that fill a
+  // Fetched and inserted vectors -- the engine's writer, a few scattered vectors per page -- go
+  // out as whole pages with O_DIRECT. Bulk installs (bootstrap, streams) come in sorted batches that fill a
   // page over several requests: buffered, the page cache combines them per page, where whole
   // pages would rewrite, and first read back, a page per request (measured: a 64 KB stream
   // request 3.5-4.6 ms, bootstrap 3x slower).
-  if (dfd_ >= 0 && origin == RawOrigin::kFetched) {
+  if (dfd_ >= 0 && (origin == RawOrigin::kFetched || origin == RawOrigin::kAdded)) {
     PutPages(locs, vecs, order);
   } else {
     PutBuffered(locs, vecs, order);
@@ -255,6 +255,7 @@ size_t RawStore::Put(const uint32_t* locs, size_t n, const uint8_t* vecs, RawOri
   present_.fetch_add(installed, std::memory_order_relaxed);
   std::atomic<uint64_t>& by = origin == RawOrigin::kIndex      ? from_index_
                               : origin == RawOrigin::kStreamed ? streamed_
+                              : origin == RawOrigin::kAdded    ? added_
                                                                : fetched_;
   by.fetch_add(installed, std::memory_order_relaxed);
   skipped_.fetch_add(n - installed, std::memory_order_relaxed);
@@ -372,6 +373,7 @@ RawStats RawStore::Stats() const {
   s.from_index = from_index_.load(std::memory_order_relaxed);
   s.streamed = streamed_.load(std::memory_order_relaxed);
   s.fetched = fetched_.load(std::memory_order_relaxed);
+  s.added = added_.load(std::memory_order_relaxed);
   s.fetches = fetches_.load(std::memory_order_relaxed);
   s.skipped = skipped_.load(std::memory_order_relaxed);
   s.served = served_.load(std::memory_order_relaxed);

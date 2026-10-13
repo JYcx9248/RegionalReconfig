@@ -110,10 +110,13 @@ const char* OpName(uint8_t op) {
     case kRawPut: return "raw_put";
     case kRawCheck: return "raw_check";
     case kRawPull: return "raw_pull";
+    case kRawAdd: return "raw_add";
+    case kPauseUpdates: return "pause_updates";
     case kNavigate: return "navigate";
     case kFilter: return "filter";
     case kRerank: return "rerank";
     case kSearchLocal: return "search_local";
+    case kAssign: return "assign";
     default: return nullptr;
   }
 }
@@ -530,6 +533,22 @@ Frame NodeServer::Handle(const Frame& req) {
         w.Put<uint32_t>(static_cast<uint32_t>(res.skipped));
         break;
       }
+      case kRawAdd: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t vb = r.Get<uint32_t>();
+        Require(vb == e.vec_bytes(), "vector size does not match this node's index");
+        Require(n <= kMaxRawBatch && static_cast<uint64_t>(n) * vb <= kMaxFrameBytes / 2,
+                "RAW_ADD batch too large");
+        const auto locs = TakeArray<uint32_t>(&r, n);
+        Require(r.remaining() == static_cast<size_t>(n) * vb, "RAW_ADD: vectors do not match the locations");
+        const fusion::RawPutResult res = e.RawAdd(locs.data(), n, r.Bytes(static_cast<size_t>(n) * vb));
+        w.Put<uint32_t>(static_cast<uint32_t>(res.installed));
+        w.Put<uint32_t>(static_cast<uint32_t>(res.skipped));
+        break;
+      }
+      case kPauseUpdates:
+        e.PauseUpdateWrites(r.Get<uint8_t>() != 0);
+        break;
       case kRawPull: {
         const uint32_t n = r.Get<uint32_t>();
         Require(n <= kMaxRawBatch && static_cast<uint64_t>(n) * e.vec_bytes() <= kMaxFrameBytes / 2,
@@ -598,6 +617,24 @@ Frame NodeServer::Handle(const Frame& req) {
         w.Put(rs.fetched);
         break;
       }
+      case kAssign: {
+        const uint32_t n = r.Get<uint32_t>();
+        const size_t qb = static_cast<size_t>(e.dim()) * fusion::DTypeSize(e.dtype());
+        const uint32_t rep = e.assign_replicas(), m = e.pq_m();
+        Require(n >= 1 && static_cast<uint64_t>(n) * (qb + 4 * rep + m) <= kMaxFrameBytes / 2,
+                "ASSIGN batch too large");
+        Require(r.remaining() == static_cast<size_t>(n) * qb, "ASSIGN: body is not n vectors");
+        std::vector<uint64_t> vecs((static_cast<size_t>(n) * qb + 7) / 8);
+        std::memcpy(vecs.data(), r.Bytes(static_cast<size_t>(n) * qb), static_cast<size_t>(n) * qb);
+        std::vector<uint32_t> lists(static_cast<size_t>(n) * rep);
+        std::vector<uint8_t> codes(static_cast<size_t>(n) * m);
+        e.Assign(vecs.data(), n, lists.data(), codes.data());
+        w.Put<uint32_t>(rep);
+        w.Put<uint32_t>(m);
+        w.PutBytes(lists.data(), lists.size() * 4);
+        w.PutBytes(codes.data(), codes.size());
+        break;
+      }
       case kSearchLocal: {
         fusion::SearchParams sp;
         sp.k = r.Get<uint32_t>();
@@ -658,11 +695,12 @@ std::string NodeServer::InfoJson(bool settle) const {
   s += fusion::StrFormat(
       "\"dtype\":\"%s\",\"dim\":%u,\"num_vectors\":%llu,\"num_lists\":%u,\"num_partitions\":%u,"
       "\"max_nprobe\":%u,\"max_rerank\":%u,\"workers\":%d,\"filter\":\"%s\",\"payload\":\"%s\","
-      "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,",
+      "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,\"id_capacity\":%llu,",
       fusion::DTypeName(e.dtype()), e.dim(), static_cast<unsigned long long>(e.size()),
       e.num_lists(), e.num_partitions(), o.max_nprobe, o.max_rerank, e.num_workers(),
       e.filter_name(), e.payload().c_str(), e.has_graph() ? "true" : "false",
-      static_cast<unsigned long long>(max_epoch_seen_.load()));
+      static_cast<unsigned long long>(max_epoch_seen_.load()),
+      static_cast<unsigned long long>(e.id_capacity()));
   s += "\"resident\":[";
   const auto res = e.ResidentPartitions();
   for (size_t i = 0; i < res.size(); ++i) s += (i ? "," : "") + std::to_string(res[i]);
@@ -681,10 +719,10 @@ std::string NodeServer::InfoJson(bool settle) const {
   const fusion::RawStats raw = e.raw_stats(settle);
   s += fusion::StrFormat(
       ",\"raw\":{\"vec_bytes\":%u,\"locations\":%llu,\"present\":%llu,\"cached\":%llu,"
-      "\"pending\":%llu,\"from_index\":%llu,\"streamed\":%llu,\"fetched\":%llu,\"fetches\":%llu,"
-      "\"skipped\":%llu,\"served\":%llu}",
+      "\"pending\":%llu,\"from_index\":%llu,\"streamed\":%llu,\"fetched\":%llu,\"added\":%llu,"
+      "\"fetches\":%llu,\"skipped\":%llu,\"served\":%llu}",
       raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.cached), u(raw.pending), u(raw.from_index),
-      u(raw.streamed), u(raw.fetched), u(raw.fetches), u(raw.skipped), u(raw.served));
+      u(raw.streamed), u(raw.fetched), u(raw.added), u(raw.fetches), u(raw.skipped), u(raw.served));
   s += ",\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
   return s;
 }
@@ -714,11 +752,13 @@ std::string NodeServer::FetchJson() const {
       "\"fetch_calls\":%llu,\"fetch_us\":%llu,\"written\":%llu,\"write_batches\":%llu,"
       "\"write_us\":%llu,\"sync_installed\":%llu,\"sync_us\":%llu,\"drain_calls\":%llu,"
       "\"drain_waiting\":%llu,\"drain_us\":%llu,\"rerank_disk\":%llu,\"rerank_mem\":%llu,"
-      "\"pending_recounts\":%llu,\"pending_us\":%llu}",
+      "\"pending_recounts\":%llu,\"pending_us\":%llu,\"added\":%llu,\"added_queued\":%llu,"
+      "\"added_written\":%llu,\"added_wait_us\":%llu}",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
       u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
-      u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us));
+      u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us), u(f.added), u(f.added_queued),
+      u(f.added_written), u(f.added_wait_us));
 }
 
 std::string NodeServer::StatsJson() const {

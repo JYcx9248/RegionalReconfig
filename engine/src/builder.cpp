@@ -207,6 +207,8 @@ void BuildIndex(const BuildParams& p) {
     meta.Set("closure_eps", p.assign.closure_eps);
     meta.Set("rng", p.assign.rng ? 1 : 0);
     meta.Set("rng_factor", p.assign.rng_factor);
+    meta.Set("assign_candidates", p.assign.candidates);  // inserts follow the same rule (U14)
+    meta.Set("assign_ef", p.assign.ef);
     meta.Set("hnsw_m", p.graph.m);
     meta.Set("hnsw_ef_construction", p.graph.ef_construction);
   }

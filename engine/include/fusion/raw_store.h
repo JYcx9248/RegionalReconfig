@@ -52,7 +52,8 @@ class RawMissingError : public std::runtime_error {
 };
 
 // Where installed vectors came from (statistics only).
-enum class RawOrigin { kIndex, kStreamed, kFetched };
+// kAdded: an inserted vector (U14), written in the background like a fetched one.
+enum class RawOrigin { kIndex, kStreamed, kFetched, kAdded };
 
 struct RawStats {
   uint32_t vec_bytes = 0;
@@ -65,6 +66,7 @@ struct RawStats {
   uint64_t streamed = 0;    // cumulative: installed by the agent's stream (RAW_PUT)
   uint64_t fetched = 0;     // cumulative: installed after an on-demand fetch from a peer (the
                             // ones still cached are not counted yet)
+  uint64_t added = 0;       // cumulative: inserted vectors installed (RAW_ADD, U14)
   uint64_t fetches = 0;     // cumulative: on-demand fetch round trips
   uint64_t skipped = 0;     // cumulative: offered but already here
   uint64_t served = 0;      // cumulative: copied out for peers (RAW_GET)
@@ -124,7 +126,7 @@ class RawStore {
   uint8_t* chunk_ = nullptr;      // under put_mu_: kChunkPages page-aligned pages
   ReadBudget* budget_ = nullptr;
   std::unique_ptr<std::atomic<uint64_t>[]> bits_;  // one bit per location
-  std::atomic<uint64_t> present_{0}, from_index_{0}, streamed_{0}, fetched_{0}, fetches_{0},
+  std::atomic<uint64_t> present_{0}, from_index_{0}, streamed_{0}, fetched_{0}, added_{0}, fetches_{0},
       skipped_{0}, served_{0};
 };
 

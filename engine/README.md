@@ -57,7 +57,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 | File | What |
 |---|---|
 | `include/fusion/partition.h`, `src/partition.cpp` | partition directory: manifest (with the page geometry), list -> partition map, per-partition posting-list segments (version 2: each posting is a vector ID and its raw vector's canonical location) with CRC-32 |
-| `include/fusion/node_engine.h`, `src/node_engine.cpp` | `NodeEngine`: posting lists held per partition (load/evict while queries run), each partition possibly at several versions (`Filter` / `Rerank` name the version their epoch sees; groundwork for update batches, U14), node-level PQ codes and raw vectors (fetched on demand from the old owner after a migration), navigation graph loadable after startup, primitives `Navigate` / `Filter` / `Rerank` / `SearchLocal` |
+| `include/fusion/node_engine.h`, `src/node_engine.cpp` | `NodeEngine`: posting lists held per partition (load/evict while queries run), each partition possibly at several versions (`Filter` / `Rerank` name the version their epoch sees; groundwork for update batches, U14), room for inserted vectors (`--max-vectors`, `--max-pages`), `Assign` (routes a vector by the build's own rule and gives its PQ code) and `RawAdd` (inserted vectors served from memory, written by the background writer after fetched ones, pausable), node-level PQ codes and raw vectors (fetched on demand from the old owner after a migration), navigation graph loadable after startup, primitives `Navigate` / `Filter` / `Rerank` / `SearchLocal` |
 | `include/fusion/pq_store.h`, `src/pq_store.cpp` | node-level PQ store: one code per vector, reference-counted by resident postings, capacity = the node's PQ budget; also where a vector's raw-vector location is looked up |
 | `include/fusion/raw_store.h`, `src/raw_store.cpp` | node-level raw vectors: a sparse local copy of the page file at the canonical offsets, one presence bit per location |
 | `include/fusion/layout.h` (`RawLayout`), `src/rerank.cpp` | page geometry and locations; re-ranking by location (the layout-map variant stays for `fusion::Engine`) |
@@ -65,7 +65,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 | `node/wire.h`, `node/server.{h,cpp}` | rtier wire protocol server (same framing as the Go side, `internal/frame`), and `PeerPool`, the connections a data node uses to fetch raw vectors from another (`RAW_GET`) |
 | `tools/rtier_node.cpp` | data-node service; prints `READY tcp=<port>` when listening; `--raw-file` for its raw vectors; `--stats-file` appends a JSON line of counters every `--stats-ms` (CLOCK_MONOTONIC); `--read-iops` sets the read budget |
 | `tools/rtier_segment.cpp` | applies a list -> partition assignment (choosing it is open question U2); writes every posting's location in `--layout` |
-| `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), partition versions, PQ store, PQ migration between two nodes, raw store, raw-vector migration (on-demand, chained and streamed, on nodes whose index has no page file), read budget (pacing, what is charged, same answers under a binding budget), wire protocol |
+| `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), partition versions, inserted vectors (`Assign` == the build's lists and codes, new IDs and locations, paused writes, backpressure), PQ store, PQ migration between two nodes, raw store, raw-vector migration (on-demand, chained and streamed, on nodes whose index has no page file), read budget (pacing, what is charged, same answers under a binding budget), wire protocol |
 
 Behavior changes to the original engine, both for deterministic results across nodes:
 
@@ -307,8 +307,9 @@ check, the PQ implementation's error matches Faiss's `ProductQuantizer` on the s
 
 ## Limitations
 
-- L2 distance only; vectors of at most 4 KB (at least one per page); static index, no
-  inserts or deletes.
+- L2 distance only; vectors of at most 4 KB (at least one per page). Updates (U14) are only
+  partly there: inserted vectors can be routed and installed, but no batch makes them visible
+  yet, there are no deletes, and inserted vectors' writes are not charged to the read budget.
 - One GPU per engine.
 - The builder keeps N × 8 assignment IDs in RAM during the build.
 - hnswlib stores a hash map entry per head, which adds several GB at 100M heads.

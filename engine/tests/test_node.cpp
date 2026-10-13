@@ -123,6 +123,7 @@ struct Fixture {
   std::string index_nopages;  // symlinks to index, without vectors_bucket.bin
   uint32_t dim = 16, nq = 40, num_parts = 4;
   std::vector<float> queries;
+  std::vector<float> base;  // the index's vectors
 };
 
 Fixture& GetFixture() {
@@ -142,6 +143,7 @@ Fixture& GetFixture() {
     };
     sample(&base, n);
     sample(&x.queries, x.nq);
+    x.base = base;
     const std::string dir = TempDir();
     SaveBin(dir + "/base.fbin", DType::kFloat, n, x.dim, base.data());
     BuildParams bp;
@@ -390,6 +392,131 @@ void TestPartitionVersions() {
   CHECK(versions_of(p).empty());
   const auto res = node->ResidentPartitions();
   CHECK(std::find(res.begin(), res.end(), p) == res.end());
+}
+
+// Inserted vectors (U14). ASSIGN routes a vector the way the build did (the same lists and
+// the same PQ code); the ID and location spaces leave room for inserts; RAW_ADD serves inserted
+// vectors from memory at once, writes them only while update writes are not paused, and holds
+// the sender back when its buffer is full.
+void TestInsertedVectors() {
+  Fixture& f = GetFixture();
+  const uint64_t n = f.base.size() / f.dim;
+  const PartitionManifest man = PartitionManifest::Load(f.parts);
+  auto open = [&](bool full, uint64_t buffer) {
+    NodeOptions o;
+    o.index_dir = f.index;
+    o.partitions_dir = f.parts;
+    o.num_workers = 2;
+    o.max_nprobe = 64;
+    o.max_rerank = 4096;
+    o.direct_io = false;
+    o.max_vectors = n + 64;
+    o.max_pages = man.raw.num_pages + 4;
+    o.update_buffer_bytes = buffer;
+    auto e = NodeEngine::Open(o);
+    if (full) {
+      e->LoadGraph(JoinPath(f.index, files::kGraph));
+      for (uint32_t p = 0; p < f.num_parts; ++p)
+        e->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
+    }
+    return e;
+  };
+  auto node = open(true, 256u << 20);
+  CHECK(node->id_capacity() == n + 64);
+  const uint64_t space0 = man.raw.locations();
+  CHECK(node->raw_stats(false).locations == space0 + 4ull * man.raw.vectors_per_page);
+
+  // ASSIGN on the index's own vectors gives back what the build gave them.
+  const uint32_t r = node->assign_replicas(), m = node->pq_m(), k = 300;
+  std::vector<uint32_t> lists(static_cast<size_t>(k) * r);
+  std::vector<uint8_t> codes(static_cast<size_t>(k) * m);
+  node->Assign(f.base.data(), k, lists.data(), codes.data());
+  const PostingLists pl = PostingLists::Load(JoinPath(f.index, files::kPostings));
+  std::vector<std::vector<uint32_t>> built(k);
+  for (uint32_t c = 0; c < pl.num_lists(); ++c)
+    for (uint32_t j = 0; j < pl.Size(c); ++j)
+      if (pl.List(c)[j] < k) built[pl.List(c)[j]].push_back(c);
+  uint32_t same = 0;
+  for (uint32_t i = 0; i < k; ++i) {
+    std::vector<uint32_t> got;
+    for (uint32_t j = 0; j < r; ++j)
+      if (lists[i * r + j] != kInvalidId) got.push_back(lists[i * r + j]);
+    std::sort(got.begin(), got.end());
+    if (got == built[i]) ++same;
+  }
+  std::printf("    ASSIGN: %u of %u vectors get the build's lists\n", same, k);
+  CHECK(same == k);
+  std::vector<uint8_t> stored(codes.size());
+  {
+    std::FILE* pf = std::fopen(JoinPath(f.index, files::kPQCodes).c_str(), "rb");
+    CHECK(pf != nullptr);
+    CHECK(std::fseek(pf, 16, SEEK_SET) == 0);
+    CHECK(std::fread(stored.data(), 1, stored.size(), pf) == stored.size());
+    std::fclose(pf);
+  }
+  CHECK(codes == stored);
+
+  // New IDs past the index's vectors take PQ codes; one past the ID space does not.
+  std::vector<uint32_t> new_ids = {static_cast<uint32_t>(n), static_cast<uint32_t>(n + 1)};
+  CHECK(node->PQPut(new_ids.data(), 2, codes.data()).installed == 2);
+  bool refused = false;
+  try {
+    const uint32_t far = static_cast<uint32_t>(n + 64);
+    node->PQPut(&far, 1, codes.data());
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  CHECK(refused);
+
+  // Inserted vectors at new locations: served at once, written only once writes resume.
+  const uint32_t vb = node->vec_bytes();
+  std::vector<uint32_t> locs = {static_cast<uint32_t>(space0), static_cast<uint32_t>(space0 + 1),
+                                static_cast<uint32_t>(space0 + 2)};
+  const uint8_t* vecs = reinterpret_cast<const uint8_t*>(f.base.data());
+  node->PauseUpdateWrites(true);
+  CHECK(node->RawAdd(locs.data(), locs.size(), vecs).installed == 3);
+  CHECK(node->RawAdd(locs.data(), 1, vecs).skipped == 1);
+  std::vector<uint32_t> via(locs.size(), 0);
+  std::vector<uint8_t> out(locs.size() * vb);
+  node->RawGet(locs.data(), via.data(), locs.size(), out.data());
+  CHECK(std::memcmp(out.data(), vecs, out.size()) == 0);
+  CHECK(node->RawAbsent(locs.data(), locs.size()).empty());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(node->fetch_stats().added_queued == 3 && node->fetch_stats().added_written == 0);
+  node->PauseUpdateWrites(false);
+  for (int i = 0; i < 500 && node->fetch_stats().added_written < 3; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(node->fetch_stats().added_written == 3 && node->fetch_stats().added_queued == 0);
+  CHECK(node->raw_stats(false).added == 3);
+  std::fill(out.begin(), out.end(), 0);
+  node->RawGet(locs.data(), via.data(), locs.size(), out.data());
+  CHECK(std::memcmp(out.data(), vecs, out.size()) == 0);
+  refused = false;
+  try {
+    const uint32_t far = static_cast<uint32_t>(space0 + 4ull * man.raw.vectors_per_page);
+    node->RawAdd(&far, 1, vecs);
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  CHECK(refused);
+
+  // Backpressure: with room for 4 vectors and writes paused, a fifth waits for the writer.
+  auto small = open(false, 4ull * vb);
+  small->PauseUpdateWrites(true);
+  std::vector<uint32_t> five = {static_cast<uint32_t>(space0), static_cast<uint32_t>(space0 + 1),
+                                static_cast<uint32_t>(space0 + 2), static_cast<uint32_t>(space0 + 3),
+                                static_cast<uint32_t>(space0 + 4)};
+  CHECK(small->RawAdd(five.data(), 4, vecs).installed == 4);
+  std::atomic<bool> done{false};
+  std::thread t([&] {
+    small->RawAdd(&five[4], 1, vecs + 4 * vb);
+    done = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(!done);
+  small->PauseUpdateWrites(false);
+  t.join();
+  CHECK(done);
 }
 
 void TestPQStore() {
@@ -1416,6 +1543,7 @@ int main() {
       {"partition_files", TestPartitionFiles},
       {"node_primitives", TestNodePrimitives},
       {"partition_versions", TestPartitionVersions},
+      {"inserted_vectors", TestInsertedVectors},
       {"pq_store", TestPQStore},
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},

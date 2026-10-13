@@ -53,6 +53,12 @@
 //   RAW_PULL        u32 n, u32 locs[n], u32 lists[n]          -> u32 installed, u32 skipped
 //                   (the node fetches what it lacks from the lists' sources with RAW_GET and
 //                   installs it: a stream that does not pass through the agents)
+//   RAW_ADD         u32 n, u32 vec_bytes, u32 locs[n],        -> u32 installed, u32 skipped
+//                   u8 vecs[n * vec_bytes]
+//                   (inserted vectors, U14: served from memory at once, written to the SSD in
+//                   the background after fetched ones; blocks while the update buffer is full)
+//   PAUSE_UPDATES   u8 paused                                 -> -
+//                   (holds back, or resumes, writing inserted vectors)
 //   NAVIGATE        u32 nprobe, u32 ef, query                 -> u32 n, u32 lists[n]
 //   FILTER          u32 topn, u32 nlists, u32 lists[nlists],  -> u32 n, u32 ids[n], f32 dists[n],
 //                   u32 versions[nlists], query                  u32 gathered, u32 unique
@@ -65,6 +71,10 @@
 //                   vector is fetched from the source of one of them that names it)
 //   SEARCH_LOCAL    u32 k, u32 nprobe, u32 rerank, u32 ef,    -> u32 n, u32 ids[n], f32 dists[n]
 //                   u8 heuristic, u8[3] pad, query
+//   ASSIGN          u32 n, vectors[n]                         -> u32 r, u32 m, u32 lists[n * r],
+//                                                                u8 codes[n * m]
+//                   (the lists the index's build would give each vector, padded with
+//                   0xFFFFFFFF, and its PQ code: the routing of inserted vectors, U14)
 #pragma once
 
 #include <cstdint>
@@ -99,10 +109,13 @@ enum Op : uint8_t {
   kRawPut = 0x19,
   kRawCheck = 0x1A,
   kRawPull = 0x1B,
+  kRawAdd = 0x1C,
+  kPauseUpdates = 0x1D,
   kNavigate = 0x20,
   kFilter = 0x21,
   kRerank = 0x22,
   kSearchLocal = 0x23,
+  kAssign = 0x24,
 };
 
 enum Status : uint16_t {

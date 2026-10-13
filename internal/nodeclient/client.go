@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync/atomic"
 	"time"
@@ -33,10 +34,13 @@ const (
 	opRawPut         uint8 = 0x19
 	opRawCheck       uint8 = 0x1A
 	opRawPull        uint8 = 0x1B
+	opRawAdd         uint8 = 0x1C
+	opPauseUpdates   uint8 = 0x1D
 	opNavigate       uint8 = 0x20
 	opFilter         uint8 = 0x21
 	opRerank         uint8 = 0x22
 	opSearchLocal    uint8 = 0x23
+	opAssign         uint8 = 0x24
 )
 
 // Status codes (engine/node/wire.h).
@@ -136,6 +140,7 @@ type RawStats struct {
 	FromIndex uint64 `json:"from_index"`
 	Streamed  uint64 `json:"streamed"`
 	Fetched   uint64 `json:"fetched"` // installed after an on-demand fetch (Cached not yet)
+	Added     uint64 `json:"added"`   // inserted vectors installed on the SSD (RawAdd, U14)
 	Fetches   uint64 `json:"fetches"`
 	Skipped   uint64 `json:"skipped"`
 	Served    uint64 `json:"served"`
@@ -155,6 +160,7 @@ type Info struct {
 	Payload       string             `json:"payload"`
 	GraphLoaded   bool               `json:"graph_loaded"`
 	MaxEpochSeen  uint64             `json:"max_epoch_seen"`
+	IDCapacity    uint64             `json:"id_capacity"` // vector IDs, room for inserts included (U14)
 	Resident      []int              `json:"resident"`
 	Versions      [][2]uint32        `json:"versions"` // every resident (partition, version)
 	PQ            PQStats            `json:"pq"`
@@ -469,6 +475,86 @@ func (c *Client) RawPut(ctx context.Context, locs []uint32, vecBytes int, vecs [
 	installed, skipped = int(r.U32()), int(r.U32())
 	return installed, skipped, r.Err
 }
+
+// RawAdd installs inserted vectors (U14) at their locations, vecBytes each in the order of
+// locs. The node serves them from memory at once and writes them to its SSD in the background,
+// after the vectors it fetched for queries and not while update writes are paused; the call
+// blocks while the node's buffer of unwritten inserted vectors is full. Vectors the node already
+// holds are skipped.
+func (c *Client) RawAdd(ctx context.Context, locs []uint32, vecBytes int, vecs []byte) (installed, skipped int, err error) {
+	if len(vecs) != vecBytes*len(locs) {
+		return 0, 0, fmt.Errorf("nodeclient: %d bytes of vectors for %d locations of %d bytes", len(vecs), len(locs), vecBytes)
+	}
+	var w frame.Writer
+	w.U32(uint32(len(locs)))
+	w.U32(uint32(vecBytes))
+	w.U32s(locs)
+	w.Bytes(vecs)
+	b, err := c.do(ctx, opRawAdd, 0, w.B)
+	if err != nil {
+		return 0, 0, err
+	}
+	r := frame.NewReader(b)
+	installed, skipped = int(r.U32()), int(r.U32())
+	return installed, skipped, r.Err
+}
+
+// PauseUpdateWrites holds back (paused) or resumes writing inserted vectors to the node's SSD,
+// e.g. while the node stages a reconfiguration, whose transfers go first.
+func (c *Client) PauseUpdateWrites(ctx context.Context, paused bool) error {
+	b := []byte{0}
+	if paused {
+		b[0] = 1
+	}
+	_, err := c.do(ctx, opPauseUpdates, 0, b)
+	return err
+}
+
+// Assignment is the routing of one vector (U14): the posting lists the index's build would
+// give it, by the build's rule, and its PQ code.
+type Assignment struct {
+	Lists []uint32
+	Code  []byte
+}
+
+// Assign routes vectors (the index's element type, vecs holds n of them) on the node's
+// navigation graph by the build's rule: an inserted vector goes where the build would have
+// put it. The node needs its graph (StatusNoGraph otherwise).
+func (c *Client) Assign(ctx context.Context, vecs []byte, n int) ([]Assignment, error) {
+	if n <= 0 || len(vecs)%n != 0 {
+		return nil, fmt.Errorf("nodeclient: ASSIGN of %d bytes as %d vectors", len(vecs), n)
+	}
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.Bytes(vecs)
+	b, err := c.do(ctx, opAssign, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	rep, m := int(r.U32()), int(r.U32())
+	lists := r.U32s(n * rep)
+	codes := r.Rest()
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	if len(codes) != n*m {
+		return nil, fmt.Errorf("nodeclient: ASSIGN reply with %d code bytes for %d vectors of %d", len(codes), n, m)
+	}
+	out := make([]Assignment, n)
+	for i := range out {
+		for _, l := range lists[i*rep : (i+1)*rep] {
+			if l != noList {
+				out[i].Lists = append(out[i].Lists, l)
+			}
+		}
+		out[i].Code = append([]byte(nil), codes[i*m:(i+1)*m]...)
+	}
+	return out, nil
+}
+
+// noList pads an ASSIGN reply's lists (fusion::kInvalidId).
+const noList = math.MaxUint32
 
 // RawPull has the node fetch the vectors at locs that it lacks from the sources of their lists
 // (lists[i] names locs[i]) -- data node to data node, as RERANK fetches -- and install them as

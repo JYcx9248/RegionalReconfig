@@ -36,7 +36,14 @@ type Manifest struct {
 	MaxListLen    int
 	Payload       string
 	ListPart      []uint32 // list -> partition
+	// The page file the postings' locations refer to (the index's vectors_<layout>.bin).
+	NumPages       uint64
+	VectorsPerPage uint64
 }
+
+// Locations is the size of the index's raw-vector address space: where the locations of
+// inserted vectors (U14) begin.
+func (m *Manifest) Locations() uint64 { return m.NumPages * m.VectorsPerPage }
 
 // PartitionOf returns the partition of list c.
 func (m *Manifest) PartitionOf(c uint32) int { return int(m.ListPart[c]) }
@@ -63,6 +70,13 @@ func LoadManifest(dir string) (*Manifest, error) {
 			return nil, fmt.Errorf("partitioning: manifest %s: bad %s", dir, key)
 		}
 		*dst = v
+	}
+	for key, dst := range map[string]*uint64{"num_pages": &m.NumPages, "vectors_per_page": &m.VectorsPerPage} {
+		if v, ok := kv[key]; ok {
+			if *dst, err = strconv.ParseUint(v, 10, 64); err != nil {
+				return nil, fmt.Errorf("partitioning: manifest %s: bad %s", dir, key)
+			}
+		}
 	}
 	if m.ListPart, err = ReadU32Array(filepath.Join(dir, ListPartFile)); err != nil {
 		return nil, err

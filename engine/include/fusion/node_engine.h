@@ -82,6 +82,15 @@ struct NodeOptions {
   int gpu_device = 0;
   uint64_t read_iops = 0;      // device reads per second this node may issue (fusion/read_budget.h,
                                // for several nodes on one SSD without cgroups); 0 = no budget
+  // Room for inserted vectors (U14). IDs and raw-vector locations are only ever appended, so
+  // both spaces are sized at startup with headroom: the vector IDs (0 = the index's vectors)
+  // and the page file's pages (0 = the index's pages).
+  uint64_t max_vectors = 0;
+  uint64_t max_pages = 0;
+  // Inserted vectors wait in memory, served from there, until the writer puts them on the SSD
+  // after the vectors fetched for queries; RawAdd blocks while more than this many bytes wait.
+  uint64_t update_buffer_bytes = 256ull << 20;
+  uint64_t update_write_bps = 0;  // bytes/s the writer spends on inserted vectors; 0 = no limit
 };
 
 // Where LoadPartition takes what the node does not hold yet.
@@ -140,6 +149,10 @@ struct FetchStats {
   uint64_t drain_us = 0;
   uint64_t rerank_disk = 0;      // RERANK candidates read from the SSD
   uint64_t rerank_mem = 0;       // RERANK candidates re-ranked from memory
+  uint64_t added = 0;            // inserted vectors received (RawAdd, U14)
+  uint64_t added_queued = 0;     // now: of those, not on the SSD yet (served from memory)
+  uint64_t added_written = 0;    // installed on the SSD by the writer
+  uint64_t added_wait_us = 0;    // time RawAdd callers waited for room in the buffer
   uint64_t pending_recounts = 0; // scans of the resident postings for the pending count
   uint64_t pending_us = 0;
 };
@@ -202,6 +215,14 @@ class NodeEngine {
   virtual void RawGet(const uint32_t* locs, const uint32_t* lists, size_t n, uint8_t* out) = 0;
   // Installs vectors streamed from a peer.
   virtual RawPutResult RawPut(const uint32_t* locs, size_t n, const uint8_t* vecs) = 0;
+  // Installs inserted vectors at their (new) locations (U14). They are kept in memory and served
+  // from there at once; the writer puts them on the SSD in the background, after the vectors
+  // fetched for queries and within update_write_bps, and not at all while update writes are
+  // paused. Blocks while update_buffer_bytes of them are waiting: backpressure on the sender.
+  virtual RawPutResult RawAdd(const uint32_t* locs, size_t n, const uint8_t* vecs) = 0;
+  // Holds back (or resumes) writing inserted vectors, e.g. while the node stages a
+  // reconfiguration, whose transfers go first.
+  virtual void PauseUpdateWrites(bool paused) = 0;
   // The stream without the agents in its path: of locs[0..n) (lists[i] names locs[i]), fetches
   // the vectors this node lacks -- not on the SSD and not fetched by a query already -- from the
   // source of their lists, data node to data node as RERANK does (chains included), and installs
@@ -236,6 +257,17 @@ class NodeEngine {
   virtual uint32_t Rerank(int w, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
                           const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
                           uint32_t* out_ids, float* out_dists, RerankStats* st) = 0;
+  // The posting lists the index's build would have given each of n vectors (`vecs`, dim()
+  // elements of dtype() each), and their PQ codes: the routing of inserted vectors (U14), by
+  // the build's own rule and parameters (index meta: replicas, closure_eps, the assignment's
+  // candidates and search width) on this node's navigation graph, so that an insert lands
+  // where the build would have put it. lists gets assign_replicas() entries per vector, padded
+  // with kInvalidId; codes gets pq_m() bytes per vector. Needs the graph (NoGraphError).
+  virtual void Assign(const void* vecs, uint32_t n, uint32_t* lists, uint8_t* codes) = 0;
+  virtual uint32_t assign_replicas() const = 0;
+  virtual uint32_t pq_m() const = 0;
+  // Size of the vector-ID space (NodeOptions::max_vectors, at least the index's vectors).
+  virtual uint64_t id_capacity() const = 0;
   // Navigate + Filter + Rerank on this node, on each partition's newest version; every probed
   // list must be resident.
   virtual uint32_t SearchLocal(int w, const void* query, const SearchParams& p, uint32_t* ids,

@@ -205,12 +205,21 @@ var Open = map[string]Question{
 			"inserts, deletes or re-encoding: versioned codes, invalidating cached copies, and " +
 			"maintaining posting lists and the graph. The design under discussion (periodic " +
 			"batches, each a content epoch) is in docs/drafts/dataset-updates-discussion.md. In " +
-			"code so far, only the groundwork: the epoch table names a version of each partition's " +
-			"lists, a data node can hold several versions of a partition and FILTER/RERANK name " +
-			"the one their epoch sees; every partition stays at version 0, and moving a partition " +
-			"at a later version is refused (Undecided) until batches stage their lists",
-		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions), " +
-			"internal/controller/reconfig.go (copyThenFlip), engine/include/fusion/pq_store.h (cached codes)"},
+			"code so far, the groundwork. Partition versions: the epoch table names a version of " +
+			"each partition's lists, a data node can hold several versions of a partition and " +
+			"FILTER/RERANK name the one their epoch sees; every partition stays at version 0, and " +
+			"moving a partition at a later version is refused (Undecided) until batches stage their " +
+			"lists. Inserts: data nodes leave room for inserted IDs and locations (rtier_node " +
+			"--max-vectors, --max-pages; IDs and locations are only appended, growing the spaces " +
+			"at an epoch boundary is not implemented); ASSIGN routes a vector by the build's own " +
+			"rule and gives its PQ code; RAW_ADD serves inserted vectors from memory and writes " +
+			"them after fetched ones, never while paused (PAUSE_UPDATES), within " +
+			"--update-write-mbps -- writes are not charged to the read budget yet; " +
+			"internal/update allocates IDs and locations, routes and groups inserts by owner. No " +
+			"batch flow yet (staging list versions, the flip, deletes, the update controller)",
+		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions, " +
+			"Assign, RawAdd), internal/update, internal/controller/reconfig.go (copyThenFlip), " +
+			"engine/include/fusion/pq_store.h (cached codes)"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
 		"every entry node needs the whole graph over the list heads, and a node that joins " +
 			"starts empty -- pre-staging it on spare nodes is not allowed, because a real " +
