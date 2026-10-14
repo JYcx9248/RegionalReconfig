@@ -41,6 +41,10 @@ const (
 	opRerank         uint8 = 0x22
 	opSearchLocal    uint8 = 0x23
 	opAssign         uint8 = 0x24
+	opStageVersions  uint8 = 0x30
+	opDropVersion    uint8 = 0x31
+	opForget         uint8 = 0x32
+	opSavePartition  uint8 = 0x33
 )
 
 // Status codes (engine/node/wire.h).
@@ -555,6 +559,97 @@ func (c *Client) Assign(ctx context.Context, vecs []byte, n int) ([]Assignment, 
 
 // noList pads an ASSIGN reply's lists (fusion::kInvalidId).
 const noList = math.MaxUint32
+
+// VersionStage asks for the next version of a partition, built from its base version (U14).
+type VersionStage struct {
+	Partition int    `json:"partition"`
+	Base      uint32 `json:"base"`
+	Next      uint32 `json:"next"`
+}
+
+// StageResult says what StageVersions did to one partition.
+type StageResult struct {
+	Partition int
+	Changed   bool // false: the batch does not touch it, no version was installed
+	Added     uint32
+	Removed   uint32
+}
+
+// StageVersions builds, for each of parts, the next version of its posting lists from the base
+// version: plus the postings (lists[i], ids[i], locs[i]) naming its lists, minus the deleted
+// IDs. Partitions the batch does not change get no new version. All or nothing: StatusPQAbsent
+// or StatusRawAbsent if an added vector's code or raw vector is not on the node yet (PQPut,
+// RawAdd), StatusNotResident if a base version is not there.
+func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, lists, ids, locs, deleted []uint32) ([]StageResult, error) {
+	if len(ids) != len(lists) || len(locs) != len(lists) {
+		return nil, fmt.Errorf("nodeclient: %d lists, %d IDs, %d locations", len(lists), len(ids), len(locs))
+	}
+	var w frame.Writer
+	w.U32(uint32(len(parts)))
+	for _, p := range parts {
+		w.U32(uint32(p.Partition))
+		w.U32(p.Base)
+		w.U32(p.Next)
+	}
+	w.U32(uint32(len(lists)))
+	w.U32s(lists)
+	w.U32s(ids)
+	w.U32s(locs)
+	w.U32(uint32(len(deleted)))
+	w.U32s(deleted)
+	b, err := c.do(ctx, opStageVersions, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	out := make([]StageResult, r.U32())
+	for i := range out {
+		out[i].Partition = int(r.U32())
+		flags := r.U32() // u8 changed, u8[3] pad
+		out[i].Changed = flags&0xFF != 0
+		out[i].Added, out[i].Removed = r.U32(), r.U32()
+	}
+	return out, r.Err
+}
+
+// DropVersion evicts version v of partition p (after the grace period of the epochs that saw
+// it); it reports whether that version was resident.
+func (c *Client) DropVersion(ctx context.Context, p int, v uint32) (bool, error) {
+	var w frame.Writer
+	w.U32(uint32(p))
+	w.U32(v)
+	b, err := c.do(ctx, opDropVersion, 0, w.B)
+	if err != nil {
+		return false, err
+	}
+	return len(b) == 1 && b[0] == 1, nil
+}
+
+// ForgetVectors frees the PQ codes of deleted vectors that no resident version names any
+// more, cached copies included, and returns how many it freed.
+func (c *Client) ForgetVectors(ctx context.Context, ids []uint32) (uint64, error) {
+	var w frame.Writer
+	w.U32(uint32(len(ids)))
+	w.U32s(ids)
+	b, err := c.do(ctx, opForget, 0, w.B)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	n := r.U64()
+	return n, r.Err
+}
+
+// SavePartition writes version v of partition p as a segment file at path (on the node's
+// host), so that a node the partition moves to can load that version.
+func (c *Client) SavePartition(ctx context.Context, p int, v uint32, path string) error {
+	var w frame.Writer
+	w.U32(uint32(p))
+	w.U32(v)
+	w.Bytes([]byte(path))
+	_, err := c.do(ctx, opSavePartition, 0, w.B)
+	return err
+}
 
 // RawPull has the node fetch the vectors at locs that it lacks from the sources of their lists
 // (lists[i] names locs[i]) -- data node to data node, as RERANK fetches -- and install them as

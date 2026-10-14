@@ -306,8 +306,40 @@ type cluster struct {
 	agents   []*agent.Agent
 	stops    []func() error
 	wg       sync.WaitGroup
-	held     heldTracker   // partitions each node has owned (see observe)
-	rescales []rescaleSpan // every Rescale call of rescale(), in order (timeline_test.go)
+	held     heldTracker                 // partitions each node has owned (see observe)
+	rescales []rescaleSpan               // every Rescale call of rescale(), in order (timeline_test.go)
+	dirs     map[placement.NodeID]string // each agent's work directory
+
+	cmu      sync.Mutex
+	contents []contentVersion // the answers once update batches change the data (U14)
+}
+
+// contentVersion: the exact answers to the fixture's queries from epoch from on, until the
+// next one.
+type contentVersion struct {
+	from    uint64
+	answers [][]nodeclient.Candidate
+}
+
+// expect records the answers of the epochs from from on: those of an update batch's flip.
+func (cl *cluster) expect(from uint64, answers [][]nodeclient.Candidate) {
+	cl.cmu.Lock()
+	defer cl.cmu.Unlock()
+	cl.contents = append(cl.contents, contentVersion{from, answers})
+}
+
+// expected is the exact answer to query qi in epoch e: the fixture's oracle until the first
+// update batch.
+func (cl *cluster) expected(e uint64, qi int) []nodeclient.Candidate {
+	cl.cmu.Lock()
+	defer cl.cmu.Unlock()
+	want := cl.f.oracle
+	for _, c := range cl.contents {
+		if e >= c.from {
+			want = c.answers
+		}
+	}
+	return want[qi]
 }
 
 // observe records the current placement in cl.held.
@@ -319,7 +351,8 @@ func (cl *cluster) observe() {
 
 func newCluster(t *testing.T, f *fixture, protocol string, initial int, opts ...func(*config.Controller)) *cluster {
 	ctx, cancel := context.WithCancel(context.Background())
-	cl := &cluster{t: t, f: f, initial: initial, protocol: protocol, ctx: ctx, cancel: cancel, held: heldTracker{}}
+	cl := &cluster{t: t, f: f, initial: initial, protocol: protocol, ctx: ctx, cancel: cancel, held: heldTracker{},
+		dirs: map[placement.NodeID]string{}}
 	t.Cleanup(cl.close)
 	cfg := config.DefaultController()
 	cfg.Listen, cfg.APIListen = "127.0.0.1:0", "127.0.0.1:0"
@@ -395,6 +428,7 @@ func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...stri
 		cl.t.Fatalf("agent %s did not register: %v", name, err)
 	}
 	cl.agents = append(cl.agents, a)
+	cl.dirs[a.ID()] = cfg.WorkDir
 	return a
 }
 

@@ -48,21 +48,31 @@ func TestResolvePlanNodes(t *testing.T) {
 }
 
 // TestPlanWarnings: with lazy, a node that leaves stays the raw-vector source of the partitions
-// it hands to nodes that have never owned them; handing a partition back to a node that has
-// held it, or a protocol that copies every raw vector before the flip, leaves no such source.
+// it hands to nodes that have never owned them, or to former owners after update batches
+// changed them; handing an unchanged partition back to a node that has held it, or a protocol
+// that copies every raw vector before the flip, leaves no such source.
 func TestPlanWarnings(t *testing.T) {
 	h := placement.NewHistory(placement.Table{Owners: []placement.NodeID{1, 1, 2, 2}})
 	cur := placement.Table{Owners: []placement.NodeID{1, 1, 2, 3}} // node 3 took partition 3 from node 2
 	h.Record(cur)
-	c := &Controller{cfg: config.Controller{Protocol: "lazy"}, history: h}
+	c := &Controller{cfg: config.Controller{Protocol: "lazy"}, history: h,
+		leftAt: map[int]map[placement.NodeID]uint32{3: {2: 0}}}
 	n2, n3 := &ManagedNode{ID: 2, Name: "n2"}, &ManagedNode{ID: 3, Name: "n3"}
+	tbl := &epoch.Table{Epoch: 5, Placement: cur}
 	warnings := func(owners []placement.NodeID, removed ...*ManagedNode) []string {
 		next := placement.Table{Owners: owners}
-		return c.planWarnings(target{next: next, changes: placement.Diff(cur, next), removed: removed})
+		return c.planWarnings(tbl, target{next: next, changes: placement.Diff(cur, next), removed: removed})
 	}
 	if w := warnings([]placement.NodeID{1, 1, 2, 2}, n3); len(w) != 0 {
 		t.Errorf("partition 3 back to node 2, which held it: warnings %q", w)
 	}
+	// A batch changed partition 3 after node 2 gave it up: node 2 lacks what the batch inserted.
+	tbl.Versions = []uint32{0, 0, 0, 1}
+	if w := warnings([]placement.NodeID{1, 1, 2, 2}, n3); len(w) != 1 ||
+		!strings.HasPrefix(w[0], "node 3 (n3) leaves") || !strings.Contains(w[0], "update batches changed them") {
+		t.Errorf("partition 3 back to node 2 after an update batch: warnings %q", w)
+	}
+	tbl.Versions = nil
 	w := warnings([]placement.NodeID{1, 1, 1, 1}, n2, n3)
 	if len(w) != 2 || !strings.HasPrefix(w[0], "node 2 (n2) leaves") || !strings.Contains(w[0], "partitions [2]") ||
 		!strings.HasPrefix(w[1], "node 3 (n3) leaves") || !strings.Contains(w[1], "partitions [3]") {

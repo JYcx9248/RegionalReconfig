@@ -31,6 +31,8 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	c.Handle(protocol.InstallEpochM, a.handleInstallEpoch)
 	c.Handle(protocol.WaitDrainedM, a.handleWaitDrained)
 	c.Handle(protocol.EvictM, a.handleEvict)
+	c.Handle(protocol.SavePartitionsM, a.handleSavePartitions)
+	c.Handle(protocol.DropVersionsM, a.handleDropVersions)
 	c.Handle(protocol.SetAdmissionM, a.handleSetAdmission)
 	c.Handle(protocol.WaitIdleM, a.handleWaitIdle)
 	c.Handle(protocol.NodeStatusM, a.handleStatus)
@@ -81,6 +83,9 @@ func (a *Agent) handleStageAggregator(ctx context.Context, body json.RawMessage)
 func (a *Agent) handleStagePartitions(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StagePartitionsReq](body)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkVersions(req.Sources); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
@@ -164,11 +169,22 @@ func (a *Agent) stopStaging(ctx context.Context) error {
 	return nil
 }
 
-// fetchSegments copies the segment files of src's partitions into the partition directory.
+// checkVersions: a source's versions, if any, name one version per partition.
+func checkVersions(sources []protocol.Source) error {
+	for _, src := range sources {
+		if len(src.Versions) != 0 && len(src.Versions) != len(src.Partitions) {
+			return fmt.Errorf("source %s: %d versions for %d partitions", src.Addr, len(src.Versions), len(src.Partitions))
+		}
+	}
+	return nil
+}
+
+// fetchSegments copies the segment files of src's partitions, at their versions, into the
+// partition directory.
 func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, error) {
 	var names []string
-	for _, p := range src.Partitions {
-		files, err := partitioning.Files(a.manifest, p)
+	for i, p := range src.Partitions {
+		files, err := partitioning.FilesAt(a.manifest, p, src.VersionOf(i))
 		if err != nil {
 			return 0, err
 		}
@@ -274,8 +290,8 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 	var pending []protocol.Source
 	for _, src := range sources {
 		if src.Kind != "peer" {
-			for _, p := range src.Partitions { // bootstrap: the node copies what it lacks from the index
-				if err := a.loadPartition(ctx, p, true, ""); err != nil {
+			for i, p := range src.Partitions { // bootstrap: the node copies what it lacks from the index
+				if err := a.loadPartition(ctx, p, src.VersionOf(i), true, ""); err != nil {
 					return err
 				}
 			}
@@ -296,13 +312,14 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 		var retry []protocol.Source
 		for _, src := range pending {
 			var again []int
-			for _, p := range src.Partitions {
+			var againV []uint32
+			for i, p := range src.Partitions {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				err := a.loadPartition(ctx, p, false, src.NodeAddr)
+				err := a.loadPartition(ctx, p, src.VersionOf(i), false, src.NodeAddr)
 				if err != nil && nodeclient.IsPQAbsent(err) && round < maxPQRounds {
-					again = append(again, p)
+					again, againV = append(again, p), append(againV, src.VersionOf(i))
 					continue
 				}
 				if err != nil {
@@ -310,7 +327,7 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 				}
 			}
 			if len(again) > 0 {
-				src.Partitions = again
+				src.Partitions, src.Versions = again, againV
 				retry = append(retry, src)
 			}
 		}
@@ -324,8 +341,8 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, reply *protocol.StageReply) error {
 	groups := make([][]string, len(sources))
 	for i, src := range sources {
-		for _, p := range src.Partitions {
-			groups[i] = append(groups[i], a.segmentPath(p))
+		for j, p := range src.Partitions {
+			groups[i] = append(groups[i], a.segmentPath(p, src.VersionOf(j)))
 		}
 	}
 	missing, err := a.localBulk.PQMissing(ctx, groups)
@@ -353,13 +370,10 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 	})
 }
 
-// segmentVersion is the version of a partition's lists in its segment file: the lists as
-// built. Later versions come from update batches (U14).
-const segmentVersion = 0
-
-func (a *Agent) loadPartition(ctx context.Context, p int, fromIndex bool, rawPeer string) error {
-	if err := a.localBulk.LoadPartition(ctx, p, segmentVersion, a.segmentPath(p), fromIndex, rawPeer); err != nil {
-		return fmt.Errorf("load partition %d: %w", p, err)
+// loadPartition loads the segment file of version v of partition p as that version.
+func (a *Agent) loadPartition(ctx context.Context, p int, v uint32, fromIndex bool, rawPeer string) error {
+	if err := a.localBulk.LoadPartition(ctx, p, v, a.segmentPath(p, v), fromIndex, rawPeer); err != nil {
+		return fmt.Errorf("load partition %d at version %d: %w", p, v, err)
 	}
 	a.mu.Lock()
 	a.resident[p] = true
@@ -367,8 +381,9 @@ func (a *Agent) loadPartition(ctx context.Context, p int, fromIndex bool, rawPee
 	return nil
 }
 
-func (a *Agent) segmentPath(p int) string {
-	path, _ := filepath.Abs(filepath.Join(a.partDir(), partitioning.SegmentName(p)))
+// segmentPath is where the segment file of version v of partition p goes on this node.
+func (a *Agent) segmentPath(p int, v uint32) string {
+	path, _ := filepath.Abs(filepath.Join(a.partDir(), partitioning.SegmentNameV(p, v)))
 	return path
 }
 
@@ -414,6 +429,9 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 	if err != nil {
 		return nil, err
 	}
+	if err := checkVersions(req.Sources); err != nil {
+		return nil, err
+	}
 	class, err := transfer.ParseClass(req.Priority)
 	if err != nil {
 		return nil, err
@@ -431,8 +449,8 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 		if src.Kind != "peer" {
 			return nil, fmt.Errorf("StageRaw: source kind %q: raw vectors are streamed from peers", src.Kind)
 		}
-		for _, p := range src.Partitions {
-			groups[i] = append(groups[i], a.segmentPath(p))
+		for j, p := range src.Partitions {
+			groups[i] = append(groups[i], a.segmentPath(p, src.VersionOf(j)))
 		}
 	}
 	missing, err := a.localBulk.RawMissing(ctx, groups)
@@ -577,11 +595,11 @@ func (a *Agent) handleWaitDrained(ctx context.Context, body json.RawMessage) (an
 	return struct{}{}, a.tracker.WaitDrained(ctx, req.Epoch)
 }
 
-// Evict: drop partitions from the data node and delete their segment files. The controller
-// calls this only after the grace period, so no query can still route here for them. Their PQ
-// codes and raw vectors stay on the data node as a cache (the dataset is static): a later
-// reconfiguration that brings them back needs no transfer, and the new owner can still fetch
-// the raw vectors from here.
+// Evict: drop partitions from the data node -- every version of their lists -- and delete their
+// segment files. The controller calls this only after the grace period, so no query can still
+// route here for them. Their PQ codes and raw vectors stay on the data node as a cache (vectors
+// are immutable: an update deletes and inserts, U14): a later reconfiguration that brings them
+// back needs no transfer, and the new owner can still fetch the raw vectors from here.
 func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.EvictReq](body)
 	if err != nil {
@@ -602,8 +620,15 @@ func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, err
 		if err != nil {
 			return nil, err
 		}
+		later, err := filepath.Glob(filepath.Join(a.partDir(), partitioning.SegmentVersionsGlob(p)))
+		if err != nil {
+			return nil, err
+		}
 		for _, f := range files {
-			if err := os.Remove(filepath.Join(a.partDir(), f)); err != nil && !os.IsNotExist(err) {
+			later = append(later, filepath.Join(a.partDir(), f))
+		}
+		for _, f := range later {
+			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 				return nil, err
 			}
 		}
@@ -613,6 +638,45 @@ func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, err
 	}
 	if req.ReleaseStagedPQ {
 		if _, err := a.localBulk.PQRelease(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return struct{}{}, nil
+}
+
+// SavePartitions: write versions of resident partitions as segment files in the partition
+// directory, where the nodes they move to pull them. A version that an update batch made lives
+// only in the data node's memory until a move needs it as a file (U14), so a batch writes no
+// segment; the controller asks the old owner for the file when the partition moves. The data
+// node writes it (it holds the lists) and the bulk port serves it, as any other segment file.
+func (a *Agent) handleSavePartitions(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := ctrl.Decode[protocol.SavePartitionsReq](body)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	defer cancel()
+	for _, pv := range req.Versions {
+		if err := a.localBulk.SavePartition(ctx, pv.Partition, pv.Version, a.segmentPath(pv.Partition, pv.Version)); err != nil {
+			return nil, fmt.Errorf("save partition %d at version %d: %w", pv.Partition, pv.Version, err)
+		}
+	}
+	return struct{}{}, nil
+}
+
+// DropVersions: drop versions of partitions that an update batch replaced, after the grace
+// period of the epochs that read them (U14), and their segment files if a move wrote one. The
+// partition stays resident at its newer version.
+func (a *Agent) handleDropVersions(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := ctrl.Decode[protocol.DropVersionsReq](body)
+	if err != nil {
+		return nil, err
+	}
+	for _, pv := range req.Versions {
+		if _, err := a.localBulk.DropVersion(ctx, pv.Partition, pv.Version); err != nil {
+			return nil, fmt.Errorf("drop partition %d at version %d: %w", pv.Partition, pv.Version, err)
+		}
+		if err := os.Remove(a.segmentPath(pv.Partition, pv.Version)); err != nil && !os.IsNotExist(err) {
 			return nil, err
 		}
 	}
@@ -652,6 +716,9 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 		st.GraphLoaded = info.GraphLoaded
 		st.RawFetched = info.Raw.FetchedOnDemand()
 		st.RawFetchedBytes = st.RawFetched * uint64(info.Raw.VecBytes)
+		for _, pv := range info.Versions {
+			st.Versions = append(st.Versions, protocol.PartitionVersion{Partition: int(pv[0]), Version: pv[1]})
+		}
 	}
 	return st, nil
 }

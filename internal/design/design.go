@@ -201,25 +201,42 @@ var Open = map[string]Question{
 			"the flip the protocol stops and keeps every old copy (safe, wasteful)",
 		"internal/controller/reconfig.go (copyThenFlip)"},
 	"U14": {"U14", "Dataset updates",
-		"the dataset is static for now, so cached PQ codes (and pages) never go stale; with " +
-			"inserts, deletes or re-encoding: versioned codes, invalidating cached copies, and " +
-			"maintaining posting lists and the graph. The design under discussion (periodic " +
-			"batches, each a content epoch) is in docs/drafts/dataset-updates-discussion.md. In " +
-			"code so far, the groundwork. Partition versions: the epoch table names a version of " +
-			"each partition's lists, a data node can hold several versions of a partition and " +
-			"FILTER/RERANK name the one their epoch sees; every partition stays at version 0, and " +
-			"moving a partition at a later version is refused (Undecided) until batches stage their " +
-			"lists. Inserts: data nodes leave room for inserted IDs and locations (rtier_node " +
-			"--max-vectors, --max-pages; IDs and locations are only appended, growing the spaces " +
-			"at an epoch boundary is not implemented); ASSIGN routes a vector by the build's own " +
-			"rule and gives its PQ code; RAW_ADD serves inserted vectors from memory and writes " +
-			"them after fetched ones, never while paused (PAUSE_UPDATES), within " +
-			"--update-write-mbps -- writes are not charged to the read budget yet; " +
-			"internal/update allocates IDs and locations, routes and groups inserts by owner. No " +
-			"batch flow yet (staging list versions, the flip, deletes, the update controller)",
+		"vectors are immutable (an update deletes a vector and inserts it again under a new ID) " +
+			"and the PQ codebook is fixed, so cached PQ codes and raw vectors on former owners stay " +
+			"valid; what remains is maintaining posting lists and the graph. The design under " +
+			"discussion (periodic batches, each a content epoch) is in " +
+			"docs/drafts/dataset-updates-discussion.md. In code, minor batches (inserts and deletes, " +
+			"no splits). Partition versions: the epoch table names a version of each partition's " +
+			"lists, a data node holds several versions of a partition side by side, and FILTER/RERANK " +
+			"name the one their epoch sees. Inserts: data nodes leave room for inserted IDs and " +
+			"locations (rtier_node --max-vectors, --max-pages; both only appended) and for longer " +
+			"lists (--max-list-len); ASSIGN routes a vector by the build's own rule and gives its PQ " +
+			"code; RAW_ADD serves inserted vectors from memory and writes them after fetched ones, " +
+			"never while paused (PAUSE_UPDATES), within --update-write-mbps -- writes are not " +
+			"charged to the read budget yet. Batches: the update controller (internal/update, " +
+			"rtier-updater) takes the controller's lease (BeginUpdate: no reconfiguration and no " +
+			"other batch until the commit or the abort, or until update_lease expires), routes the " +
+			"inserts, checks the owners' room, sends the PQ codes and raw vectors to the owners, and " +
+			"has every data node stage the next version of the partitions the batch changes " +
+			"(STAGE_VERSIONS: inserts appended, deleted IDs dropped; deletes are broadcast and each " +
+			"node finds its copies); CommitUpdate checks the staged versions, flips (all entries at " +
+			"once), waits out the grace period and has the owners drop the replaced versions; then " +
+			"every node frees the deleted vectors' PQ codes (FORGET). A staging that fails is undone " +
+			"before the lease is given up; a commit that fails before the flip drops the staged " +
+			"versions. A partition at a later version moves with its current lists: its owner writes " +
+			"them as a segment file for the move (SAVE_PARTITION). Not implemented: growing the ID " +
+			"and location spaces at an epoch boundary; the response to a batch over budget (splitting " +
+			"partitions, scaling out first -- the batch fails before anything is sent); splits, " +
+			"merges and major epochs (the graph rebuild); the health check that triggers them; the " +
+			"decision log and replay; freeing the pages of deleted vectors. Open: with lazy, a " +
+			"scale-in that returns a partition after batches changed it leaves the node that leaves " +
+			"the raw-vector source of the vectors inserted meanwhile (planWarnings names it) -- " +
+			"streaming those in before it leaves is a U9 question; and versions staged under a lease " +
+			"that expired stay on their owner until a later batch replaces them or the partition moves",
 		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions, " +
-			"Assign, RawAdd), internal/update, internal/controller/reconfig.go (copyThenFlip), " +
-			"engine/include/fusion/pq_store.h (cached codes)"},
+			"Assign, RawAdd, StageVersions), internal/update (batch.go), internal/controller/update.go, " +
+			"internal/controller/reconfig.go (copyThenFlip, planWarnings), engine/include/fusion/pq_store.h " +
+			"(cached codes, Forget)"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
 		"every entry node needs the whole graph over the list heads, and a node that joins " +
 			"starts empty -- pre-staging it on spare nodes is not allowed, because a real " +

@@ -121,7 +121,7 @@ func (c *Controller) Reconfigure(ctx context.Context, req protocol.RescaleReq) (
 		return nil, fmt.Errorf("controller: initial deployment has not finished (%s)", c.LastError())
 	}
 	if !c.reconfigRunning.CompareAndSwap(false, true) {
-		return nil, fmt.Errorf("controller: another reconfiguration is in progress, retry later")
+		return nil, fmt.Errorf("controller: another reconfiguration or an update batch is in progress, retry later")
 	}
 	defer c.reconfigRunning.Store(false)
 	reply, err := c.reconfigure(ctx, req)
@@ -156,7 +156,7 @@ func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq) (
 	if err != nil {
 		return nil, err
 	}
-	plan, warnings := protocol.PlanOf(t.next, cur.Epoch), c.planWarnings(t)
+	plan, warnings := protocol.PlanOf(t.next, cur.Epoch), c.planWarnings(cur, t)
 	if req.DryRun || len(t.changes) == 0 {
 		return &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
 			Added: ids(t.added), Removed: ids(t.removed), Moved: t.changes.Moved(), Plan: plan,
@@ -270,29 +270,41 @@ func (c *Controller) planTarget(cur *epoch.Table, p *protocol.Plan) (target, err
 // (copyThenFlip, step 6). With "lazy" a node that leaves stays the raw-vector source of the
 // partitions it hands to nodes that have never owned them -- their raw vectors move only as
 // queries need them -- so it has to keep running. The reversible policies never do that (a
-// scale-in returns partitions to nodes that have held them); a plan may.
-func (c *Controller) planWarnings(t target) []string {
+// scale-in returns partitions to nodes that have held them); a plan may. Update batches (U14)
+// break it too: a partition that returns to a former owner after a batch changed it names the
+// vectors inserted meanwhile, which that owner never held. Streaming those in before the node
+// leaves, so that it can stop, is not implemented (U9 with U14).
+func (c *Controller) planWarnings(cur *epoch.Table, t target) []string {
 	if c.cfg.Protocol != "lazy" || len(t.removed) == 0 {
 		return nil
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	h := c.history
-	c.mu.Unlock()
 	var out []string
 	for _, r := range t.removed {
-		var ps []int
+		var never, changed []int
 		for dst, l := range t.changes[r.ID] {
 			for _, p := range l {
-				if h == nil || !h.HasOwned(p, dst) {
-					ps = append(ps, p)
+				switch {
+				case h == nil || !h.HasOwned(p, dst):
+					never = append(never, p)
+				case c.leftAt[p][dst] < cur.Version(p):
+					changed = append(changed, p)
 				}
 			}
 		}
-		if len(ps) > 0 {
-			sort.Ints(ps)
+		if len(never) > 0 {
+			sort.Ints(never)
 			out = append(out, fmt.Sprintf("node %d (%s) leaves but stays the raw-vector source of partitions %v: "+
 				"their new owners have never held them, and with lazy their raw vectors move only as queries "+
-				"need them -- keep node %d running", r.ID, r.Name, ps, r.ID))
+				"need them -- keep node %d running", r.ID, r.Name, never, r.ID))
+		}
+		if len(changed) > 0 {
+			sort.Ints(changed)
+			out = append(out, fmt.Sprintf("node %d (%s) leaves but stays the raw-vector source of partitions %v: "+
+				"update batches changed them since their new owners last held them, and with lazy the vectors "+
+				"those batches inserted move only as queries need them -- keep node %d running", r.ID, r.Name, changed, r.ID))
 		}
 	}
 	return out
@@ -371,13 +383,6 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		c.event("reconfig."+name+"_s", s)
 		mark = time.Now()
 	}
-	// A move loads the partition from its segment file, which holds version 0 of its lists. A
-	// partition an update batch has changed would need its current lists instead (U14).
-	for _, p := range reply.Moved {
-		if v := cur.Version(p); v != 0 {
-			return reply, design.Undecided("U14", fmt.Sprintf("moving partition %d at version %d (lists changed by updates)", p, v))
-		}
-	}
 	c.event("reconfig.start", float64(cur.Epoch))
 	log.Printf("controller: reconfiguration %s: epoch %d, add %v, remove %v, move %d partitions",
 		c.cfg.Protocol, cur.Epoch, reply.Added, reply.Removed, len(reply.Moved))
@@ -432,16 +437,30 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		return reply, err
 	}
 	// Each destination pulls from the moved partitions' current owners: their bulk port for
-	// files, PQ codes and raw vectors, their data node for on-demand raw-vector fetches.
+	// files, PQ codes and raw vectors, their data node for on-demand raw-vector fetches. It
+	// loads each partition at its version in e, which the reconfiguration does not change: a
+	// partition that update batches changed moves with its current lists (U14).
 	sources := map[placement.NodeID][]protocol.Source{}
+	saves := map[placement.NodeID][]protocol.PartitionVersion{} // by source: versions no file holds yet
 	for _, d := range dests {
 		for _, pull := range plan[d] {
 			from, ok := c.nodes.Get(pull.From)
 			if !ok {
 				return reply, fmt.Errorf("unknown source node %d", pull.From)
 			}
-			sources[d] = append(sources[d], protocol.Source{Kind: "peer", Addr: from.Info.BulkAddr,
-				NodeAddr: from.Info.NodeAddr, Partitions: pull.Partitions})
+			src := protocol.Source{Kind: "peer", Addr: from.Info.BulkAddr, NodeAddr: from.Info.NodeAddr, Partitions: pull.Partitions}
+			for i, p := range pull.Partitions {
+				v := cur.Version(p)
+				if v == 0 {
+					continue
+				}
+				if src.Versions == nil {
+					src.Versions = make([]uint32, len(pull.Partitions))
+				}
+				src.Versions[i] = v
+				saves[pull.From] = append(saves[pull.From], protocol.PartitionVersion{Partition: p, Version: v})
+			}
+			sources[d] = append(sources[d], src)
 		}
 	}
 	bg := context.Background() // cleanup runs even if the protocol failed on a timeout
@@ -496,6 +515,21 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 			graphBytes.Add(st.Bytes)
 			graphs <- graphDone{n, err}
 		}(n)
+	}
+
+	// A version that an update batch made is in its owner's memory only (U14): the owner writes
+	// it as a segment file for the destinations to pull.
+	if len(saves) > 0 {
+		saveNodes, err := c.managed(sortedKeys(saves))
+		if err != nil {
+			return reply, err
+		}
+		if err := forEach(saveNodes, func(n *ManagedNode) error {
+			return n.call(ctx, c.stageTimeout(), protocol.SavePartitionsM, protocol.SavePartitionsReq{Versions: saves[n.ID]}, nil)
+		}); err != nil {
+			return reply, err
+		}
+		phase("save_versions")
 	}
 
 	// Stop-and-copy baseline: pause admission everywhere and wait for in-flight queries.
@@ -655,6 +689,10 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		for _, l := range m {
 			for _, p := range l {
 				c.history.Forget(p, src)
+				if c.leftAt[p] == nil {
+					c.leftAt[p] = map[placement.NodeID]uint32{}
+				}
+				c.leftAt[p][src] = cur.Version(p)
 			}
 		}
 	}

@@ -519,6 +519,164 @@ void TestInsertedVectors() {
   CHECK(done);
 }
 
+// An update batch on one node (U14): StageVersions builds each partition's next version from
+// the base one (inserts in, deletes out) next to it, all or nothing; the base version keeps
+// serving; dropping it and forgetting the deleted vectors frees their codes; a version saved
+// as a segment loads elsewhere.
+void TestStageVersions() {
+  Fixture& f = GetFixture();
+  const uint64_t n = f.base.size() / f.dim;
+  const PartitionManifest man = PartitionManifest::Load(f.parts);
+  NodeOptions o;
+  o.index_dir = f.index;
+  o.partitions_dir = f.parts;
+  o.num_workers = 2;
+  o.max_nprobe = 64;
+  o.max_rerank = 4096;
+  o.direct_io = false;
+  o.max_vectors = n + 64;
+  o.max_pages = man.raw.num_pages + 4;
+  o.max_list_len = man.max_list_len + 16;
+  auto node = NodeEngine::Open(o);
+  node->LoadGraph(JoinPath(f.index, files::kGraph));
+  for (uint32_t p = 0; p < f.num_parts; ++p)
+    node->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
+  const float* q = &f.queries[0];
+  auto search = [&](uint32_t* top) {
+    SearchParams sp;
+    sp.k = 10;
+    sp.nprobe = 16;
+    sp.rerank = 4096;
+    sp.rr.heuristic = false;
+    std::vector<uint32_t> ids(10);
+    std::vector<float> d(10);
+    QueryStats qs;
+    node->SearchLocal(0, q, sp, ids.data(), d.data(), &qs);
+    *top = ids[0];
+    return std::vector<uint32_t>(ids.begin(), ids.end());
+  };
+  uint32_t top0 = 0;
+  const std::vector<uint32_t> before = search(&top0);
+
+  // The batch: the query itself as a new vector, and the old top answer deleted.
+  const uint32_t r = node->assign_replicas(), m = node->pq_m();
+  std::vector<uint32_t> lists(r);
+  std::vector<uint8_t> code(m);
+  node->Assign(q, 1, lists.data(), code.data());
+  const uint32_t id = static_cast<uint32_t>(n), loc = static_cast<uint32_t>(man.raw.locations());
+  std::vector<uint32_t> al, ai, ac;
+  for (uint32_t c : lists)
+    if (c != kInvalidId) {
+      al.push_back(c);
+      ai.push_back(id);
+      ac.push_back(loc);
+    }
+  std::vector<VersionStage> parts;
+  for (uint32_t p = 0; p < f.num_parts; ++p) parts.push_back({p, 0, 1});
+  const uint32_t del = top0;
+
+  // Refused, and nothing changes: the new vector's code and raw vector are not here yet.
+  bool refused = false;
+  try {
+    node->StageVersions(parts, al.data(), ai.data(), ac.data(), al.size(), &del, 1);
+  } catch (const RawMissingError&) {
+    refused = true;
+  }
+  CHECK(refused);
+  CHECK(node->RawAdd(&loc, 1, reinterpret_cast<const uint8_t*>(q)).installed == 1);
+  refused = false;
+  try {
+    node->StageVersions(parts, al.data(), ai.data(), ac.data(), al.size(), &del, 1);
+  } catch (const PQMissingError&) {
+    refused = true;
+  }
+  CHECK(refused);
+  CHECK(node->ResidentVersions().size() == f.num_parts);  // still version 0 only
+  CHECK(node->PQPut(&id, 1, code.data()).installed == 1);
+  const auto res = node->StageVersions(parts, al.data(), ai.data(), ac.data(), al.size(), &del, 1);
+  std::vector<uint32_t> changed;
+  uint64_t added = 0, removed = 0;
+  for (const auto& x : res) {
+    if (x.changed) changed.push_back(x.partition);
+    added += x.added;
+    removed += x.removed;
+  }
+  CHECK(!changed.empty() && added == al.size() && removed > 0);
+  CHECK(node->ResidentVersions().size() == f.num_parts + changed.size());
+
+  // Version 0 still answers as before; version 1 has the insert and not the deleted vector.
+  std::vector<uint32_t> probe(16);
+  const uint32_t np = node->Navigate(q, 16, 0, probe.data());
+  auto filter = [&](uint32_t v, std::vector<uint32_t>* out) {
+    std::vector<uint32_t> vs(np);
+    for (uint32_t i = 0; i < np; ++i) {
+      const uint32_t p = man.list_part[probe[i]];
+      vs[i] = std::find(changed.begin(), changed.end(), p) != changed.end() ? v : 0;
+    }
+    out->assign(4096, 0);
+    std::vector<float> d(4096);
+    FilterStats fs;
+    out->resize(node->Filter(0, q, probe.data(), vs.data(), np, 4096, out->data(), d.data(), &fs));
+  };
+  std::vector<uint32_t> c0, c1;
+  filter(0, &c0);
+  filter(1, &c1);
+  auto has = [](const std::vector<uint32_t>& v, uint32_t x) { return std::find(v.begin(), v.end(), x) != v.end(); };
+  CHECK(has(c0, del) && !has(c0, id));
+  CHECK(!has(c1, del) && has(c1, id));
+  uint32_t top1 = 0;
+  const std::vector<uint32_t> after = search(&top1);  // the newest versions
+  CHECK(top1 == id && !has(after, del) && after != before);
+
+  // Saved and loaded elsewhere as version 1, the partition answers the same.
+  const uint32_t p0 = changed[0];
+  const std::string saved = JoinPath(TempDir(), "saved.seg");
+  node->SavePartition(p0, 1, saved);
+  const ListSegment back = ListSegment::Load(saved);
+  CHECK(back.partition == p0 && std::find(back.ids.begin(), back.ids.end(), del) == back.ids.end());
+
+  // A node without room for a list that long refuses the segment at load, before it changes
+  // anything (here: one list grown past the build's longest, on a node at the build's limit).
+  ListSegment longer = back;
+  const uint64_t grow = man.max_list_len + 1 - (longer.offsets[1] - longer.offsets[0]);
+  longer.ids.insert(longer.ids.begin() + longer.offsets[1], grow, longer.ids[longer.offsets[0]]);
+  longer.locs.insert(longer.locs.begin() + longer.offsets[1], grow, longer.locs[longer.offsets[0]]);
+  for (size_t i = 1; i < longer.offsets.size(); ++i) longer.offsets[i] += grow;
+  const std::string long_path = JoinPath(TempDir(), "longer.seg");
+  longer.Save(long_path);
+  NodeOptions tight = o;
+  tight.max_list_len = 0;  // the manifest's
+  auto small = NodeEngine::Open(tight);
+  refused = false;
+  try {
+    small->LoadPartition(p0, long_path, PQSource::kIndex);
+  } catch (const std::exception& e) {
+    refused = std::string(e.what()).find("--max-list-len") != std::string::npos;
+  }
+  CHECK(refused && small->ResidentVersions().empty() && small->pq_stats().resident == 0);
+
+  // Reclaim: drop version 0 of the changed partitions, then forget the deleted vector.
+  for (uint32_t p : changed) CHECK(node->DropVersion(p, 0) && !node->DropVersion(p, 0));
+  CHECK(node->ResidentVersions().size() == f.num_parts);
+  CHECK(node->ForgetVectors(&del, 1) == 1);
+  CHECK(node->ForgetVectors(&del, 1) == 0);
+  uint32_t top2 = 0;
+  CHECK(search(&top2) == after);
+
+  // A posting may only name a list of a staged partition.
+  std::vector<VersionStage> one = {{changed[0], 1, 2}};
+  uint32_t other = kInvalidId;
+  for (uint32_t c = 0; c < man.num_lists && other == kInvalidId; ++c)
+    if (man.list_part[c] != changed[0]) other = c;
+  refused = false;
+  try {
+    node->StageVersions(one, &other, &id, &loc, 1, nullptr, 0);
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  CHECK(refused);
+}
+
 void TestPQStore() {
   PQStore s(100, 2, 5);  // IDs 0..99, 2-byte codes, room for 5 codes
   auto codes_of = [](const std::vector<uint32_t>& ids) {
@@ -1544,6 +1702,7 @@ int main() {
       {"node_primitives", TestNodePrimitives},
       {"partition_versions", TestPartitionVersions},
       {"inserted_vectors", TestInsertedVectors},
+      {"stage_versions", TestStageVersions},
       {"pq_store", TestPQStore},
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},

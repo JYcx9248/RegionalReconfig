@@ -6,7 +6,7 @@ C++ data nodes built on the FusionANNS reimplementation.
 
 **Status:** skeleton. The settled parts of the design are implemented and covered by tests.
 Open design questions (U1–U17, without U4) are placeholders: on a code path they fail with
-`design decision pending [Un ...]`; the few without a code path yet (U12, U14, U15, U17) are
+`design decision pending [Un ...]`; the few without a code path yet (U12, U15, U17) are
 recorded in the registry with what the code does meanwhile. U4 (replicas of hot partitions) was
 ruled out of scope -- elastic read capacity for a hot key is the serverless-instance pattern of
 streaming systems, and rtier keeps one owner per partition. List them with `bin/rtier-client design`
@@ -17,8 +17,9 @@ its resident posting lists, however many lists or partitions name it. When parti
 destination's data node lists the codes it lacks, split by source so each is fetched once
 (`PQ_MISSING`); the old owners send exactly those over the rate-limited bulk channel
 (`PULL_PQ`); they are installed (`PQ_PUT`) before the partitions load, so a new node goes online
-only once it holds every posting list and PQ code of its partitions and can filter at once. The
-dataset is static, so the old owner keeps the codes of partitions that moved away as a cache;
+only once it holds every posting list and PQ code of its partitions and can filter at once.
+Vectors are immutable (an update deletes and inserts under a new ID, U14), so the old owner keeps
+the codes of partitions that moved away as a cache;
 they are dropped only when a later staging needs the room, and a staging protects the codes it
 needs. `rtier_node --pq-capacity N` sets a node's budget (its HBM, in codes). In fact nothing is
 ever dropped: a scale-out only takes partitions away and a reversible scale-in only gives back
@@ -116,6 +117,39 @@ on the nodes in parallel, so this is what lets a joining node aggregate for an e
 installed the new epoch before it did, and a leaving node finish the queries it was handed just
 before the flip (`test/e2e/flip_race_test.go` holds an install or a query to reproduce both).
 
+**Dataset updates (decided part of U14, first version):** updates come in batches, and each
+batch is a content epoch that reuses staging, flip, grace and reclaim. Vectors are immutable and
+the PQ codebook is fixed: a modification deletes a vector and inserts it under a new ID, and IDs
+and raw-vector locations are only ever appended, so nothing a former owner keeps goes stale. The
+epoch table names a version of each partition's lists, and FILTER and RERANK name the version
+their epoch sees, so a data node holds a partition's next version next to the one the current
+epoch's queries read. The update controller (`internal/update`, `bin/rtier-updater`) decides a
+batch and the nodes carry it out:
+
+1. It takes the controller's lease (`BeginUpdate`): no reconfiguration and no other batch runs
+   until it commits or aborts, or `"update_lease"` expires.
+2. It gives each insert an ID and a location and routes it by the build's own rule on an entry's
+   navigation graph (`ASSIGN`: the lists the build would have chosen, and the PQ code), then
+   checks that every owner has room.
+3. It sends the codes and raw vectors to the owners' data nodes (`PQ_PUT`, `RAW_ADD`), which
+   serve the vectors from memory and write them at the lowest I/O priority.
+4. It has every data node stage the next version of the partitions the batch changes
+   (`STAGE_VERSIONS`): inserts appended, deleted IDs dropped. Deletes go to every node, and each
+   finds its own copies.
+5. `CommitUpdate` checks the staged versions, flips (all entries switch at once), waits out the
+   grace period, and the owners drop the replaced versions. Then every node frees the deleted
+   vectors' PQ codes.
+
+A failed staging is undone before the lease is given up, and a commit that fails before the flip
+drops what was staged. A partition at a later version moves with its current lists: its owner
+writes them as a segment file when it moves. One cost of `lazy`: a scale-in that returns a
+partition after batches changed it leaves the vectors inserted meanwhile on the node that leaves,
+which then has to keep running (the rescale reply warns). Not there yet: splits and merges in
+major epochs with a rebuilt graph, the health check that triggers them, growing the ID and
+location spaces, a response to a batch over budget (it fails before anything is sent), and a log
+to replay batches from. `test/e2e/update_test.go` checks every answer against an oracle that
+applies the same decisions, across batches, a failed batch and rescales.
+
 ## Layout
 
 | Path | What |
@@ -124,6 +158,7 @@ before the flip (`test/e2e/flip_race_test.go` holds an install or a query to rep
 | `cmd/rtier-agent` | per-node agent next to `rtier_node`: staging, epochs, entry + aggregator roles |
 | `cmd/rtier-client` | status / rescale / design / queries / single-node baseline |
 | `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time), with a rate schedule |
+| `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14) |
 | `cmd/rtier-overhead` | cost of fan-out: emulates N owners on one data node holding every partition and reports what the two-phase query adds over N = 1 (owners per query, duplicate PQ scoring, extra page reads, per-call and merge time); `-compare` sets two-phase against local re-ranking (recall with `-gt`), `-owners` shows how queries spread over owners |
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |

@@ -1,8 +1,8 @@
-// Package update holds what the update controller decides for a batch of dataset updates
-// (U14) before the data nodes execute it: the IDs and raw-vector locations of inserted vectors,
-// the posting lists each insert joins and its PQ code, and the owners that receive it. The
-// design is in docs/drafts/dataset-updates-discussion.md. The batch itself -- staging the next
-// version of the lists it changes, the flip, the deletes -- is not here yet.
+// Package update is the update controller (U14): it decides a batch of dataset updates -- the
+// IDs and raw-vector locations of inserted vectors, the posting lists each insert joins and its
+// PQ code, the owners that receive it -- and has the data nodes execute it: the owners stage the
+// next version of the lists the batch changes, and the controller flips to them (batch.go). The
+// design is in docs/drafts/dataset-updates-discussion.md.
 package update
 
 import (

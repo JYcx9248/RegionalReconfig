@@ -75,6 +75,16 @@
 //                                                                u8 codes[n * m]
 //                   (the lists the index's build would give each vector, padded with
 //                   0xFFFFFFFF, and its PQ code: the routing of inserted vectors, U14)
+//   STAGE_VERSIONS  u32 nparts, (u32 partition, u32 base,     -> u32 nparts, (u32 partition,
+//                   u32 next)[nparts], u32 nadds,                u8 changed, u8[3] pad,
+//                   u32 lists[nadds], u32 ids[nadds],            u32 added, u32 removed)[nparts]
+//                   u32 locs[nadds], u32 ndel, u32 deleted[ndel]
+//                   (an update batch, U14: each partition's next version = base + the postings
+//                   naming its lists - the deleted IDs; all or nothing)
+//   DROP_VERSION    u32 partition, u32 version                -> u8 was_resident
+//   FORGET          u32 n, u32 ids[n]                         -> u64 freed (PQ codes of deleted
+//                                                                vectors no version names any more)
+//   SAVE_PARTITION  u32 partition, u32 version, path          -> - (that version as a segment file)
 #pragma once
 
 #include <cstdint>
@@ -116,6 +126,10 @@ enum Op : uint8_t {
   kRerank = 0x22,
   kSearchLocal = 0x23,
   kAssign = 0x24,
+  kStageVersions = 0x30,
+  kDropVersion = 0x31,
+  kForget = 0x32,
+  kSavePartition = 0x33,
 };
 
 enum Status : uint16_t {

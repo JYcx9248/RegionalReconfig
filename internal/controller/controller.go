@@ -34,16 +34,22 @@ type Controller struct {
 	sink     *metrics.Sink
 	nodes    *NodeManager
 
+	// reconfigRunning: a reconfiguration runs, or an update batch holds its lease (lease). One
+	// at a time: both change the epoch, and a batch is staged for one placement.
 	reconfigRunning atomic.Bool
 	Ready           *syncflag.SyncFlag // initial deployment finished
 	Listening       *syncflag.SyncFlag // listeners bound (addresses valid)
 
-	mu        sync.Mutex
-	history   *placement.History
+	mu      sync.Mutex
+	history *placement.History
+	// leftAt[p][n]: the version of partition p's lists when node n last gave it up (U14): a
+	// former owner that gets it back lacks the vectors inserted since (planWarnings).
+	leftAt    map[int]map[placement.NodeID]uint32
 	graphNext int // round-robin cursor over the entries that serve the graph to new nodes
 	lastErr   string
 	ctrlAddr  string
 	apiAddr   string
+	lease     *updateLease // the update batch holding reconfigRunning, if any (update.go)
 }
 
 // New validates cfg and loads the partition manifest.
@@ -68,6 +74,9 @@ func New(cfg config.Controller) (*Controller, error) {
 	}
 	if cfg.EntryFlipInterval.Duration <= 0 {
 		return nil, fmt.Errorf("controller: entry_flip_interval must be positive, got %v", cfg.EntryFlipInterval.Duration)
+	}
+	if cfg.UpdateLease.Duration <= 0 {
+		return nil, fmt.Errorf("controller: update_lease must be positive, got %v", cfg.UpdateLease.Duration)
 	}
 	m, err := partitioning.LoadManifest(cfg.PartitionsDir)
 	if err != nil {
@@ -100,7 +109,7 @@ func New(cfg config.Controller) (*Controller, error) {
 	}
 	c := &Controller{
 		cfg: cfg, manifest: m, policy: policy, store: store, nodes: NewNodeManager(),
-		Ready: syncflag.NewSyncFlag(), Listening: syncflag.NewSyncFlag(),
+		Ready: syncflag.NewSyncFlag(), Listening: syncflag.NewSyncFlag(), leftAt: map[int]map[placement.NodeID]uint32{},
 	}
 	if cfg.MetricsPath != "" {
 		if c.sink, err = metrics.OpenSink(cfg.MetricsPath); err != nil {
@@ -191,6 +200,27 @@ func (c *Controller) setupAPIConn(conn *ctrl.Conn) {
 		}
 		return c.Status(), nil
 	})
+	conn.Handle(protocol.BeginUpdateA, func(ctx context.Context, body json.RawMessage) (any, error) {
+		req, err := ctrl.Decode[protocol.BeginUpdateReq](body)
+		if err != nil {
+			return nil, err
+		}
+		return c.BeginUpdate(ctx, req)
+	})
+	conn.Handle(protocol.CommitUpdateA, func(ctx context.Context, body json.RawMessage) (any, error) {
+		req, err := ctrl.Decode[protocol.CommitUpdateReq](body)
+		if err != nil {
+			return nil, err
+		}
+		return c.CommitUpdate(ctx, req)
+	})
+	conn.Handle(protocol.AbortUpdateA, func(ctx context.Context, body json.RawMessage) (any, error) {
+		req, err := ctrl.Decode[protocol.AbortUpdateReq](body)
+		if err != nil {
+			return nil, err
+		}
+		return struct{}{}, c.AbortUpdate(ctx, req)
+	})
 	conn.Handle(protocol.DesignA, func(ctx context.Context, _ json.RawMessage) (any, error) {
 		var qs []design.Question
 		for _, id := range design.IDs() {
@@ -203,11 +233,15 @@ func (c *Controller) setupAPIConn(conn *ctrl.Conn) {
 // Status reports the cluster state.
 func (c *Controller) Status() protocol.ClusterStatus {
 	t, _ := c.store.Current()
+	c.mu.Lock()
+	updating := c.lease != nil
+	c.mu.Unlock()
 	return protocol.ClusterStatus{
 		Ready:              !c.Ready.IsBlocked(),
 		Table:              t,
 		Nodes:              c.nodes.Summaries(t),
 		ReconfigInProgress: c.reconfigRunning.Load(),
+		UpdateInProgress:   updating,
 		LastError:          c.LastError(),
 	}
 }

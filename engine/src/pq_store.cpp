@@ -259,6 +259,19 @@ size_t PQStore::ReleaseStaged() {
   return freed;
 }
 
+size_t PQStore::Forget(const uint32_t* ids, size_t n) {
+  std::lock_guard<std::mutex> l(mu_);
+  size_t freed = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (ids[i] >= n_) continue;
+    const uint32_t s = slot_of_[ids[i]];
+    if (s == kNoSlot || CategoryOf(s) != kCached) continue;
+    FreeLocked(s);
+    ++freed;
+  }
+  return freed;
+}
+
 void PQStore::EvictLocked(uint64_t count) {
   // Sweep the slots from where the last eviction stopped (FIFO-like order) and drop cached
   // codes until `count` are gone. The caller checked that enough cached codes exist.

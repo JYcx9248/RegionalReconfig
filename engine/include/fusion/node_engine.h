@@ -91,6 +91,23 @@ struct NodeOptions {
   // after the vectors fetched for queries; RawAdd blocks while more than this many bytes wait.
   uint64_t update_buffer_bytes = 256ull << 20;
   uint64_t update_write_bps = 0;  // bytes/s the writer spends on inserted vectors; 0 = no limit
+  // Longest posting list a request may gather (0 = the manifest's): inserts make lists longer,
+  // and the filter's candidate buffers are sized by it.
+  uint32_t max_list_len = 0;
+};
+
+// One partition of a StageVersions call: its next version is built from `base`.
+struct VersionStage {
+  uint32_t partition = 0;
+  uint32_t base = 0;
+  uint32_t next = 0;
+};
+
+struct StageResult {
+  uint32_t partition = 0;
+  bool changed = false;  // false: nothing named it, no version was installed
+  uint64_t added = 0;    // postings added and removed
+  uint64_t removed = 0;
 };
 
 // Where LoadPartition takes what the node does not hold yet.
@@ -184,6 +201,28 @@ class NodeEngine {
   virtual std::vector<uint32_t> ResidentPartitions() const = 0;
   // Every resident (partition, version), ascending.
   virtual std::vector<std::pair<uint32_t, uint32_t>> ResidentVersions() const = 0;
+  // Update batches (U14). For each of `parts` (resident at its base version), builds the next
+  // version of its posting lists: the base lists, plus the postings (lists[i], ids[i],
+  // locs[i]) that name its lists, minus the IDs in deleted. Each list stays sorted by ID; a
+  // posting already there is skipped. A partition the batch does not change gets no new
+  // version (changed = false); the others are installed as version `next`, replacing that
+  // version if it is resident, next to the base version, which keeps serving queries of the
+  // current epoch. All or nothing: NotResidentError, PQMissingError (an added vector's code
+  // must be here, PQPut), RawMissingError (its raw vector too, RawAdd) or a list longer than
+  // max_list_len leave every partition as it was. A posting may only name a list of `parts`.
+  virtual std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts,
+                                                 const uint32_t* lists, const uint32_t* ids,
+                                                 const uint32_t* locs, size_t nadds,
+                                                 const uint32_t* deleted, size_t ndeleted) = 0;
+  // Evicts one version of a partition (after the grace period of the epoch that used it);
+  // returns false if it was not resident.
+  virtual bool DropVersion(uint32_t partition, uint32_t version) = 0;
+  // Frees the PQ codes of deleted vectors that no resident version names any more (cached
+  // copies included); returns how many were freed.
+  virtual size_t ForgetVectors(const uint32_t* ids, size_t n) = 0;
+  // Writes a resident version of a partition as a segment file (the format of the partition
+  // directory's), so that a node the partition moves to can load that version.
+  virtual void SavePartition(uint32_t partition, uint32_t version, const std::string& path) const = 0;
 
   // PQ codes (node-level store). For each group of segment files (one group per source a
   // staging pulls from): the vector IDs they name that have no code on this node and are not

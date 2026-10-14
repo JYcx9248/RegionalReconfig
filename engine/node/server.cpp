@@ -117,6 +117,10 @@ const char* OpName(uint8_t op) {
     case kRerank: return "rerank";
     case kSearchLocal: return "search_local";
     case kAssign: return "assign";
+    case kStageVersions: return "stage_versions";
+    case kDropVersion: return "drop_version";
+    case kForget: return "forget";
+    case kSavePartition: return "save_partition";
     default: return nullptr;
   }
 }
@@ -633,6 +637,55 @@ Frame NodeServer::Handle(const Frame& req) {
         w.Put<uint32_t>(m);
         w.PutBytes(lists.data(), lists.size() * 4);
         w.PutBytes(codes.data(), codes.size());
+        break;
+      }
+      case kStageVersions: {
+        const uint32_t np = r.Get<uint32_t>();
+        Require(np <= e.num_partitions(), "STAGE_VERSIONS: too many partitions");
+        std::vector<fusion::VersionStage> parts(np);
+        for (auto& vs : parts) {
+          vs.partition = r.Get<uint32_t>();
+          vs.base = r.Get<uint32_t>();
+          vs.next = r.Get<uint32_t>();
+        }
+        const uint32_t na = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(na) * 12 <= r.remaining(), "STAGE_VERSIONS: postings truncated");
+        const auto lists = TakeArray<uint32_t>(&r, na);
+        const auto ids = TakeArray<uint32_t>(&r, na);
+        const auto locs = TakeArray<uint32_t>(&r, na);
+        const uint32_t nd = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(nd) * 4 == r.remaining(), "STAGE_VERSIONS: deleted IDs do not match");
+        const auto del = TakeArray<uint32_t>(&r, nd);
+        const auto res = e.StageVersions(parts, lists.data(), ids.data(), locs.data(), na, del.data(), nd);
+        w.Put<uint32_t>(static_cast<uint32_t>(res.size()));
+        for (const auto& x : res) {
+          w.Put<uint32_t>(x.partition);
+          w.Put<uint8_t>(x.changed ? 1 : 0);
+          w.Put<uint8_t>(0);
+          w.Put<uint8_t>(0);
+          w.Put<uint8_t>(0);
+          w.Put<uint32_t>(static_cast<uint32_t>(x.added));
+          w.Put<uint32_t>(static_cast<uint32_t>(x.removed));
+        }
+        break;
+      }
+      case kDropVersion: {
+        const uint32_t p = r.Get<uint32_t>();
+        const uint32_t v = r.Get<uint32_t>();
+        w.Put<uint8_t>(e.DropVersion(p, v) ? 1 : 0);
+        break;
+      }
+      case kForget: {
+        const uint32_t n = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(n) * 4 == r.remaining(), "FORGET: IDs do not match");
+        const auto ids = TakeArray<uint32_t>(&r, n);
+        w.Put<uint64_t>(e.ForgetVectors(ids.data(), n));
+        break;
+      }
+      case kSavePartition: {
+        const uint32_t p = r.Get<uint32_t>();
+        const uint32_t v = r.Get<uint32_t>();
+        e.SavePartition(p, v, r.Rest());
         break;
       }
       case kSearchLocal: {

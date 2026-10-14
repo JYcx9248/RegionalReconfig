@@ -26,8 +26,21 @@ const (
 	PayloadListsOnly = "lists-only"
 )
 
-// SegmentName is the file holding partition p's posting lists.
+// SegmentName is the file holding partition p's posting lists as built (version 0).
 func SegmentName(p int) string { return fmt.Sprintf("part-%05d.seg", p) }
+
+// SegmentNameV is the file holding version v of partition p's posting lists: the build's
+// segment for version 0; for a later one, made by update batches (U14), the segment its owner
+// writes when the partition moves.
+func SegmentNameV(p int, v uint32) string {
+	if v == 0 {
+		return SegmentName(p)
+	}
+	return fmt.Sprintf("part-%05d.v%d.seg", p, v)
+}
+
+// SegmentVersionsGlob matches the files of partition p's later versions (SegmentNameV, v > 0).
+func SegmentVersionsGlob(p int) string { return fmt.Sprintf("part-%05d.v*.seg", p) }
 
 // Manifest describes a partition directory.
 type Manifest struct {

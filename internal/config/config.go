@@ -67,6 +67,10 @@ type Controller struct {
 	// last pull finishes, its nodes join at once). Default 1 s: clients refresh their entry
 	// list about that often, so flipping more often would not put a new entry to use sooner.
 	EntryFlipInterval Duration `json:"entry_flip_interval"`
+	// UpdateLease: how long an update batch may hold the cluster between BeginUpdate and its
+	// commit or abort (U14) before the controller gives the lease up -- an update controller that
+	// died must not block reconfigurations for good. Default 10 min.
+	UpdateLease Duration `json:"update_lease"`
 }
 
 // DefaultController returns the controller defaults.
@@ -86,6 +90,7 @@ func DefaultController() Controller {
 		RawPriority:   "background",
 
 		EntryFlipInterval: Duration{time.Second},
+		UpdateLease:       Duration{10 * time.Minute},
 	}
 }
 

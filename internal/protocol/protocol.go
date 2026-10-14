@@ -16,10 +16,14 @@
 //	5 waitAllTasksReconfigDone                         WaitDrained(old epoch) everywhere
 //	6 terminateTasks                                   Evict on old owners
 //	  (none)                                           StageGraph; entry flips add new nodes as graphs load
+//	  (none)                                           update batches (U14): BeginUpdate, staging by the
+//	                                                   update controller, CommitUpdate (flip, grace,
+//	                                                   DropVersions)
 package protocol
 
 import (
 	"strconv"
+	"time"
 
 	"rtier/internal/epoch"
 	"rtier/internal/placement"
@@ -34,6 +38,8 @@ const (
 	InstallEpochM    = "InstallEpoch"    // switch routing to a new table
 	WaitDrainedM     = "WaitDrained"     // grace period: queries pinned to <= epoch finished
 	EvictM           = "Evict"           // drop partitions and their files
+	SavePartitionsM  = "SavePartitions"  // write versions of resident partitions as segment files (U14)
+	DropVersionsM    = "DropVersions"    // drop versions an update batch replaced, and their files (U14)
 	SetAdmissionM    = "SetAdmission"    // pause/resume client queries (stop-and-copy baseline)
 	WaitIdleM        = "WaitIdle"        // no query in flight at all
 	NodeStatusM      = "Status"
@@ -52,6 +58,11 @@ const (
 	StatusA    = "Status"
 	WaitReadyA = "WaitReady"
 	DesignA    = "Design"
+
+	// Update batches (U14), called by the update controller (internal/update).
+	BeginUpdateA  = "BeginUpdate"
+	CommitUpdateA = "CommitUpdate"
+	AbortUpdateA  = "AbortUpdate"
 )
 
 // Register is an agent's first message (Koala's Registration: data-plane and state-comm
@@ -79,7 +90,24 @@ type Source struct {
 	NodeAddr   string `json:"node_addr,omitempty"`
 	Dir        string `json:"dir,omitempty"`
 	Partitions []int  `json:"partitions,omitempty"`
-	File       string `json:"file,omitempty"` // StageGraph: the file name at the source
+	// Versions: the version of each of Partitions in the epoch the staging is for (absent: all
+	// 0) -- the segment file to fetch and the version to load it as (U14).
+	Versions []uint32 `json:"versions,omitempty"`
+	File     string   `json:"file,omitempty"` // StageGraph: the file name at the source
+}
+
+// VersionOf is the version of Partitions[i].
+func (s Source) VersionOf(i int) uint32 {
+	if i < len(s.Versions) {
+		return s.Versions[i]
+	}
+	return 0
+}
+
+// PartitionVersion names one version of a partition's lists (U14).
+type PartitionVersion struct {
+	Partition int    `json:"partition"`
+	Version   uint32 `json:"version"`
 }
 
 // StagePartitionsReq asks the agent to fetch and load partitions.
@@ -131,6 +159,20 @@ type EvictReq struct {
 	ReleaseStagedPQ bool `json:"release_staged_pq,omitempty"`
 }
 
+// SavePartitionsReq asks the agent to write these versions of resident partitions as segment
+// files in its partition directory, where the nodes they move to pull them: a version an update
+// batch made exists only in the data node's memory until then (U14).
+type SavePartitionsReq struct {
+	Versions []PartitionVersion `json:"versions"`
+}
+
+// DropVersionsReq asks the agent to drop these versions of its partitions, and their segment
+// files: the versions an update batch replaced, after the grace period of the epochs that read
+// them (U14).
+type DropVersionsReq struct {
+	Versions []PartitionVersion `json:"versions"`
+}
+
 type SetAdmissionReq struct {
 	Paused bool `json:"paused"`
 }
@@ -147,6 +189,8 @@ type NodeStatus struct {
 	// Raw vectors the data node fetched on demand since it started, and their bytes.
 	RawFetched      uint64 `json:"raw_fetched"`
 	RawFetchedBytes uint64 `json:"raw_fetched_bytes"`
+	// Versions: every version of a partition's lists the data node holds (U14).
+	Versions []PartitionVersion `json:"versions,omitempty"`
 }
 
 // RescaleReq asks for a reconfiguration in one of two forms: DataNodes, a number of data
@@ -247,11 +291,58 @@ type ClusterStatus struct {
 	Ready              bool          `json:"ready"`
 	Table              *epoch.Table  `json:"table"`
 	Nodes              []NodeSummary `json:"nodes"`
-	ReconfigInProgress bool          `json:"reconfig_in_progress"`
+	ReconfigInProgress bool          `json:"reconfig_in_progress"` // a reconfiguration or an update batch
+	UpdateInProgress   bool          `json:"update_in_progress,omitempty"`
 	LastError          string        `json:"last_error,omitempty"`
 }
 
 // WaitReadyReq blocks until the initial deployment finished.
 type WaitReadyReq struct {
 	TimeoutSeconds float64 `json:"timeout_seconds"`
+}
+
+// BeginUpdateReq asks for the lease an update batch runs under (U14). Until the batch is
+// committed or aborted, or the lease expires, the controller starts no reconfiguration and no
+// other batch: the update controller routes the batch by the lease's epoch and stages it on
+// that epoch's owners, so the placement must not change underneath it.
+type BeginUpdateReq struct {
+	// LeaseSeconds: how long the lease lasts without a commit or an abort (0: the controller's
+	// update_lease).
+	LeaseSeconds float64 `json:"lease_seconds,omitempty"`
+}
+
+// UpdateLease is the lease of one update batch.
+type UpdateLease struct {
+	Token string `json:"token"`
+	// Table: the current epoch. The batch is staged for its placement and versions, and the
+	// commit flips from it.
+	Table *epoch.Table `json:"table"`
+	// Nodes: every registered node. Former owners not in Table hold cached PQ codes of vectors
+	// the batch deletes.
+	Nodes   []NodeSummary `json:"nodes"`
+	Expires time.Time     `json:"expires"`
+}
+
+// CommitUpdateReq flips to the versions an update batch staged on the owners of the lease's
+// epoch: the next version of every partition the batch changed (partitions it did not change
+// keep theirs).
+type CommitUpdateReq struct {
+	Token     string             `json:"token"`
+	FromEpoch uint64             `json:"from_epoch"`
+	Versions  []PartitionVersion `json:"versions"`
+}
+
+// UpdateReply summarizes a committed batch. ToEpoch is FromEpoch when it changed nothing, or
+// when the commit failed before the flip.
+type UpdateReply struct {
+	FromEpoch uint64             `json:"from_epoch"`
+	ToEpoch   uint64             `json:"to_epoch"`
+	Changed   []int              `json:"changed"` // partitions at a new version
+	Phases    map[string]float64 `json:"phases"`  // seconds per phase
+}
+
+// AbortUpdateReq ends a lease without a flip. What the batch staged is the update
+// controller's to drop.
+type AbortUpdateReq struct {
+	Token string `json:"token"`
 }

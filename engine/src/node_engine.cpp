@@ -12,6 +12,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -178,9 +179,10 @@ class NodeEngineImpl : public NodeEngine {
     segs_.resize(man_.num_partitions);
     list_src_.assign(man_.num_lists, 0);
     index_pages_path_ = path(files::LayoutVectors(man_.layout));
+    // Inserts make lists longer (U14): o.max_list_len leaves room for them.
+    max_list_len_ = std::max<uint32_t>(std::max(o.max_list_len, man_.max_list_len), 1);
     const uint64_t max_cand =
-        static_cast<uint64_t>(std::min<uint32_t>(o.max_nprobe, man_.num_lists)) *
-        std::max<uint32_t>(man_.max_list_len, 1);
+        static_cast<uint64_t>(std::min<uint32_t>(o.max_nprobe, man_.num_lists)) * max_list_len_;
     FUSION_CHECK(max_cand < 0xFFFFFFFFull, "max_nprobe too large");
     max_candidates_ = static_cast<uint32_t>(max_cand);
 
@@ -272,6 +274,13 @@ class NodeEngineImpl : public NodeEngine {
     rs->seg = LoadSegment(seg_path);
     FUSION_CHECK(rs->seg.partition == p, "%s holds partition %u, not %u", seg_path.c_str(),
                  rs->seg.partition, p);
+    // A version that update batches made can hold lists longer than the build's (U14): refuse
+    // it here, before the flip, rather than fail the queries that gather it.
+    for (size_t li = 0; li + 1 < rs->seg.offsets.size(); ++li)
+      FUSION_CHECK(rs->seg.offsets[li + 1] - rs->seg.offsets[li] <= max_list_len_,
+                   "%s: list %u holds %llu postings, more than the %u a request may gather (--max-list-len)",
+                   seg_path.c_str(), rs->seg.list_ids[li],
+                   static_cast<unsigned long long>(rs->seg.offsets[li + 1] - rs->seg.offsets[li]), max_list_len_);
     const std::vector<uint32_t>& ids = rs->seg.ids;
     const std::vector<uint32_t>& locs = rs->seg.locs;
     std::vector<uint32_t> raw_miss;
@@ -343,6 +352,156 @@ class NodeEngineImpl : public NodeEngine {
     for (uint32_t p = 0; p < segs_.size(); ++p)
       for (const auto& s : segs_[p]) r.emplace_back(p, s->version);
     return r;
+  }
+
+  // ------------------------------------------------------------ update batches (U14)
+  std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts, const uint32_t* lists,
+                                         const uint32_t* ids, const uint32_t* locs, size_t nadds,
+                                         const uint32_t* deleted, size_t ndeleted) override {
+    std::unordered_map<uint32_t, size_t> which;  // partition -> index in parts
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const VersionStage& vs = parts[i];
+      FUSION_CHECK(vs.partition < man_.num_partitions, "partition %u out of range", vs.partition);
+      FUSION_CHECK(vs.next != vs.base, "partition %u: the next version must differ from the base", vs.partition);
+      FUSION_CHECK(which.emplace(vs.partition, i).second, "partition %u is listed twice", vs.partition);
+    }
+    const uint64_t space = raw_->layout().locations();
+    // The postings to add, by partition and list: (ID, location).
+    std::vector<std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>> adds(parts.size());
+    for (size_t a = 0; a < nadds; ++a) {
+      FUSION_CHECK(lists[a] < man_.num_lists, "list %u out of range", lists[a]);
+      FUSION_CHECK(ids[a] < ids_, "vector ID %u out of range", ids[a]);
+      FUSION_CHECK(locs[a] < space, "location %u out of range", locs[a]);
+      const auto it = which.find(man_.list_part[lists[a]]);
+      FUSION_CHECK(it != which.end(), "a posting names list %u of partition %u, which is not staged",
+                   lists[a], man_.list_part[lists[a]]);
+      // An added vector is served by this node from now on: its raw vector must be here.
+      if (!raw_->Present(locs[a]) && !Cached(locs[a]))
+        throw RawMissingError(StrFormat("vector %u at location %u is not on this node (RAW_ADD it first)",
+                                        ids[a], locs[a]));
+      adds[it->second][lists[a]].emplace_back(ids[a], locs[a]);
+    }
+    std::vector<uint32_t> del(deleted, deleted + ndeleted);
+    std::sort(del.begin(), del.end());
+    del.erase(std::unique(del.begin(), del.end()), del.end());
+    auto is_deleted = [&](uint32_t id) { return std::binary_search(del.begin(), del.end(), id); };
+
+    // Build every next version first; install only if all could be built. A built segment
+    // holds PQ references from the moment it exists, and drops them (through the reclaimer)
+    // if it is discarded.
+    std::vector<StageResult> out(parts.size());
+    std::vector<std::shared_ptr<const ResidentSegment>> built(parts.size());
+    Reclaimer* reclaimer = reclaimer_.get();
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const VersionStage& vs = parts[i];
+      out[i].partition = vs.partition;
+      std::shared_ptr<const ResidentSegment> base;
+      {
+        std::lock_guard<std::mutex> l(seg_mu_);
+        base = SegmentLocked(vs.partition, &vs.base);
+      }
+      if (!base)
+        throw NotResidentError(StrFormat("partition %u is not resident at version %u", vs.partition, vs.base));
+      const ListSegment& b = base->seg;
+      for (const auto& kv : adds[i])
+        FUSION_CHECK(std::binary_search(b.list_ids.begin(), b.list_ids.end(), kv.first),
+                     "list %u is not in partition %u's segment", kv.first, vs.partition);
+      auto rs = std::make_unique<ResidentSegment>();
+      ListSegment& seg = rs->seg;
+      seg.partition = vs.partition;
+      seg.list_ids = b.list_ids;
+      seg.offsets.assign(1, 0);
+      std::vector<std::pair<uint32_t, uint32_t>> post;
+      for (size_t li = 0; li < b.list_ids.size(); ++li) {
+        post.clear();
+        for (uint64_t j = b.offsets[li]; j < b.offsets[li + 1]; ++j) {
+          if (is_deleted(b.ids[j])) {
+            ++out[i].removed;
+            continue;
+          }
+          post.emplace_back(b.ids[j], b.locs[j]);
+        }
+        const auto it = adds[i].find(b.list_ids[li]);
+        if (it != adds[i].end()) {
+          const size_t kept = post.size();
+          for (const auto& pl : it->second)
+            if (!is_deleted(pl.first)) post.push_back(pl);
+          std::sort(post.begin(), post.end());
+          post.erase(std::unique(post.begin(), post.end(),
+                                 [](const auto& x, const auto& y) { return x.first == y.first; }),
+                     post.end());
+          out[i].added += post.size() - std::min(post.size(), kept);
+        }
+        FUSION_CHECK(post.size() <= max_list_len_,
+                     "list %u would hold %zu postings, more than the %u a request may gather (--max-list-len)",
+                     b.list_ids[li], post.size(), max_list_len_);
+        for (const auto& pl : post) {
+          seg.ids.push_back(pl.first);
+          seg.locs.push_back(pl.second);
+        }
+        seg.offsets.push_back(seg.ids.size());
+      }
+      out[i].changed = out[i].added + out[i].removed > 0;
+      if (!out[i].changed) continue;
+      rs->version = vs.next;
+      rs->slots.resize(seg.ids.size());
+      // PQMissingError: this segment holds no reference yet; the ones built before drop theirs.
+      store_->Ref(seg.ids.data(), seg.ids.size(), rs->slots.data(), seg.locs.data());
+      built[i].reset(rs.release(), [reclaimer](const ResidentSegment* r) { reclaimer->Push(r); });
+    }
+    std::vector<std::shared_ptr<const ResidentSegment>> replaced;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (size_t i = 0; i < parts.size(); ++i) {
+        if (!built[i]) continue;
+        auto& vs = segs_[parts[i].partition];
+        const uint32_t v = parts[i].next;
+        auto it = std::find_if(vs.begin(), vs.end(), [&](const auto& r) { return r->version >= v; });
+        if (it != vs.end() && (*it)->version == v) {
+          replaced.push_back(std::move(*it));
+          *it = std::move(built[i]);
+        } else {
+          vs.insert(it, std::move(built[i]));
+        }
+      }
+    }
+    resident_version_.fetch_add(1);
+    return out;
+  }
+
+  bool DropVersion(uint32_t p, uint32_t version) override {
+    FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
+    std::shared_ptr<const ResidentSegment> old;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      auto& vs = segs_[p];
+      auto it = std::find_if(vs.begin(), vs.end(), [&](const auto& r) { return r->version == version; });
+      if (it != vs.end()) {
+        old = std::move(*it);
+        vs.erase(it);
+      }
+    }
+    const bool was = old != nullptr;
+    old.reset();  // its references go (unless a query still holds it) before ForgetVectors runs
+    reclaimer_->Flush();
+    resident_version_.fetch_add(1);
+    return was;
+  }
+
+  size_t ForgetVectors(const uint32_t* ids, size_t n) override {
+    reclaimer_->Flush();
+    return store_->Forget(ids, n);
+  }
+
+  void SavePartition(uint32_t p, uint32_t version, const std::string& path) const override {
+    FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
+    std::shared_ptr<const ResidentSegment> seg;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      seg = SegmentLocked(p, &version);
+    }
+    if (!seg) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
+    seg->seg.Save(path);
   }
 
   // ---------------------------------------------------------------- PQ codes
@@ -1316,6 +1475,7 @@ class NodeEngineImpl : public NodeEngine {
   uint32_t dim_ = 0;
   uint64_t n_ = 0;    // the index's vectors
   uint64_t ids_ = 0;  // the vector-ID space: n_ and room for inserted vectors
+  uint32_t max_list_len_ = 0;  // longest list a request may gather (room for inserts)
   AssignParams assign_;  // the build's, for Assign
   std::unique_ptr<PQCodebook> codebook_;
   uint32_t max_candidates_ = 0;

@@ -71,7 +71,8 @@ func unavailableReason(err error) string {
 }
 
 // startLoad runs closed-loop query workers against the current entries until stop is called.
-// Every answer must equal the single-node oracle exactly.
+// Every answer must equal the single-node oracle exactly -- the oracle of the data its epoch
+// holds, once update batches change it (cluster.expected).
 func startLoad(cl *cluster, workers int) func() loadStats {
 	ctx, cancel := context.WithCancel(cl.ctx)
 	var (
@@ -136,9 +137,9 @@ func startLoad(cl *cluster, workers int) func() loadStats {
 					problem(fmt.Sprintf("query %d: %v", qi, err))
 				} else {
 					st.epochs[res.Epoch]++
-					if !equal(res.Candidates, cl.f.oracle[qi]) {
+					if want := cl.expected(res.Epoch, qi); !equal(res.Candidates, want) {
 						st.mismatches++
-						problem(fmt.Sprintf("query %d in epoch %d: got %v want %v", qi, res.Epoch, res.Candidates, cl.f.oracle[qi]))
+						problem(fmt.Sprintf("query %d in epoch %d: got %v want %v", qi, res.Epoch, res.Candidates, want))
 					}
 				}
 				mu.Unlock()

@@ -119,6 +119,10 @@ class PQStore {
   // Ends a staging that did not load (rollback): frees staged codes no partition ever named
   // and returns the claimed ones to the cache. Returns how many codes were freed.
   size_t ReleaseStaged();
+  // Frees the codes of ids[0..n) that no resident posting references any more and no staging
+  // protects -- deleted vectors (U14), once the lists that named them are gone: their cached
+  // copies are stale, not a cache. Live or staged ones stay. Returns how many were freed.
+  size_t Forget(const uint32_t* ids, size_t n);
 
   PQStats Stats() const;
 
