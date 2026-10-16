@@ -482,15 +482,17 @@ class NodeEngineImpl : public NodeEngine {
       }
     }
     const bool was = old != nullptr;
-    old.reset();  // its references go (unless a query still holds it) before ForgetVectors runs
+    // Its references go now, unless a query still holds it; the codes of deleted vectors that
+    // ForgetVectors marked go with them.
+    old.reset();
     reclaimer_->Flush();
     resident_version_.fetch_add(1);
     return was;
   }
 
-  size_t ForgetVectors(const uint32_t* ids, size_t n) override {
+  size_t ForgetVectors(const uint32_t* ids, size_t n, bool deleted) override {
     reclaimer_->Flush();
-    return store_->Forget(ids, n);
+    return store_->Forget(ids, n, deleted);
   }
 
   void SavePartition(uint32_t p, uint32_t version, const std::string& path) const override {

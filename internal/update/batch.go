@@ -54,8 +54,10 @@ type Updater struct {
 	Controller Controller
 	Manifest   *partitioning.Manifest
 	Alloc      *Allocator
-	// Router routes the inserts (ASSIGN): a data node with the navigation graph. Nil: the data
-	// node of the first entry of the lease's epoch.
+	// Router routes the inserts (ASSIGN): the update controller's own rtier_node, holding the
+	// index's navigation graph and codebook and nothing else (rtier-updater -router or -index).
+	// Never a serving node: routing must not take the navigation CPU that queries need (section
+	// 5 of the draft), and in a major epoch the update controller's graph is the one entries get.
 	Router *nodeclient.Client
 
 	mu      sync.Mutex
@@ -119,6 +121,9 @@ func (u *Updater) Prepare(ctx context.Context, vecs []byte, vecBytes int, delete
 	if len(del) > 0 && uint64(del[len(del)-1]) >= next {
 		return nil, fmt.Errorf("update: deleting vector %d, which was never inserted (the next ID is %d)", del[len(del)-1], next)
 	}
+	if len(vecs) > 0 && u.Router == nil {
+		return nil, errors.New("update: no router: the update controller routes inserts with its own navigation graph")
+	}
 	lease, err := u.Controller.BeginUpdate(ctx, protocol.BeginUpdateReq{})
 	if err != nil {
 		return nil, err
@@ -129,16 +134,9 @@ func (u *Updater) Prepare(ctx context.Context, vecs []byte, vecBytes int, delete
 		}
 	}()
 	t := lease.Table
-	router := u.Router
-	if router == nil {
-		if len(t.Entries) == 0 {
-			return nil, fmt.Errorf("update: epoch %d has no entry to route inserts with", t.Epoch)
-		}
-		router = u.client(t.Nodes[t.Entries[0]].NodeAddr)
-	}
 	var ins []Insert
 	if len(vecs) > 0 {
-		if ins, err = Route(ctx, router, u.Alloc, vecs, vecBytes); err != nil {
+		if ins, err = Route(ctx, u.Router, u.Alloc, vecs, vecBytes); err != nil {
 			return nil, err
 		}
 	}
@@ -152,7 +150,8 @@ func (u *Updater) Prepare(ctx context.Context, vecs []byte, vecBytes int, delete
 
 // checkRoom: every data node has the IDs and locations the batch uses -- a partition can move
 // to any of them -- and every owner the PQ codes of its inserts, on top of the codes it holds
-// that it cannot evict. That is the batch's peak: the codes of deleted vectors are freed only
+// that it cannot evict: live ones, and staged ones, of which there are none once BeginUpdate has
+// released the leftovers. That is the batch's peak: the codes of deleted vectors are freed only
 // after the grace period. Over budget the batch fails here, before anything is sent: splitting
 // the partitions that grew too large, or scaling out first (agreed item 10), is not
 // implemented, and neither is growing the spaces (item 9).
@@ -182,31 +181,23 @@ func (u *Updater) checkRoom(ctx context.Context, b *Batch) error {
 	})
 }
 
-// Execute has the owners stage b and the controller flip to it, then has every node free the
-// PQ codes of the deleted vectors. If the staging fails, Execute drops what it staged and gives
-// the lease up. If the commit fails, the controller has dropped the staged versions when it
-// failed before the flip, and stopped where it was after it (U13).
+// Execute has the owners stage b and the controller flip to it; the controller's reclaim frees
+// the deleted vectors' PQ codes on every node. If the staging fails, Execute drops what it
+// staged and gives the lease up. If the commit fails, the controller has dropped the staged
+// versions when it failed before the flip, and stopped where it was after it (U13).
 func (u *Updater) Execute(ctx context.Context, b *Batch) (*protocol.UpdateReply, error) {
 	if err := u.stage(ctx, b); err != nil {
 		u.undo(ctx, b)
 		return nil, errors.Join(err, u.abort(ctx, b.Lease))
 	}
 	reply, err := u.Controller.CommitUpdate(ctx, protocol.CommitUpdateReq{Token: b.Lease.Token,
-		FromEpoch: b.Lease.Table.Epoch, Versions: b.Versions()})
+		FromEpoch: b.Lease.Table.Epoch, Versions: b.Versions(), Deleted: b.Deleted})
 	if err != nil {
-		// Whatever happened, freeing the inserts' codes is safe: only those no resident version
-		// names any more go, i.e. those of versions the controller dropped.
-		u.forget(ctx, b.ownerAddrs(), b.insertIDs())
+		// Whether the flip happened may be unknown here (a reply lost with the connection), so the
+		// inserts are not declared dead: only their unreferenced codes go -- those of versions the
+		// controller dropped -- which is safe either way.
+		u.forget(ctx, b.ownerAddrs(), b.insertIDs(), false)
 		return reply, err
-	}
-	if len(b.Deleted) > 0 {
-		var addrs []string
-		for _, n := range b.Lease.Nodes {
-			if n.Alive {
-				addrs = append(addrs, n.Info.NodeAddr)
-			}
-		}
-		u.forget(ctx, addrs, b.Deleted)
 	}
 	return reply, nil
 }
@@ -311,9 +302,10 @@ func (u *Updater) stage(ctx context.Context, b *Batch) error {
 }
 
 // undo drops what stage put on the nodes, while the batch still holds its lease (no other
-// staging runs): the staged versions, then the inserts' PQ codes -- those still protected for the
-// batch, and those the dropped versions left cached. The raw vectors stay where they were sent:
-// no list names them, and their locations are never handed out again.
+// staging runs, and the batch will not flip): the staged versions, then the inserts' PQ codes --
+// those still protected for the batch, and the rest as deleted, since their IDs are never named
+// again. The raw vectors stay where they were sent: no list names them, and their locations are
+// never handed out again.
 func (u *Updater) undo(ctx context.Context, b *Batch) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
@@ -330,14 +322,13 @@ func (u *Updater) undo(ctx context.Context, b *Batch) {
 			log.Printf("update: undo: releasing PQ codes on node %d: %v", o, err)
 		}
 	}
-	u.forget(ctx, b.ownerAddrs(), b.insertIDs())
+	u.forget(ctx, b.ownerAddrs(), b.insertIDs(), true)
 }
 
-// forget has the data nodes at addrs free the PQ codes of ids that no resident version names
-// (deleted vectors after the grace period, inserts whose versions were dropped). It only frees
-// memory: no list will name these IDs again, so a code it misses is never read. Failures are
-// logged.
-func (u *Updater) forget(ctx context.Context, addrs []string, ids []uint32) {
+// forget has the data nodes at addrs free the PQ codes of ids, inserts no list will name
+// (nodeclient.ForgetVectors; deleted: also those a version still names, with that version). It
+// only frees memory, so failures are logged.
+func (u *Updater) forget(ctx context.Context, addrs []string, ids []uint32, deleted bool) {
 	if len(ids) == 0 {
 		return
 	}
@@ -345,7 +336,7 @@ func (u *Updater) forget(ctx context.Context, addrs []string, ids []uint32) {
 	defer cancel()
 	parallel(ctx, len(addrs), func(ctx context.Context, i int) error {
 		for lo := 0; lo < len(ids); lo += forgetBatch {
-			if _, err := u.client(addrs[i]).ForgetVectors(ctx, ids[lo:min(lo+forgetBatch, len(ids))]); err != nil {
+			if _, err := u.client(addrs[i]).ForgetVectors(ctx, ids[lo:min(lo+forgetBatch, len(ids))], deleted); err != nil {
 				log.Printf("update: freeing the PQ codes of %d vectors on %s: %v", len(ids), addrs[i], err)
 				return nil
 			}

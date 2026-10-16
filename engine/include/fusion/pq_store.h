@@ -10,11 +10,16 @@
 //   live    named by at least one posting of a resident partition (one reference per posting);
 //   staged  protected for a staging in progress: installed by Put, or already here and claimed
 //           by Reserve, and not yet named by a loaded partition;
-//   cached  no longer named by a resident partition (its partition moved away). The dataset is
-//           static, so the code stays valid and is kept: the node held it before, and a later
-//           reconfiguration may bring the partition back. Cached codes are only dropped when a
-//           Put would otherwise exceed the capacity. (Invalidating them when the dataset
-//           changes is open question U14.)
+//   cached  no longer named by a resident partition (its partition moved away, or a version
+//           an update batch replaced). Vectors are immutable (an update deletes and inserts
+//           under a new ID, U14), so the code stays valid and is kept: the node held it before,
+//           and a later reconfiguration may bring the partition back. Cached codes are only
+//           dropped when a Put would otherwise exceed the capacity.
+//
+// A deleted vector's code never becomes cached: it can never be named again, so it is no
+// cache. Forget frees it at once if nothing names it, and otherwise marks it, so that it is
+// freed with its last reference -- the version that queries of an epoch before the delete may
+// still read.
 //
 // With the placement rtier uses, the last case does not arise: a scale-out only takes
 // partitions away from a node and a scale-in gives them back to a node that held them, so the
@@ -70,7 +75,10 @@ struct PQStats {
   uint64_t from_index = 0; // cumulative: codes installed from the index files
   uint64_t skipped = 0;    // cumulative: codes offered that were already held
   uint64_t evicted = 0;    // cumulative: cached codes dropped to make room
-  uint64_t freed = 0;      // cumulative: codes dropped (evicted, or released after a staging)
+  uint64_t freed = 0;      // cumulative: codes dropped (evicted, released after a staging, deleted)
+  // Codes of deleted vectors that a resident version still names (Forget marked them): freed
+  // with their last reference, not cached.
+  uint64_t deleted = 0;
   uint64_t served = 0;     // cumulative: codes copied out for peers (PQ_GET)
 };
 
@@ -119,10 +127,13 @@ class PQStore {
   // Ends a staging that did not load (rollback): frees staged codes no partition ever named
   // and returns the claimed ones to the cache. Returns how many codes were freed.
   size_t ReleaseStaged();
-  // Frees the codes of ids[0..n) that no resident posting references any more and no staging
-  // protects -- deleted vectors (U14), once the lists that named them are gone: their cached
-  // copies are stale, not a cache. Live or staged ones stay. Returns how many were freed.
-  size_t Forget(const uint32_t* ids, size_t n);
+  // Frees the codes of ids[0..n) that no resident posting references and no staging protects.
+  // With deleted (U14: the vectors are deleted, so their copies are dead, not a cache), the
+  // others -- named by a version that old queries may still read -- are marked, and each is
+  // freed when its last reference goes instead of becoming cached. Without it, only the
+  // unreferenced ones go (codes known to be unused, e.g. of inserts whose batch did not flip).
+  // Returns how many were freed now.
+  size_t Forget(const uint32_t* ids, size_t n, bool deleted);
 
   PQStats Stats() const;
 
@@ -147,7 +158,7 @@ class PQStore {
   std::vector<uint32_t> id_of_;    // per slot; kNoSlot = free
   std::vector<uint32_t> refs_;     // per slot
   std::vector<uint32_t> loc_;      // per slot: raw-vector location of its vector, or kNoLoc
-  std::vector<uint8_t> flags_;     // per slot: kProtected | kEverReferenced
+  std::vector<uint8_t> flags_;     // per slot: kProtected | kEverReferenced | kDeleted
   std::vector<uint32_t> free_;     // freed slots, reused first
   uint64_t next_ = 0;              // slots [0, next_) have been handed out at least once
   uint64_t hand_ = 0;              // eviction sweep position

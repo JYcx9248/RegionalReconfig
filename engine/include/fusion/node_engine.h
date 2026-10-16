@@ -217,9 +217,11 @@ class NodeEngine {
   // Evicts one version of a partition (after the grace period of the epoch that used it);
   // returns false if it was not resident.
   virtual bool DropVersion(uint32_t partition, uint32_t version) = 0;
-  // Frees the PQ codes of deleted vectors that no resident version names any more (cached
-  // copies included); returns how many were freed.
-  virtual size_t ForgetVectors(const uint32_t* ids, size_t n) = 0;
+  // PQ codes of vectors no list will name again (PQStore::Forget): with deleted, the vectors
+  // are deleted -- their unreferenced copies are freed now, and the ones a resident version
+  // still names are freed with their last reference, never cached; without it, only the
+  // unreferenced copies go. Returns how many were freed now.
+  virtual size_t ForgetVectors(const uint32_t* ids, size_t n, bool deleted) = 0;
   // Writes a resident version of a partition as a segment file (the format of the partition
   // directory's), so that a node the partition moves to can load that version.
   virtual void SavePartition(uint32_t partition, uint32_t version, const std::string& path) const = 0;

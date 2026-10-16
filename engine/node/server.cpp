@@ -676,10 +676,11 @@ Frame NodeServer::Handle(const Frame& req) {
         break;
       }
       case kForget: {
+        const uint32_t flags = r.Get<uint32_t>();
         const uint32_t n = r.Get<uint32_t>();
         Require(static_cast<uint64_t>(n) * 4 == r.remaining(), "FORGET: IDs do not match");
         const auto ids = TakeArray<uint32_t>(&r, n);
-        w.Put<uint64_t>(e.ForgetVectors(ids.data(), n));
+        w.Put<uint64_t>(e.ForgetVectors(ids.data(), n, (flags & 1) != 0));
         break;
       }
       case kSavePartition: {
@@ -766,9 +767,10 @@ std::string NodeServer::InfoJson(bool settle) const {
   s += fusion::StrFormat(
       "],\"pq\":{\"m\":%u,\"capacity\":%llu,\"resident\":%llu,\"live\":%llu,\"staged\":%llu,"
       "\"cached\":%llu,\"received\":%llu,\"from_index\":%llu,\"skipped\":%llu,\"evicted\":%llu,"
-      "\"freed\":%llu,\"served\":%llu}",
+      "\"freed\":%llu,\"served\":%llu,\"deleted\":%llu}",
       pq.m, u(pq.capacity), u(pq.resident), u(pq.live), u(pq.staged), u(pq.cached),
-      u(pq.received), u(pq.from_index), u(pq.skipped), u(pq.evicted), u(pq.freed), u(pq.served));
+      u(pq.received), u(pq.from_index), u(pq.skipped), u(pq.evicted), u(pq.freed), u(pq.served),
+      u(pq.deleted));
   const fusion::RawStats raw = e.raw_stats(settle);
   s += fusion::StrFormat(
       ",\"raw\":{\"vec_bytes\":%u,\"locations\":%llu,\"present\":%llu,\"cached\":%llu,"

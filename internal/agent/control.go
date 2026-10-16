@@ -664,13 +664,24 @@ func (a *Agent) handleSavePartitions(ctx context.Context, body json.RawMessage) 
 	return struct{}{}, nil
 }
 
-// DropVersions: drop versions of partitions that an update batch replaced, after the grace
-// period of the epochs that read them (U14), and their segment files if a move wrote one. The
-// partition stays resident at its newer version.
+// forgetBatch bounds the IDs of one FORGET (its frame).
+const forgetBatch = 1 << 22
+
+// DropVersions: an update batch's reclaim on this node (U14), after the grace period of the
+// epochs that read the replaced versions. First the deleted vectors: their PQ codes go now
+// where nothing names them, and the ones the replaced versions name are marked, so that they go
+// with those versions below instead of becoming cached codes -- a deleted vector is no cache.
+// Then the replaced versions go, with their segment files if a move wrote one; the partitions
+// stay resident at their newer versions.
 func (a *Agent) handleDropVersions(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.DropVersionsReq](body)
 	if err != nil {
 		return nil, err
+	}
+	for lo := 0; lo < len(req.Deleted); lo += forgetBatch {
+		if _, err := a.localBulk.ForgetVectors(ctx, req.Deleted[lo:min(lo+forgetBatch, len(req.Deleted))], true); err != nil {
+			return nil, fmt.Errorf("freeing the PQ codes of deleted vectors: %w", err)
+		}
 	}
 	for _, pv := range req.Versions {
 		if _, err := a.localBulk.DropVersion(ctx, pv.Partition, pv.Version); err != nil {

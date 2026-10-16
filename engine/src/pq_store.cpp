@@ -9,6 +9,7 @@ namespace {
 constexpr uint32_t kPending = 0xFFFFFFFEu;
 constexpr uint8_t kProtected = 1;       // a staging in progress needs this code
 constexpr uint8_t kEverReferenced = 2;  // a loaded partition has named this code
+constexpr uint8_t kDeleted = 4;         // the vector is deleted (U14): freed with its last reference
 }  // namespace
 
 PQStore::PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity)
@@ -232,6 +233,8 @@ void PQStore::Unref(const uint32_t* ids, size_t n) noexcept {
     if (--refs_[s] == 0) {  // kept: cached (or staged, if a staging protects it)
       Count(kLive, -1);
       Count(CategoryOf(s), +1);
+      // A deleted vector's code is no cache. FreeLocked cannot allocate (free_ is reserved).
+      if ((flags_[s] & kDeleted) && CategoryOf(s) == kCached) FreeLocked(s);
     }
   }
   if (bad) Log("PQ store: %zu references to drop were not held (bug)", bad);
@@ -255,19 +258,28 @@ size_t PQStore::ReleaseStaged() {
       Count(before, -1);
       Count(after, +1);
     }
+    if (after == kCached && (flags_[s] & kDeleted)) {
+      FreeLocked(s);
+      ++freed;
+    }
   }
   return freed;
 }
 
-size_t PQStore::Forget(const uint32_t* ids, size_t n) {
+size_t PQStore::Forget(const uint32_t* ids, size_t n, bool deleted) {
   std::lock_guard<std::mutex> l(mu_);
   size_t freed = 0;
   for (size_t i = 0; i < n; ++i) {
     if (ids[i] >= n_) continue;
     const uint32_t s = slot_of_[ids[i]];
-    if (s == kNoSlot || CategoryOf(s) != kCached) continue;
-    FreeLocked(s);
-    ++freed;
+    if (s == kNoSlot) continue;
+    if (CategoryOf(s) == kCached) {
+      FreeLocked(s);
+      ++freed;
+    } else if (deleted && !(flags_[s] & kDeleted)) {
+      flags_[s] |= kDeleted;
+      ++st_.deleted;
+    }
   }
   return freed;
 }
@@ -289,6 +301,7 @@ void PQStore::EvictLocked(uint64_t count) {
 
 void PQStore::FreeLocked(uint32_t s) {
   Count(CategoryOf(s), -1);
+  if (flags_[s] & kDeleted) --st_.deleted;
   slot_of_[id_of_[s]] = kNoSlot;
   id_of_[s] = kNoSlot;
   refs_[s] = 0;

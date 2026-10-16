@@ -19,13 +19,15 @@ import (
 // epoch store and serializes everything that changes the epoch:
 //
 //  1. BeginUpdate takes the reconfiguration slot under a lease and returns the current epoch.
-//     The update controller routes the batch by that epoch's placement, sends the inserts' PQ
+//     The update controller routes the inserts with its own copy of the navigation graph, by
+//     that epoch's placement, sends their PQ
 //     codes and raw vectors to their owners, and has every owner stage the next version of the
 //     lists the batch changes next to the current one (STAGE_VERSIONS). Queries go on reading
 //     the current versions.
 //  2. CommitUpdate checks that every owner holds the versions the batch names, then flips: CAS,
 //     install everywhere -- only the partitions' versions change, so all entries switch at
 //     once -- grace (queries of the old epoch read the old versions until they end), and reclaim:
+//     every node frees the deleted vectors' PQ codes (former owners' cached copies included) and
 //     the owners drop the versions the batch replaced. A commit that fails before the flip drops
 //     the staged versions itself, since the lease ends with the commit.
 //  3. AbortUpdate gives the lease up without a flip. Dropping what was staged is the update
@@ -33,6 +35,7 @@ import (
 //
 // A lease that sees neither a commit nor an abort for update_lease expires, so that an update
 // controller that died does not block reconfigurations for good; a later commit is refused.
+// Batches run only with allow_updates.
 
 // updateLease is the lease of the batch in progress.
 type updateLease struct {
@@ -44,6 +47,9 @@ type updateLease struct {
 // BeginUpdate starts an update batch: it takes the reconfiguration slot under a lease and
 // returns the epoch the batch is for.
 func (c *Controller) BeginUpdate(ctx context.Context, req protocol.BeginUpdateReq) (*protocol.UpdateLease, error) {
+	if !c.cfg.AllowUpdates {
+		return nil, fmt.Errorf("controller: update batches are off (allow_updates)")
+	}
 	if c.Ready.IsBlocked() {
 		return nil, fmt.Errorf("controller: initial deployment has not finished (%s)", c.LastError())
 	}
@@ -54,6 +60,15 @@ func (c *Controller) BeginUpdate(ctx context.Context, req protocol.BeginUpdateRe
 	if err != nil {
 		c.reconfigRunning.Store(false)
 		return nil, err
+	}
+	// PQ codes still protected for a staging that ended without releasing them -- a rollback that
+	// failed, or an update controller that died between PQ_PUT and STAGE_VERSIONS -- would hold
+	// slots the batch's room check has to count as taken, for good. While the slot is held no
+	// staging runs, so every protected code is such a leftover: the agents stop what may still run
+	// of one and release them (the rollback of a staging).
+	if err := c.releaseStaged(ctx, cur.Placement.Nodes()); err != nil {
+		c.reconfigRunning.Store(false)
+		return nil, fmt.Errorf("controller: releasing PQ codes left staged: %w", err)
 	}
 	d := c.cfg.UpdateLease.Duration
 	if req.LeaseSeconds > 0 {
@@ -71,6 +86,18 @@ func (c *Controller) BeginUpdate(ctx context.Context, req protocol.BeginUpdateRe
 	c.mu.Unlock()
 	log.Printf("controller: update batch begins at epoch %d (lease %v)", cur.Epoch, d)
 	return &protocol.UpdateLease{Token: l.token, Table: cur, Nodes: c.nodes.Summaries(cur), Expires: time.Now().Add(d)}, nil
+}
+
+// releaseStaged has the agents of nodes stop any staging still running and release the PQ
+// codes left protected for one.
+func (c *Controller) releaseStaged(ctx context.Context, ids []placement.NodeID) error {
+	nodes, err := c.managed(ids)
+	if err != nil {
+		return err
+	}
+	return forEach(nodes, func(n *ManagedNode) error {
+		return n.call(ctx, c.callTimeout(), protocol.EvictM, protocol.EvictReq{ReleaseStagedPQ: true}, nil)
+	})
 }
 
 // expireLease ends lease l if it still holds the slot.
@@ -239,12 +266,30 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 	}
 	phase("drain")
 
-	// 4. RECLAIM: the owners drop the replaced versions. The PQ codes of the vectors the batch
-	// deleted become cached with them; the update controller has every node free those.
+	// 4. RECLAIM: every node frees the PQ codes of the vectors the batch deleted, and the owners
+	// drop the replaced versions -- in that order on each node, so that a deleted vector's code
+	// goes with the last version that names it and never becomes a cached one. A deleted vector
+	// is no cache: its ID is never named again. Former owners hold cached copies of deleted
+	// vectors too; for them the step only frees memory (no list can name those copies), so a
+	// node that does not answer is logged, not an error.
 	if err := forEach(owners, func(n *ManagedNode) error {
-		return n.call(ctx, c.callTimeout(), protocol.DropVersionsM, protocol.DropVersionsReq{Versions: replaced[n.ID]}, nil)
+		return n.call(ctx, c.callTimeout(), protocol.DropVersionsM,
+			protocol.DropVersionsReq{Versions: replaced[n.ID], Deleted: req.Deleted}, nil)
 	}); err != nil {
 		return reply, afterFlip(err)
+	}
+	if len(req.Deleted) > 0 {
+		var others []*ManagedNode
+		for _, n := range c.nodes.All() {
+			if _, owner := staged[n.ID]; !owner && n.Alive() {
+				others = append(others, n)
+			}
+		}
+		if err := forEach(others, func(n *ManagedNode) error {
+			return n.call(ctx, c.callTimeout(), protocol.DropVersionsM, protocol.DropVersionsReq{Deleted: req.Deleted}, nil)
+		}); err != nil {
+			log.Printf("controller: freeing the PQ codes of deleted vectors on former owners: %v", err)
+		}
 	}
 	phase("reclaim")
 	log.Printf("controller: update batch done: epoch %d -> %d, partitions %v at new versions, phases %v",

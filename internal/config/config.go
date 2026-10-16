@@ -67,6 +67,10 @@ type Controller struct {
 	// last pull finishes, its nodes join at once). Default 1 s: clients refresh their entry
 	// list about that often, so flipping more often would not put a new entry to use sooner.
 	EntryFlipInterval Duration `json:"entry_flip_interval"`
+	// AllowUpdates: whether update batches (U14) may run. Off by default: an experiment on a
+	// static dataset refuses BeginUpdate, so no batch can change its data, and its config says
+	// that it is static.
+	AllowUpdates bool `json:"allow_updates"`
 	// UpdateLease: how long an update batch may hold the cluster between BeginUpdate and its
 	// commit or abort (U14) before the controller gives the lease up -- an update controller that
 	// died must not block reconfigurations for good. Default 10 min.

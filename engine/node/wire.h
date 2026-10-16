@@ -82,8 +82,11 @@
 //                   (an update batch, U14: each partition's next version = base + the postings
 //                   naming its lists - the deleted IDs; all or nothing)
 //   DROP_VERSION    u32 partition, u32 version                -> u8 was_resident
-//   FORGET          u32 n, u32 ids[n]                         -> u64 freed (PQ codes of deleted
-//                                                                vectors no version names any more)
+//   FORGET          u32 flags, u32 n, u32 ids[n]              -> u64 freed (PQ codes no version
+//                                                                names; flags bit 0: the vectors
+//                                                                are deleted, and the codes a
+//                                                                version still names are freed
+//                                                                with their last reference)
 //   SAVE_PARTITION  u32 partition, u32 version, path          -> - (that version as a segment file)
 #pragma once
 

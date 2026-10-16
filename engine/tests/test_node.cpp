@@ -655,11 +655,27 @@ void TestStageVersions() {
   }
   CHECK(refused && small->ResidentVersions().empty() && small->pq_stats().resident == 0);
 
-  // Reclaim: drop version 0 of the changed partitions, then forget the deleted vector.
+  // Reclaim, in the controller's order. The deleted vector is marked first: version 0 still
+  // names it, so its code stays for the old epoch's queries. Then version 0 of the changed
+  // partitions goes, and the code goes with its last reference -- freed, never cached. Without
+  // the deleted flag a code that a version names is left alone (the inserted one here).
+  CHECK(node->ForgetVectors(&id, 1, false) == 0 && node->pq_stats().deleted == 0);
+  const PQStats pq0 = node->pq_stats();
+  CHECK(node->ForgetVectors(&del, 1, true) == 0 && node->pq_stats().deleted == 1);
   for (uint32_t p : changed) CHECK(node->DropVersion(p, 0) && !node->DropVersion(p, 0));
   CHECK(node->ResidentVersions().size() == f.num_parts);
-  CHECK(node->ForgetVectors(&del, 1) == 1);
-  CHECK(node->ForgetVectors(&del, 1) == 0);
+  const PQStats pq1 = node->pq_stats();
+  CHECK(pq1.deleted == 0 && pq1.cached == pq0.cached && pq1.freed == pq0.freed + 1 &&
+        pq1.resident == pq0.resident - 1);
+  std::vector<uint8_t> gone(m);
+  refused = false;
+  try {
+    node->PQGet(&del, 1, gone.data());
+  } catch (const PQMissingError&) {
+    refused = true;
+  }
+  CHECK(refused);
+  CHECK(node->ForgetVectors(&del, 1, true) == 0);
   uint32_t top2 = 0;
   CHECK(search(&top2) == after);
 
@@ -796,6 +812,29 @@ void TestPQStore() {
   const std::vector<uint32_t> thirteen = {13};
   s.Get(thirteen.data(), 1, out.data());
   CHECK(out[0] == 13 && out[1] == 39 && s.Stats().from_index == 4 && s.Stats().resident == 5);
+
+  // Deleted vectors (U14) never leave a cached code. An unreferenced copy goes at once; a code
+  // still named is marked and goes with its last reference, or when the staging protecting it
+  // ends. Without the deleted flag only unreferenced copies go.
+  const std::vector<uint32_t> ten_eleven = {10, 11};
+  s.Ref(ten_eleven.data(), 2, nullptr);  // 10 and 11 live; 12 and 13 staged, never named
+  const std::vector<uint32_t> unused = {kept, 10, 12};
+  CHECK(s.Forget(unused.data(), unused.size(), false) == 1);  // the cached one only
+  st = s.Stats();
+  CHECK(st.deleted == 0 && st.resident == 4 && st.cached == 0);
+  CHECK(s.Forget(ten_eleven.data(), 2, true) == 0);
+  CHECK(s.Stats().deleted == 2 && s.Stats().live == 2);
+  s.Unref(ten_eleven.data(), 1);  // 10's last reference: freed, not cached
+  st = s.Stats();
+  CHECK(st.deleted == 1 && st.cached == 0 && st.live == 1 && st.resident == 3);
+  const std::vector<uint32_t> eleven = {11};
+  CHECK(s.Reserve(eleven.data(), 1).empty());  // a staging claims 11 ...
+  s.Unref(eleven.data(), 1);                    // ... so it stays, staged, past its last reference
+  st = s.Stats();
+  CHECK(st.staged == 3 && st.deleted == 1 && st.resident == 3);
+  CHECK(s.ReleaseStaged() == 3);  // 12 and 13 never named, and 11 deleted: none is cached
+  st = s.Stats();
+  CHECK(st.resident == 0 && st.cached == 0 && st.deleted == 0);
 }
 
 // Moving partitions between two NodeEngines the way an agent does: PQMissing on the

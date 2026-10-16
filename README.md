@@ -123,22 +123,28 @@ the PQ codebook is fixed: a modification deletes a vector and inserts it under a
 and raw-vector locations are only ever appended, so nothing a former owner keeps goes stale. The
 epoch table names a version of each partition's lists, and FILTER and RERANK name the version
 their epoch sees, so a data node holds a partition's next version next to the one the current
-epoch's queries read. The update controller (`internal/update`, `bin/rtier-updater`) decides a
-batch and the nodes carry it out:
+epoch's queries read. Batches run only when the controller has `"allow_updates"` (off by
+default, so a static experiment cannot have its data changed; `run_local.py`'s `"Updates"` turns
+it on). The update controller (`internal/update`, `bin/rtier-updater`) decides a batch and the
+nodes carry it out:
 
 1. It takes the controller's lease (`BeginUpdate`): no reconfiguration and no other batch runs
-   until it commits or aborts, or `"update_lease"` expires.
-2. It gives each insert an ID and a location and routes it by the build's own rule on an entry's
-   navigation graph (`ASSIGN`: the lists the build would have chosen, and the PQ code), then
-   checks that every owner has room.
+   until it commits or aborts, or `"update_lease"` expires. Before granting it, the controller has
+   the agents release PQ codes left staged by a staging that never ended.
+2. It gives each insert an ID and a location and routes it by the build's own rule (`ASSIGN`: the
+   lists the build would have chosen, and the PQ code) on its own router: an `rtier_node` with the
+   index's navigation graph and codebook and nothing else, never a serving node, whose navigation
+   CPU queries need. Then it checks that every owner has room.
 3. It sends the codes and raw vectors to the owners' data nodes (`PQ_PUT`, `RAW_ADD`), which
    serve the vectors from memory and write them at the lowest I/O priority.
 4. It has every data node stage the next version of the partitions the batch changes
    (`STAGE_VERSIONS`): inserts appended, deleted IDs dropped. Deletes go to every node, and each
    finds its own copies.
 5. `CommitUpdate` checks the staged versions, flips (all entries switch at once), waits out the
-   grace period, and the owners drop the replaced versions. Then every node frees the deleted
-   vectors' PQ codes.
+   grace period and reclaims. Every node, former owners included, frees the deleted vectors' PQ
+   codes, and then the owners drop the replaced versions. A code that a replaced version still
+   names is marked first and goes with it, so a deleted vector's code never becomes a cached one:
+   cached codes are kept because they may be needed again, and a deleted vector never is.
 
 A failed staging is undone before the lease is given up, and a commit that fails before the flip
 drops what was staged. A partition at a later version moves with its current lists: its owner
@@ -158,7 +164,7 @@ applies the same decisions, across batches, a failed batch and rescales.
 | `cmd/rtier-agent` | per-node agent next to `rtier_node`: staging, epochs, entry + aggregator roles |
 | `cmd/rtier-client` | status / rescale / design / queries / single-node baseline |
 | `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time), with a rate schedule |
-| `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14) |
+| `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14), routing inserts with its own router (`-router`, or `-index` to start one) |
 | `cmd/rtier-overhead` | cost of fan-out: emulates N owners on one data node holding every partition and reports what the two-phase query adds over N = 1 (owners per query, duplicate PQ scoring, extra page reads, per-call and merge time); `-compare` sets two-phase against local re-ranking (recall with `-gt`), `-owners` shows how queries spread over owners |
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |

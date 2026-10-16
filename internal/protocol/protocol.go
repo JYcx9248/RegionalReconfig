@@ -166,11 +166,14 @@ type SavePartitionsReq struct {
 	Versions []PartitionVersion `json:"versions"`
 }
 
-// DropVersionsReq asks the agent to drop these versions of its partitions, and their segment
-// files: the versions an update batch replaced, after the grace period of the epochs that read
-// them (U14).
+// DropVersionsReq is the reclaim of an update batch on one node (U14), after the grace period
+// of the epochs that read the replaced versions. Deleted: the vectors the batch deleted; the
+// node frees their PQ codes -- now if nothing names them (a former owner's cached copies), with
+// the dropped versions otherwise -- so that none becomes a cached code. Then it drops Versions,
+// the versions the batch replaced on this node, and their segment files.
 type DropVersionsReq struct {
-	Versions []PartitionVersion `json:"versions"`
+	Versions []PartitionVersion `json:"versions,omitempty"`
+	Deleted  []uint32           `json:"deleted,omitempty"`
 }
 
 type SetAdmissionReq struct {
@@ -325,11 +328,13 @@ type UpdateLease struct {
 
 // CommitUpdateReq flips to the versions an update batch staged on the owners of the lease's
 // epoch: the next version of every partition the batch changed (partitions it did not change
-// keep theirs).
+// keep theirs). Deleted: the vectors the batch deletes, whose PQ codes the reclaim frees on
+// every node, former owners included.
 type CommitUpdateReq struct {
 	Token     string             `json:"token"`
 	FromEpoch uint64             `json:"from_epoch"`
 	Versions  []PartitionVersion `json:"versions"`
+	Deleted   []uint32           `json:"deleted,omitempty"`
 }
 
 // UpdateReply summarizes a committed batch. ToEpoch is FromEpoch when it changed nothing, or

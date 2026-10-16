@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"rtier/internal/config"
 	"rtier/internal/nodeclient"
 	"rtier/internal/partitioning"
 	"rtier/internal/protocol"
@@ -23,14 +24,18 @@ import (
 )
 
 // TestUpdateBatch applies update batches (U14) to a cluster under query load, and the same
-// decisions to a single-node oracle. Every answer must equal the oracle's for the data of its
+// decisions to a single-node oracle. The update controller routes inserts with its own router,
+// an rtier_node on the index without its page file that serves no query. Every answer must
+// equal the oracle's for the data of its
 // epoch -- queries of the epoch before a batch's flip read the old lists, those of the epoch after
 // it the new ones -- across the batches and across reconfigurations that move partitions the
 // batches changed:
 //
 //  1. A batch inserts copies of half the queries and fresh vectors, and deletes the nearest
 //     neighbor of each query of the other half, and random vectors. From the flip on, each copy
-//     is its query's nearest neighbor, and no deleted vector is in any answer.
+//     is its query's nearest neighbor, and no deleted vector is in any answer. PQ codes left
+//     staged on a data node before the batch (by a staging that never ended) are released when
+//     the batch begins.
 //  2. A batch that cannot be staged (more postings for one list than a request may gather)
 //     changes nothing: no version, no PQ code left behind, the lease released.
 //  3. A scale-out moves partitions the first batch changed; the new node loads them at that
@@ -43,7 +48,7 @@ import (
 //
 // After each step every node holds its partitions at exactly the epoch's versions (and segment
 // files only of versions it holds), live PQ codes for exactly the vectors its partitions name,
-// no staged code, and no code of a deleted vector.
+// no staged code, and no code of a deleted vector, not even one marked for later.
 func TestUpdateBatch(t *testing.T) {
 	f := getFixture(t)
 	for _, protocol := range []string{"lazy", "lazy-stream"} {
@@ -61,7 +66,7 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 	extraPages := uint64(extraIDs)/m.VectorsPerPage + 2
 	room := []string{"--max-vectors", strconv.Itoa(numVectors + extraIDs),
 		"--max-pages", strconv.FormatUint(m.NumPages+extraPages, 10), "--max-list-len", strconv.Itoa(maxLen)}
-	cl := newCluster(t, f, proto, 2)
+	cl := newCluster(t, f, proto, 2, func(c *config.Controller) { c.AllowUpdates = true })
 	cl.addNode("n1", query.TwoPhase{}, room...)
 	cl.addNode("n2", query.TwoPhase{}, room...)
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
@@ -90,7 +95,27 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &update.Updater{Controller: cl.ctl, Manifest: m, Alloc: alloc}
+	// The update controller's router: the graph and codebook only, no page file, no partition.
+	logPath := filepath.Join(f.dir, fmt.Sprintf("router-%d.log", nodeSeq.Add(1)))
+	logf, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.indexNoPages, f.parts, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := stopRouter()
+		logf.Close()
+		out, _ := os.ReadFile(logPath)
+		if err != nil || strings.Contains(string(out), "Sanitizer") || strings.Contains(string(out), "runtime error:") {
+			t.Errorf("router: %v (log %s)", err, logPath)
+		}
+	}()
+	router := nodeclient.New(raddr, 2)
+	defer router.Close()
+	u := &update.Updater{Controller: cl.ctl, Manifest: m, Alloc: alloc, Router: router}
 	defer u.Close()
 	oracleVersions := make([]uint32, numPartitions)
 	model := newContent(f)
@@ -138,6 +163,16 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 		return b, after
 	}
 
+	// Codes staged for a staging that never ended (an update controller that died after PQ_PUT):
+	// IDs at the end of the space, which no batch here reaches.
+	tbl := cl.ctl.Status().Table
+	n1 := nodeclient.New(tbl.Nodes[tbl.Placement.Nodes()[0]].NodeAddr, 1)
+	leftover := []uint32{uint32(in.IDCapacity) - 3, uint32(in.IDCapacity) - 2, uint32(in.IDCapacity) - 1}
+	if k, _, err := n1.PQPut(ctx, leftover, in.PQ.M, make([]byte, len(leftover)*in.PQ.M)); err != nil || k != len(leftover) {
+		t.Fatalf("leftover staged codes: %d installed, %v", k, err)
+	}
+	n1.Close()
+
 	stop := startLoad(cl, 4)
 	time.Sleep(200 * time.Millisecond)
 
@@ -165,7 +200,7 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 		}
 	}
 	time.Sleep(200 * time.Millisecond)
-	checkContent(t, cl, model, deleted)
+	checkContent(t, cl, model, append(append([]uint32(nil), deleted...), leftover...))
 
 	// 2. A batch no owner can stage: every copy of one vector goes to the same lists, more of them
 	// than a list may hold. Nothing may change, and nothing of it may stay on the nodes.
@@ -303,8 +338,9 @@ func (c *content) count(ps []int) uint64 {
 }
 
 // applyOracle applies b's decisions to the oracle, which holds every partition at versions[p]:
-// the inserts' codes and vectors, the next version of every partition the batch changes (the
-// replaced versions dropped), and the deleted vectors' codes freed.
+// the inserts' codes and vectors, the next version of every partition the batch changes, then
+// the reclaim in the controller's order -- the deleted vectors marked, the replaced versions
+// dropped.
 func applyOracle(t *testing.T, ctx context.Context, nc *nodeclient.Client, b *update.Batch, versions []uint32) {
 	t.Helper()
 	if len(b.Inserts) > 0 {
@@ -330,6 +366,9 @@ func applyOracle(t *testing.T, ctx context.Context, nc *nodeclient.Client, b *up
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := nc.ForgetVectors(ctx, b.Deleted, true); err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range res {
 		if r.Changed {
 			if _, err := nc.DropVersion(ctx, r.Partition, versions[r.Partition]); err != nil {
@@ -337,9 +376,6 @@ func applyOracle(t *testing.T, ctx context.Context, nc *nodeclient.Client, b *up
 			}
 			versions[r.Partition]++
 		}
-	}
-	if _, err := nc.ForgetVectors(ctx, b.Deleted); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -384,9 +420,9 @@ func checkContent(t *testing.T, cl *cluster, model *content, gone []uint32) {
 		for _, pv := range info.Versions {
 			held[partitioning.SegmentNameV(int(pv[0]), pv[1])] = true
 		}
-		if n := model.count(parts); info.PQ.Live != n || info.PQ.Staged != 0 {
-			t.Errorf("node %d (%s) PQ store %+v: want %d live codes (the vectors its partitions name), none staged",
-				ns.ID, ns.Name, info.PQ, n)
+		if n := model.count(parts); info.PQ.Live != n || info.PQ.Staged != 0 || info.PQ.Deleted != 0 {
+			t.Errorf("node %d (%s) PQ store %+v: want %d live codes (the vectors its partitions name), none staged, "+
+				"none of a deleted vector", ns.ID, ns.Name, info.PQ, n)
 		}
 		for _, id := range gone {
 			if _, _, err := nc.PQGet(cl.ctx, []uint32{id}); !nodeclient.IsPQAbsent(err) {

@@ -129,6 +129,7 @@ type PQStats struct {
 	Evicted   uint64 `json:"evicted"`
 	Freed     uint64 `json:"freed"`
 	Served    uint64 `json:"served"`
+	Deleted   uint64 `json:"deleted"` // deleted vectors' codes a resident version still names
 }
 
 // RawStats describe the node's raw vectors (engine/include/fusion/raw_store.h): a sparse copy
@@ -625,10 +626,17 @@ func (c *Client) DropVersion(ctx context.Context, p int, v uint32) (bool, error)
 	return len(b) == 1 && b[0] == 1, nil
 }
 
-// ForgetVectors frees the PQ codes of deleted vectors that no resident version names any
-// more, cached copies included, and returns how many it freed.
-func (c *Client) ForgetVectors(ctx context.Context, ids []uint32) (uint64, error) {
+// ForgetVectors frees the PQ codes of ids that no resident version names, and returns how
+// many it freed. With deleted the vectors are deleted (U14): the codes a version still names
+// are marked and freed with their last reference instead of being cached. Without it the
+// call only frees codes known to be unused, and is safe whatever their versions' fate.
+func (c *Client) ForgetVectors(ctx context.Context, ids []uint32, deleted bool) (uint64, error) {
 	var w frame.Writer
+	var flags uint32
+	if deleted {
+		flags = 1
+	}
+	w.U32(flags)
 	w.U32(uint32(len(ids)))
 	w.U32s(ids)
 	b, err := c.do(ctx, opForget, 0, w.B)

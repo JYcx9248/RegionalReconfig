@@ -213,17 +213,25 @@ var Open = map[string]Question{
 			"lists (--max-list-len); ASSIGN routes a vector by the build's own rule and gives its PQ " +
 			"code; RAW_ADD serves inserted vectors from memory and writes them after fetched ones, " +
 			"never while paused (PAUSE_UPDATES), within --update-write-mbps -- writes are not " +
-			"charged to the read budget yet. Batches: the update controller (internal/update, " +
-			"rtier-updater) takes the controller's lease (BeginUpdate: no reconfiguration and no " +
-			"other batch until the commit or the abort, or until update_lease expires), routes the " +
-			"inserts, checks the owners' room, sends the PQ codes and raw vectors to the owners, and " +
+			"charged to the read budget yet. Batches run only with the controller's allow_updates " +
+			"(off by default: a static experiment refuses them; run_local.py's \"Updates\" turns it on, " +
+			"leaves room on the data nodes and requires an explicit PQ budget, since the default " +
+			"budget is the whole ID space, headroom included). The update controller " +
+			"(internal/update, rtier-updater) takes the controller's lease (BeginUpdate: no " +
+			"reconfiguration and no other batch until the commit or the abort, or until update_lease " +
+			"expires; the agents first release PQ codes left staged by a staging that never ended), " +
+			"routes the inserts with its own router (an rtier_node with the graph and codebook only, " +
+			"never a serving node), checks the owners' room, sends the PQ codes and raw vectors to " +
+			"the owners, and " +
 			"has every data node stage the next version of the partitions the batch changes " +
 			"(STAGE_VERSIONS: inserts appended, deleted IDs dropped; deletes are broadcast and each " +
 			"node finds its copies); CommitUpdate checks the staged versions, flips (all entries at " +
-			"once), waits out the grace period and has the owners drop the replaced versions; then " +
-			"every node frees the deleted vectors' PQ codes (FORGET). A staging that fails is undone " +
-			"before the lease is given up; a commit that fails before the flip drops the staged " +
-			"versions. A partition at a later version moves with its current lists: its owner writes " +
+			"once), waits out the grace period, and reclaims: every node frees the deleted vectors' " +
+			"PQ codes (FORGET, deleted: copies nothing names go at once, the others are marked) and " +
+			"then the owners drop the replaced versions, so a deleted vector's code goes with its " +
+			"last version and never becomes a cached one -- a deleted vector is no cache. A staging " +
+			"that fails is undone before the lease is given up; a commit that fails before the " +
+			"flip drops the staged versions. A partition at a later version moves with its current lists: its owner writes " +
 			"them as a segment file for the move (SAVE_PARTITION). Not implemented: growing the ID " +
 			"and location spaces at an epoch boundary; the response to a batch over budget (splitting " +
 			"partitions, scaling out first -- the batch fails before anything is sent); splits, " +
@@ -236,7 +244,7 @@ var Open = map[string]Question{
 		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions, " +
 			"Assign, RawAdd, StageVersions), internal/update (batch.go), internal/controller/update.go, " +
 			"internal/controller/reconfig.go (copyThenFlip, planWarnings), engine/include/fusion/pq_store.h " +
-			"(cached codes, Forget)"},
+			"(cached codes, Forget), cmd/rtier-updater, scripts/run_local.py (\"Updates\")"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
 		"every entry node needs the whole graph over the list heads, and a node that joins " +
 			"starts empty -- pre-staging it on spare nodes is not allowed, because a real " +

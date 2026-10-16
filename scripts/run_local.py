@@ -63,6 +63,15 @@ optional (protocol.Plan). P is the plan itself or the path of a JSON file with o
 the experiment file. `bin/rtier-client rescale -dry-run -save-plan plan.json N` writes the plan
 the policy would carry out, to start from.
 
+"Updates": {"Headroom": 1.5, "PQCapacity": 200000} lets update batches (U14) run against the
+cluster (bin/rtier-updater; the controller gets "allow_updates"). Every data node leaves room for
+1.5 times the index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and
+for lists twice as long as the longest ("ListHeadroom": 2.0, or "MaxListLen": N; --max-list-len).
+The PQ budget has to be given ("PQCapacity", or --pq-capacity in "NodeArgs"): by default it is the
+whole ID space, so the headroom would grow every node's PQ buffer -- its GPU memory -- by the same
+factor and change what the run measures. Without "Updates" the dataset is static: no room, and
+the controller refuses update batches.
+
     python3 scripts/run_local.py configs/experiment.example.json results/run1
 
 Open design questions this script depends on (see `bin/rtier-client design`):
@@ -78,6 +87,7 @@ listens on the bridge address 10.10.0.1. Delay and rate values are per-experimen
 """
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -135,6 +145,39 @@ def saturation(table: list) -> float:
             break
         served = s["offered_per_s"]
     return served
+
+
+def read_kv(path: str) -> dict:
+    """key=value lines: the index's meta.txt, a partition manifest."""
+    kv = {}
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+    return kv
+
+
+def update_args(cfg: dict, index: str, parts: str, node_args: list) -> list:
+    """rtier_node flags for "Updates" (U14): room for inserted vectors, their locations and
+    longer lists, and the PQ budget, which must be explicit (see the module doc)."""
+    upd = cfg.get("Updates")
+    if upd is None:
+        return []
+    meta, man = read_kv(os.path.join(index, "meta.txt")), read_kv(os.path.join(parts, "manifest.txt"))
+    head = float(upd.get("Headroom", 1.5))
+    if head < 1:
+        raise RuntimeError('"Updates": "Headroom" must be at least 1')
+    max_len = upd.get("MaxListLen") or math.ceil(int(man["max_list_len"]) * float(upd.get("ListHeadroom", 2.0)))
+    args = ["--max-vectors", str(math.ceil(int(meta["num_vectors"]) * head)),
+            "--max-pages", str(math.ceil(int(man["num_pages"]) * head)),
+            "--max-list-len", str(int(max_len))]
+    if "--pq-capacity" not in node_args:
+        if "PQCapacity" not in upd:
+            raise RuntimeError('"Updates" needs the PQ budget ("PQCapacity", or --pq-capacity in "NodeArgs"): '
+                               "by default it is the whole ID space, headroom included")
+        args += ["--pq-capacity", str(int(upd["PQCapacity"]))]
+    return args
 
 
 def check_load(cfg: dict) -> None:
@@ -577,6 +620,7 @@ def main(cfg_path: str, out_dir: str) -> None:
              ", no read-IOPS limit"))
     node_args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
                                            if res.get("ReadIOPSPerNode") else [])
+    node_args += update_args(cfg, index, parts, node_args)
     gpus = [str(g) for g in cfg.get("GPUs", [])] if cfg.get("Backend") == "gpu" else []
     # Each data node sees only its GPU, named to CUDA by UUID (CUDA does not take bus ids, and an
     # index can name another card after a hardware change). The log records which card each got.
@@ -616,6 +660,7 @@ def main(cfg_path: str, out_dir: str) -> None:
             "protocol": cfg.get("Protocol", "lazy"),
             "raw_priority": cfg.get("RawPriority", "background"),
             "placement": cfg.get("Placement", ""),  # "" = the controller's default (U3)
+            "allow_updates": "Updates" in cfg,
             "metrics_path": os.path.join(out_dir, "metrics.jsonl"),
         }, open(ctl_cfg, "w"), indent=2)
         procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg], prefix=rest_cpus(cfg, nodes))
