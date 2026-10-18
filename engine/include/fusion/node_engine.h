@@ -47,6 +47,7 @@
 #include "fusion/common.h"
 #include "fusion/engine.h"
 #include "fusion/page_reader.h"
+#include "fusion/partition.h"
 #include "fusion/pq_store.h"
 #include "fusion/raw_store.h"
 #include "fusion/read_budget.h"
@@ -126,17 +127,25 @@ struct PQPutResult {
 };
 using RawPutResult = PQPutResult;
 
-// Fetches n raw vectors (vec_bytes each, in the order of locs) from the data node at `peer`
-// into out; lists[i] is the posting list that named locs[i] here, so that a peer still lacking
-// it knows its own source (chained migrations). Throws on failure. The node server installs one
-// (the peer's RAW_GET).
-using RawFetcher = std::function<void(const std::string& peer, const uint32_t* locs,
-                                      const uint32_t* lists, size_t n, uint8_t* out)>;
+// Fetches n raw vectors (vec_bytes each, in the order of locs) from the data node at `peer`,
+// which holds them, into out. Throws on failure. The node server installs one (the peer's
+// RAW_GET).
+using RawFetcher = std::function<void(const std::string& peer, const uint32_t* locs, size_t n,
+                                      uint8_t* out)>;
 
-// Raw-vector locations and, for each, the posting list that names it (parallel arrays).
+// Raw-vector locations held by one node, each with a posting list here that names it
+// (parallel arrays).
 struct RawRefs {
+  uint16_t holder = kNoHolder;
   std::vector<uint32_t> locs;
   std::vector<uint32_t> lists;
+};
+
+// What RawHeldBy found: postings that named the node and whose vector is here now (they name
+// this node from now on), and the ones whose vector must be pulled from it.
+struct HeldBy {
+  uint64_t repointed = 0;
+  RawRefs missing;
 };
 
 struct FilterStats {
@@ -154,7 +163,9 @@ struct FetchStats {
   uint64_t queued = 0;           // now: of those, waiting for the writer
   uint64_t queued_peak = 0;
   uint64_t fetched = 0;          // new vectors fetched from peers
-  uint64_t fetch_calls = 0;      // fetches that asked a peer (RERANK, SEARCH_LOCAL, RAW_GET chains)
+  uint64_t fetch_calls = 0;      // fetches that asked a peer (RERANK, SEARCH_LOCAL)
+  uint64_t coalesced = 0;        // missing vectors a fetch waited for instead of fetching: another
+                                 // query was fetching them
   uint64_t fetch_us = 0;         // time those callers waited for them, backpressure included
   uint64_t written = 0;          // installed on the SSD by the writer
   uint64_t write_batches = 0;
@@ -186,13 +197,13 @@ class NodeEngine {
   // resident; the partition's other versions stay. Every vector they name must end up with a PQ
   // code on this node (see PQSource); the partition's postings then hold references on those
   // codes.
-  // With kPresent, raw_peer (a data node's address, normally the partition's old owner) becomes
-  // the source of the partition's lists: a raw vector not on the node is fetched from it when a
-  // query needs it (and only then); without raw_peer they must all be here already
-  // (RawMissingError). The source of a list outlives the partition's eviction, so the node can
-  // still resolve a peer's request for it (chains).
+  // Raw vectors: every key (list, vector) has one current holder. With kIndex the node copies
+  // them all and holds them. With kPresent, a vector not on the node is fetched, when a query
+  // needs it, from the holder its posting records (partition.h; a segment written at a hand-off
+  // records one for every posting). fallback_holder stands in for postings that record none (a
+  // version-2 segment); a vector missing here with no holder at all is a RawMissingError.
   virtual void LoadPartition(uint32_t partition, const std::string& segment_path, PQSource pq,
-                             const std::string& raw_peer = "", uint32_t version = 0) = 0;
+                             uint32_t version = 0, uint16_t fallback_holder = kNoHolder) = 0;
   // Evicts every version of the partition; returns false if none was resident. Queries already
   // holding the partition finish on the old copy; its PQ references are dropped when the last
   // one lets go of it. Its codes stay on the node (cached) for a later reconfiguration.
@@ -223,8 +234,13 @@ class NodeEngine {
   // unreferenced copies go. Returns how many were freed now.
   virtual size_t ForgetVectors(const uint32_t* ids, size_t n, bool deleted) = 0;
   // Writes a resident version of a partition as a segment file (the format of the partition
-  // directory's), so that a node the partition moves to can load that version.
+  // directory's), so that a node the partition moves to can load that version. Every posting
+  // records its current holder: this node (SetNodes) for the vectors it holds, the recorded one
+  // for the others.
   virtual void SavePartition(uint32_t partition, uint32_t version, const std::string& path) const = 0;
+  // The cluster's node IDs: this node's (0: unchanged) and other data nodes' addresses, where
+  // it fetches the vectors that postings say they hold. Merged into what it knew.
+  virtual void SetNodes(uint16_t self, const std::vector<std::pair<uint16_t, std::string>>& peers) = 0;
 
   // PQ codes (node-level store). For each group of segment files (one group per source a
   // staging pulls from): the vector IDs they name that have no code on this node and are not
@@ -243,17 +259,21 @@ class NodeEngine {
   virtual size_t PQReleaseStaged() = 0;
   virtual PQStats pq_stats() const = 0;
 
-  // Raw vectors (node-level, fusion/raw_store.h). For each group of segment files (one group
-  // per source): the locations they name whose vector is not on this node and that no earlier
-  // group lists, sorted, each with a list that names it -- what a stream brings from each
-  // source (the eager baselines and lazy-stream; the lazy protocol fetches on demand only).
-  virtual std::vector<RawRefs> RawMissing(const std::vector<std::vector<std::string>>& groups) = 0;
+  // Raw vectors (node-level, fusion/raw_store.h). The vectors the newest resident versions of
+  // these partitions name that are not on this node, grouped by holder, each once with a list
+  // naming it -- what a stream brings (the eager baselines and lazy-stream; the lazy protocol
+  // fetches on demand only).
+  virtual std::vector<RawRefs> RawMissing(const std::vector<uint32_t>& partitions) = 0;
+  // Before a node leaves (U9): of every resident posting whose holder is `holder`, the ones
+  // whose vector is here now are made to name this node, and the others are returned, to be
+  // pulled from it (RawPull). Once they are, no posting here names the node.
+  virtual HeldBy RawHeldBy(uint16_t holder) = 0;
   // Which of locs[0..n) are not on this node (sorted, without duplicates): the stream asks
   // again before each batch, so that what queries fetched meanwhile is not sent twice.
   virtual std::vector<uint32_t> RawAbsent(const uint32_t* locs, size_t n) const = 0;
-  // Vectors at locs for a peer (vec_bytes each); lists[i] names locs[i]. One this node lacks
-  // is fetched from the source of lists[i] first; RawMissingError if the list has none.
-  virtual void RawGet(const uint32_t* locs, const uint32_t* lists, size_t n, uint8_t* out) = 0;
+  // Vectors at locs for a peer (vec_bytes each), from this node's own store: a peer asks the
+  // holder, so there is no chain to follow. RawMissingError for one that is not here.
+  virtual void RawGet(const uint32_t* locs, size_t n, uint8_t* out) = 0;
   // Installs vectors streamed from a peer.
   virtual RawPutResult RawPut(const uint32_t* locs, size_t n, const uint8_t* vecs) = 0;
   // Installs inserted vectors at their (new) locations (U14). They are kept in memory and served
@@ -266,9 +286,9 @@ class NodeEngine {
   virtual void PauseUpdateWrites(bool paused) = 0;
   // The stream without the agents in its path: of locs[0..n) (lists[i] names locs[i]), fetches
   // the vectors this node lacks -- not on the SSD and not fetched by a query already -- from the
-  // source of their lists, data node to data node as RERANK does (chains included), and installs
-  // them as RawPut does (counted as streamed, not as fetched on demand). RawMissingError if a
-  // list has no source.
+  // holders their postings in lists[i] record, data node to data node as RERANK does, installs
+  // them as RawPut does (counted as streamed, not as fetched on demand), and makes those
+  // postings name this node. RawMissingError if one has no holder.
   virtual RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) = 0;
   // A snapshot that waits for nothing, or (settle) one taken once the vectors fetched before
   // the call are on the SSD: with no query fetching, cached is then 0.
@@ -291,10 +311,10 @@ class NodeEngine {
   // Exact distances for all `n` IDs (no early stop: fixed-n re-ranking); keeps the k best.
   // Every ID must be named by a partition loaded here (NotResidentError). `lists` are the
   // query's lists on this node (those its FILTER gathered from): a raw vector not on the node
-  // is fetched first from the source of a list among them that names it (RawMissingError if
-  // that fails). The worker waits for the fetch, not for the write: fetched vectors are
-  // re-ranked from memory, kept for other queries until a background writer has put them on
-  // the SSD.
+  // is fetched first, through a list among them that names it, from the holder that posting
+  // records (RawMissingError if that fails), and the posting names this node from then on. A vector another query is fetching already is waited for, not fetched twice. The worker
+  // waits for the fetch, not for the write: fetched vectors are re-ranked from memory, kept for
+  // other queries until a background writer has put them on the SSD.
   virtual uint32_t Rerank(int w, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
                           const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
                           uint32_t* out_ids, float* out_dists, RerankStats* st) = 0;

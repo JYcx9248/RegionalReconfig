@@ -56,7 +56,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 
 | File | What |
 |---|---|
-| `include/fusion/partition.h`, `src/partition.cpp` | partition directory: manifest (with the page geometry), list -> partition map, per-partition posting-list segments (version 2: each posting is a vector ID and its raw vector's canonical location) with CRC-32 |
+| `include/fusion/partition.h`, `src/partition.cpp` | partition directory: manifest (with the page geometry), list -> partition map, per-partition posting-list segments (version 3: each posting is a vector ID, its raw vector's canonical location and the node that holds the vector; version 2 still loads) with CRC-32 |
 | `include/fusion/node_engine.h`, `src/node_engine.cpp` | `NodeEngine`: posting lists held per partition (load/evict while queries run), each partition possibly at several versions (`Filter` / `Rerank` name the version their epoch sees), update batches (U14: `StageVersions` builds a partition's next version next to the current one -- inserts appended, deleted IDs dropped, all or nothing; `DropVersion`; `ForgetVectors`; `SavePartition` writes a version as a segment file for a move), room for inserted vectors (`--max-vectors`, `--max-pages`) and longer lists (`--max-list-len`; a segment with a longer list is refused at load), `Assign` (routes a vector by the build's own rule and gives its PQ code) and `RawAdd` (inserted vectors served from memory, written by the background writer after fetched ones, pausable), node-level PQ codes and raw vectors (fetched on demand from the old owner after a migration), navigation graph loadable after startup, primitives `Navigate` / `Filter` / `Rerank` / `SearchLocal` |
 | `include/fusion/pq_store.h`, `src/pq_store.cpp` | node-level PQ store: one code per vector, reference-counted by resident postings, capacity = the node's PQ budget (`Forget` frees deleted vectors' codes, and marks the ones a version still names so that they are freed with it, never cached); also where a vector's raw-vector location is looked up |
 | `include/fusion/raw_store.h`, `src/raw_store.cpp` | node-level raw vectors: a sparse local copy of the page file at the canonical offsets, one presence bit per location |
@@ -65,7 +65,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 | `node/wire.h`, `node/server.{h,cpp}` | rtier wire protocol server (same framing as the Go side, `internal/frame`), and `PeerPool`, the connections a data node uses to fetch raw vectors from another (`RAW_GET`) |
 | `tools/rtier_node.cpp` | data-node service; prints `READY tcp=<port>` when listening; `--raw-file` for its raw vectors; `--stats-file` appends a JSON line of counters every `--stats-ms` (CLOCK_MONOTONIC); `--read-iops` sets the read budget |
 | `tools/rtier_segment.cpp` | applies a list -> partition assignment (choosing it is open question U2); writes every posting's location in `--layout` |
-| `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), partition versions, inserted vectors (`Assign` == the build's lists and codes, new IDs and locations, paused writes, backpressure), update batches (next version next to the current one, all or nothing, saved, dropped, deleted codes freed with their last version, never cached), PQ store (with deleted codes), PQ migration between two nodes, raw store, raw-vector migration (on-demand, chained and streamed, on nodes whose index has no page file), read budget (pacing, what is charged, same answers under a binding budget), wire protocol |
+| `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), partition versions, inserted vectors (`Assign` == the build's lists and codes, new IDs and locations, paused writes, backpressure), update batches (next version next to the current one, all or nothing, saved, dropped, deleted codes freed with their last version, never cached), PQ store (with deleted codes), PQ migration between two nodes, raw store, raw-vector migration (on demand from the holder each posting records, coalesced, streamed, a leaving node drained, on nodes whose index has no page file), read budget (pacing, what is charged, same answers under a binding budget), wire protocol |
 
 Behavior changes to the original engine, both for deterministic results across nodes:
 
@@ -88,38 +88,51 @@ the index's `pq_codes.bin`. Both filter backends address codes by slot in this m
 checks slot addressing against ID addressing.
 
 Raw vectors are node-level too (`include/fusion/raw_store.h`, `src/raw_store.cpp`; the other
-decided part of U1). Every vector has a canonical location in the index's page file, `page *
-vectors_per_page + slot` (`RawLayout` in `include/fusion/layout.h`), and `rtier_segment` writes
-it into the segment next to every vector ID. A data node keeps the vectors it holds in its own
-sparse file laid out like the whole page file (`--raw-file`; an anonymous temporary file by
-default) with a presence bit per location, and finds a candidate's location through the PQ
-store, which records it with the code when a partition loads -- so no node has a vector -> page
-map, and the index's page file is read only to bootstrap (`PQSource::kIndex`, `--load`). Pages
-may have empty slots (the bucket layout packs tails of other lists into them); only present
-slots are read. After a migration a partition loads without its raw vectors (U9): `LOAD_PARTITION`
-names the old owner's data node, which becomes the source of every list of the partition, and
-`Rerank` / `SearchLocal` fetch a vector a query needs from it before reading pages, when the
-query first needs it and only then (`RAW_GET`, through the server's `PeerPool`). RERANK requests
-carry the query's lists on the node: the engine finds each missing candidate in one of them and
-fetches it from that list's source (lists overlap, so a per-list source is enough). A peer's
-`RAW_GET` names the list of every vector, so a node asked for one it lacks itself fetches it from
-its own source of that list first: chains of migrations work. A fetched vector is re-ranked from
-memory: it stays in a node-level fetch cache, served to queries and peers from there, until a
-background writer has installed it. The writer takes everything queued at once and writes whole
-pages with `O_DIRECT`, reading back first only the pages that already hold vectors (batched,
-Linux AIO), so its installs never touch the page cache: buffered writes of single vectors made
-the kernel read each uncached page synchronously under the file's inode lock, which the queries'
-direct reads of the same file then waited for, and left dirty pages that a direct read had to
-write back first (with a slow writer a lazy scale-out ran below capacity for minutes after its
-warm-up; `results/bigann10m-spatial-scaleout/lazy-diag`). Bulk installs -- bootstrap and
-streams, sorted batches that fill a page over several requests -- stay buffered: the page cache
-combines them per page, where whole-page writes made a 64 KB stream request take 3.5-4.6 ms and
-bootstrap three times longer. The lazy-stream baseline also
-streams the rest in (`RAW_MISSING` with a list per location, a peer's `RAW_GET` over the bulk
-channel, `RAW_PUT`; before each batch `RAW_CHECK` drops what queries fetched meanwhile). Nothing
-is dropped: the vectors of partitions that move away stay, like cached PQ codes, so the old owner
-can serve them and a partition that comes back needs no transfer; a list keeps its source after
-its partition leaves, for the peers that took it.
+decided part of U1). Every vector has a canonical location in the index's page file,
+`page * vectors_per_page + slot` (`RawLayout` in `include/fusion/layout.h`), and `rtier_segment`
+writes it into the segment next to every vector ID. A data node keeps the vectors it holds in its
+own sparse file laid out like the whole page file (`--raw-file`; an anonymous temporary file by
+default) with a presence bit per location, and finds a candidate's location through the PQ store,
+which records it with the code when a partition loads -- so no node has a vector -> page map, and
+the index's page file is read only to bootstrap (`PQSource::kIndex`, `--load`). Pages may have
+empty slots (the bucket layout packs tails of other lists into them); only present slots are
+read. After a migration a partition loads without its raw vectors (U9). Every posting records the
+holder of its vector -- the node that stores it, a `u16` node ID (segment version 3; 0 = none) --
+so each key (list, vector) has one current holder: the owner if it has the vector, else the node
+the posting names. In memory a posting that says "here" holds `kSelfHolder`, and only the owner's
+copy of a list is valid: `SAVE_PARTITION` writes the node's own ID there for the next owner
+(every move saves the segment), and `LOAD_PARTITION` makes each posting whose vector is here say
+"here" and refuses a segment that names no other holder for a vector this node lacks. Data nodes
+know each other by node ID (`SET_NODES`, from the agents). `Rerank` / `SearchLocal` fetch a
+vector a query needs before reading pages, when the query first needs it and only then: RERANK
+requests carry the query's lists on the node, the engine finds each missing candidate in one of
+them, fetches it from the holder that posting records (`RAW_GET`, through the server's
+`PeerPool`; one hop, since a holder has the vector) and makes that posting say "here" -- the one
+key it fetched for; other lists that name the vector keep a holder that still has it. Queries
+that miss a vector another one is fetching wait for that fetch (`coalesced` in the fetch stats).
+A posting is made to say "here" only once its vector is present or in the fetch cache, and every
+presence check looks at both under the cache's lock, since the writer marks a vector present
+before it drops it from the cache. A fetched vector is re-ranked from memory: it stays in a
+node-level fetch cache, served to queries and peers from there, until a background writer has
+installed it. The writer takes everything queued at once and writes whole pages with `O_DIRECT`,
+reading back first only the pages that already hold vectors (batched, Linux AIO), so its installs
+never touch the page cache: buffered writes of single vectors made the kernel read each uncached
+page synchronously under the file's inode lock, which the queries' direct reads of the same file
+then waited for, and left dirty pages that a direct read had to write back first (with a slow
+writer a lazy scale-out ran below capacity for minutes after its warm-up;
+`results/bigann10m-spatial-scaleout/lazy-diag`). Bulk installs -- bootstrap and streams, sorted
+batches that fill a page over several requests -- stay buffered: the page cache combines them per
+page, where whole-page writes made a 64 KB stream request take 3.5-4.6 ms and bootstrap three
+times longer. The lazy-stream baseline also streams the rest in: `RAW_MISSING` lists each missing
+vector once, grouped by the holder a posting records, and `RAW_PULL` has the data node fetch them
+from those holders and install them as a stream's batch (or the agents carry them: the holder's
+`RAW_GET` over the bulk channel, `RAW_PUT`, with `RAW_CHECK` before each batch dropping what
+queries fetched meanwhile). A node that leaves is drained the same way first: `RAW_HELD_BY` makes
+the postings naming it whose vector is here say "here" and lists the others, which `RAW_PULL`
+brings. A pull and a query may fetch the same vector at once (the second install is a no-op);
+either one that finds the posting already saying "here" takes the vector as arrived. Nothing is
+dropped: the vectors of partitions that move away stay, like cached PQ codes, so the old owner
+can serve the peers whose postings name it, and a partition that comes back needs no transfer.
 
 Known limits of the PQ path:
 - `PQ_MISSING` answers in one frame (256 MiB, about 67M IDs). At billion scale a staging has to
@@ -153,17 +166,19 @@ Known limits of the PQ path:
   running before a rollback releases.
 
 Known limits of the raw-vector path:
-- Sources are kept per posting list (2 B per list, sized by the number of lists: 200 KB at 1M
-  vectors, 200 MB at 1B with a centroid ratio of 0.1). A missing vector is found by scanning the
-  postings of the request's lists, only when something is missing.
+- Holders are kept per posting (2 B per posting, in memory and in the segment: with r ≈ 7.3
+  postings per vector, 15 MB per million vectors over the cluster, 25% on top of the 8 B of ID
+  and location). A missing vector is found by scanning the postings of the request's lists, only
+  when something is missing.
 - `raw.pending` (named by resident partitions, neither here nor fetched): the locations the
   resident partitions name are collected into a bitmap after a load or an eviction (one pass
   over the resident postings); INFO counts with a word-wise pass over it and the presence bits.
   INFO waits for nothing: fetched vectors still in memory count as `cached`, and the settle flag
   (tests) first waits for the writer.
-- A re-ranking that must fetch holds its engine worker for the round trip, and two queries that
-  miss the same vector both fetch it (the second write is a no-op; nothing coalesces them). With
-  the lazy protocol this lasts for as long as queries meet vectors that have not moved.
+- A re-ranking that must fetch holds its engine worker for the round trip, and so does one that
+  waits for another query's fetch of the same vector. With the lazy protocol this lasts for as
+  long as queries meet vectors that have not moved. Pulls (stream, drain) do not join the
+  queries' fetches: a vector both need at once comes twice.
 - A peer's `RAW_GET` reads its vectors one buffered `pread` per run, one after another. Reading
   the pages with `O_DIRECT` all at once instead (tried 2026-09-30; patch kept outside the repo)
   made things worse on BIGANN-10M, 2 -> 3: the old owners are at their read-IOPS cap during a

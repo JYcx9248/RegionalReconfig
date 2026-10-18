@@ -40,11 +40,8 @@ type Controller struct {
 	Ready           *syncflag.SyncFlag // initial deployment finished
 	Listening       *syncflag.SyncFlag // listeners bound (addresses valid)
 
-	mu      sync.Mutex
-	history *placement.History
-	// leftAt[p][n]: the version of partition p's lists when node n last gave it up (U14): a
-	// former owner that gets it back lacks the vectors inserted since (planWarnings).
-	leftAt    map[int]map[placement.NodeID]uint32
+	mu        sync.Mutex
+	history   *placement.History
 	graphNext int // round-robin cursor over the entries that serve the graph to new nodes
 	lastErr   string
 	ctrlAddr  string
@@ -109,7 +106,7 @@ func New(cfg config.Controller) (*Controller, error) {
 	}
 	c := &Controller{
 		cfg: cfg, manifest: m, policy: policy, store: store, nodes: NewNodeManager(),
-		Ready: syncflag.NewSyncFlag(), Listening: syncflag.NewSyncFlag(), leftAt: map[int]map[placement.NodeID]uint32{},
+		Ready: syncflag.NewSyncFlag(), Listening: syncflag.NewSyncFlag(),
 	}
 	if cfg.MetricsPath != "" {
 		if c.sink, err = metrics.OpenSink(cfg.MetricsPath); err != nil {

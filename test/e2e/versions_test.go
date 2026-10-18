@@ -73,7 +73,7 @@ func TestPartitionVersions(t *testing.T) {
 
 	// Version 1 next to version 0 (the same lists here): both serve.
 	seg := filepath.Join(f.parts, partitioning.SegmentName(p))
-	if err := nc.LoadPartition(ctx, p, 1, seg, false, ""); err != nil {
+	if err := nc.LoadPartition(ctx, p, 1, seg, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := versionsOf(p); !reflect.DeepEqual(got, []uint32{0, 1}) {

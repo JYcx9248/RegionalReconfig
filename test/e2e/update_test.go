@@ -43,8 +43,9 @@ import (
 //  4. A second batch changes partitions on their new owners, and deletes vectors the first one
 //     inserted.
 //  5. A scale-in returns partitions to their former owners, which lack the vectors inserted
-//     meanwhile. With lazy they fetch them on demand from the node that leaves, and the reply
-//     warns that it has to keep running; lazy-stream streams them in.
+//     meanwhile: they take them over from the node that leaves before the rescale returns (with
+//     lazy, the drain; lazy-stream streams them in), and once that node is stopped every answer
+//     is still exact.
 //
 // After each step every node holds its partitions at exactly the epoch's versions (and segment
 // files only of versions it holds), live PQ codes for exactly the vectors its partitions name,
@@ -72,7 +73,7 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
 		t.Fatalf("initial deployment: %v (%s)", err, cl.ctl.LastError())
 	}
-	cl.addNode("n3", query.TwoPhase{}, room...) // registers idle; joins at scale-out
+	n3 := cl.addNode("n3", query.TwoPhase{}, room...) // registers idle; joins at scale-out
 	ctx := cl.ctx
 
 	// The oracle holds every partition and applies every batch's decisions.
@@ -242,7 +243,7 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 			changed++
 		}
 	}
-	if changed == 0 || out.Phases["save_versions"] == 0 {
+	if changed == 0 || out.Phases["save_segments"] == 0 {
 		t.Fatalf("scale-out moved %v at versions %v (phases %v): want partitions the batch changed, saved for the move",
 			out.Moved, cur.Versions, out.Phases)
 	}
@@ -280,11 +281,11 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 	if err != nil {
 		t.Fatalf("scale-in: %v", err)
 	}
-	t.Logf("scale-in: epoch %d -> %d, moved %v, phases %v, warnings %q", out.FromEpoch, out.ToEpoch, out.Moved, out.Phases, out.Warnings)
-	if lazy := proto == "lazy"; lazy != (len(out.Warnings) > 0) ||
-		lazy && !strings.Contains(out.Warnings[0], "update batches changed them") {
-		t.Errorf("%s scale-in after batch 2: warnings %q; want the leaving node named as the source of the inserted "+
-			"vectors with lazy, which moves them only on demand, and nothing otherwise", proto, out.Warnings)
+	t.Logf("scale-in: epoch %d -> %d, moved %v, phases %v, %d raw vectors drained from the leaving node",
+		out.FromEpoch, out.ToEpoch, out.Moved, out.Phases, out.DrainVectors)
+	if proto == "lazy" && out.DrainVectors == 0 {
+		t.Errorf("lazy scale-in after batch 2 drained nothing: the vectors batch 2 inserted into the returning " +
+			"partitions were only on the leaving node")
 	}
 	time.Sleep(300 * time.Millisecond)
 	st := stop()
@@ -297,6 +298,9 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 	if len(st.epochs) < 5 {
 		t.Fatalf("load did not span the batches and reconfigurations: %v", st.epochs)
 	}
+	// The node that left can go offline: nothing it held is needed from it any more.
+	cl.stopDataNode(n3)
+	exactPass(t, cl, nil)
 }
 
 // content tracks the vector IDs each partition's lists name as batches change them.

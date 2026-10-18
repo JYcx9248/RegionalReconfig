@@ -11,8 +11,10 @@
 //	  (state that must be there first)                 StagePartitions: lists + PQ codes before the flip
 //	4 notifyUpstreamTasks + InflightBarrier            store CAS + InstallEpoch everywhere
 //	  (lazy state fetch during processing)             raw vectors: fetched on demand by RERANK, only
-//	                                                   those queries need (lazy-stream: StageRaw
-//	                                                   streams the rest after the flip)
+//	                                                   those queries need, from each posting's
+//	                                                   holder (lazy-stream: StageRaw streams the rest
+//	                                                   after the flip); nodes that leave are drained
+//	                                                   first (DrainRaw)
 //	5 waitAllTasksReconfigDone                         WaitDrained(old epoch) everywhere
 //	6 terminateTasks                                   Evict on old owners
 //	  (none)                                           StageGraph; entry flips add new nodes as graphs load
@@ -35,6 +37,7 @@ const (
 	StagePartitionsM = "StagePartitions" // fetch segments, load them into the data node
 	StageGraphM      = "StageGraph"      // fetch the navigation graph, load it
 	StageRawM        = "StageRaw"        // stream the raw vectors the node's partitions lack
+	DrainRawM        = "DrainRaw"        // before nodes leave: take over the raw vectors only they hold
 	InstallEpochM    = "InstallEpoch"    // switch routing to a new table
 	WaitDrainedM     = "WaitDrained"     // grace period: queries pinned to <= epoch finished
 	EvictM           = "Evict"           // drop partitions and their files
@@ -81,13 +84,12 @@ type StageAggregatorReq struct {
 	Table *epoch.Table `json:"table"`
 }
 
-// Source is where staged files come from.
+// Source is where staged files come from. The raw vectors of the partitions are not: each
+// posting of a segment records the node holding its vector, and the destination fetches from
+// that node.
 type Source struct {
-	Kind string `json:"kind"` // "peer": another agent's bulk port; "local": a directory
-	Addr string `json:"addr,omitempty"`
-	// NodeAddr: a peer's data node, where the destination's data node fetches the raw vectors
-	// of these partitions on demand until they are streamed in (StagePartitions).
-	NodeAddr   string `json:"node_addr,omitempty"`
+	Kind       string `json:"kind"` // "peer": another agent's bulk port; "local": a directory
+	Addr       string `json:"addr,omitempty"`
 	Dir        string `json:"dir,omitempty"`
 	Partitions []int  `json:"partitions,omitempty"`
 	// Versions: the version of each of Partitions in the epoch the staging is for (absent: all
@@ -110,9 +112,12 @@ type PartitionVersion struct {
 	Version   uint32 `json:"version"`
 }
 
-// StagePartitionsReq asks the agent to fetch and load partitions.
+// StagePartitionsReq asks the agent to fetch and load partitions. Nodes: the cluster's nodes,
+// among them those the segments name as holders of raw vectors -- where the data node fetches
+// them.
 type StagePartitionsReq struct {
-	Sources []Source `json:"sources"`
+	Sources []Source                            `json:"sources"`
+	Nodes   map[placement.NodeID]epoch.NodeInfo `json:"nodes,omitempty"`
 }
 
 // StageReply reports what a staging step moved. Bytes counts everything received (segment
@@ -120,12 +125,15 @@ type StagePartitionsReq struct {
 // from peers, i.e. only what the destination lacked (each vector's code and raw vector once
 // per node, U1).
 type StageReply struct {
-	Bytes      int64   `json:"bytes"`
-	PQCodes    int64   `json:"pq_codes"`
-	PQBytes    int64   `json:"pq_bytes"`
-	RawVectors int64   `json:"raw_vectors,omitempty"`
-	RawBytes   int64   `json:"raw_bytes,omitempty"`
-	Seconds    float64 `json:"seconds"`
+	Bytes      int64 `json:"bytes"`
+	PQCodes    int64 `json:"pq_codes"`
+	PQBytes    int64 `json:"pq_bytes"`
+	RawVectors int64 `json:"raw_vectors,omitempty"`
+	RawBytes   int64 `json:"raw_bytes,omitempty"`
+	// Repointed (DrainRaw): postings that named a leaving node and whose vector was here
+	// already; they name this node now, nothing moved for them.
+	Repointed int64   `json:"repointed,omitempty"`
+	Seconds   float64 `json:"seconds"`
 }
 
 // StageRawReq asks the agent to stream in the raw vectors that the given partitions (already
@@ -134,6 +142,16 @@ type StageReply struct {
 type StageRawReq struct {
 	Sources  []Source `json:"sources"`
 	Priority string   `json:"priority,omitempty"`
+}
+
+// DrainRawReq asks the agent, before the nodes From leave, to take over the raw vectors its
+// postings say only they hold: the data node pulls each from its holder (as StageRaw does, at
+// Priority), and its postings then name it. Afterwards no posting on the node names a node of
+// From, so they can go offline. Nodes: where they are.
+type DrainRawReq struct {
+	From     []placement.NodeID                  `json:"from"`
+	Nodes    map[placement.NodeID]epoch.NodeInfo `json:"nodes,omitempty"`
+	Priority string                              `json:"priority,omitempty"`
 }
 
 // StageGraphReq asks the agent to fetch and load the navigation graph. Priority is the
@@ -247,6 +265,13 @@ type RescaleReply struct {
 	RawVectors int64   `json:"raw_vectors"`
 	RawBytes   int64   `json:"raw_bytes"`
 	RawSeconds float64 `json:"raw_seconds,omitempty"`
+	// Drain: when nodes leave, the raw vectors only they held, pulled by the nodes whose
+	// postings named them (U9: whatever protocol, a node that leaves is never left as the
+	// only holder of a vector, so it can go offline once the reconfiguration returns), and how
+	// long after the flip that ended.
+	DrainVectors int64   `json:"drain_vectors,omitempty"`
+	DrainBytes   int64   `json:"drain_bytes,omitempty"`
+	DrainSeconds float64 `json:"drain_seconds,omitempty"`
 	// GraphBytes: navigation graphs copied to the new entries (in the background, see
 	// EntryFlips), counted once every pull has ended.
 	GraphBytes int64 `json:"graph_bytes,omitempty"`
@@ -268,9 +293,6 @@ type RescaleReply struct {
 	// for FromEpoch that a RescaleReq can pass back, edited or not.
 	Plan   *Plan `json:"plan,omitempty"`
 	DryRun bool  `json:"dry_run,omitempty"`
-	// Warnings: what this placement gives up of the invariants the protocol relies on
-	// (controller.planWarnings). The reconfiguration runs regardless.
-	Warnings []string `json:"warnings,omitempty"`
 }
 
 // EntryFlip is one flip of a scale-out that made new nodes entries once their graph loaded.

@@ -34,11 +34,34 @@ constexpr uint64_t kPQFileHeader = 16;  // pq_codes.bin: u64 n, u32 m, u32 reser
 
 // A partition's posting lists as held by a node, with the PQ slot of every posting (resolved
 // once at load time: slots do not move while referenced).
+// A posting's holder in memory: this node holds the vector. A segment written for a hand-off
+// records this node's ID there instead.
+constexpr uint16_t kSelfHolder = 0xFFFF;
+
 struct ResidentSegment {
-  ListSegment seg;
+  ListSegment seg;                                // seg.holders moves into `holders` at load
   std::vector<uint32_t> slots;                    // parallel to seg.ids
+  // Per posting, the node holding its raw vector (kSelfHolder, a peer's ID, or kNoHolder). The
+  // key (list, vector) has one holder at a time: a fetch through the posting makes it this node.
+  // The only part of a shared segment that changes, hence atomic. A posting is made to say
+  // kSelfHolder only once its vector is here (present, or in the fetch cache), and release /
+  // acquire carry that: a thread that reads kSelfHolder finds the vector.
+  std::unique_ptr<std::atomic<uint16_t>[]> holders;
   uint32_t version = 0;                           // of the partition (see NodeEngine)
   mutable const ResidentSegment* next = nullptr;  // Reclaimer queue
+
+  uint16_t Holder(size_t j) const { return holders[j].load(std::memory_order_acquire); }
+  void SetHolder(size_t j, uint16_t h) const { holders[j].store(h, std::memory_order_release); }
+  // The posting of `loc` in `list`, or SIZE_MAX.
+  size_t Find(uint32_t list, uint32_t loc) const {
+    uint32_t len = 0;
+    const uint32_t* v = seg.Find(list, &len);
+    if (!v) return SIZE_MAX;
+    const size_t at = static_cast<size_t>(v - seg.ids.data());
+    for (size_t j = at; j < at + len; ++j)
+      if (seg.locs[j] == loc) return j;
+    return SIZE_MAX;
+  }
 };
 
 // Drops the PQ references of released segments and deletes them, off the query path: the last
@@ -177,7 +200,6 @@ class NodeEngineImpl : public NodeEngine {
     FUSION_CHECK(o.max_nprobe >= 1 && o.max_rerank >= 1, "max_nprobe and max_rerank must be >= 1");
     space_ = MakeL2Space(DTypeOf<T>(), dim_);
     segs_.resize(man_.num_partitions);
-    list_src_.assign(man_.num_lists, 0);
     index_pages_path_ = path(files::LayoutVectors(man_.layout));
     // Inserts make lists longer (U14): o.max_list_len leaves room for them.
     max_list_len_ = std::max<uint32_t>(std::max(o.max_list_len, man_.max_list_len), 1);
@@ -266,8 +288,8 @@ class NodeEngineImpl : public NodeEngine {
     return graph_ != nullptr;
   }
 
-  void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq,
-                     const std::string& raw_peer, uint32_t version) override {
+  void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq, uint32_t version,
+                     uint16_t fallback_holder) override {
     FUSION_CHECK(p < man_.num_partitions, "partition %u out of range (%u partitions)", p,
                  man_.num_partitions);
     auto rs = std::make_unique<ResidentSegment>();
@@ -283,22 +305,37 @@ class NodeEngineImpl : public NodeEngine {
                    static_cast<unsigned long long>(rs->seg.offsets[li + 1] - rs->seg.offsets[li]), max_list_len_);
     const std::vector<uint32_t>& ids = rs->seg.ids;
     const std::vector<uint32_t>& locs = rs->seg.locs;
-    std::vector<uint32_t> raw_miss;
+    rs->holders.reset(new std::atomic<uint16_t>[ids.size()]);
     if (pq == PQSource::kIndex) {
-      FUSION_CHECK(raw_peer.empty(), "a bootstrap load takes its raw vectors from the index, not %s",
-                   raw_peer.c_str());
       FillFromIndex(ids);
       FillRawFromIndex(locs);
+      for (size_t j = 0; j < ids.size(); ++j) rs->SetHolder(j, kSelfHolder);
     } else {
-      raw_miss = raw_->Missing(locs.data(), locs.size());
-      if (!raw_miss.empty() && raw_peer.empty())
-        throw RawMissingError(StrFormat("partition %u: %zu raw vectors are not on this node and no "
-                                        "source was given", p, raw_miss.size()));
+      // Each key's holder: this node if the vector is here, else the one the posting records.
+      // A missing vector with no holder could never be fetched: refused before anything changes.
+      const std::vector<uint32_t> absent = RawAbsent(locs.data(), locs.size());
+      const uint16_t me = self_id_.load();
+      size_t unknown = 0;
+      uint32_t first = 0;
+      for (size_t j = 0; j < ids.size(); ++j) {
+        uint16_t h = rs->seg.holders.empty() ? kNoHolder : rs->seg.holders[j];
+        if (h == kNoHolder) h = fallback_holder;
+        if (!std::binary_search(absent.begin(), absent.end(), locs[j])) {
+          h = kSelfHolder;
+        } else if (h == kNoHolder || h == me) {
+          if (unknown++ == 0) first = locs[j];
+        }
+        rs->SetHolder(j, h);
+      }
+      if (unknown)
+        throw RawMissingError(StrFormat("partition %u: %zu postings name raw vectors that are not on "
+                                        "this node and record no other holder (first: location %u)",
+                                        p, unknown, first));
     }
+    std::vector<uint16_t>().swap(rs->seg.holders);
     rs->slots.resize(ids.size());
     // PQMissingError: nothing changed. The locations are recorded with the codes.
     store_->Ref(ids.data(), ids.size(), rs->slots.data(), locs.data());
-    SetListSources(rs->seg.list_ids, raw_miss.empty() ? std::string() : raw_peer);
     // The references are dropped (by the reclaimer) once the last holder -- the table below,
     // or a query that pinned the segment -- lets go of it.
     rs->version = version;
@@ -376,7 +413,7 @@ class NodeEngineImpl : public NodeEngine {
       FUSION_CHECK(it != which.end(), "a posting names list %u of partition %u, which is not staged",
                    lists[a], man_.list_part[lists[a]]);
       // An added vector is served by this node from now on: its raw vector must be here.
-      if (!raw_->Present(locs[a]) && !Cached(locs[a]))
+      if (!Held(locs[a]))
         throw RawMissingError(StrFormat("vector %u at location %u is not on this node (RAW_ADD it first)",
                                         ids[a], locs[a]));
       adds[it->second][lists[a]].emplace_back(ids[a], locs[a]);
@@ -411,7 +448,13 @@ class NodeEngineImpl : public NodeEngine {
       seg.partition = vs.partition;
       seg.list_ids = b.list_ids;
       seg.offsets.assign(1, 0);
-      std::vector<std::pair<uint32_t, uint32_t>> post;
+      // A kept posting keeps its holder; an added one is held here (its vector was RAW_ADDed).
+      struct Post {
+        uint32_t id, loc;
+        uint16_t holder;
+      };
+      std::vector<Post> post;
+      std::vector<uint16_t> holders;
       for (size_t li = 0; li < b.list_ids.size(); ++li) {
         post.clear();
         for (uint64_t j = b.offsets[li]; j < b.offsets[li + 1]; ++j) {
@@ -419,30 +462,32 @@ class NodeEngineImpl : public NodeEngine {
             ++out[i].removed;
             continue;
           }
-          post.emplace_back(b.ids[j], b.locs[j]);
+          post.push_back({b.ids[j], b.locs[j], base->Holder(j)});
         }
         const auto it = adds[i].find(b.list_ids[li]);
         if (it != adds[i].end()) {
           const size_t kept = post.size();
           for (const auto& pl : it->second)
-            if (!is_deleted(pl.first)) post.push_back(pl);
-          std::sort(post.begin(), post.end());
-          post.erase(std::unique(post.begin(), post.end(),
-                                 [](const auto& x, const auto& y) { return x.first == y.first; }),
+            if (!is_deleted(pl.first)) post.push_back({pl.first, pl.second, kSelfHolder});
+          std::stable_sort(post.begin(), post.end(), [](const Post& x, const Post& y) { return x.id < y.id; });
+          post.erase(std::unique(post.begin(), post.end(), [](const Post& x, const Post& y) { return x.id == y.id; }),
                      post.end());
           out[i].added += post.size() - std::min(post.size(), kept);
         }
         FUSION_CHECK(post.size() <= max_list_len_,
                      "list %u would hold %zu postings, more than the %u a request may gather (--max-list-len)",
                      b.list_ids[li], post.size(), max_list_len_);
-        for (const auto& pl : post) {
-          seg.ids.push_back(pl.first);
-          seg.locs.push_back(pl.second);
+        for (const Post& pl : post) {
+          seg.ids.push_back(pl.id);
+          seg.locs.push_back(pl.loc);
+          holders.push_back(pl.holder);
         }
         seg.offsets.push_back(seg.ids.size());
       }
       out[i].changed = out[i].added + out[i].removed > 0;
       if (!out[i].changed) continue;
+      rs->holders.reset(new std::atomic<uint16_t>[holders.size()]);
+      for (size_t j = 0; j < holders.size(); ++j) rs->SetHolder(j, holders[j]);
       rs->version = vs.next;
       rs->slots.resize(seg.ids.size());
       // PQMissingError: this segment holds no reference yet; the ones built before drop theirs.
@@ -503,7 +548,32 @@ class NodeEngineImpl : public NodeEngine {
       seg = SegmentLocked(p, &version);
     }
     if (!seg) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
-    seg->seg.Save(path);
+    // The next owner gets every key's current holder: this node, by its ID, for the vectors it
+    // holds; the recorded holder for the others.
+    const uint16_t me = self_id_.load();
+    ListSegment out = seg->seg;
+    out.holders.resize(out.ids.size());
+    for (size_t j = 0; j < out.ids.size(); ++j) {
+      const uint16_t h = seg->Holder(j);
+      FUSION_CHECK(h != kSelfHolder || me != kNoHolder,
+                   "partition %u: this node holds vectors of it but does not know its own node ID (SetNodes)", p);
+      out.holders[j] = h == kSelfHolder ? me : h;
+    }
+    out.Save(path);
+  }
+
+  void SetNodes(uint16_t self, const std::vector<std::pair<uint16_t, std::string>>& peers) override {
+    FUSION_CHECK(self != kSelfHolder, "node ID %u is reserved", self);
+    if (self != kNoHolder) {
+      uint16_t was = kNoHolder;
+      FUSION_CHECK(self_id_.compare_exchange_strong(was, self) || was == self,
+                   "this node is node %u already, not %u", was, self);
+    }
+    std::lock_guard<std::mutex> l(raw_mu_);
+    for (const auto& kv : peers) {
+      FUSION_CHECK(kv.first != kNoHolder && kv.first != kSelfHolder, "node ID %u is reserved", kv.first);
+      book_[kv.first] = kv.second;
+    }
   }
 
   // ---------------------------------------------------------------- PQ codes
@@ -546,36 +616,99 @@ class NodeEngineImpl : public NodeEngine {
   PQStats pq_stats() const override { return store_->Stats(); }
 
   // ------------------------------------------------------------- raw vectors
-  std::vector<RawRefs> RawMissing(const std::vector<std::vector<std::string>>& groups) override {
-    std::vector<RawRefs> out(groups.size());
-    std::vector<uint32_t> taken;  // sorted: listed for an earlier group
-    for (size_t g = 0; g < groups.size(); ++g) {
-      std::vector<std::pair<uint32_t, uint32_t>> refs;  // (location, a list naming it)
-      for (const std::string& path : groups[g]) {
-        const ListSegment seg = LoadSegment(path);
-        for (size_t i = 0; i < seg.list_ids.size(); ++i)
-          for (uint64_t j = seg.offsets[i]; j < seg.offsets[i + 1]; ++j)
-            if (!raw_->Present(seg.locs[j])) refs.emplace_back(seg.locs[j], seg.list_ids[i]);
+  std::vector<RawRefs> RawMissing(const std::vector<uint32_t>& partitions) override {
+    std::vector<std::shared_ptr<const ResidentSegment>> segs;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (uint32_t p : partitions) {
+        FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
+        std::shared_ptr<const ResidentSegment> s = SegmentLocked(p, nullptr);
+        if (!s) throw NotResidentError(StrFormat("partition %u is not resident", p));
+        segs.push_back(std::move(s));
       }
-      std::sort(refs.begin(), refs.end());
-      {
-        // What queries fetched is not listed again: it is in memory, on its way to the SSD.
-        std::lock_guard<std::mutex> l(cache_mu_);
-        refs.erase(std::remove_if(refs.begin(), refs.end(),
-                                  [&](const std::pair<uint32_t, uint32_t>& r) { return cache_.count(r.first) != 0; }),
-                   refs.end());
+    }
+    struct Ref {
+      uint32_t loc, list;
+      uint16_t holder;
+    };
+    std::vector<Ref> refs;  // every posting whose vector is not here (fetched ones are)
+    for (const auto& s : segs) {
+      const std::vector<uint32_t> absent = RawAbsent(s->seg.locs.data(), s->seg.locs.size());
+      if (absent.empty()) continue;
+      for (size_t i = 0; i < s->seg.list_ids.size(); ++i)
+        for (uint64_t j = s->seg.offsets[i]; j < s->seg.offsets[i + 1]; ++j)
+          if (std::binary_search(absent.begin(), absent.end(), s->seg.locs[j]))
+            refs.push_back({s->seg.locs[j], s->seg.list_ids[i], s->Holder(j)});
+    }
+    std::stable_sort(refs.begin(), refs.end(), [](const Ref& a, const Ref& b) { return a.loc < b.loc; });
+    // Each vector once, from the first posting that records a holder. A posting that says the
+    // vector is here: a query fetched it since RawAbsent looked.
+    std::map<uint16_t, RawRefs> by;
+    size_t unknown = 0;
+    uint32_t first = 0;
+    for (size_t i = 0; i < refs.size();) {
+      size_t e = i;  // [i, e): the postings of one location
+      while (e < refs.size() && refs[e].loc == refs[i].loc) ++e;
+      size_t k = e;
+      bool here = false;
+      for (size_t r = i; r < e; ++r) {
+        here = here || refs[r].holder == kSelfHolder;
+        if (k == e && Fetchable(refs[r].holder)) k = r;
       }
-      RawRefs& o = out[g];
-      for (size_t i = 0; i < refs.size(); ++i) {
-        if (i > 0 && refs[i].first == refs[i - 1].first) continue;  // one list per location
-        if (std::binary_search(taken.begin(), taken.end(), refs[i].first)) continue;
-        o.locs.push_back(refs[i].first);
-        o.lists.push_back(refs[i].second);
+      if (!here && k < e) {
+        RawRefs& g = by[refs[k].holder];
+        g.locs.push_back(refs[k].loc);
+        g.lists.push_back(refs[k].list);
+      } else if (!here && unknown++ == 0) {
+        first = refs[i].loc;
       }
-      std::vector<uint32_t> merged;
-      merged.reserve(taken.size() + o.locs.size());
-      std::merge(taken.begin(), taken.end(), o.locs.begin(), o.locs.end(), std::back_inserter(merged));
-      taken.swap(merged);
+      i = e;
+    }
+    if (unknown)
+      throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no posting naming "
+                                      "them records a holder (first: location %u)", unknown, first));
+    std::vector<RawRefs> out;
+    for (auto& kv : by) {
+      kv.second.holder = kv.first;
+      out.push_back(std::move(kv.second));
+    }
+    return out;
+  }
+
+  HeldBy RawHeldBy(uint16_t holder) override {
+    FUSION_CHECK(Fetchable(holder), "node ID %u is reserved", holder);
+    std::vector<std::shared_ptr<const ResidentSegment>> segs;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (const auto& vs : segs_) segs.insert(segs.end(), vs.begin(), vs.end());
+    }
+    HeldBy out;
+    out.missing.holder = holder;
+    std::vector<std::pair<uint32_t, uint32_t>> missing;  // (location, list)
+    for (const auto& s : segs) {
+      std::vector<size_t> named;
+      for (size_t j = 0; j < s->seg.ids.size(); ++j)
+        if (s->Holder(j) == holder) named.push_back(j);
+      if (named.empty()) continue;
+      std::vector<uint32_t> locs(named.size());
+      for (size_t k = 0; k < named.size(); ++k) locs[k] = s->seg.locs[named[k]];
+      const std::vector<uint32_t> absent = RawAbsent(locs.data(), locs.size());
+      for (size_t j : named) {
+        if (!std::binary_search(absent.begin(), absent.end(), s->seg.locs[j])) {
+          s->SetHolder(j, kSelfHolder);  // the vector is here: the key's holder is this node
+          ++out.repointed;
+          continue;
+        }
+        const size_t li = static_cast<size_t>(
+            std::upper_bound(s->seg.offsets.begin(), s->seg.offsets.end(), j) - s->seg.offsets.begin() - 1);
+        missing.emplace_back(s->seg.locs[j], s->seg.list_ids[li]);
+      }
+    }
+    std::sort(missing.begin(), missing.end());
+    for (size_t i = 0; i < missing.size(); ++i) {
+      if (i > 0 && missing[i].first == missing[i - 1].first) continue;
+      out.missing.locs.push_back(missing[i].first);
+      out.missing.lists.push_back(missing[i].second);
     }
     return out;
   }
@@ -583,13 +716,14 @@ class NodeEngineImpl : public NodeEngine {
   std::vector<uint32_t> RawAbsent(const uint32_t* locs, size_t n) const override {
     std::vector<uint32_t> miss = raw_->Missing(locs, n);
     std::lock_guard<std::mutex> l(cache_mu_);
-    miss.erase(std::remove_if(miss.begin(), miss.end(), [&](uint32_t loc) { return cache_.count(loc) != 0; }),
+    // Present is looked at again: a vector the writer installed since the first look has left
+    // the cache.
+    miss.erase(std::remove_if(miss.begin(), miss.end(), [&](uint32_t loc) { return HeldLocked(loc); }),
                miss.end());
     return miss;
   }
 
-  void RawGet(const uint32_t* locs, const uint32_t* lists, size_t n, uint8_t* out) override {
-    EnsureRawVia(locs, lists, n);  // a vector this node lacks itself comes through it (chains)
+  void RawGet(const uint32_t* locs, size_t n, uint8_t* out) override {
     const uint32_t vb = raw_->layout().vec_bytes;
     std::vector<uint32_t> disk;
     std::vector<size_t> at;
@@ -645,7 +779,7 @@ class NodeEngineImpl : public NodeEngine {
         return stop_writer_ || (added_queued_ + n) * vb <= opts_.update_buffer_bytes;
       });
       for (size_t i = 0; i < n; ++i) {
-        if (raw_->Present(locs[i]) || cache_.count(locs[i])) continue;
+        if (HeldLocked(locs[i])) continue;
         cache_.emplace(locs[i], std::vector<uint8_t>(vecs + i * vb, vecs + (i + 1) * vb));
         fresh.push_back(locs[i]);
       }
@@ -717,29 +851,38 @@ class NodeEngineImpl : public NodeEngine {
   uint32_t pq_m() const override { return codebook_->m(); }
   uint64_t id_capacity() const override { return ids_; }
 
-  // Fetched as RERANK fetches (same sources, same peer requests, chains included), but written
+  // Fetched as RERANK fetches (from the postings' holders, the same peer requests), but written
   // straight to the SSD as a stream's batch: nothing waits for these vectors in memory, and a
   // copy of a whole partition must not pass through the fetch cache and its writer.
   RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) override {
-    std::vector<uint32_t> miss, via;
-    Lacking(locs, lists, n, &miss, &via);
-    RawPutResult r;
-    if (!miss.empty()) {
-      BySource g = GroupBySource(miss, via);
-      std::vector<uint8_t> buf;
-      for (size_t src = 0; src < g.locs.size(); ++src) {
-        const std::vector<uint32_t>& ls = g.locs[src];
-        if (ls.empty()) continue;
-        if (!g.fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
-        buf.resize(ls.size() * raw_->layout().vec_bytes);
-        try {
-          g.fetch(g.peers[src], ls.data(), g.lists[src].data(), ls.size(), buf.data());
-        } catch (const std::exception& e) {
-          throw RawMissingError(StrFormat("pulling %zu raw vectors from %s: %s", ls.size(),
-                                          g.peers[src].c_str(), e.what()));
-        }
-        r.installed += raw_->Put(ls.data(), ls.size(), buf.data(), RawOrigin::kStreamed);
+    const std::vector<uint32_t> absent = RawAbsent(locs, n);
+    std::map<uint16_t, std::vector<Posting>> by;  // the postings to pull through, by holder
+    std::map<uint32_t, std::shared_ptr<const ResidentSegment>> segs;  // by partition: the newest
+    for (size_t i = 0; i < n; ++i) {
+      if (!std::binary_search(absent.begin(), absent.end(), locs[i])) continue;
+      FUSION_CHECK(lists[i] < man_.num_lists, "list %u out of range", lists[i]);
+      const uint32_t p = man_.list_part[lists[i]];
+      auto it = segs.find(p);
+      if (it == segs.end()) {
+        std::lock_guard<std::mutex> l(seg_mu_);
+        it = segs.emplace(p, SegmentLocked(p, nullptr)).first;
       }
+      if (!it->second) throw NotResidentError(StrFormat("partition %u is not resident", p));
+      const size_t j = it->second->Find(lists[i], locs[i]);
+      FUSION_CHECK(j != SIZE_MAX, "list %u does not name location %u here", lists[i], locs[i]);
+      const uint16_t h = it->second->Holder(j);
+      if (h != kSelfHolder) by[h].push_back({it->second, j});  // here: a query fetched it meanwhile
+    }
+    RawPutResult r;
+    std::vector<uint8_t> buf;
+    for (auto& kv : by) {
+      std::vector<uint32_t> ls;
+      for (const Posting& q : kv.second) ls.push_back(q.seg->seg.locs[q.j]);
+      std::sort(ls.begin(), ls.end());
+      ls.erase(std::unique(ls.begin(), ls.end()), ls.end());
+      FetchFrom(kv.first, ls, &buf);
+      r.installed += raw_->Put(ls.data(), ls.size(), buf.data(), RawOrigin::kStreamed);
+      for (const Posting& q : kv.second) q.seg->SetHolder(q.j, kSelfHolder);
     }
     r.skipped = n - r.installed;
     return r;
@@ -769,6 +912,7 @@ class NodeEngineImpl : public NodeEngine {
     auto get = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
     f.fetched = get(fc_.fetched);
     f.fetch_calls = get(fc_.fetch_calls);
+    f.coalesced = get(fc_.coalesced);
     f.fetch_us = get(fc_.fetch_us);
     f.written = get(fc_.written);
     f.write_us = get(fc_.write_us);
@@ -1097,30 +1241,50 @@ class NodeEngineImpl : public NodeEngine {
     return *index_pages_;
   }
 
-  // Makes `peer` the raw-vector source of `lists` ("": none, their vectors are all here).
-  void SetListSources(const std::vector<uint32_t>& lists, const std::string& peer) {
-    std::lock_guard<std::mutex> l(raw_mu_);
-    uint16_t src = 0;
-    if (!peer.empty()) {
-      size_t i = 0;
-      while (i < sources_.size() && sources_[i] != peer) ++i;
-      if (i == sources_.size()) {
-        FUSION_CHECK(sources_.size() < 0xFFFF, "too many raw-vector sources");
-        sources_.push_back(peer);
-      }
-      src = static_cast<uint16_t>(i + 1);
+  // A posting in a resident segment (index into its arrays).
+  struct Posting {
+    std::shared_ptr<const ResidentSegment> seg;
+    size_t j = SIZE_MAX;
+  };
+
+  // A holder a vector can be fetched from: a peer's ID.
+  static bool Fetchable(uint16_t holder) { return holder != kNoHolder && holder != kSelfHolder; }
+
+  // Fetches the vectors at locs (sorted, unique) from the data node `holder` into *buf.
+  // RawMissingError if the node does not know where that holder is, or the fetch fails.
+  void FetchFrom(uint16_t holder, const std::vector<uint32_t>& locs, std::vector<uint8_t>* buf) {
+    std::string addr;
+    RawFetcher fetch;
+    {
+      std::lock_guard<std::mutex> l(raw_mu_);
+      const auto it = book_.find(holder);
+      if (it != book_.end()) addr = it->second;
+      fetch = fetcher_;
     }
-    for (uint32_t c : lists) list_src_[c] = src;
+    if (!Fetchable(holder))
+      throw RawMissingError(StrFormat("%zu raw vectors are not on this node and their postings record "
+                                      "no holder (first: location %u)", locs.size(), locs[0]));
+    if (addr.empty())
+      throw RawMissingError(StrFormat("%zu raw vectors are held by node %u, whose address this node "
+                                      "does not know (first: location %u)", locs.size(), holder, locs[0]));
+    if (!fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
+    buf->resize(locs.size() * raw_->layout().vec_bytes);
+    try {
+      fetch(addr, locs.data(), locs.size(), buf->data());
+    } catch (const std::exception& e) {
+      throw RawMissingError(StrFormat("fetching %zu raw vectors from node %u (%s): %s", locs.size(),
+                                      holder, addr.c_str(), e.what()));
+    }
   }
 
   // Makes the raw vectors at locs[0..n) present, the missing ones fetched through the query's
   // lists: the lists a query probed name all its candidates, so one of them names each missing
-  // vector and knows its source. Only the missing ones are scanned for, and only then.
+  // vector and records its holder. Only the missing ones are scanned for, and only then.
   size_t EnsureRawInLists(const uint32_t* locs, size_t n, const uint32_t* lists,
                           const uint32_t* versions, uint32_t nlists) {
     const std::vector<uint32_t> miss = RawAbsent(locs, n);  // sorted, unique; cached is not missing
     if (miss.empty()) return 0;
-    std::vector<uint32_t> via(miss.size(), kInvalidId);
+    std::vector<Posting> via(miss.size());
     std::vector<std::shared_ptr<const ResidentSegment>> segs(nlists);
     {
       std::lock_guard<std::mutex> l(seg_mu_);
@@ -1135,83 +1299,30 @@ class NodeEngineImpl : public NodeEngine {
       uint32_t len = 0;
       const uint32_t* v = segs[i]->seg.Find(lists[i], &len);
       if (!v) continue;
-      const uint32_t* ls = segs[i]->seg.locs.data() + (v - segs[i]->seg.ids.data());
-      for (uint32_t j = 0; j < len && left; ++j) {
-        const auto it = std::lower_bound(miss.begin(), miss.end(), ls[j]);
-        if (it != miss.end() && *it == ls[j] && via[it - miss.begin()] == kInvalidId) {
-          via[it - miss.begin()] = lists[i];
+      const size_t at = static_cast<size_t>(v - segs[i]->seg.ids.data());
+      for (size_t j = at; j < at + len && left; ++j) {
+        const auto it = std::lower_bound(miss.begin(), miss.end(), segs[i]->seg.locs[j]);
+        if (it != miss.end() && *it == segs[i]->seg.locs[j] && !via[it - miss.begin()].seg) {
+          via[it - miss.begin()] = {segs[i], j};
           --left;
         }
       }
     }
-    return FetchRaw(miss, via);
+    return FetchForQuery(miss, via);
   }
 
-  // The same for a peer's request, which names the list of every location (RAW_GET).
-  size_t EnsureRawVia(const uint32_t* locs, const uint32_t* lists, size_t n) {
-    std::vector<uint32_t> miss, via;
-    Lacking(locs, lists, n, &miss, &via);
-    return miss.empty() ? 0 : FetchRaw(miss, via);
-  }
-
-  // Of locs[0..n) (lists[i] names locs[i]): the locations whose vector is neither on the SSD
-  // nor fetched already, sorted, each once with a list that names it.
-  void Lacking(const uint32_t* locs, const uint32_t* lists, size_t n, std::vector<uint32_t>* miss,
-               std::vector<uint32_t>* via) const {
-    std::vector<std::pair<uint32_t, uint32_t>> refs;
-    {
-      std::lock_guard<std::mutex> l(cache_mu_);
-      for (size_t i = 0; i < n; ++i)
-        if (!raw_->Present(locs[i]) && !cache_.count(locs[i])) refs.emplace_back(locs[i], lists[i]);
-    }
-    std::sort(refs.begin(), refs.end());
-    for (size_t i = 0; i < refs.size(); ++i) {
-      if (i > 0 && refs[i].first == refs[i - 1].first) continue;
-      FUSION_CHECK(refs[i].second < man_.num_lists, "list %u out of range", refs[i].second);
-      miss->push_back(refs[i].first);
-      via->push_back(refs[i].second);
-    }
-  }
-
-  // miss[i] grouped by the source of list via[i] (kInvalidId: no list named it), with the
-  // sources' addresses and the fetcher as of now. RawMissingError if one has no source (and has
-  // not arrived meanwhile).
-  struct BySource {
-    std::vector<std::vector<uint32_t>> locs, lists;  // per source
-    std::vector<std::string> peers;
-    RawFetcher fetch;
+  // A fetch in flight: queries that miss the same vector meanwhile wait for it instead of
+  // fetching it again.
+  struct InFlight {
+    bool done = false;
+    bool ok = false;
   };
-  BySource GroupBySource(const std::vector<uint32_t>& miss, const std::vector<uint32_t>& via) const {
-    BySource g;
-    std::lock_guard<std::mutex> l(raw_mu_);
-    g.locs.resize(sources_.size());
-    g.lists.resize(sources_.size());
-    size_t unknown = 0;
-    uint32_t first = 0;
-    for (size_t i = 0; i < miss.size(); ++i) {
-      const uint16_t src = via[i] == kInvalidId ? 0 : list_src_[via[i]];
-      if (src) {
-        g.locs[src - 1].push_back(miss[i]);
-        g.lists[src - 1].push_back(via[i]);
-      } else if (!raw_->Present(miss[i]) && !Cached(miss[i]) && unknown++ == 0) {  // it may have arrived
-        first = miss[i];
-      }
-    }
-    if (unknown)
-      throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no list naming "
-                                      "them has a source (first: location %u)", unknown, first));
-    g.peers = sources_;
-    g.fetch = fetcher_;
-    return g;
-  }
 
-  // Fetches miss[i] from the source of list via[i], one request per source; returns how many
-  // were installed. RawMissingError if one has no source or its fetch fails. Two queries that
-  // miss the same vector may both fetch it; the second write is a no-op.
-  size_t FetchRaw(const std::vector<uint32_t>& miss, const std::vector<uint32_t>& via) {
-    BySource g = GroupBySource(miss, via);
-    size_t fetched = 0;
-    std::vector<uint8_t> buf;
+  // Fetches miss[i] from the holder that posting via[i] records, one request per holder, and
+  // waits for those another query is fetching already; every posting used then names this node.
+  // Returns how many vectors this call installed. RawMissingError if one has no holder or a
+  // fetch fails (its own, or one it waited for).
+  size_t FetchForQuery(const std::vector<uint32_t>& miss, const std::vector<Posting>& via) {
     Timer t;
     struct Count {  // also when a fetch throws
       FetchCounters& fc;
@@ -1221,26 +1332,109 @@ class NodeEngineImpl : public NodeEngine {
         fc.fetch_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
       }
     } count{fc_, t};
-    for (size_t src = 0; src < g.locs.size(); ++src) {
-      const std::vector<uint32_t>& ls = g.locs[src];
-      if (ls.empty()) continue;
-      if (!g.fetch) throw RawMissingError("raw vectors are missing and this node has no fetcher");
-      buf.resize(ls.size() * raw_->layout().vec_bytes);
-      try {
-        g.fetch(g.peers[src], ls.data(), g.lists[src].data(), ls.size(), buf.data());
-      } catch (const std::exception& e) {
-        throw RawMissingError(StrFormat("fetching %zu raw vectors from %s: %s", ls.size(),
-                                        g.peers[src].c_str(), e.what()));
+    std::vector<size_t> mine, here;  // indices into miss: to fetch; arrived meanwhile
+    std::vector<std::pair<size_t, std::shared_ptr<InFlight>>> waits;
+    std::map<uint32_t, std::shared_ptr<InFlight>> claimed;  // by location
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      for (size_t i = 0; i < miss.size(); ++i) {
+        if (HeldLocked(miss[i])) {
+          here.push_back(i);
+          continue;
+        }
+        const auto it = inflight_.find(miss[i]);
+        if (it != inflight_.end()) {
+          waits.emplace_back(i, it->second);
+          continue;
+        }
+        auto f = std::make_shared<InFlight>();
+        inflight_.emplace(miss[i], f);
+        claimed.emplace(miss[i], f);
+        mine.push_back(i);
       }
+    }
+    if (!waits.empty()) fc_.coalesced.fetch_add(waits.size(), std::memory_order_relaxed);
+    // However this call ends, its claims end with it, so that no waiter blocks for good.
+    auto settle = [&](const std::vector<uint32_t>& locs, bool ok) {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      for (uint32_t loc : locs) {
+        const auto it = claimed.find(loc);
+        if (it == claimed.end()) continue;
+        it->second->done = true;
+        it->second->ok = ok;
+        inflight_.erase(loc);
+        claimed.erase(it);
+      }
+      inflight_cv_.notify_all();
+    };
+    struct Unclaim {
+      std::function<void()> f;
+      ~Unclaim() { f(); }
+    } unclaim{[&] {
+      std::vector<uint32_t> rest;
+      for (const auto& kv : claimed) rest.push_back(kv.first);
+      if (!rest.empty()) settle(rest, false);
+    }};
+    std::map<uint16_t, std::vector<size_t>> by;  // what this call fetches, by holder
+    // Claimed, but the posting says here: a stream or a drain (RawPull) brought the vector since
+    // the claim. It is here, and its claim ends well.
+    std::vector<uint32_t> arrived;
+    size_t unknown = 0;
+    uint32_t first = 0;
+    bool listed = false;  // whether a list of the query names the first one
+    for (size_t i : mine) {
+      const uint16_t h = via[i].seg ? via[i].seg->Holder(via[i].j) : kNoHolder;
+      if (Fetchable(h)) {
+        by[h].push_back(i);
+      } else if (h == kSelfHolder) {
+        arrived.push_back(miss[i]);
+      } else if (unknown++ == 0) {
+        first = miss[i];
+        listed = via[i].seg != nullptr;
+      }
+    }
+    if (unknown)
+      throw RawMissingError(StrFormat("%zu raw vectors are not on this node and cannot be fetched (first: "
+                                      "location %u, %s)", unknown, first,
+                                      listed ? "its posting records no holder" : "no list of the query names it"));
+    if (!arrived.empty()) settle(arrived, true);
+    size_t fetched = 0;
+    std::vector<uint8_t> buf;
+    for (const auto& kv : by) {
+      std::vector<uint32_t> ls;
+      for (size_t i : kv.second) ls.push_back(miss[i]);  // ascending, as miss
+      FetchFrom(kv.first, ls, &buf);
       raw_->CountFetch();
       fetched += Cache(ls.data(), ls.size(), buf.data());
+      for (size_t i : kv.second) via[i].seg->SetHolder(via[i].j, kSelfHolder);
+      settle(ls, true);
     }
+    if (!waits.empty()) {
+      std::unique_lock<std::mutex> l(cache_mu_);
+      inflight_cv_.wait(l, [&] {
+        for (const auto& w : waits)
+          if (!w.second->done) return false;
+        return true;
+      });
+      for (const auto& w : waits)
+        if (!w.second->ok)
+          throw RawMissingError(StrFormat("raw vector at location %u: the fetch this query waited for "
+                                          "failed", miss[w.first]));
+    }
+    for (const auto& w : waits)
+      if (via[w.first].seg) via[w.first].seg->SetHolder(via[w.first].j, kSelfHolder);
+    for (size_t i : here)
+      if (via[i].seg) via[i].seg->SetHolder(via[i].j, kSelfHolder);
     return fetched;
   }
 
-  bool Cached(uint32_t loc) const {
+  // Whether the raw vector at loc is here: on the SSD, or fetched and in the cache. Both under
+  // cache_mu_: the writer marks a vector present before it drops it from the cache, so the two
+  // looks cannot both miss one on its way from memory to the SSD.
+  bool HeldLocked(uint32_t loc) const { return raw_->Present(loc) || cache_.count(loc) != 0; }
+  bool Held(uint32_t loc) const {
     std::lock_guard<std::mutex> l(cache_mu_);
-    return cache_.count(loc) != 0;
+    return HeldLocked(loc);
   }
 
   // Keeps fetched vectors for the queries and queues them for the SSD; returns how many were
@@ -1256,7 +1450,7 @@ class NodeEngineImpl : public NodeEngine {
       full = (queued_ + n) * vb > kMaxQueuedBytes;
       if (!full) {
         for (size_t i = 0; i < n; ++i) {
-          if (raw_->Present(locs[i]) || cache_.count(locs[i])) continue;  // fetched twice: once is enough
+          if (HeldLocked(locs[i])) continue;  // fetched twice: once is enough
           cache_.emplace(locs[i], std::vector<uint8_t>(vecs + i * vb, vecs + (i + 1) * vb));
           fresh.push_back(locs[i]);
         }
@@ -1507,13 +1701,15 @@ class NodeEngineImpl : public NodeEngine {
   std::string index_pages_path_;
   std::mutex index_pages_mu_;
   std::unique_ptr<ReadOnlyFile> index_pages_;  // bootstrap only (IndexPages)
-  // Where to fetch a raw vector this node lacks: the source of any posting list that names it
-  // (1 + an index into sources_, 0 for none), set when the list's partition loads from a
-  // peer. Lists overlap, so no per-vector table is needed, and a list keeps its source after
-  // its partition leaves, for peers that got the partition from here.
+  // Where the holders that postings record are: this node's ID and its peers' addresses
+  // (SetNodes), and how to fetch from them.
   mutable std::mutex raw_mu_;
-  std::vector<uint16_t> list_src_;
-  std::vector<std::string> sources_;
+  std::atomic<uint16_t> self_id_{kNoHolder};
+  std::unordered_map<uint16_t, std::string> book_;
+  // Fetches in flight, by location (under cache_mu_): a query that misses a vector another one
+  // is fetching waits for that fetch.
+  std::unordered_map<uint32_t, std::shared_ptr<InFlight>> inflight_;
+  std::condition_variable inflight_cv_;
   std::atomic<uint64_t> resident_version_{1};  // bumped by loads and evictions (PendingCount)
   // Raw vectors fetched on demand that are not on the SSD yet. Queries use them from here and
   // the writer installs them in the background: the query that fetched a vector does not wait
@@ -1535,7 +1731,7 @@ class NodeEngineImpl : public NodeEngine {
   bool update_paused_ = false;
   std::chrono::steady_clock::time_point next_update_write_{};  // update_write_bps
   struct FetchCounters {  // fetch_stats
-    std::atomic<uint64_t> fetched{0}, fetch_calls{0}, fetch_us{0}, written{0}, write_us{0},
+    std::atomic<uint64_t> fetched{0}, fetch_calls{0}, coalesced{0}, fetch_us{0}, written{0}, write_us{0},
         sync_installed{0}, sync_us{0}, drain_calls{0}, drain_waiting{0}, drain_us{0},
         rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0}, added{0},
         added_written{0}, added_wait_us{0};

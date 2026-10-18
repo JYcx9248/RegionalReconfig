@@ -1,11 +1,9 @@
 package e2e
 
 import (
-	"fmt"
 	"reflect"
 	"sort"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -60,7 +58,7 @@ func TestReconfigurePlan(t *testing.T) {
 			}}
 			out := reconfigure(t, cl, protocol.RescaleReq{Plan: swap})
 			if len(out.Added) != 0 || len(out.Removed) != 0 || !reflect.DeepEqual(out.Moved, ascending(pa, pb)) ||
-				out.ToEpoch != out.FromEpoch+1 || len(out.Warnings) != 0 {
+				out.ToEpoch != out.FromEpoch+1 || out.DrainVectors != 0 {
 				t.Errorf("rebalance reply %+v: want partitions %d and %d traded in one flip, nobody joining or leaving",
 					out, pa, pb)
 			}
@@ -80,11 +78,12 @@ func TestReconfigurePlan(t *testing.T) {
 			if src, ok := out.GraphSources[n3.ID()]; !ok || src != n1.ID() {
 				t.Errorf("node %d copied the graph from %d (%v), want node %d: the entry that stays", n3.ID(), src, ok, n1.ID())
 			}
-			// With lazy, n2 stays the raw-vector source of every partition it hands over: n3 has
-			// never held one.
-			if wantWarn := proto == "lazy"; wantWarn != (len(out.Warnings) == 1) ||
-				wantWarn && !strings.Contains(out.Warnings[0], fmt.Sprintf("node %d (n2) leaves", n2.ID())) {
-				t.Errorf("replacement warnings %q: want one about node %d with lazy, none otherwise", out.Warnings, n2.ID())
+			// n2 leaves, and n3 has never held its partitions: with lazy, n3 takes over the raw
+			// vectors that only n2 holds before the rescale returns (the drain); copy-then-flip
+			// copied them all before the flip.
+			if lazy := proto == "lazy"; lazy != (out.DrainVectors > 0) {
+				t.Errorf("replacement drained %d raw vectors from node %d: want some with lazy, none otherwise",
+					out.DrainVectors, n2.ID())
 			}
 			tbl := cl.ctl.Status().Table
 			if !tbl.IsEntry(n3.ID()) || tbl.IsEntry(n2.ID()) || tbl.IsAggregator(n2.ID()) {
@@ -125,6 +124,9 @@ func TestReconfigurePlan(t *testing.T) {
 			if st.total == 0 || len(st.epochs) < 3 {
 				t.Fatalf("load did not span the reconfigurations: %v", st.epochs)
 			}
+			// n2 left: it can go offline, and every answer is still exact.
+			cl.stopDataNode(n2)
+			exactPass(t, cl, nil)
 		})
 	}
 }

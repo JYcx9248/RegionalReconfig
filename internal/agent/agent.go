@@ -220,8 +220,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.bulk.PQ = func(ctx context.Context, ids []uint32) (int, []byte, error) {
 		return a.localBulk.PQGet(ctx, ids) // peers staging our partitions pull their PQ codes
 	}
-	a.bulk.Raw = func(ctx context.Context, locs, lists []uint32) (int, []byte, error) {
-		return a.localBulk.RawGet(ctx, locs, lists) // ... and stream their raw vectors
+	a.bulk.Raw = func(ctx context.Context, locs []uint32) (int, []byte, error) {
+		return a.localBulk.RawGet(ctx, locs) // ... and stream the raw vectors we hold
 	}
 	go a.bulk.Serve(bln)
 	go a.serveQueries(ctx, qln)
@@ -240,6 +240,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.id.Store(uint32(reply.ID))
 	a.info.ID = reply.ID
+	// The data node records this ID as the holder of the raw vectors it holds, in the segments
+	// it writes at a hand-off.
+	if err := a.localBulk.SetNodes(ctx, uint16(reply.ID), nil); err != nil {
+		return fmt.Errorf("agent: telling the data node its ID: %w", err)
+	}
 	log.Printf("agent %s: registered as node %d (query %s, bulk %s, data node %s)",
 		a.cfg.Name, reply.ID, a.info.QueryAddr, a.info.BulkAddr, a.cfg.NodeAddr)
 	a.Registered.Signal()
@@ -293,12 +298,38 @@ func (a *Agent) partDir() string  { return filepath.Join(a.cfg.WorkDir, "partiti
 func (a *Agent) graphDir() string { return filepath.Join(a.cfg.WorkDir, "graph") }
 
 // learn records node addresses from a table.
-func (a *Agent) learn(t *epoch.Table) {
+func (a *Agent) learn(t *epoch.Table) { a.learnNodes(t.Nodes) }
+
+// learnNodes records node addresses and gives the data node the data nodes' among them: where
+// the holders its postings record are.
+func (a *Agent) learnNodes(nodes map[placement.NodeID]epoch.NodeInfo) {
+	if len(nodes) == 0 {
+		return
+	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	for id, n := range t.Nodes {
+	for id, n := range nodes {
 		a.addrs[id] = n
 	}
+	book := make(map[uint16]string, len(a.addrs))
+	for id, n := range a.addrs {
+		if id != a.ID() {
+			book[uint16(id)] = n.NodeAddr
+		}
+	}
+	a.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.localBulk.SetNodes(ctx, 0, book); err != nil {
+		log.Printf("agent %s: giving the data node the node addresses: %v", a.cfg.Name, err)
+	}
+}
+
+// nodeInfo is what the agent knows of how to reach node id.
+func (a *Agent) nodeInfo(id placement.NodeID) (epoch.NodeInfo, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n, ok := a.addrs[id]
+	return n, ok
 }
 
 // Client implements query.Nodes: the data-node client of node id.

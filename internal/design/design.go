@@ -57,7 +57,8 @@ var Open = map[string]Question{
 			"Decided and implemented too: raw vectors are addressed by a CANONICAL GLOBAL OFFSET and " +
 			"each node holds a sparse subset of that address space. The location (u32: page x " +
 			"vectors_per_page + slot) sits in the posting entry next to the vector ID, 8 B per entry " +
-			"(segment version 2, payload \"lists+locations\"), and is inherited with the list, so it " +
+			"(segment version 2, payload \"lists+locations\"; version 3 adds the node that holds " +
+			"the vector, U9), and is inherited with the list, so it " +
 			"survives every migration untouched and no node needs a global vector -> page map: a " +
 			"node keeps its vectors in a local sparse file laid out like the whole page file, one " +
 			"presence bit per location, and finds a candidate's location through its PQ store, " +
@@ -159,30 +160,34 @@ var Open = map[string]Question{
 		"Decided: a node goes online (the flip) only once it holds every posting list and PQ " +
 			"code of its partitions, so it can filter at once; a raw vector moves only when a " +
 			"query first needs it (protocol \"lazy\", the default) -- the point of being lazy " +
-			"is that queries touch a small working set of what moved. A RERANK that meets a " +
-			"vector not there fetches it from the partition's old owner, data node to data node " +
-			"(RAW_GET; the RERANK waits for the fetch only: fetched vectors are re-ranked from " +
-			"memory and a background writer installs them with whole-page direct writes). " +
-			"Sources are kept per posting list (the old owner " +
-			"of its partition; lists overlap, so no per-vector table): RERANK requests carry the " +
-			"query's lists on that owner, and RAW_GET names the list of every vector, so a node " +
-			"asked for one it lacks fetches it from its own source of that list (chains of " +
-			"migrations). The rescale does not wait for raw vectors. The old owners stay valid " +
-			"sources because no node drops a raw vector it has held (static dataset), the nodes " +
-			"that leave are the ones that joined last and a scale-in returns partitions to nodes " +
-			"that held them (U3): a disk budget or another leave order would need a hand-off of " +
-			"what only a leaving node holds. Baselines: \"lazy-stream\" also streams the rest in " +
-			"after the flip (StageRaw at raw_priority; RAW_MISSING lists each missing vector once " +
-			"with a list naming it, RAW_CHECK drops what queries fetched meanwhile; the rescale " +
-			"waits for it) -- also the building block for handing data off before a node leaves " +
-			"or after a failure; \"copy-then-flip\" streams before the flip, \"stop-and-copy\" " +
-			"while paused. Open: taking the fetch off the query path (re-rank the missing " +
-			"candidates at the old owner, which has them, and fetch the ones used in the " +
-			"background); coalescing concurrent fetches of one vector; the workload that decides " +
-			"the working set (U11); chunks (U12)",
-		"internal/controller/reconfig.go (copyThenFlip, stageRaw), internal/agent/control.go " +
-			"(StageRaw), engine/src/node_engine.cpp (EnsureRawInLists, FetchRaw, SetListSources), " +
-			"engine/node/server.cpp (PeerPool)"},
+			"is that queries touch a small working set of what moved. Every posting records the " +
+			"holder of its vector, the node that stores it (u16 node ID, segment version 3), so " +
+			"each key (list, vector) has one current holder: the list's owner if it holds the " +
+			"vector, else the node the posting names. Only the owner's copy of a list is valid: a " +
+			"partition moves as its owner saves it from memory, holders included (SAVE_PARTITION), " +
+			"and the next owner makes the postings of the vectors it holds name itself. A RERANK " +
+			"that meets a vector not there fetches it from the holder that a posting in one of the " +
+			"query's lists on that node records, data node to data node (RAW_GET, one hop: a " +
+			"holder has the vector; data nodes know each other by node ID, SET_NODES), and makes " +
+			"that one posting name itself -- other lists naming the vector keep their holder, " +
+			"which still has it; queries that miss the same vector meanwhile wait for that one " +
+			"fetch. The RERANK waits for the fetch only: fetched vectors are re-ranked from memory " +
+			"and a background writer installs them with whole-page direct writes. A scale-out " +
+			"does not wait for raw vectors. A scale-in drains the nodes that leave first " +
+			"(DrainRaw: each remaining node takes over the vectors its postings say only a leaving " +
+			"node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so they can go " +
+			"offline when it returns: lazy fetches as little as possible, it does not forbid " +
+			"streaming. Holders stay valid because no node drops a raw vector it has held (static " +
+			"dataset); a disk budget would need the same hand-off first. Baselines: " +
+			"\"lazy-stream\" also streams the rest in after the flip (StageRaw at raw_priority; " +
+			"RAW_MISSING groups each missing vector by its holder; the rescale waits for it); " +
+			"\"copy-then-flip\" streams before the flip, \"stop-and-copy\" while paused. Open: " +
+			"taking the fetch off the query path (re-rank the missing candidates at their holder, " +
+			"which has them, and fetch the ones used in the background); fetching more per fetch; " +
+			"the workload that decides the working set (U11); chunks (U12)",
+		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw), internal/agent/control.go " +
+			"(StageRaw, DrainRaw), engine/src/node_engine.cpp (EnsureRawInLists, FetchForQuery, " +
+			"RawHeldBy, RawPull), engine/node/server.cpp (PeerPool)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
 			"single-machine prototype uses; also what happens when the controller fails mid-flip",
@@ -236,14 +241,14 @@ var Open = map[string]Question{
 			"and location spaces at an epoch boundary; the response to a batch over budget (splitting " +
 			"partitions, scaling out first -- the batch fails before anything is sent); splits, " +
 			"merges and major epochs (the graph rebuild); the health check that triggers them; the " +
-			"decision log and replay; freeing the pages of deleted vectors. Open: with lazy, a " +
-			"scale-in that returns a partition after batches changed it leaves the node that leaves " +
-			"the raw-vector source of the vectors inserted meanwhile (planWarnings names it) -- " +
-			"streaming those in before it leaves is a U9 question; and versions staged under a lease " +
-			"that expired stay on their owner until a later batch replaces them or the partition moves",
+			"decision log and replay; freeing the pages of deleted vectors. An inserted vector stays " +
+			"with the owner that added it when its partition moves on (the postings name that node " +
+			"as its holder), and a node that leaves is drained first (U9). Open: versions staged " +
+			"under a lease that expired stay on their owner until a later batch replaces them or " +
+			"the partition moves",
 		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions, " +
 			"Assign, RawAdd, StageVersions), internal/update (batch.go), internal/controller/update.go, " +
-			"internal/controller/reconfig.go (copyThenFlip, planWarnings), engine/include/fusion/pq_store.h " +
+			"internal/controller/reconfig.go (copyThenFlip, drainRaw), engine/include/fusion/pq_store.h " +
 			"(cached codes, Forget), cmd/rtier-updater, scripts/run_local.py (\"Updates\")"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
 		"every entry node needs the whole graph over the list heads, and a node that joins " +

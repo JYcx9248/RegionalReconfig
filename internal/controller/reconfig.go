@@ -156,18 +156,15 @@ func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq) (
 	if err != nil {
 		return nil, err
 	}
-	plan, warnings := protocol.PlanOf(t.next, cur.Epoch), c.planWarnings(cur, t)
+	plan := protocol.PlanOf(t.next, cur.Epoch)
 	if req.DryRun || len(t.changes) == 0 {
 		return &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
 			Added: ids(t.added), Removed: ids(t.removed), Moved: t.changes.Moved(), Plan: plan,
-			DryRun: req.DryRun, Warnings: warnings}, nil
-	}
-	for _, w := range warnings {
-		log.Printf("controller: warning: %s", w)
+			DryRun: req.DryRun}, nil
 	}
 	reply, err := c.run(ctx, cur, t)
 	if reply != nil {
-		reply.Plan, reply.Warnings = plan, warnings
+		reply.Plan = plan
 	}
 	return reply, err
 }
@@ -266,50 +263,6 @@ func (c *Controller) planTarget(cur *epoch.Table, p *protocol.Plan) (target, err
 	return t, nil
 }
 
-// planWarnings names what a placement gives up of the invariants the lazy protocol relies on
-// (copyThenFlip, step 6). With "lazy" a node that leaves stays the raw-vector source of the
-// partitions it hands to nodes that have never owned them -- their raw vectors move only as
-// queries need them -- so it has to keep running. The reversible policies never do that (a
-// scale-in returns partitions to nodes that have held them); a plan may. Update batches (U14)
-// break it too: a partition that returns to a former owner after a batch changed it names the
-// vectors inserted meanwhile, which that owner never held. Streaming those in before the node
-// leaves, so that it can stop, is not implemented (U9 with U14).
-func (c *Controller) planWarnings(cur *epoch.Table, t target) []string {
-	if c.cfg.Protocol != "lazy" || len(t.removed) == 0 {
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	h := c.history
-	var out []string
-	for _, r := range t.removed {
-		var never, changed []int
-		for dst, l := range t.changes[r.ID] {
-			for _, p := range l {
-				switch {
-				case h == nil || !h.HasOwned(p, dst):
-					never = append(never, p)
-				case c.leftAt[p][dst] < cur.Version(p):
-					changed = append(changed, p)
-				}
-			}
-		}
-		if len(never) > 0 {
-			sort.Ints(never)
-			out = append(out, fmt.Sprintf("node %d (%s) leaves but stays the raw-vector source of partitions %v: "+
-				"their new owners have never held them, and with lazy their raw vectors move only as queries "+
-				"need them -- keep node %d running", r.ID, r.Name, never, r.ID))
-		}
-		if len(changed) > 0 {
-			sort.Ints(changed)
-			out = append(out, fmt.Sprintf("node %d (%s) leaves but stays the raw-vector source of partitions %v: "+
-				"update batches changed them since their new owners last held them, and with lazy the vectors "+
-				"those batches inserted move only as queries need them -- keep node %d running", r.ID, r.Name, changed, r.ID))
-		}
-	}
-	return out
-}
-
 // run carries out a reconfiguration to t with the configured protocol.
 func (c *Controller) run(ctx context.Context, cur *epoch.Table, t target) (*protocol.RescaleReply, error) {
 	switch c.cfg.Protocol {
@@ -357,15 +310,16 @@ const (
 //     entry_flip_interval, one more flip adds those whose graph loaded since the previous
 //     one (promoteEntries). A node whose graph fails to load stays a data node and aggregator.
 //  6. RAW      from the flip on, a new owner's data node fetches the raw vectors a query needs
-//     from the old owners on demand (every posting list knows the source of its partition),
-//     and with rawOnDemand nothing else: what no query needs never moves, and the rescale
-//     does not wait for any of it. That the old owners stay sources rests on invariants of
-//     the design (U9): no node drops a raw vector it has held, the nodes that leave are the
-//     ones that joined last, and a scale-in returns partitions to nodes that held them. A plan
-//     may break the last two; planWarnings names the nodes that then have to keep running. With
-//     rawStreamAfterFlip, alongside 3-5, the destinations also stream in the rest from the old
-//     owners (raw_priority, background by default); the old owners -- removed nodes included
-//     -- stay up as sources until it ends, and the rescale waits for it.
+//     on demand, each straight from its holder: every posting records the node holding its
+//     vector (the old owner writes the moved segments for that), and with rawOnDemand nothing
+//     else moves -- what no query needs stays where it is, and the rescale does not wait for
+//     any of it. With rawStreamAfterFlip, alongside 3-5, the destinations also stream in the
+//     rest from the holders (raw_priority, background by default), and the rescale waits for it.
+//  7. DRAIN    alongside 3-5, when nodes leave: every data node of e+1 pulls the raw vectors its
+//     postings say only they hold, and its postings then name it (DrainRaw). That holders stay
+//     rests on one invariant (U9): no node drops a raw vector it has held -- and a node that
+//     leaves is drained first, so it can go offline once the rescale returns, whatever placement
+//     the reconfiguration went to.
 //
 // Failures: before the flip, partitions already copied to destinations are dropped again and
 // the old epoch stays in force. After the flip, the protocol stops and keeps every old copy
@@ -436,21 +390,23 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	if err != nil {
 		return reply, err
 	}
-	// Each destination pulls from the moved partitions' current owners: their bulk port for
-	// files, PQ codes and raw vectors, their data node for on-demand raw-vector fetches. It
-	// loads each partition at its version in e, which the reconfiguration does not change: a
-	// partition that update batches changed moves with its current lists (U14).
+	// Each destination pulls from the moved partitions' current owners, over their bulk port:
+	// the segment files, which the owners write for the move (every posting records the node
+	// holding its raw vector as of now), and the PQ codes it lacks. It loads each partition at
+	// its version in e, which the reconfiguration does not change: a partition that update
+	// batches changed moves with its current lists (U14). Raw vectors come from the holders.
 	sources := map[placement.NodeID][]protocol.Source{}
-	saves := map[placement.NodeID][]protocol.PartitionVersion{} // by source: versions no file holds yet
+	saves := map[placement.NodeID][]protocol.PartitionVersion{} // by source
 	for _, d := range dests {
 		for _, pull := range plan[d] {
 			from, ok := c.nodes.Get(pull.From)
 			if !ok {
 				return reply, fmt.Errorf("unknown source node %d", pull.From)
 			}
-			src := protocol.Source{Kind: "peer", Addr: from.Info.BulkAddr, NodeAddr: from.Info.NodeAddr, Partitions: pull.Partitions}
+			src := protocol.Source{Kind: "peer", Addr: from.Info.BulkAddr, Partitions: pull.Partitions}
 			for i, p := range pull.Partitions {
 				v := cur.Version(p)
+				saves[pull.From] = append(saves[pull.From], protocol.PartitionVersion{Partition: p, Version: v})
 				if v == 0 {
 					continue
 				}
@@ -458,9 +414,15 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 					src.Versions = make([]uint32, len(pull.Partitions))
 				}
 				src.Versions[i] = v
-				saves[pull.From] = append(saves[pull.From], protocol.PartitionVersion{Partition: p, Version: v})
 			}
 			sources[d] = append(sources[d], src)
+		}
+	}
+	// Where every node is: the holders the moved segments name, and the nodes that leave.
+	book := map[placement.NodeID]epoch.NodeInfo{}
+	for _, t := range []*epoch.Table{cur, draft} {
+		for id, n := range t.Nodes {
+			book[id] = n
 		}
 	}
 	bg := context.Background() // cleanup runs even if the protocol failed on a timeout
@@ -517,8 +479,9 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		}(n)
 	}
 
-	// A version that an update batch made is in its owner's memory only (U14): the owner writes
-	// it as a segment file for the destinations to pull.
+	// The old owners write the moved partitions as segment files, from memory: every posting
+	// records where its raw vector is now (the owner itself for those it holds), and a version
+	// that an update batch made exists only in memory until then (U14).
 	if len(saves) > 0 {
 		saveNodes, err := c.managed(sortedKeys(saves))
 		if err != nil {
@@ -529,7 +492,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		}); err != nil {
 			return reply, err
 		}
-		phase("save_versions")
+		phase("save_segments")
 	}
 
 	// Stop-and-copy baseline: pause admission everywhere and wait for in-flight queries.
@@ -572,7 +535,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	var moved, pqCodes, pqBytes atomic.Int64
 	if err := forEach(destNodes, func(n *ManagedNode) error {
 		var st protocol.StageReply
-		err := n.call(ctx, c.stageTimeout(), protocol.StagePartitionsM, protocol.StagePartitionsReq{Sources: sources[n.ID]}, &st)
+		err := n.call(ctx, c.stageTimeout(), protocol.StagePartitionsM, protocol.StagePartitionsReq{Sources: sources[n.ID], Nodes: book}, &st)
 		moved.Add(st.Bytes)
 		pqCodes.Add(st.PQCodes)
 		pqBytes.Add(st.PQBytes)
@@ -632,6 +595,24 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	}
 	defer func() { <-rawDone }()
 
+	// 7. DRAIN: the data nodes of e+1 take over what only the nodes that leave hold, so that
+	// they can go offline once the rescale returns; every return waits for it.
+	drainDone := make(chan struct{})
+	var drainErr error
+	if len(removed) > 0 {
+		go func() {
+			defer close(drainDone)
+			var st protocol.StageReply
+			st, drainErr = c.drainRaw(ctx, draft, removed, book)
+			reply.DrainVectors, reply.DrainBytes = st.RawVectors, st.RawBytes
+			reply.DrainSeconds = time.Since(flipDone).Seconds()
+			c.event("reconfig.drain_s", reply.DrainSeconds)
+		}()
+	} else {
+		close(drainDone)
+	}
+	defer func() { <-drainDone }()
+
 	// 5. ENTRY, alongside GRACE and RECLAIM: the new nodes become entries as their graphs load.
 	// Those flips change only the entries, so routing stays that of e+1: they need no grace
 	// period of their own, and they do not hold up the one of e (WaitDrained(e) needs a newer
@@ -689,10 +670,6 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		for _, l := range m {
 			for _, p := range l {
 				c.history.Forget(p, src)
-				if c.leftAt[p] == nil {
-					c.leftAt[p] = map[placement.NodeID]uint32{}
-				}
-				c.leftAt[p][src] = cur.Version(p)
 			}
 		}
 	}
@@ -707,6 +684,10 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	<-rawDone
 	if rawErr != nil {
 		return reply, afterFlip(rawErr)
+	}
+	<-drainDone
+	if drainErr != nil {
+		return reply, afterFlip(drainErr)
 	}
 	// What queries fetched on demand while the reconfiguration ran. Without a stream they go on
 	// fetching afterwards, as they meet vectors that have not moved yet: the nodes' raw.fetched
@@ -751,6 +732,26 @@ func (c *Controller) stageRaw(ctx context.Context, dests []*ManagedNode, sources
 	err := forEach(dests, func(n *ManagedNode) error {
 		var st protocol.StageReply
 		err := n.call(ctx, c.stageTimeout(), protocol.StageRawM, protocol.StageRawReq{Sources: sources[n.ID], Priority: priority}, &st)
+		vectors.Add(st.RawVectors)
+		bytes.Add(st.RawBytes)
+		return err
+	})
+	return protocol.StageReply{RawVectors: vectors.Load(), RawBytes: bytes.Load()}, err
+}
+
+// drainRaw has every data node of t pull the raw vectors its postings say only the removed
+// nodes hold (at raw_priority), and adds up what moved.
+func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, removed []*ManagedNode,
+	book map[placement.NodeID]epoch.NodeInfo) (protocol.StageReply, error) {
+	nodes, err := c.managed(t.Placement.Nodes())
+	if err != nil {
+		return protocol.StageReply{}, err
+	}
+	req := protocol.DrainRawReq{From: ids(removed), Nodes: book, Priority: c.cfg.RawPriority}
+	var vectors, bytes atomic.Int64
+	err = forEach(nodes, func(n *ManagedNode) error {
+		var st protocol.StageReply
+		err := n.call(ctx, c.stageTimeout(), protocol.DrainRawM, req, &st)
 		vectors.Add(st.RawVectors)
 		bytes.Add(st.RawBytes)
 		return err

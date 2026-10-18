@@ -102,7 +102,7 @@ func TestInsertRouting(t *testing.T) {
 		t.Fatalf("RAW_ADD: %d installed, %v", n, err)
 	}
 	read := func() []byte {
-		_, got, err := nc.RawGet(ctx, locs, make([]uint32, k))
+		_, got, err := nc.RawGet(ctx, locs)
 		if err != nil {
 			t.Fatal(err)
 		}

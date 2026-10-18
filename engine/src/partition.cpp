@@ -14,7 +14,7 @@ std::string SegmentName(uint32_t partition) { return StrFormat("part-%05u.seg", 
 namespace {
 
 constexpr uint32_t kSegMagic = 0x47535452;  // "RTSG" little endian
-constexpr uint32_t kSegVersion = 2;  // 1: IDs only (payload lists-only)
+constexpr uint32_t kSegVersion = 3;  // 1: IDs only (payload lists-only); 2: no holders
 
 struct CrcTable {
   uint32_t t[256];
@@ -94,6 +94,8 @@ void ListSegment::Save(const std::string& path) const {
   FUSION_CHECK(offsets.size() == list_ids.size() + 1, "segment offsets/list mismatch");
   FUSION_CHECK(locs.size() == ids.size(), "segment has %zu locations for %zu IDs", locs.size(),
                ids.size());
+  FUSION_CHECK(holders.empty() || holders.size() == ids.size(), "segment has %zu holders for %zu IDs",
+               holders.size(), ids.size());
   std::vector<uint8_t> buf;
   auto put = [&](const void* p, size_t n) {
     const uint8_t* b = static_cast<const uint8_t*>(p);
@@ -106,6 +108,11 @@ void ListSegment::Save(const std::string& path) const {
   put(offsets.data(), offsets.size() * 8);
   put(ids.data(), ids.size() * 4);
   put(locs.data(), locs.size() * 4);
+  if (holders.empty()) {
+    buf.resize(buf.size() + ids.size() * 2, 0);  // kNoHolder
+  } else {
+    put(holders.data(), holders.size() * 2);
+  }
   const uint32_t crc = Crc32(buf.data(), buf.size());
   put(&crc, 4);
   // Write to a temporary name and rename, so a reader never sees a half-written segment.
@@ -125,10 +132,11 @@ ListSegment ListSegment::Load(const std::string& path) {
   uint32_t hdr[4];
   std::memcpy(hdr, buf.data(), sizeof(hdr));
   FUSION_CHECK(hdr[0] == kSegMagic, "%s is not a segment file", path.c_str());
-  FUSION_CHECK(hdr[1] == kSegVersion,
+  FUSION_CHECK(hdr[1] == kSegVersion || hdr[1] == 2,
                "segment %s has version %u, expected %u (version 1 has no raw-vector locations: "
                "rerun rtier_segment)",
                path.c_str(), hdr[1], kSegVersion);
+  const bool with_holders = hdr[1] >= 3;
   ListSegment s;
   s.partition = hdr[2];
   const size_t nl = hdr[3];
@@ -148,14 +156,20 @@ ListSegment ListSegment::Load(const std::string& path) {
   for (size_t i = 0; i < nl; ++i)
     FUSION_CHECK(s.offsets[i] <= s.offsets[i + 1], "segment %s: offsets not monotonic", path.c_str());
   const uint64_t nid = s.offsets.back();
-  FUSION_CHECK(nid <= (buf.size() - off) / 8, "segment %s is truncated", path.c_str());
-  need(nid * 8);
+  const size_t per = with_holders ? 10 : 8;
+  FUSION_CHECK(nid <= (buf.size() - off) / per, "segment %s is truncated", path.c_str());
+  need(nid * per);
   s.ids.resize(nid);
   std::memcpy(s.ids.data(), buf.data() + off, nid * 4);
   off += nid * 4;
   s.locs.resize(nid);
   std::memcpy(s.locs.data(), buf.data() + off, nid * 4);
   off += nid * 4;
+  if (with_holders) {
+    s.holders.resize(nid);
+    std::memcpy(s.holders.data(), buf.data() + off, nid * 2);
+    off += nid * 2;
+  }
   FUSION_CHECK(off + 4 == buf.size(), "segment %s has trailing bytes", path.c_str());
   FUSION_CHECK(std::is_sorted(s.list_ids.begin(), s.list_ids.end()),
                "segment %s: list IDs not sorted", path.c_str());

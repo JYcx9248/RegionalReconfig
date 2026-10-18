@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +46,8 @@ const (
 	opDropVersion    uint8 = 0x31
 	opForget         uint8 = 0x32
 	opSavePartition  uint8 = 0x33
+	opSetNodes       uint8 = 0x34
+	opRawHeldBy      uint8 = 0x35
 )
 
 // Status codes (engine/node/wire.h).
@@ -331,11 +334,11 @@ func (c *Client) LoadGraph(ctx context.Context, path string) error {
 // LoadPartition makes the node load version v of partition p from the segment at path,
 // replacing that version if it is resident (the partition's other versions stay). With fromIndex, the PQ
 // codes and raw vectors the node lacks are copied from the index (bootstrap). Otherwise the PQ
-// codes must have been installed with PQPut (or the load fails with StatusPQAbsent), and the
-// raw vectors the node lacks are fetched from rawPeer, a data node's address, when a query
-// needs them -- until RawPut brings them (StatusRawAbsent if some are missing and rawPeer is
-// empty).
-func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string, fromIndex bool, rawPeer string) error {
+// codes must have been installed with PQPut (or the load fails with StatusPQAbsent), and a raw
+// vector the node lacks is fetched, when a query needs it, from the holder its posting records
+// (a segment saved at a hand-off records one for every posting; StatusRawAbsent if one is
+// missing with no holder recorded).
+func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string, fromIndex bool) error {
 	var w frame.Writer
 	w.U32(uint32(p))
 	w.U32(v)
@@ -344,8 +347,6 @@ func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string
 	} else {
 		w.U8(0)
 	}
-	w.U32(uint32(len(rawPeer)))
-	w.Str(rawPeer)
 	w.Bytes([]byte(path))
 	_, err := c.do(ctx, opLoadPartition, 0, w.B)
 	return err
@@ -360,28 +361,80 @@ func (c *Client) PQMissing(ctx context.Context, groups [][]string) ([][]uint32, 
 	return c.missing(ctx, opPQMissing, groups)
 }
 
-// RawRefs are raw-vector locations and, for each, a posting list that names it (parallel).
-// A node asked for a vector it lacks looks up that list's source (chained migrations).
+// RawRefs are raw-vector locations held by one node (its cluster ID) and, for each, a posting
+// list on this node that names it (parallel): what RawPull needs to bring them.
 type RawRefs struct {
+	Holder      uint16
 	Locs, Lists []uint32
 }
 
-// RawMissing returns, for each group of segment files, the raw-vector locations they name whose
-// vector the node lacks and that no earlier group lists, each with a list that names it.
-func (c *Client) RawMissing(ctx context.Context, groups [][]string) ([]RawRefs, error) {
-	r, err := c.missingReply(ctx, opRawMissing, groups)
+// RawMissing returns the raw vectors that the newest resident versions of partitions name and
+// the node lacks, grouped by the node holding them, each once with a list that names it.
+func (c *Client) RawMissing(ctx context.Context, partitions []int) ([]RawRefs, error) {
+	var w frame.Writer
+	w.U32(uint32(len(partitions)))
+	for _, p := range partitions {
+		w.U32(uint32(p))
+	}
+	b, err := c.do(ctx, opRawMissing, 0, w.B)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]RawRefs, len(groups))
+	r := frame.NewReader(b)
+	out := make([]RawRefs, r.U32())
 	for i := range out {
+		out[i].Holder = r.U16()
+		r.U16()
 		n := int(r.U32())
-		out[i] = RawRefs{Locs: r.U32s(n), Lists: r.U32s(n)}
+		out[i].Locs, out[i].Lists = r.U32s(n), r.U32s(n)
 	}
 	if r.Err == nil && r.Remaining() != 0 {
 		return nil, fmt.Errorf("nodeclient: trailing bytes in the RAW_MISSING reply from %s", c.addr)
 	}
 	return out, r.Err
+}
+
+// RawHeldBy is the drain of node `holder` before it leaves: the node makes every posting that
+// names it, and whose vector it has now, name itself (repointed), and returns the vectors still
+// to pull from it (RawPull), each with a list that names it.
+func (c *Client) RawHeldBy(ctx context.Context, holder uint16) (repointed uint64, missing RawRefs, err error) {
+	var w frame.Writer
+	w.U16(holder)
+	w.U16(0)
+	b, err := c.do(ctx, opRawHeldBy, 0, w.B)
+	if err != nil {
+		return 0, RawRefs{}, err
+	}
+	r := frame.NewReader(b)
+	repointed = r.U64()
+	n := int(r.U32())
+	missing = RawRefs{Holder: holder, Locs: r.U32s(n), Lists: r.U32s(n)}
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, RawRefs{}, fmt.Errorf("nodeclient: trailing bytes in the RAW_HELD_BY reply from %s", c.addr)
+	}
+	return repointed, missing, r.Err
+}
+
+// SetNodes tells the node its cluster ID (0: unchanged) and where other data nodes are: the
+// holders its postings record, which it fetches raw vectors from.
+func (c *Client) SetNodes(ctx context.Context, self uint16, peers map[uint16]string) error {
+	ids := make([]int, 0, len(peers))
+	for id := range peers {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	var w frame.Writer
+	w.U16(self)
+	w.U16(0)
+	w.U32(uint32(len(ids)))
+	for _, id := range ids {
+		w.U16(uint16(id))
+		w.U16(0)
+		w.U32(uint32(len(peers[uint16(id)])))
+		w.Str(peers[uint16(id)])
+	}
+	_, err := c.do(ctx, opSetNodes, 0, w.B)
+	return err
 }
 
 func (c *Client) missing(ctx context.Context, op uint8, groups [][]string) ([][]uint32, error) {
@@ -421,16 +474,12 @@ func (c *Client) missingReply(ctx context.Context, op uint8, groups [][]string) 
 	return r, nil
 }
 
-// RawGet returns the raw vectors at locs (vecBytes each, in order); lists[i] is a posting list
-// that names locs[i]. The node fetches a vector it lacks itself from that list's source first.
-func (c *Client) RawGet(ctx context.Context, locs, lists []uint32) (int, []byte, error) {
-	if len(lists) != len(locs) {
-		return 0, nil, fmt.Errorf("nodeclient: RAW_GET of %d locations with %d lists", len(locs), len(lists))
-	}
+// RawGet returns the raw vectors at locs (vecBytes each, in order) from the node's own store
+// (StatusRawAbsent for one it does not hold: a peer asks the holder, there is no chain).
+func (c *Client) RawGet(ctx context.Context, locs []uint32) (int, []byte, error) {
 	var w frame.Writer
 	w.U32(uint32(len(locs)))
 	w.U32s(locs)
-	w.U32s(lists)
 	b, err := c.do(ctx, opRawGet, 0, w.B)
 	if err != nil {
 		return 0, nil, err

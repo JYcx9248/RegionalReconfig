@@ -207,10 +207,9 @@ func checkResidency(t *testing.T, cl *cluster) {
 		case rawComplete(cl.protocol) && (raw.Present != all || raw.Pending != 0):
 			t.Errorf("node %d (%s) raw vectors %+v: want the %d vectors of every partition it has owned, "+
 				"none pending", ns.ID, ns.Name, raw, all)
-		case !rawComplete(cl.protocol) &&
-			(raw.Streamed != 0 || raw.Present > all || raw.Pending > live || raw.Present+raw.Pending < live):
-			t.Errorf("node %d (%s) raw vectors %+v: lazy: want none streamed, at most the %d of the partitions "+
-				"it has owned, and every one of the %d its partitions name here or pending", ns.ID, ns.Name, raw, all, live)
+		case !rawComplete(cl.protocol) && (raw.Present > all || raw.Pending > live || raw.Present+raw.Pending < live):
+			t.Errorf("node %d (%s) raw vectors %+v: lazy: want at most the %d of the partitions it has owned, "+
+				"and every one of the %d its partitions name here or pending", ns.ID, ns.Name, raw, all, live)
 		}
 	}
 }
@@ -305,18 +304,21 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 		t.Errorf("%s pulled %d PQ codes, want %d (the vectors new to each destination)", what, out.PQCodes, want)
 	}
 	// A vector new to a destination needs its code and its raw vector: the same count -- except
-	// with lazy, which moves only the raw vectors queries need. The stream may bring one that a
-	// query fetched while its batch was in flight (installed once).
+	// with lazy, which moves only the raw vectors queries need, and those that only a node that
+	// leaves holds (the drain). The stream may bring one that a query fetched while its batch
+	// was in flight (installed once).
 	if !rawComplete(out.Protocol) {
-		if streamed != 0 || out.RawVectors != 0 || fetched > uint64(want) {
-			t.Errorf("%s (lazy) streamed %d raw vectors (reply %d) and fetched %d: want none "+
-				"streamed and at most the %d new to the destinations fetched", what, streamed, out.RawVectors, fetched, want)
+		// No bound on the fetches: a lazy destination may lack raw vectors whose PQ codes it kept,
+		// and other nodes go on fetching for earlier moves meanwhile.
+		if streamed != uint64(out.DrainVectors) || out.RawVectors != 0 {
+			t.Errorf("%s (lazy) streamed %d raw vectors (reply %d, drained %d) and fetched %d: want only the "+
+				"drain streamed", what, streamed, out.RawVectors, out.DrainVectors, fetched)
 		}
-	} else if streamed+fetched != uint64(want) || uint64(out.RawVectors) < streamed {
-		t.Errorf("%s installed %d raw vectors (%d streamed, reply received %d; %d fetched), want %d",
-			what, streamed+fetched, streamed, out.RawVectors, fetched, want)
+	} else if streamed+fetched != uint64(want) || uint64(out.RawVectors+out.DrainVectors) < streamed {
+		t.Errorf("%s installed %d raw vectors (%d streamed, reply received %d, drained %d; %d fetched), want %d",
+			what, streamed+fetched, streamed, out.RawVectors, out.DrainVectors, fetched, want)
 	}
-	if out.Protocol != "lazy" && out.Protocol != "lazy-stream" && (fetched != 0 || uint64(out.RawVectors) != streamed) {
+	if out.Protocol != "lazy" && out.Protocol != "lazy-stream" && (fetched != 0 || uint64(out.RawVectors+out.DrainVectors) != streamed) {
 		t.Errorf("protocol %s: %d raw vectors fetched on demand, %d of %d streamed installed: want every one "+
 			"copied before the flip, once", out.Protocol, fetched, streamed, out.RawVectors)
 	}
@@ -783,9 +785,10 @@ func TestRawVectorsFetchedOnDemand(t *testing.T) {
 // TestLazyMovesOnlyWhatQueriesNeed: with the lazy protocol a reconfiguration moves posting lists
 // and PQ codes, and a raw vector only when a query first needs it (U9). Two scale-outs without
 // load move no raw vector at all. The third node takes a partition from the second, which never
-// fetched its vectors, so the third node's misses go to the second, which gets them from the
-// first (a chain, resolved through the lists' sources). Every answer is exact, a second pass
-// over the same queries fetches nothing, and what no query needed is still where it was.
+// fetched its vectors: the second's segment says the first holds them, so the third fetches
+// them straight from the first, and the second serves nothing and fetches nothing for it (no
+// chain). Every answer is exact, a second pass over the same queries fetches nothing, and what
+// no query needed is still where it was.
 func TestLazyMovesOnlyWhatQueriesNeed(t *testing.T) {
 	f := getFixture(t)
 	cl := newCluster(t, f, "lazy", 1)
@@ -846,15 +849,14 @@ func TestLazyMovesOnlyWhatQueriesNeed(t *testing.T) {
 		}
 	}
 	pass()
-	s2, s3 := raw(second), raw(third)
-	if s3.Fetched == 0 || s2.Served == 0 {
-		t.Errorf("third node fetched %d raw vectors, the second served %d: want the third's misses of the "+
-			"second's former partition served by the second", s3.Fetched, s2.Served)
+	s1, s2, s3 := raw(first), raw(second), raw(third)
+	if s3.Fetched == 0 || s2.Served != 0 || s1.Served != s2.Fetched+s3.Fetched {
+		t.Errorf("the third node fetched %d raw vectors and the second %d; the first served %d, the second %d: "+
+			"want every fetch served by the first, which holds the vectors", s3.Fetched, s2.Fetched, s1.Served, s2.Served)
 	}
 	if s2.Pending == 0 && s3.Pending == 0 {
 		t.Errorf("every raw vector moved (%+v, %+v): want some that no query needed still pending", s2, s3)
 	}
-	s1 := raw(first)
 	pass()
 	for _, c := range []struct {
 		a      *agent.Agent
@@ -867,8 +869,8 @@ func TestLazyMovesOnlyWhatQueriesNeed(t *testing.T) {
 	}
 	checkResidency(t, cl)
 	t.Logf("lazy 1 -> 2 -> 3: second node holds %d of %d (%d pending), third %d of %d (%d pending); the "+
-		"second served %d to the third", s2.Present, s2.Present+s2.Pending, s2.Pending, s3.Present,
-		s3.Present+s3.Pending, s3.Pending, s2.Served)
+		"first served %d", s2.Present, s2.Present+s2.Pending, s2.Pending, s3.Present,
+		s3.Present+s3.Pending, s3.Pending, s1.Served)
 }
 
 // TestNodeShutdownUnderLoad interrupts rtier_node while requests are in flight. The node must

@@ -121,6 +121,8 @@ const char* OpName(uint8_t op) {
     case kDropVersion: return "drop_version";
     case kForget: return "forget";
     case kSavePartition: return "save_partition";
+    case kSetNodes: return "set_nodes";
+    case kRawHeldBy: return "raw_held_by";
     default: return nullptr;
   }
 }
@@ -225,8 +227,8 @@ void PeerPool::Give(const std::string& addr, int fd) {
   idle_[addr].push_back(fd);
 }
 
-void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, const uint32_t* lists,
-                      size_t n, uint32_t vec_bytes, uint8_t* out) {
+void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, uint32_t vec_bytes,
+                      uint8_t* out) {
   for (size_t done = 0; done < n;) {  // frames stay far below kMaxFrameBytes
     const size_t batch = std::min<size_t>(
         {n - done, kMaxRawBatch, std::max<size_t>(1, (kMaxFrameBytes / 4) / vec_bytes)});
@@ -236,7 +238,6 @@ void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, const uint3
     BodyWriter w;
     w.Put<uint32_t>(static_cast<uint32_t>(batch));
     w.PutBytes(locs + done, batch * 4);
-    w.PutBytes(lists + done, batch * 4);
     req.body = std::move(w.buf);
     const int fd = Take(addr);
     Frame resp;
@@ -269,9 +270,8 @@ void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, const uint3
 NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
   for (int i = engine->num_workers() - 1; i >= 0; --i) free_workers_.push_back(i);
   const uint32_t vb = engine->vec_bytes();
-  engine->SetRawFetcher([this, vb](const std::string& peer, const uint32_t* locs,
-                                   const uint32_t* lists, size_t n, uint8_t* out) {
-    peers_.RawGet(peer, locs, lists, n, vb, out);
+  engine->SetRawFetcher([this, vb](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+    peers_.RawGet(peer, locs, n, vb, out);
   });
 }
 
@@ -433,9 +433,8 @@ Frame NodeServer::Handle(const Frame& req) {
         const uint32_t version = r.Get<uint32_t>();
         const uint8_t src = r.Get<uint8_t>();
         Require(src <= 1, "unknown PQ source");
-        const std::string raw_peer = TakeStr(&r);
         e.LoadPartition(p, r.Rest(), src == 1 ? fusion::PQSource::kIndex : fusion::PQSource::kPresent,
-                        raw_peer, version);
+                        version);
         break;
       }
       case kEvictPartition:
@@ -486,18 +485,49 @@ Frame NodeServer::Handle(const Frame& req) {
         w.Put<uint64_t>(e.PQReleaseStaged());
         break;
       case kRawMissing: {
-        const auto groups = TakeGroups(&r);
-        const auto miss = e.RawMissing(groups);
+        const uint32_t np = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(np) * 4 == r.remaining(), "RAW_MISSING: partitions do not match");
+        const auto parts = TakeArray<uint32_t>(&r, np);
+        const auto miss = e.RawMissing(parts);
         uint64_t bytes = 4;
-        for (const auto& m : miss) bytes += 4 + 8 * static_cast<uint64_t>(m.locs.size());
+        for (const auto& m : miss) bytes += 8 + 8 * static_cast<uint64_t>(m.locs.size());
         Require(bytes + 64 <= kMaxFrameBytes,
                 "the missing locations do not fit in one frame; ask for fewer partitions per call");
-        w.Put<uint32_t>(static_cast<uint32_t>(groups.size()));
+        w.Put<uint32_t>(static_cast<uint32_t>(miss.size()));
         for (const auto& m : miss) {
+          w.Put<uint16_t>(m.holder);
+          w.Put<uint16_t>(0);
           w.Put<uint32_t>(static_cast<uint32_t>(m.locs.size()));
           w.PutBytes(m.locs.data(), m.locs.size() * 4);
           w.PutBytes(m.lists.data(), m.lists.size() * 4);
         }
+        break;
+      }
+      case kRawHeldBy: {
+        const uint16_t holder = r.Get<uint16_t>();
+        r.Get<uint16_t>();
+        Require(r.remaining() == 0, "trailing bytes in RAW_HELD_BY");
+        const fusion::HeldBy hb = e.RawHeldBy(holder);
+        Require(8 + 4 + 8 * static_cast<uint64_t>(hb.missing.locs.size()) + 64 <= kMaxFrameBytes,
+                "the vectors held by that node do not fit in one frame");
+        w.Put<uint64_t>(hb.repointed);
+        w.Put<uint32_t>(static_cast<uint32_t>(hb.missing.locs.size()));
+        w.PutBytes(hb.missing.locs.data(), hb.missing.locs.size() * 4);
+        w.PutBytes(hb.missing.lists.data(), hb.missing.lists.size() * 4);
+        break;
+      }
+      case kSetNodes: {
+        const uint16_t self = r.Get<uint16_t>();
+        r.Get<uint16_t>();
+        const uint32_t n = r.Get<uint32_t>();
+        std::vector<std::pair<uint16_t, std::string>> peers;
+        for (uint32_t i = 0; i < n; ++i) {
+          const uint16_t id = r.Get<uint16_t>();
+          r.Get<uint16_t>();
+          peers.emplace_back(id, TakeStr(&r));
+        }
+        Require(r.remaining() == 0, "trailing bytes in SET_NODES");
+        e.SetNodes(self, peers);
         break;
       }
       case kRawGet: {
@@ -506,10 +536,9 @@ Frame NodeServer::Handle(const Frame& req) {
         Require(n <= kMaxRawBatch && static_cast<uint64_t>(n) * vb <= kMaxFrameBytes / 2,
                 "RAW_GET batch too large");
         const auto locs = TakeArray<uint32_t>(&r, n);
-        const auto lists = TakeArray<uint32_t>(&r, n);
         Require(r.remaining() == 0, "trailing bytes in RAW_GET");
         std::vector<uint8_t> vecs(static_cast<size_t>(n) * vb);
-        e.RawGet(locs.data(), lists.data(), n, vecs.data());
+        e.RawGet(locs.data(), n, vecs.data());
         w.Put<uint32_t>(vb);
         w.PutBytes(vecs.data(), vecs.size());
         break;
@@ -804,13 +833,13 @@ std::string NodeServer::FetchJson() const {
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
   return fusion::StrFormat(
       "{\"present\":%llu,\"cached\":%llu,\"queued\":%llu,\"queued_peak\":%llu,\"fetched\":%llu,"
-      "\"fetch_calls\":%llu,\"fetch_us\":%llu,\"written\":%llu,\"write_batches\":%llu,"
+      "\"fetch_calls\":%llu,\"coalesced\":%llu,\"fetch_us\":%llu,\"written\":%llu,\"write_batches\":%llu,"
       "\"write_us\":%llu,\"sync_installed\":%llu,\"sync_us\":%llu,\"drain_calls\":%llu,"
       "\"drain_waiting\":%llu,\"drain_us\":%llu,\"rerank_disk\":%llu,\"rerank_mem\":%llu,"
       "\"pending_recounts\":%llu,\"pending_us\":%llu,\"added\":%llu,\"added_queued\":%llu,"
       "\"added_written\":%llu,\"added_wait_us\":%llu}",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
-      u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
+      u(f.coalesced), u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
       u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us), u(f.added), u(f.added_queued),
       u(f.added_written), u(f.added_wait_us));

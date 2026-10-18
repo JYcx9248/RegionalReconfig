@@ -12,12 +12,14 @@
 //   part-00000.seg    posting lists of partition 0, ...  (format below)
 //
 // Segment file (little endian):
-//   u32 magic 'RTSG' | u32 version (2) | u32 partition | u32 num_lists
+//   u32 magic 'RTSG' | u32 version (3) | u32 partition | u32 num_lists
 //   u32 list_ids[num_lists]            ascending
 //   u64 offsets[num_lists + 1]         CSR offsets into ids
 //   u32 ids[offsets[num_lists]]        vector IDs
 //   u32 locs[offsets[num_lists]]       canonical location of each posting's raw vector
+//   u16 holders[offsets[num_lists]]    version 3: the node holding each posting's raw vector
 //   u32 crc32 of every byte before it
+// Version 2 (no holders) still loads, with no holder recorded.
 //
 // Payload (the decided part of U1). A posting is (vector ID, location): the location is where
 // the vector sits in the index's page file (fusion/layout.h, RawLayout), 8 B per posting with
@@ -26,6 +28,12 @@
 // two lists names the same location. PQ codes and raw vectors are node-level and move
 // separately, deduplicated per node (fusion/pq_store.h, fusion/raw_store.h); segments carry
 // only the lists.
+//
+// Where a vector is, in the cluster: every key (list, vector ID) has one current holder, a node
+// that stores its raw vector -- the list's owner once it holds the vector, otherwise the node
+// recorded in the posting (the cluster's node ID, kNoHolder for none). A segment written at a
+// hand-off records it for every posting, so the next owner fetches each missing vector straight
+// from its holder.
 #pragma once
 
 #include <string>
@@ -63,6 +71,9 @@ struct PartitionManifest {
   void Save(const std::string& dir) const;
 };
 
+// No holder recorded for a posting (a version-2 segment, or one rtier_segment wrote).
+constexpr uint16_t kNoHolder = 0;
+
 // One partition's posting lists.
 struct ListSegment {
   uint32_t partition = 0;
@@ -70,11 +81,12 @@ struct ListSegment {
   std::vector<uint64_t> offsets;   // list_ids.size() + 1
   std::vector<uint32_t> ids;
   std::vector<uint32_t> locs;      // parallel to ids
+  std::vector<uint16_t> holders;   // parallel to ids, or empty: none recorded
 
   // Vector IDs of `list`, or nullptr if the list is not in this segment.
   const uint32_t* Find(uint32_t list, uint32_t* len) const;
   uint64_t bytes() const {
-    return list_ids.size() * 4 + offsets.size() * 8 + ids.size() * 4 + locs.size() * 4;
+    return list_ids.size() * 4 + offsets.size() * 8 + ids.size() * 4 + locs.size() * 4 + holders.size() * 2;
   }
 
   void Save(const std::string& path) const;

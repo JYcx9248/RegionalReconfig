@@ -103,6 +103,7 @@ void TestPartitionFiles() {
   CHECK((s0.ids == std::vector<uint32_t>{9} && s0.locs == std::vector<uint32_t>{0}));
   // Offsets that point outside the segment are rejected even with a valid checksum.
   ListSegment bad = s0;
+  bad.holders.clear();
   bad.offsets = {0, 5, 3};
   bad.list_ids = {1, 3};
   bad.ids = {1, 2, 3, 4, 5};
@@ -194,14 +195,21 @@ std::unique_ptr<NodeEngine> OpenNode(const Fixture& f, const std::vector<uint32_
 
 using Result = std::vector<std::pair<float, uint32_t>>;
 
-// In-process stand-in for the node server's peer pool: raw vectors are fetched by calling the
-// named peer's RawGet directly.
-void LinkPeers(NodeEngine* node, std::map<std::string, NodeEngine*> peers) {
-  node->SetRawFetcher([peers](const std::string& peer, const uint32_t* locs, const uint32_t* lists,
-                              size_t n, uint8_t* out) {
-    auto it = peers.find(peer);
-    if (it == peers.end()) throw std::runtime_error("unknown peer " + peer);
-    it->second->RawGet(locs, lists, n, out);
+// In-process stand-in for the node server's peer pool and the agents' address book: `node` is
+// node `self` and reaches each of `peers` (by node ID) by calling its RawGet directly.
+void LinkPeers(NodeEngine* node, uint16_t self, std::map<uint16_t, NodeEngine*> peers) {
+  std::vector<std::pair<uint16_t, std::string>> book;
+  std::map<std::string, NodeEngine*> by_addr;
+  for (const auto& kv : peers) {
+    const std::string addr = "node-" + std::to_string(kv.first);
+    book.emplace_back(kv.first, addr);
+    by_addr[addr] = kv.second;
+  }
+  node->SetNodes(self, book);
+  node->SetRawFetcher([by_addr](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+    auto it = by_addr.find(peer);
+    if (it == by_addr.end()) throw std::runtime_error("unknown peer " + peer);
+    it->second->RawGet(locs, n, out);
   });
 }
 
@@ -370,7 +378,7 @@ void TestPartitionVersions() {
   // Version 1 next to version 0 (the same lists here): both serve, and no version means the
   // newest one.
   const std::string seg = JoinPath(f.parts, partfiles::SegmentName(p));
-  node->LoadPartition(p, seg, PQSource::kPresent, "", 1);
+  node->LoadPartition(p, seg, PQSource::kPresent, 1);
   filter(&v1, &at1);
   filter(nullptr, &newest);
   CHECK(at1 == at0 && newest == at0);
@@ -378,7 +386,7 @@ void TestPartitionVersions() {
   CHECK(at0 == at1);
   CHECK((versions_of(p) == std::vector<uint32_t>{0, 1}));
   // Loading a version again replaces it; RERANK takes the versions too.
-  node->LoadPartition(p, seg, PQSource::kPresent, "", 1);
+  node->LoadPartition(p, seg, PQSource::kPresent, 1);
   CHECK((versions_of(p) == std::vector<uint32_t>{0, 1}));
   {
     std::vector<uint32_t> out(10);
@@ -476,9 +484,8 @@ void TestInsertedVectors() {
   node->PauseUpdateWrites(true);
   CHECK(node->RawAdd(locs.data(), locs.size(), vecs).installed == 3);
   CHECK(node->RawAdd(locs.data(), 1, vecs).skipped == 1);
-  std::vector<uint32_t> via(locs.size(), 0);
   std::vector<uint8_t> out(locs.size() * vb);
-  node->RawGet(locs.data(), via.data(), locs.size(), out.data());
+  node->RawGet(locs.data(), locs.size(), out.data());
   CHECK(std::memcmp(out.data(), vecs, out.size()) == 0);
   CHECK(node->RawAbsent(locs.data(), locs.size()).empty());
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -489,7 +496,7 @@ void TestInsertedVectors() {
   CHECK(node->fetch_stats().added_written == 3 && node->fetch_stats().added_queued == 0);
   CHECK(node->raw_stats(false).added == 3);
   std::fill(out.begin(), out.end(), 0);
-  node->RawGet(locs.data(), via.data(), locs.size(), out.data());
+  node->RawGet(locs.data(), locs.size(), out.data());
   CHECK(std::memcmp(out.data(), vecs, out.size()) == 0);
   refused = false;
   try {
@@ -538,6 +545,7 @@ void TestStageVersions() {
   o.max_pages = man.raw.num_pages + 4;
   o.max_list_len = man.max_list_len + 16;
   auto node = NodeEngine::Open(o);
+  node->SetNodes(1, {});  // SavePartition records this node as the holder of what it holds
   node->LoadGraph(JoinPath(f.index, files::kGraph));
   for (uint32_t p = 0; p < f.num_parts; ++p)
     node->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
@@ -638,6 +646,7 @@ void TestStageVersions() {
   // A node without room for a list that long refuses the segment at load, before it changes
   // anything (here: one list grown past the build's longest, on a node at the build's limit).
   ListSegment longer = back;
+  longer.holders.clear();
   const uint64_t grow = man.max_list_len + 1 - (longer.offsets[1] - longer.offsets[0]);
   longer.ids.insert(longer.ids.begin() + longer.offsets[1], grow, longer.ids[longer.offsets[0]]);
   longer.locs.insert(longer.locs.begin() + longer.offsets[1], grow, longer.locs[longer.offsets[0]]);
@@ -867,9 +876,9 @@ void TestPQMigration() {
   CHECK(postings > d012.size());  // boundary replication: fewer codes than postings
 
   auto dst = OpenNode(f, {}, false);
-  LinkPeers(dst.get(), {{"src", src.get()}});
+  LinkPeers(dst.get(), 2, {{1, src.get()}});
   bool threw = false;
-  try {  // raw vectors missing, and no source to fetch them from
+  try {  // raw vectors missing, and no holder to fetch them from
     dst->LoadPartition(1, seg(1), PQSource::kPresent);
   } catch (const RawMissingError&) {
     threw = true;
@@ -877,7 +886,7 @@ void TestPQMigration() {
   CHECK(threw && dst->ResidentPartitions().empty() && dst->pq_stats().resident == 0);
   threw = false;
   try {
-    dst->LoadPartition(1, seg(1), PQSource::kPresent, "src");
+    dst->LoadPartition(1, seg(1), PQSource::kPresent, 0, 1);
   } catch (const PQMissingError&) {
     threw = true;
   }
@@ -892,8 +901,8 @@ void TestPQMigration() {
     CHECK(r.installed == ids.size() && r.skipped == 0);
   }
   CHECK(dst->pq_stats().staged == d12.size());
-  dst->LoadPartition(1, seg(1), PQSource::kPresent, "src");
-  dst->LoadPartition(2, seg(2), PQSource::kPresent, "src");
+  dst->LoadPartition(1, seg(1), PQSource::kPresent, 0, 1);
+  dst->LoadPartition(2, seg(2), PQSource::kPresent, 0, 1);
   st = dst->pq_stats();
   CHECK(st.resident == d12.size() && st.live == d12.size() && st.staged == 0 &&
         st.received == d12.size() && st.from_index == 0);
@@ -902,7 +911,7 @@ void TestPQMigration() {
   const auto miss0 = dst->PQMissing({{seg(0)}});
   CHECK(miss0[0].size() == d012.size() - d12.size());
   move_codes(src.get(), dst.get(), miss0[0]);
-  dst->LoadPartition(0, seg(0), PQSource::kPresent, "src");
+  dst->LoadPartition(0, seg(0), PQSource::kPresent, 0, 1);
   CHECK(dst->pq_stats().resident == d012.size());
 
   // Same PQ top-n as the source for every query (codes are addressed by slot on both nodes,
@@ -931,7 +940,7 @@ void TestPQMigration() {
         st.cached == d012.size() - d12.size());
   // Bringing partition 0 back needs no transfer at all.
   CHECK(dst->PQMissing({{seg(0)}})[0].empty());
-  dst->LoadPartition(0, seg(0), PQSource::kPresent, "src");
+  dst->LoadPartition(0, seg(0), PQSource::kPresent, 0, 1);
   st = dst->pq_stats();
   CHECK(st.live == d012.size() && st.cached == 0 && st.staged == 0 && st.received == d012.size());
   CHECK(dst->EvictPartition(0));
@@ -995,7 +1004,7 @@ void TestPQEvictUnderLoad() {
   o.direct_io = false;
   o.pq_capacity = half.size() + 200;  // about two of the four partitions fit
   auto node = NodeEngine::Open(o);
-  LinkPeers(node.get(), {{"oracle", oracle.get()}});
+  LinkPeers(node.get(), 2, {{1, oracle.get()}});
   PartitionManifest man = PartitionManifest::Load(f.parts);
   std::vector<std::vector<uint32_t>> qlists(f.nq);
   for (uint32_t qi = 0; qi < f.nq; ++qi) {
@@ -1058,7 +1067,7 @@ void TestPQEvictUnderLoad() {
         const size_t h = ids.size() / 2;
         node->PQPut(ids.data(), h, codes.data());
         node->PQPut(ids.data() + h, ids.size() - h, codes.data() + h * m);
-        node->LoadPartition(p, seg(p), PQSource::kPresent, "oracle");
+        node->LoadPartition(p, seg(p), PQSource::kPresent, 0, 1);
         stagings++;
       } else if (action < 9) {
         node->LoadPartition(p, seg(p), PQSource::kIndex);
@@ -1200,17 +1209,22 @@ void TestRawStore() {
   RawStoreManyPages(true);
 }
 
-// Stages partitions on `to` the way an agent does after a migration: the PQ codes it lacks from
-// `from`, then loads with `peer` (the name of `from`) as the source of the raw vectors.
-void StageFrom(const Fixture& f, NodeEngine* to, NodeEngine* from, const std::vector<uint32_t>& parts,
-               const std::string& peer) {
+// Stages partitions on `to` the way an agent does after a migration: `from` writes each as a
+// segment file (every posting records its current holder), `to` gets the PQ codes it lacks
+// from `from` and loads the files.
+void StageFrom(const Fixture& f, NodeEngine* to, NodeEngine* from, const std::vector<uint32_t>& parts) {
+  (void)f;
+  static int seq = 0;
   std::vector<std::string> paths;
-  for (uint32_t p : parts) paths.push_back(JoinPath(f.parts, partfiles::SegmentName(p)));
+  for (uint32_t p : parts) {
+    paths.push_back(JoinPath(TempDir(), "handoff-" + std::to_string(++seq) + ".seg"));
+    from->SavePartition(p, 0, paths.back());
+  }
   const auto miss = to->PQMissing({paths});
   std::vector<uint8_t> codes(miss[0].size() * from->pq_stats().m);
   from->PQGet(miss[0].data(), miss[0].size(), codes.data());
   to->PQPut(miss[0].data(), miss[0].size(), codes.data());
-  for (size_t i = 0; i < parts.size(); ++i) to->LoadPartition(parts[i], paths[i], PQSource::kPresent, peer);
+  for (size_t i = 0; i < parts.size(); ++i) to->LoadPartition(parts[i], paths[i], PQSource::kPresent);
 }
 
 // Filters at `at` over the query's lists of `parts`, re-ranks the top 200 at `at` and at `ref`,
@@ -1244,14 +1258,17 @@ bool SameRerank(const Fixture& f, uint32_t qi, NodeEngine* at, NodeEngine* ref,
 void TestRawMigration() {
   Fixture& f = GetFixture();
   auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
+  static const PartitionManifest man = PartitionManifest::Load(f.parts);
+  // Node IDs: src 1, dst 2, third 3, pulled 4, fourth 5, after 6, whole 7, slow 8.
   auto src = OpenNode(f, {0, 1, 2, 3}, true);
+  src->SetNodes(1, {});
   const auto locs_all = Named(f, {0, 1, 2, 3}).second;
   CHECK(src->raw_stats(true).present == locs_all.size() &&
         src->raw_stats(true).from_index == locs_all.size());
 
   auto dst = OpenNode(f, {}, false, f.index_nopages);
-  LinkPeers(dst.get(), {{"src", src.get()}});
-  StageFrom(f, dst.get(), src.get(), {2, 3}, "src");
+  LinkPeers(dst.get(), 2, {{1, src.get()}});
+  StageFrom(f, dst.get(), src.get(), {2, 3});
   const auto locs23 = Named(f, {2, 3}).second;
   RawStats rs = dst->raw_stats(true);
   CHECK(rs.present == 0 && rs.pending == locs23.size() && rs.from_index == 0);
@@ -1274,36 +1291,39 @@ void TestRawMigration() {
   CHECK(rs.fetched > 0 && rs.fetches > 0 && rs.present == rs.fetched &&
         rs.pending == locs23.size() - rs.present);
 
-  // A node that takes partition 3 from dst before dst has all its vectors: dst fetches what it
-  // lacks itself from src on the way (chained), and the answers still agree.
+  // dst hands partition 3 on before it holds all of its vectors. The segment it writes says
+  // where each one is -- dst for those it fetched, src for the others -- so third fetches each
+  // straight from its holder, and dst fetches nothing on its behalf: no chain.
   auto third = OpenNode(f, {}, false, f.index_nopages);
-  LinkPeers(third.get(), {{"dst", dst.get()}});
-  StageFrom(f, third.get(), dst.get(), {3}, "dst");
+  LinkPeers(third.get(), 3, {{1, src.get()}, {2, dst.get()}});
+  StageFrom(f, third.get(), dst.get(), {3});
   const uint64_t dst_fetched = dst->raw_stats(true).fetched;
+  const uint64_t served0 = src->raw_stats(true).served + dst->raw_stats(true).served;
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, third.get(), src.get(), {3}) && same;
-  CHECK(same && third->raw_stats(true).fetched > 0 && dst->raw_stats(true).fetched > dst_fetched);
+  const uint64_t third_fetched = third->raw_stats(true).fetched;
+  CHECK(same && third_fetched > 0 && dst->raw_stats(true).fetched == dst_fetched &&
+        src->raw_stats(true).served + dst->raw_stats(true).served - served0 == third_fetched);
 
   // What nothing needed stays missing (the lazy protocol stops here); a stream brings the rest:
-  // exactly the vectors still missing, once, each with a list that names it.
-  const auto miss = dst->RawMissing({{seg(2)}, {seg(3)}});
+  // exactly the vectors still missing, once, by holder (all src's here), each with a list of
+  // these partitions that names it.
+  const auto miss = dst->RawMissing({2, 3});
   rs = dst->raw_stats(true);
   CHECK(rs.pending > 0);
-  CHECK(miss.size() == 2 && miss[0].locs.size() + miss[1].locs.size() == locs23.size() - rs.present &&
-        miss[1].locs.size() + miss[0].locs.size() == rs.pending);
-  for (size_t g = 0; g < miss.size(); ++g)
-    for (size_t i = 0; i < miss[g].locs.size(); ++i)
-      CHECK(ListNamingLoc(f, g == 0 ? 2 : 3, miss[g].locs[i]) != kInvalidId);
-  for (const auto& m : miss) {
-    std::vector<uint8_t> v(m.locs.size() * dst->vec_bytes());
-    src->RawGet(m.locs.data(), m.lists.data(), m.locs.size(), v.data());
-    const RawPutResult pr = dst->RawPut(m.locs.data(), m.locs.size(), v.data());
-    CHECK(pr.installed == m.locs.size() && pr.skipped == 0);
+  CHECK(miss.size() == 1 && miss[0].holder == 1 && miss[0].locs.size() == locs23.size() - rs.present &&
+        miss[0].locs.size() == rs.pending);
+  for (size_t i = 0; i < miss[0].locs.size(); ++i) {
+    const uint32_t part = man.list_part[miss[0].lists[i]];
+    CHECK((part == 2 || part == 3) && ListNamingLoc(f, part, miss[0].locs[i]) != kInvalidId);
   }
+  std::vector<uint8_t> v(miss[0].locs.size() * dst->vec_bytes());
+  src->RawGet(miss[0].locs.data(), miss[0].locs.size(), v.data());
+  const RawPutResult pr = dst->RawPut(miss[0].locs.data(), miss[0].locs.size(), v.data());
+  CHECK(pr.installed == miss[0].locs.size() && pr.skipped == 0);
   rs = dst->raw_stats(true);
-  CHECK(rs.present == locs23.size() && rs.pending == 0 &&
-        rs.streamed == miss[0].locs.size() + miss[1].locs.size());
-  CHECK(dst->RawMissing({{seg(2), seg(3)}})[0].locs.empty());
+  CHECK(rs.present == locs23.size() && rs.pending == 0 && rs.streamed == miss[0].locs.size());
+  CHECK(dst->RawMissing({2, 3}).empty());
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, dst.get(), src.get(), {2, 3}) && same;
   CHECK(same && dst->raw_stats(true).fetched == rs.fetched);  // nothing left to fetch
@@ -1312,50 +1332,77 @@ void TestRawMigration() {
   // vectors it lacks, installed as streamed and not as fetched on demand; a second pull brings
   // nothing.
   auto pulled = OpenNode(f, {}, false, f.index_nopages);
-  LinkPeers(pulled.get(), {{"src", src.get()}});
-  StageFrom(f, pulled.get(), src.get(), {2, 3}, "src");
-  const auto want = pulled->RawMissing({{seg(2)}, {seg(3)}});
+  LinkPeers(pulled.get(), 4, {{1, src.get()}});
+  StageFrom(f, pulled.get(), src.get(), {2, 3});
+  const auto want = pulled->RawMissing({2, 3});
   uint64_t got = 0;
   for (const auto& m : want) {
-    const RawPutResult pr = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
-    CHECK(pr.installed + pr.skipped == m.locs.size());
-    got += pr.installed;
+    const RawPutResult r = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
+    CHECK(r.installed + r.skipped == m.locs.size());
+    got += r.installed;
   }
   RawStats ps = pulled->raw_stats(true);
   CHECK(got == locs23.size() && ps.present == got && ps.streamed == got && ps.fetched == 0 &&
         ps.fetches == 0 && ps.pending == 0);
   for (const auto& m : want) {
-    const RawPutResult pr = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
-    CHECK(pr.installed == 0 && pr.skipped == m.locs.size());
+    const RawPutResult r = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
+    CHECK(r.installed == 0 && r.skipped == m.locs.size());
   }
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, pulled.get(), src.get(), {2, 3}) && same;
   CHECK(same && pulled->raw_stats(true).fetched == 0);
 
-  // Chains as RERANK's fetches do: pulling partition 3 from `third`, which holds only the vectors
-  // its queries fetched, brings them all -- third fetches what it lacks from dst on the way.
+  // Partition 3 moves on from third (src -> dst -> third -> fourth): third's segment records
+  // third, dst or src for every posting, and fourth pulls each vector from that node; third
+  // fetches nothing on the way.
   auto fourth = OpenNode(f, {}, false, f.index_nopages);
-  LinkPeers(fourth.get(), {{"third", third.get()}});
-  StageFrom(f, fourth.get(), third.get(), {3}, "third");
-  const auto want3 = fourth->RawMissing({{seg(3)}});
-  const uint64_t third_fetched = third->raw_stats(true).fetched;
-  CHECK(third->raw_stats(true).pending > 0);
-  const RawPutResult p3 = fourth->RawPull(want3[0].locs.data(), want3[0].lists.data(), want3[0].locs.size());
-  CHECK(p3.installed == want3[0].locs.size() && fourth->RawMissing({{seg(3)}})[0].locs.empty() &&
-        third->raw_stats(true).fetched > third_fetched);
+  LinkPeers(fourth.get(), 5, {{1, src.get()}, {2, dst.get()}, {3, third.get()}});
+  StageFrom(f, fourth.get(), third.get(), {3});
+  const auto want3 = fourth->RawMissing({3});
+  std::set<uint16_t> holders;
+  uint64_t need3 = 0, got3 = 0;
+  for (const auto& m : want3) {
+    holders.insert(m.holder);
+    need3 += m.locs.size();
+    got3 += fourth->RawPull(m.locs.data(), m.lists.data(), m.locs.size()).installed;
+  }
+  CHECK(holders.count(3) && holders.count(1) && got3 == need3 && fourth->RawMissing({3}).empty() &&
+        third->raw_stats(true).fetched == third_fetched);
+
+  // Before a node leaves, the nodes whose postings name it drain it. `after` takes partition 3
+  // from third without fetching anything, so its postings name third for what third holds.
+  // RawHeldBy(3) lists those; once they are pulled from third, a second call only repoints the
+  // postings of other lists that name the same vectors, and then nothing names third: with
+  // third gone, every answer still comes out the same.
+  auto after = OpenNode(f, {}, false, f.index_nopages);
+  LinkPeers(after.get(), 6, {{1, src.get()}, {2, dst.get()}, {3, third.get()}});
+  StageFrom(f, after.get(), third.get(), {3});
+  HeldBy hb = after->RawHeldBy(3);
+  CHECK(hb.repointed == 0 && hb.missing.holder == 3 && hb.missing.locs.size() == third_fetched);
+  CHECK(after->RawPull(hb.missing.locs.data(), hb.missing.lists.data(), hb.missing.locs.size()).installed ==
+        third_fetched);
+  hb = after->RawHeldBy(3);
+  CHECK(hb.missing.locs.empty());
+  CHECK(after->RawHeldBy(3).repointed == 0 && after->RawHeldBy(3).missing.locs.empty());
+  LinkPeers(after.get(), 6, {{1, src.get()}, {2, dst.get()}});  // third is gone
+  third.reset();
+  same = true;
+  for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, after.get(), src.get(), {3}) && same;
+  CHECK(same);
 
   // A partition that moves away leaves its vectors (a cache, like its PQ codes): it comes back
-  // with nothing to transfer, and no source is needed.
+  // with nothing to transfer, and no holder is needed.
   CHECK(dst->EvictPartition(2));
-  CHECK(dst->raw_stats(true).present == locs23.size() && dst->RawMissing({{seg(2)}})[0].locs.empty());
+  CHECK(dst->raw_stats(true).present == locs23.size());
   dst->LoadPartition(2, seg(2), PQSource::kPresent);
-  CHECK(dst->ResidentPartitions().size() == 2 && dst->raw_stats(true).pending == 0);
+  CHECK(dst->ResidentPartitions().size() == 2 && dst->raw_stats(true).pending == 0 &&
+        dst->RawMissing({2}).empty());
 
   // The whole pipeline on a node that holds every partition but no vector yet: SearchLocal
   // fetches before re-ranking and returns the single-node answer.
   auto whole = OpenNode(f, {}, true, f.index_nopages);
-  LinkPeers(whole.get(), {{"src", src.get()}});
-  StageFrom(f, whole.get(), src.get(), {0, 1, 2, 3}, "src");
+  LinkPeers(whole.get(), 7, {{1, src.get()}});
+  StageFrom(f, whole.get(), src.get(), {0, 1, 2, 3});
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) {
     SearchParams sp;
@@ -1372,6 +1419,40 @@ void TestRawMigration() {
     same = same && na == nb && ia == ib && da == db;
   }
   CHECK(same && whole->raw_stats(true).fetched > 0 && whole->raw_stats(true).fetched == whole->raw_stats(true).present);
+
+  // Two queries that miss the same vectors at once: one fetches them, the other waits for that
+  // fetch, and the holder serves each vector once.
+  auto slow = OpenNode(f, {}, false, f.index_nopages);
+  slow->SetNodes(8, {{1, "node-1"}});
+  slow->SetRawFetcher([&](const std::string&, const uint32_t* locs, size_t n, uint8_t* out) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    src->RawGet(locs, n, out);
+  });
+  StageFrom(f, slow.get(), src.get(), {2, 3});
+  const float* q = &f.queries[0];
+  std::vector<uint32_t> lists(16), mine;
+  const uint32_t nl = src->Navigate(q, 16, 0, lists.data());
+  for (uint32_t i = 0; i < nl; ++i)
+    if (man.list_part[lists[i]] >= 2) mine.push_back(lists[i]);
+  std::vector<uint32_t> cand(200);
+  std::vector<float> pqd(200);
+  FilterStats fs;
+  const uint32_t nc = slow->Filter(0, q, mine.data(), nullptr, static_cast<uint32_t>(mine.size()), 200,
+                                   cand.data(), pqd.data(), &fs);
+  CHECK(nc > 0);
+  const uint64_t served1 = src->raw_stats(true).served;
+  std::vector<uint32_t> ra(10), rb(10);
+  std::vector<float> da(10), db(10);
+  RerankStats sa, sb;
+  std::thread other([&] {
+    slow->Rerank(1, q, cand.data(), nc, 10, mine.data(), nullptr, static_cast<uint32_t>(mine.size()),
+                 rb.data(), db.data(), &sb);
+  });
+  slow->Rerank(0, q, cand.data(), nc, 10, mine.data(), nullptr, static_cast<uint32_t>(mine.size()), ra.data(),
+               da.data(), &sa);
+  other.join();
+  CHECK(ra == rb && da == db && slow->fetch_stats().coalesced > 0 &&
+        src->raw_stats(true).served - served1 == slow->raw_stats(true).fetched);
 }
 
 // Drops a file's pages from the page cache; false where that is not possible (tmpfs keeps a
@@ -1545,38 +1626,66 @@ void TestWire() {
   std::vector<uint32_t> ids0 = ListSegment::Load(seg0).ids;
   std::sort(ids0.begin(), ids0.end());
   ids0.erase(std::unique(ids0.begin(), ids0.end()), ids0.end());
-  auto load0 = [&](uint8_t pq_source, const std::string& raw_peer) {
+  auto load0 = [&](uint8_t pq_source, const std::string& path) {
     rtier::BodyWriter w;
     w.Put<uint32_t>(0);  // partition
     w.Put<uint32_t>(0);  // version
     w.Put<uint8_t>(pq_source);
-    w.Put<uint32_t>(static_cast<uint32_t>(raw_peer.size()));
-    w.PutBytes(raw_peer.data(), raw_peer.size());
-    w.PutBytes(seg0.data(), seg0.size());
+    w.PutBytes(path.data(), path.size());
+    return w;
+  };
+  auto set_nodes = [](uint16_t self, const std::vector<std::pair<uint16_t, std::string>>& peers) {
+    rtier::BodyWriter w;
+    w.Put<uint16_t>(self);
+    w.Put<uint16_t>(0);
+    w.Put<uint32_t>(static_cast<uint32_t>(peers.size()));
+    for (const auto& kv : peers) {
+      w.Put<uint16_t>(kv.first);
+      w.Put<uint16_t>(0);
+      w.Put<uint32_t>(static_cast<uint32_t>(kv.second.size()));
+      w.PutBytes(kv.second.data(), kv.second.size());
+    }
     return w;
   };
   // The codes and vectors are still here: partition 0 loads again without any transfer.
-  r = Call(fd, rtier::kLoadPartition, load0(0, ""), 6);
+  r = Call(fd, rtier::kLoadPartition, load0(0, seg0), 6);
   CHECK(r.status == rtier::kOk && e->pq_stats().live == ids0.size());
 
-  // A node without the codes or vectors (and without the index's pages): with no source for
-  // the vectors the load is refused; with one, the load reports the codes absent; PQ_MISSING
-  // lists them and PQ_PUT installs them (as a peer would send them); then the load succeeds.
+  // The hand-off: this node is node 1 (SET_NODES) and writes partition 0 as a segment that
+  // records, for every posting, the node holding its vector -- itself (SAVE_PARTITION).
+  r = Call(fd, rtier::kSetNodes, set_nodes(1, {}), 58);
+  CHECK(r.status == rtier::kOk);
+  const std::string saved0 = JoinPath(TempDir(), "wire-part0.seg");
+  rtier::BodyWriter save;
+  save.Put<uint32_t>(0);
+  save.Put<uint32_t>(0);
+  save.PutBytes(saved0.data(), saved0.size());
+  r = Call(fd, rtier::kSavePartition, save, 57);
+  const ListSegment s0 = ListSegment::Load(saved0);
+  CHECK(r.status == rtier::kOk && s0.holders.size() == s0.ids.size() &&
+        std::all_of(s0.holders.begin(), s0.holders.end(), [](uint16_t h) { return h == 1; }));
+
+  // A node without the codes or vectors (and without the index's pages): the build's segment,
+  // which records no holder, is refused (the vectors could not be fetched); the saved one
+  // reports the codes absent; PQ_MISSING lists them and PQ_PUT installs them (as a peer would
+  // send them); then the load succeeds.
   const std::string peer1 = "127.0.0.1:" + std::to_string(port);
   auto fresh = OpenNode(f, {}, false, f.index_nopages);
   rtier::NodeServer server2(fresh.get());
   const int port2 = server2.ListenTcp("127.0.0.1", 0);
   std::thread serve2([&] { server2.Serve(); });
   const int fd2 = Connect(port2);
-  r = Call(fd2, rtier::kLoadPartition, load0(0, ""), 59);
+  r = Call(fd2, rtier::kSetNodes, set_nodes(2, {{1, peer1}}), 56);
+  CHECK(r.status == rtier::kOk);
+  r = Call(fd2, rtier::kLoadPartition, load0(0, seg0), 59);
   CHECK(r.status == rtier::kRawAbsent);
-  r = Call(fd2, rtier::kLoadPartition, load0(0, peer1), 60);
+  r = Call(fd2, rtier::kLoadPartition, load0(0, saved0), 60);
   CHECK(r.status == rtier::kPQAbsent);
   rtier::BodyWriter miss;
   miss.Put<uint32_t>(1);
   miss.Put<uint32_t>(1);
-  miss.Put<uint32_t>(static_cast<uint32_t>(seg0.size()));
-  miss.PutBytes(seg0.data(), seg0.size());
+  miss.Put<uint32_t>(static_cast<uint32_t>(saved0.size()));
+  miss.PutBytes(saved0.data(), saved0.size());
   r = Call(fd2, rtier::kPQMissing, miss, 61);
   CHECK(r.status == rtier::kOk);
   rtier::BodyReader mr(r.body.data(), r.body.size());
@@ -1604,7 +1713,7 @@ void TestWire() {
   r = Call(fd2, rtier::kPQGet, get, 63);
   CHECK(r.status == rtier::kOk && r.body.size() == 4 + codes.size());
   CHECK(std::memcmp(r.body.data() + 4, codes.data(), codes.size()) == 0);
-  r = Call(fd2, rtier::kLoadPartition, load0(0, peer1), 64);
+  r = Call(fd2, rtier::kLoadPartition, load0(0, saved0), 64);
   CHECK(r.status == rtier::kOk);
   st = fresh->pq_stats();
   CHECK(st.live == ids0.size() && st.staged == 0 && st.received == ids0.size());
@@ -1637,18 +1746,17 @@ void TestWire() {
   CHECK(fresh->raw_stats(true).fetches == 1 && e->raw_stats(true).served >= fetched2);
   CHECK(rerank(fd2, 72, &fetched3) == want && fetched3 == 0);
 
-  // The stream: RAW_MISSING lists what is still missing, RAW_GET reads it from the first node,
-  // RAW_PUT installs it.
+  // The stream: RAW_MISSING lists what is still missing, by holder (node 1 here), RAW_GET
+  // reads it from the first node, RAW_PUT installs it.
   const std::vector<uint32_t> locs0 = Named(f, {0}).second;
   rtier::BodyWriter rmiss;
   rmiss.Put<uint32_t>(1);
-  rmiss.Put<uint32_t>(1);
-  rmiss.Put<uint32_t>(static_cast<uint32_t>(seg0.size()));
-  rmiss.PutBytes(seg0.data(), seg0.size());
+  rmiss.Put<uint32_t>(0);  // partition 0
   r = Call(fd2, rtier::kRawMissing, rmiss, 73);
   CHECK(r.status == rtier::kOk);
   rtier::BodyReader rr(r.body.data(), r.body.size());
-  CHECK(rr.Get<uint32_t>() == 1);
+  CHECK(rr.Get<uint32_t>() == 1 && rr.Get<uint16_t>() == 1);
+  rr.Get<uint16_t>();
   const uint32_t nraw = rr.Get<uint32_t>();
   CHECK(nraw == locs0.size() - fetched2 && rr.remaining() == nraw * 8u);
   std::vector<uint32_t> rlocs(nraw), rlists(nraw);
@@ -1669,7 +1777,6 @@ void TestWire() {
   rtier::BodyWriter rget;
   rget.Put<uint32_t>(rest);
   rget.PutBytes(rlocs.data() + half, rest * 4u);
-  rget.PutBytes(rlists.data() + half, rest * 4u);
   r = Call(fd, rtier::kRawGet, rget, 74);
   const uint32_t vb = fresh->vec_bytes();
   CHECK(r.status == rtier::kOk && r.body.size() == 4 + static_cast<size_t>(rest) * vb);
@@ -1694,14 +1801,25 @@ void TestWire() {
   uint32_t other = kInvalidId;
   for (uint32_t l : locs3)
     if (!std::binary_search(locs0.begin(), locs0.end(), l)) other = l;
-  rtier::BodyWriter rget2;  // its list's partition never loaded here: the list has no source
+  rtier::BodyWriter rget2;  // RAW_GET serves only what is here: there is no chain to follow
   rget2.Put<uint32_t>(1);
   rget2.Put<uint32_t>(other);
-  rget2.Put<uint32_t>(ListNamingLoc(f, 3, other));
   r = Call(fd2, rtier::kRawGet, rget2, 76);
   CHECK(other != kInvalidId && r.status == rtier::kRawAbsent);
-  r = Call(fd2, rtier::kRawPull, rget2, 80);  // nor pulled
-  CHECK(r.status == rtier::kRawAbsent);
+  rtier::BodyWriter rpull2;  // nor pulled: its list's partition is not here
+  rpull2.Put<uint32_t>(1);
+  rpull2.Put<uint32_t>(other);
+  rpull2.Put<uint32_t>(ListNamingLoc(f, 3, other));
+  r = Call(fd2, rtier::kRawPull, rpull2, 80);
+  CHECK(r.status == rtier::kNotResident);
+  // RAW_HELD_BY before node 1 leaves: every posting naming it has its vector here now.
+  rtier::BodyWriter held;
+  held.Put<uint16_t>(1);
+  held.Put<uint16_t>(0);
+  r = Call(fd2, rtier::kRawHeldBy, held, 81);
+  CHECK(r.status == rtier::kOk && r.body.size() == 12);
+  rtier::BodyReader hr(r.body.data(), r.body.size());
+  CHECK(hr.Get<uint64_t>() > 0 && hr.Get<uint32_t>() == 0);
   // RAW_CHECK: of these, the ones not here.
   rtier::BodyWriter check;
   check.Put<uint32_t>(3);

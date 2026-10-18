@@ -47,20 +47,23 @@ locations existed (payload `lists-only`) are refused: rerun `rtier_segment`.
 **Raw vectors after a migration (decided part of U9):** a new owner goes online with posting
 lists and PQ codes only -- all it needs to filter -- and gets a raw vector only when a query first
 needs it (`"protocol": "lazy"`, the default): the point of being lazy is that queries touch a
-small working set of what moved, and the rest never has to. From the flip on, a RERANK that meets
-a vector not there fetches it from the partition's old owner, data node to data node, and waits
-for it -- for the fetch only: fetched vectors are re-ranked from memory, and a background writer
-installs them on the SSD with whole-page direct writes, off the query path. The data node keeps one source per posting list -- the old owner of the list's partition
--- so any list that names a missing vector says where to fetch it: lists overlap, no per-vector
-table. RERANK requests carry the query's lists on that owner for this, and a peer's RAW_GET
-names the list of every vector, so a node asked for one it lacks fetches it from its own source
-of that list first (chains of migrations). Nothing else moves and the rescale does not wait for
-raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it ran, and
-each node reports `raw.fetched` (installed or still in memory), `raw.pending` (named by its
-partitions, not needed so far) and `raw.present` in its metrics. That old owners stay sources rests on three invariants: no node
-drops a raw vector it has held, the nodes that leave are the ones that joined last, and a
-scale-in returns partitions to nodes that held them (U3); a disk budget or another leave order
-would need a hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
+small working set of what moved, and the rest never has to. Every posting records the holder of
+its vector, the node that stores it (segment version 3), so each (list, vector) has one current
+holder: the list's owner if it has the vector, else the node its posting names. Only the owner's
+copy of a list counts: a partition moves as its owner saves it, holders included. From the flip
+on, a RERANK that meets a vector not there fetches it from the holder that one of the query's
+lists on that node records -- one hop, data node to data node -- waits for that fetch only, and
+makes that posting name itself; queries that miss the same vector meanwhile wait for the one
+fetch. Fetched vectors are re-ranked from memory, and a background writer installs them on the
+SSD with whole-page direct writes, off the query path. Nothing else moves and a scale-out does
+not wait for raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it
+ran, and each node reports `raw.fetched` (installed or still in memory), `raw.pending` (named by
+its partitions, not needed so far) and `raw.present` in its metrics. A scale-in does stream:
+before it returns, each remaining node takes over the vectors that its postings say only a
+leaving node holds (the drain; `drain_vectors` and `drain_seconds` in the reply), so the nodes
+that leave can go offline -- lazy fetches as little as possible, it does not forbid fetching.
+Holders stay valid because no node drops a raw vector it has held; a disk budget would need the
+same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
 (`StageRaw`, `"raw_priority": "background"` by default; the rescale waits for it and reports
 `raw_vectors` / `raw_seconds`), `"copy-then-flip"` streams them before the flip, `"stop-and-copy"`
 while paused.
@@ -148,12 +151,12 @@ nodes carry it out:
 
 A failed staging is undone before the lease is given up, and a commit that fails before the flip
 drops what was staged. A partition at a later version moves with its current lists: its owner
-writes them as a segment file when it moves. One cost of `lazy`: a scale-in that returns a
-partition after batches changed it leaves the vectors inserted meanwhile on the node that leaves,
-which then has to keep running (the rescale reply warns). Not there yet: splits and merges in
-major epochs with a rebuilt graph, the health check that triggers them, growing the ID and
-location spaces, a response to a batch over budget (it fails before anything is sent), and a log
-to replay batches from. `test/e2e/update_test.go` checks every answer against an oracle that
+writes them as a segment file when it moves. With `lazy`, a vector inserted into a partition
+stays with the owner that added it when the partition moves on (the postings name that node as
+its holder), and a scale-in that removes the node drains it first. Not there yet: splits and
+merges in major epochs with a rebuilt graph, the health check that triggers them, growing the ID
+and location spaces, a response to a batch over budget (it fails before anything is sent), and a
+log to replay batches from. `test/e2e/update_test.go` checks every answer against an oracle that
 applies the same decisions, across batches, a failed batch and rescales.
 
 ## Layout

@@ -449,6 +449,53 @@ func (cl *cluster) close() {
 	}
 }
 
+// stopDataNode stops the rtier_node of a node that left, as an operator would once its
+// reconfiguration returned (its agent stays registered, idle).
+func (cl *cluster) stopDataNode(a *agent.Agent) {
+	cl.t.Helper()
+	for i, x := range cl.agents {
+		if x != a {
+			continue
+		}
+		if err := cl.stops[i](); err != nil {
+			cl.t.Error(err)
+		}
+		cl.stops[i] = func() error { return nil }
+		return
+	}
+	cl.t.Fatalf("no data node for agent %s", a.Info().Name)
+}
+
+// exactPass sends every query of the fixture once, to the current entries in turn, and checks
+// each answer against answers (nil: the answers of the epoch it ran in, cluster.expected).
+func exactPass(t *testing.T, cl *cluster, answers [][]nodeclient.Candidate) {
+	t.Helper()
+	tbl := cl.ctl.Status().Table
+	clients := map[string]*query.Client{}
+	for qi := 0; qi < numQueries; qi++ {
+		addr := tbl.Nodes[tbl.Entries[qi%len(tbl.Entries)]].QueryAddr
+		c, ok := clients[addr]
+		if !ok {
+			c = query.NewClient(addr, 1)
+			clients[addr] = c
+		}
+		ctx, cancel := context.WithTimeout(cl.ctx, 10*time.Second)
+		res, err := c.Query(ctx, &query.Request{Vec: cl.f.queries.Row(qi),
+			Params: query.Params{K: testK, NProbe: testNProbe, N: maxRerank}})
+		cancel()
+		if err != nil {
+			t.Fatalf("query %d at %s: %v", qi, addr, err)
+		}
+		want := cl.expected(res.Epoch, qi)
+		if answers != nil {
+			want = answers[qi]
+		}
+		if !equal(res.Candidates, want) {
+			t.Fatalf("query %d at %s in epoch %d: got %v, want %v", qi, addr, res.Epoch, res.Candidates, want)
+		}
+	}
+}
+
 func (cl *cluster) entryClients() []*query.Client {
 	st := cl.ctl.Status()
 	var out []*query.Client

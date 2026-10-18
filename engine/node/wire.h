@@ -24,12 +24,12 @@
 //                   request are on the SSD (tests); without it INFO waits for nothing
 //   LOAD_GRAPH      path                                      -> -
 //   LOAD_PARTITION  u32 partition, u32 version, u8 pq_source, -> -
-//                   str raw_peer, path
+//                   path
 //                   loads (or replaces) that version of the partition; its other versions stay
 //                   pq_source 0: every PQ code must already be on the node (PQ_PUT); raw
-//                                vectors not here are fetched from raw_peer (a data node,
-//                                "host:port", the source of the partition's lists) when a
-//                                query needs them
+//                                vectors not here are fetched, when a query needs them, from
+//                                the holder each posting records (a segment saved at a
+//                                hand-off records one for every posting)
 //                             1: bootstrap: copy the missing codes and raw vectors from the index
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
 //                                                                version is evicted)
@@ -40,19 +40,28 @@
 //   PQ_PUT          u32 n, u32 m, u32 ids[n], u8 codes[n * m] -> u32 installed, u32 skipped
 //   PQ_RELEASE      -                                         -> u64 freed (a staging that did
 //                                                                not load: its new codes)
-//   RAW_MISSING     u32 groups, per group: u32 paths,         -> u32 groups, per group:
-//                   str path[paths] (segment files)              u32 n, u32 locs[n], u32 lists[n]
-//                                                                (a list naming each location)
-//   RAW_GET         u32 n, u32 locs[n], u32 lists[n]          -> u32 vec_bytes, u8 vecs[n * vb]
-//                   (lists[i] names locs[i]; a vector not here is fetched from that list's
-//                   source on this node first: chained migrations)
+//   RAW_MISSING     u32 n, u32 partitions[n] (resident)       -> u32 groups, per group: u16 holder,
+//                                                                u16 pad, u32 n, u32 locs[n],
+//                                                                u32 lists[n] (a list naming each)
+//                   (the vectors their newest versions name that are not here, by holder)
+//   RAW_HELD_BY     u16 holder, u16 pad                       -> u64 repointed, u32 n, u32 locs[n],
+//                                                                u32 lists[n]
+//                   (before that node leaves: postings naming it whose vector is here now name
+//                   this node; the others are returned, to be pulled with RAW_PULL)
+//   RAW_GET         u32 n, u32 locs[n]                        -> u32 vec_bytes, u8 vecs[n * vb]
+//                   (from this node's own store: a peer asks the holder, there is no chain)
 //   RAW_PUT         u32 n, u32 vec_bytes, u32 locs[n],        -> u32 installed, u32 skipped
 //                   u8 vecs[n * vec_bytes]
 //   RAW_CHECK       u32 n, u32 locs[n]                        -> u32 m, u32 locs[m] (those not
 //                                                                here, sorted, unique)
 //   RAW_PULL        u32 n, u32 locs[n], u32 lists[n]          -> u32 installed, u32 skipped
-//                   (the node fetches what it lacks from the lists' sources with RAW_GET and
-//                   installs it: a stream that does not pass through the agents)
+//                   (the node fetches what it lacks from the holders its postings in those
+//                   lists record, with RAW_GET, and installs it: a stream that does not pass
+//                   through the agents; those postings then name this node)
+//   SET_NODES       u16 self, u16 pad, u32 n,                 -> -
+//                   (u16 id, u16 pad, str addr)[n]
+//                   (this node's cluster ID, 0 = unchanged, and other data nodes' addresses:
+//                   where the holders that postings record are)
 //   RAW_ADD         u32 n, u32 vec_bytes, u32 locs[n],        -> u32 installed, u32 skipped
 //                   u8 vecs[n * vec_bytes]
 //                   (inserted vectors, U14: served from memory at once, written to the SSD in
@@ -68,7 +77,7 @@
 //                   u32 lists[nlists], u32 versions[nlists],     u32 pages_read, u32 fetched
 //                   query
 //                   (lists: the query's lists on this node, at their versions; a missing raw
-//                   vector is fetched from the source of one of them that names it)
+//                   vector is fetched from the holder that a posting among them records)
 //   SEARCH_LOCAL    u32 k, u32 nprobe, u32 rerank, u32 ef,    -> u32 n, u32 ids[n], f32 dists[n]
 //                   u8 heuristic, u8[3] pad, query
 //   ASSIGN          u32 n, vectors[n]                         -> u32 r, u32 m, u32 lists[n * r],
@@ -133,6 +142,8 @@ enum Op : uint8_t {
   kDropVersion = 0x31,
   kForget = 0x32,
   kSavePartition = 0x33,
+  kSetNodes = 0x34,
+  kRawHeldBy = 0x35,
 };
 
 enum Status : uint16_t {
