@@ -42,7 +42,7 @@ func TestPartitionVersions(t *testing.T) {
 	}
 
 	q := f.queries.Row(0)
-	all, err := nc.Navigate(ctx, 1, q, testNProbe, 0)
+	all, err := nc.Navigate(ctx, 1, nodeclient.NewestGraph, q, testNProbe, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

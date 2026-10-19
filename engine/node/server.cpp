@@ -117,12 +117,21 @@ const char* OpName(uint8_t op) {
     case kRerank: return "rerank";
     case kSearchLocal: return "search_local";
     case kAssign: return "assign";
+    case kSplitList: return "split_list";
+    case kNearestHeads: return "nearest_heads";
+    case kEditGraph: return "edit_graph";
     case kStageVersions: return "stage_versions";
     case kDropVersion: return "drop_version";
     case kForget: return "forget";
     case kSavePartition: return "save_partition";
     case kSetNodes: return "set_nodes";
     case kRawHeldBy: return "raw_held_by";
+    case kListGet: return "list_get";
+    case kPatchStage: return "patch_stage";
+    case kPatchLoad: return "patch_load";
+    case kPatchMerge: return "patch_merge";
+    case kPatchDrop: return "patch_drop";
+    case kPatchSave: return "patch_save";
     default: return nullptr;
   }
 }
@@ -597,10 +606,11 @@ Frame NodeServer::Handle(const Frame& req) {
       case kNavigate: {
         const uint32_t nprobe = r.Get<uint32_t>();
         const uint32_t ef = r.Get<uint32_t>();
+        const uint32_t graph = r.Get<uint32_t>();
         Require(nprobe >= 1 && nprobe <= o.max_nprobe, "nprobe out of range");
         const auto q = TakeQuery(&r, e);
         std::vector<uint32_t> lists(nprobe);
-        const uint32_t n = e.Navigate(q.data(), nprobe, ef, lists.data());
+        const uint32_t n = e.Navigate(q.data(), nprobe, ef, lists.data(), graph);
         w.Put(n);
         w.PutBytes(lists.data(), n * 4);
         break;
@@ -678,14 +688,38 @@ Frame NodeServer::Handle(const Frame& req) {
           vs.next = r.Get<uint32_t>();
         }
         const uint32_t na = r.Get<uint32_t>();
-        Require(static_cast<uint64_t>(na) * 12 <= r.remaining(), "STAGE_VERSIONS: postings truncated");
+        Require(static_cast<uint64_t>(na) * 14 <= r.remaining(), "STAGE_VERSIONS: postings truncated");
         const auto lists = TakeArray<uint32_t>(&r, na);
         const auto ids = TakeArray<uint32_t>(&r, na);
         const auto locs = TakeArray<uint32_t>(&r, na);
+        const auto holders = TakeArray<uint16_t>(&r, na);
         const uint32_t nd = r.Get<uint32_t>();
-        Require(static_cast<uint64_t>(nd) * 4 == r.remaining(), "STAGE_VERSIONS: deleted IDs do not match");
+        Require(static_cast<uint64_t>(nd) * 4 <= r.remaining(), "STAGE_VERSIONS: deleted IDs truncated");
         const auto del = TakeArray<uint32_t>(&r, nd);
-        const auto res = e.StageVersions(parts, lists.data(), ids.data(), locs.data(), na, del.data(), nd);
+        const uint32_t nc = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(nc) * 8 <= r.remaining(), "STAGE_VERSIONS: created lists truncated");
+        std::vector<uint32_t> created(nc), created_parts(nc);
+        for (uint32_t i = 0; i < nc; ++i) {
+          created[i] = r.Get<uint32_t>();
+          created_parts[i] = r.Get<uint32_t>();
+        }
+        const uint32_t nr = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(nr) * 4 == r.remaining(), "STAGE_VERSIONS: removed lists do not match");
+        const auto removed = TakeArray<uint32_t>(&r, nr);
+        fusion::VersionEdits ed;
+        ed.lists = lists.data();
+        ed.ids = ids.data();
+        ed.locs = locs.data();
+        ed.holders = holders.data();
+        ed.nadds = na;
+        ed.deleted = del.data();
+        ed.ndeleted = nd;
+        ed.created = created.data();
+        ed.created_parts = created_parts.data();
+        ed.ncreated = nc;
+        ed.removed = removed.data();
+        ed.nremoved = nr;
+        const auto res = e.StageVersions(parts, ed);
         w.Put<uint32_t>(static_cast<uint32_t>(res.size()));
         for (const auto& x : res) {
           w.Put<uint32_t>(x.partition);
@@ -695,7 +729,83 @@ Frame NodeServer::Handle(const Frame& req) {
           w.Put<uint8_t>(0);
           w.Put<uint32_t>(static_cast<uint32_t>(x.added));
           w.Put<uint32_t>(static_cast<uint32_t>(x.removed));
+          w.Put<uint32_t>(static_cast<uint32_t>(x.lengths.size()));
+          for (const auto& l : x.lengths) {
+            w.Put<uint32_t>(l.first);
+            w.Put<uint32_t>(l.second);
+          }
         }
+        break;
+      }
+      case kListGet: {
+        const uint32_t list = r.Get<uint32_t>();
+        const uint32_t version = r.Get<uint32_t>();
+        const fusion::ListPostings lp = e.GetList(list, version);
+        w.Put<uint32_t>(static_cast<uint32_t>(lp.ids.size()));
+        w.PutBytes(lp.ids.data(), lp.ids.size() * 4);
+        w.PutBytes(lp.locs.data(), lp.locs.size() * 4);
+        w.PutBytes(lp.holders.data(), lp.holders.size() * 2);
+        break;
+      }
+      case kPatchStage: {
+        const size_t n = r.remaining();
+        e.StageGraphPatch(r.Bytes(n), n);
+        break;
+      }
+      case kPatchLoad: {
+        const std::vector<uint8_t> b = fusion::ReadFile(r.Rest());
+        e.StageGraphPatch(b.data(), b.size());
+        break;
+      }
+      case kPatchMerge:
+        e.MergeGraphPatch(r.Get<uint32_t>());
+        break;
+      case kPatchDrop:
+        w.Put<uint8_t>(e.DropGraphPatch(r.Get<uint32_t>()) ? 1 : 0);
+        break;
+      case kPatchSave: {
+        const uint32_t v = r.Get<uint32_t>();
+        e.SaveGraphPatch(v, r.Rest());
+        break;
+      }
+      case kSplitList: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        Require(m == e.pq_m(), "SPLIT_LIST: codes of the wrong size");
+        Require(static_cast<uint64_t>(n) * m == r.remaining(), "SPLIT_LIST: body is not n codes");
+        std::vector<uint8_t> side(n);
+        uint32_t heads[2] = {0, 0};
+        e.SplitCodes(r.Bytes(static_cast<size_t>(n) * m), n, side.data(), heads);
+        w.Put<uint32_t>(heads[0]);
+        w.Put<uint32_t>(heads[1]);
+        w.PutBytes(side.data(), side.size());
+        break;
+      }
+      case kNearestHeads: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        const uint32_t ef = r.Get<uint32_t>();
+        Require(m == e.pq_m(), "NEAREST_HEADS: codes of the wrong size");
+        Require(static_cast<uint64_t>(n) * m == r.remaining(), "NEAREST_HEADS: body is not n codes");
+        std::vector<uint32_t> lists(n);
+        e.NearestHeads(r.Bytes(static_cast<size_t>(n) * m), n, ef, lists.data());
+        w.PutBytes(lists.data(), lists.size() * 4);
+        break;
+      }
+      case kEditGraph: {
+        const uint32_t version = r.Get<uint32_t>();
+        const uint32_t nn = r.Get<uint32_t>();
+        const size_t qb = static_cast<size_t>(e.dim()) * fusion::DTypeSize(e.dtype());
+        Require(static_cast<uint64_t>(nn) * (4 + qb) <= r.remaining(), "EDIT_GRAPH: heads truncated");
+        const auto labels = TakeArray<uint32_t>(&r, nn);
+        std::vector<uint64_t> vecs((static_cast<size_t>(nn) * qb + 7) / 8);
+        if (nn) std::memcpy(vecs.data(), r.Bytes(static_cast<size_t>(nn) * qb), static_cast<size_t>(nn) * qb);
+        const uint32_t nd = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(nd) * 4 == r.remaining(), "EDIT_GRAPH: deleted heads do not match");
+        const auto del = TakeArray<uint32_t>(&r, nd);
+        const std::vector<uint8_t> patch = e.EditGraph(version, labels.data(), vecs.data(), nn, del.data(), nd);
+        Require(patch.size() <= kMaxFrameBytes - 64, "EDIT_GRAPH: the patch does not fit in a frame");
+        w.PutBytes(patch.data(), patch.size());
         break;
       }
       case kDropVersion: {
@@ -778,12 +888,12 @@ std::string NodeServer::InfoJson(bool settle) const {
   s += fusion::StrFormat(
       "\"dtype\":\"%s\",\"dim\":%u,\"num_vectors\":%llu,\"num_lists\":%u,\"num_partitions\":%u,"
       "\"max_nprobe\":%u,\"max_rerank\":%u,\"workers\":%d,\"filter\":\"%s\",\"payload\":\"%s\","
-      "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,\"id_capacity\":%llu,",
+      "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,\"id_capacity\":%llu,\"graph\":%s,",
       fusion::DTypeName(e.dtype()), e.dim(), static_cast<unsigned long long>(e.size()),
       e.num_lists(), e.num_partitions(), o.max_nprobe, o.max_rerank, e.num_workers(),
       e.filter_name(), e.payload().c_str(), e.has_graph() ? "true" : "false",
       static_cast<unsigned long long>(max_epoch_seen_.load()),
-      static_cast<unsigned long long>(e.id_capacity()));
+      static_cast<unsigned long long>(e.id_capacity()), GraphJson().c_str());
   s += "\"resident\":[";
   const auto res = e.ResidentPartitions();
   for (size_t i = 0; i < res.size(); ++i) s += (i ? "," : "") + std::to_string(res[i]);
@@ -809,6 +919,13 @@ std::string NodeServer::InfoJson(bool settle) const {
       u(raw.streamed), u(raw.fetched), u(raw.added), u(raw.fetches), u(raw.skipped), u(raw.served));
   s += ",\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
   return s;
+}
+
+std::string NodeServer::GraphJson() const {
+  const fusion::GraphState g = engine_->graph_state();
+  return fusion::StrFormat("{\"version\":%u,\"patch\":%u,\"count\":%llu,\"capacity\":%llu,\"deleted\":%llu}",
+                           g.version, g.patch, static_cast<unsigned long long>(g.count),
+                           static_cast<unsigned long long>(g.capacity), static_cast<unsigned long long>(g.deleted));
 }
 
 std::string NodeServer::OpsJson() const {

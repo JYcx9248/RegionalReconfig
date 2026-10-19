@@ -59,6 +59,14 @@ type Updater struct {
 	// Never a serving node: routing must not take the navigation CPU that queries need (section
 	// 5 of the draft), and in a major epoch the update controller's graph is the one entries get.
 	Router *nodeclient.Client
+	// Major epochs (U14). GraphPath: the build's graph as the router reads it (the index's
+	// graph.hnsw), reloaded when the router's graph is ahead of the epoch -- a major epoch's edit
+	// that did not commit. PatchDir: the patch of every committed graph version, with which a
+	// router is brought to the epoch's version (PatchPath). MergeEF: the search width of a
+	// merge's nearest-head search (0: 64).
+	GraphPath string
+	PatchDir  string
+	MergeEF   int
 
 	mu      sync.Mutex
 	clients map[string]*nodeclient.Client
@@ -77,6 +85,9 @@ type Batch struct {
 	Owners map[placement.NodeID][]int
 	// Staged: by owner, the next version of each partition the batch changed (Execute).
 	Staged map[placement.NodeID][]protocol.PartitionVersion
+	// Lengths: the new length of every list the batch changed, as the owners staged it -- what
+	// decides whether a major epoch is due (MajorDue).
+	Lengths map[uint32]uint32
 }
 
 // Versions is every version the batch staged, by partition.
@@ -136,6 +147,10 @@ func (u *Updater) Prepare(ctx context.Context, vecs []byte, vecBytes int, delete
 	t := lease.Table
 	var ins []Insert
 	if len(vecs) > 0 {
+		// Routed on the epoch's graph: the router's is brought to its version first.
+		if err = u.syncRouter(ctx, t.Graph); err != nil {
+			return nil, err
+		}
 		if ins, err = Route(ctx, u.Router, u.Alloc, vecs, vecBytes); err != nil {
 			return nil, err
 		}
@@ -257,7 +272,7 @@ func (u *Updater) stage(ctx context.Context, b *Batch) error {
 	byPart := map[int][]posting{}
 	for _, in := range b.Inserts {
 		for _, l := range in.Lists {
-			p := u.Manifest.PartitionOf(l)
+			p := t.PartitionOf(l, u.Manifest)
 			byPart[p] = append(byPart[p], posting{l, in.ID, in.Loc})
 		}
 	}
@@ -284,7 +299,7 @@ func (u *Updater) stage(ctx context.Context, b *Batch) error {
 					lists, ids, locs = append(lists, x.list), append(ids, x.id), append(locs, x.loc)
 				}
 			}
-			res, err := nc.StageVersions(ctx, vs, lists, ids, locs, b.Deleted)
+			res, err := nc.StageVersions(ctx, vs, nodeclient.Edits{Lists: lists, IDs: ids, Locs: locs, Deleted: b.Deleted})
 			if err != nil {
 				return fmt.Errorf("update: staging partitions %v on node %d: %w", parts[lo:hi], o, err)
 			}
@@ -292,6 +307,12 @@ func (u *Updater) stage(ctx context.Context, b *Batch) error {
 			for k, r := range res {
 				if r.Changed {
 					b.Staged[o] = append(b.Staged[o], protocol.PartitionVersion{Partition: r.Partition, Version: vs[k].Next})
+				}
+				for _, l := range r.Lengths {
+					if b.Lengths == nil {
+						b.Lengths = map[uint32]uint32{}
+					}
+					b.Lengths[l.List] = l.Postings
 				}
 			}
 			mu.Unlock()

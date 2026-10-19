@@ -1596,6 +1596,7 @@ void TestWire() {
   rtier::BodyWriter nav;
   nav.Put<uint32_t>(8);
   nav.Put<uint32_t>(0);
+  nav.Put<uint32_t>(0xFFFFFFFFu);  // the newest graph
   nav.PutBytes(&f.queries[0], f.dim * sizeof(float));
   r = Call(fd, rtier::kNavigate, nav, 3);
   CHECK(r.status == rtier::kOk);
@@ -1850,6 +1851,315 @@ void TestWire() {
   serve.join();
 }
 
+// The navigation graph's lists for every query at `graph`.
+std::vector<std::vector<uint32_t>> NavigateAll(const Fixture& f, NodeEngine& e, uint32_t graph) {
+  std::vector<std::vector<uint32_t>> out;
+  for (uint32_t q = 0; q < f.nq; ++q) {
+    std::vector<uint32_t> lists(16);
+    const uint32_t n = e.Navigate(&f.queries[q * f.dim], 16, 40, lists.data(), graph);
+    lists.resize(n);
+    out.push_back(lists);
+  }
+  return out;
+}
+
+template <class F>
+bool Throws(F&& fn) {
+  try {
+    fn();
+  } catch (const std::exception&) {
+    return true;
+  }
+  return false;
+}
+
+// Graph patches (U14 major epochs): the router edits its own graph and exports a patch; an entry
+// stages it next to its graph -- its own version still searches the graph alone, the next one
+// searches through the patch, exactly as the router's edited graph -- and merges it in place
+// while queries search through it.
+void TestGraphPatches() {
+  Fixture& f = GetFixture();
+  auto router = OpenNode(f, {}, true);
+  auto entry = OpenNode(f, {}, true);
+  auto later = OpenNode(f, {}, true);  // gets the patch as a file
+  const uint32_t nl = router->num_lists();
+  const GraphState g0 = router->graph_state();
+  CHECK(g0.loaded && g0.version == 0 && g0.patch == 0 && g0.count == nl && g0.deleted == 0);
+  CHECK(g0.capacity >= nl + nl / 5);  // the default headroom, 20%
+
+  const auto before = NavigateAll(f, *entry, 0);
+  // Three new heads at queries (so that queries find them) and two heads queries probe first.
+  const std::vector<uint32_t> labels = {nl, nl + 1, nl + 2};
+  const std::vector<float> vecs(f.queries.begin(), f.queries.begin() + 3 * f.dim);
+  std::vector<uint32_t> dead = {before[5][0], before[7][0]};
+  if (dead[0] == dead[1]) dead[1] = before[7][1];
+  const std::vector<uint8_t> patch = router->EditGraph(1, labels.data(), vecs.data(), 3, dead.data(), 2);
+  const GraphState g1 = router->graph_state();
+  CHECK(g1.version == 1 && g1.count == nl + 3 && g1.deleted == 2 && g1.patch == 0);
+  const auto want = NavigateAll(f, *router, kNewestGraph);
+  bool fresh = false;
+  for (const auto& ls : want)
+    for (uint32_t c : ls) {
+      fresh = fresh || c >= nl;
+      CHECK(c != dead[0] && c != dead[1]);
+    }
+  CHECK(fresh);
+  CHECK(want != before);
+
+  // Staged: the graph's version searches the graph alone, the patch's version through it.
+  entry->StageGraphPatch(patch.data(), patch.size());
+  CHECK(entry->graph_state().version == 0 && entry->graph_state().patch == 1);
+  CHECK(NavigateAll(f, *entry, 0) == before);
+  CHECK(NavigateAll(f, *entry, 1) == want);
+  CHECK(NavigateAll(f, *entry, kNewestGraph) == want);
+  CHECK(Throws([&] { NavigateAll(f, *entry, 2); }));
+  const std::string path = JoinPath(TempDir(), "patch-1.bin");
+  entry->SaveGraphPatch(1, path);
+
+  // Merged in place while queries search through the patch: none sees anything else.
+  std::atomic<bool> stop{false};
+  std::atomic<int> wrong{0}, rounds{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < 4; ++t)
+    ts.emplace_back([&] {
+      while (!stop) {
+        if (NavigateAll(f, *entry, 1) != want) ++wrong;
+        ++rounds;
+      }
+    });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  entry->MergeGraphPatch(1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  stop = true;
+  for (auto& t : ts) t.join();
+  CHECK(wrong == 0 && rounds > 4);
+  const GraphState ge = entry->graph_state();
+  CHECK(ge.version == 1 && ge.patch == 0 && ge.count == nl + 3 && ge.deleted == 2);
+  CHECK(NavigateAll(f, *entry, 1) == want);
+  CHECK(Throws([&] { NavigateAll(f, *entry, 0); }));  // the old version is gone
+  entry->MergeGraphPatch(1);  // merged already: nothing to do
+
+  // A later entry: the build's graph, then the patch from the file.
+  const std::vector<uint8_t> file = ReadFile(path);
+  later->StageGraphPatch(file.data(), file.size());
+  later->MergeGraphPatch(1);
+  CHECK(NavigateAll(f, *later, 1) == want);
+
+  // Refused, with nothing changed: a patch for another version, a damaged one.
+  CHECK(Throws([&] { later->StageGraphPatch(patch.data(), patch.size()); }));
+  std::vector<uint8_t> broken = patch;
+  broken[broken.size() / 2] ^= 1;
+  auto other = OpenNode(f, {}, true);
+  CHECK(Throws([&] { other->StageGraphPatch(broken.data(), broken.size()); }));
+  CHECK(other->graph_state().patch == 0);
+
+  // An edit beyond the headroom, or one deleting a deleted head, changes nothing.
+  std::vector<uint32_t> many(g1.capacity - g1.count + 1);
+  for (size_t i = 0; i < many.size(); ++i) many[i] = nl + 3 + static_cast<uint32_t>(i);
+  const std::vector<float> mv(many.size() * f.dim, 0.5f);
+  CHECK(Throws([&] { router->EditGraph(2, many.data(), mv.data(), static_cast<uint32_t>(many.size()), nullptr, 0); }));
+  CHECK(Throws([&] { router->EditGraph(2, nullptr, nullptr, 0, dead.data(), 1); }));
+  CHECK(Throws([&] { router->EditGraph(3, nullptr, nullptr, 0, &before[9][0], 1); }));  // not the next version
+  CHECK(router->graph_state().count == g1.count && router->graph_state().version == 1);
+
+  // A second edit on top of the first; a patch staged and dropped.
+  const std::vector<uint32_t> l2 = {nl + 3};
+  const std::vector<float> v2(f.queries.begin() + 10 * f.dim, f.queries.begin() + 11 * f.dim);
+  const std::vector<uint8_t> p2 = router->EditGraph(2, l2.data(), v2.data(), 1, nullptr, 0);
+  entry->StageGraphPatch(p2.data(), p2.size());
+  CHECK(entry->DropGraphPatch(2) && !entry->DropGraphPatch(2) && entry->graph_state().patch == 0);
+  entry->StageGraphPatch(p2.data(), p2.size());
+  entry->MergeGraphPatch(2);
+  CHECK(NavigateAll(f, *entry, 2) == NavigateAll(f, *router, kNewestGraph));
+
+  // The router's decisions, on the PQ codes of a list's members.
+  auto owner = OpenNode(f, {0}, false);
+  owner->SetNodes(1, {});
+  const ListSegment s0 = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(0)));
+  size_t longest = 0;
+  for (size_t i = 1; i < s0.list_ids.size(); ++i)
+    if (s0.offsets[i + 1] - s0.offsets[i] > s0.offsets[longest + 1] - s0.offsets[longest]) longest = i;
+  const ListPostings lp = owner->GetList(s0.list_ids[longest], 0);
+  const uint32_t n = static_cast<uint32_t>(lp.ids.size());
+  CHECK(n >= 4);
+  const uint32_t m = owner->pq_m();
+  std::vector<uint8_t> codes(static_cast<size_t>(n) * m);
+  owner->PQGet(lp.ids.data(), n, codes.data());
+  std::vector<uint8_t> side(n), side2(n);
+  uint32_t heads[2], heads2[2];
+  router->SplitCodes(codes.data(), n, side.data(), heads);
+  router->SplitCodes(codes.data(), n, side2.data(), heads2);
+  const uint32_t ones = static_cast<uint32_t>(std::count(side.begin(), side.end(), 1));
+  CHECK(ones == n / 2 && side == side2 && heads[0] == heads2[0] && heads[1] == heads2[1]);
+  CHECK(heads[0] < n && heads[1] < n && side[heads[0]] == 0 && side[heads[1]] == 1);
+  std::vector<uint32_t> nearest(n);
+  router->NearestHeads(codes.data(), n, 32, nearest.data());
+  for (uint32_t c : nearest) CHECK(c < nl + 4 && c != dead[0] && c != dead[1]);
+}
+
+// List edits (U14 major epochs): a list split inside its partition, a list merged into a list
+// another node owns -- its postings name the node that holds their vectors, fetched from there
+// when a query needs them -- and a later owner that learns the new lists from the segment.
+void TestListEdits() {
+  Fixture& f = GetFixture();
+  auto x = OpenNode(f, {0, 1}, true);
+  auto y = OpenNode(f, {2, 3}, true);
+  LinkPeers(x.get(), 1, {{2, y.get()}});
+  LinkPeers(y.get(), 2, {{1, x.get()}});
+  const uint32_t nl = x->num_lists();
+  const uint32_t m = x->pq_m();
+  auto longest_of = [&](uint32_t part) {
+    const ListSegment s = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(part)));
+    size_t best = 0;
+    for (size_t i = 1; i < s.list_ids.size(); ++i)
+      if (s.offsets[i + 1] - s.offsets[i] > s.offsets[best + 1] - s.offsets[best]) best = i;
+    return s.list_ids[best];
+  };
+  auto shortest_of = [&](uint32_t part) {
+    const ListSegment s = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(part)));
+    size_t best = s.list_ids.size();
+    for (size_t i = 0; i < s.list_ids.size(); ++i)
+      if (s.offsets[i + 1] > s.offsets[i] &&
+          (best == s.list_ids.size() || s.offsets[i + 1] - s.offsets[i] < s.offsets[best + 1] - s.offsets[best]))
+        best = i;
+    return s.list_ids[best];
+  };
+  auto filter = [&](NodeEngine& e, uint32_t qi, const std::vector<uint32_t>& lists, const std::vector<uint32_t>& vers) {
+    std::vector<uint32_t> ids(4096);
+    std::vector<float> d(4096);
+    FilterStats st;
+    const uint32_t k = e.Filter(0, &f.queries[qi * f.dim], lists.data(), vers.data(),
+                                static_cast<uint32_t>(lists.size()), 4096, ids.data(), d.data(), &st);
+    ids.resize(k);
+    return ids;
+  };
+
+  // Split L (partition 0) into nl and nl + 1, inside the partition: every posting stays held here.
+  const uint32_t L = longest_of(0);
+  const ListPostings lp = x->GetList(L, 0);
+  const uint32_t n = static_cast<uint32_t>(lp.ids.size());
+  for (uint16_t h : lp.holders) CHECK(h == 1);
+  std::vector<uint8_t> codes(static_cast<size_t>(n) * m), side(n);
+  x->PQGet(lp.ids.data(), n, codes.data());
+  uint32_t heads[2];
+  x->SplitCodes(codes.data(), n, side.data(), heads);
+  std::vector<uint32_t> lists(n);
+  for (uint32_t i = 0; i < n; ++i) lists[i] = nl + side[i];
+  const std::vector<uint32_t> created = {nl, nl + 1}, created_parts = {0, 0};
+  VersionEdits e;
+  e.lists = lists.data();
+  e.ids = lp.ids.data();
+  e.locs = lp.locs.data();
+  e.holders = lp.holders.data();
+  e.nadds = n;
+  e.created = created.data();
+  e.created_parts = created_parts.data();
+  e.ncreated = 2;
+  e.removed = &L;
+  e.nremoved = 1;
+  const auto res = x->StageVersions({{0, 0, 1}}, e);
+  CHECK(res.size() == 1 && res[0].changed && res[0].added == n && res[0].removed == n);
+  std::map<uint32_t, uint32_t> lens(res[0].lengths.begin(), res[0].lengths.end());
+  const uint32_t ones = static_cast<uint32_t>(std::count(side.begin(), side.end(), 1));
+  CHECK(lens.size() == 2 && lens[nl] == n - ones && lens[nl + 1] == ones);
+  // The children name exactly L's postings: the same FILTER answer, at version 1 against 0.
+  for (uint32_t qi = 0; qi < 5; ++qi) CHECK(filter(*x, qi, {nl, nl + 1}, {1, 1}) == filter(*x, qi, {L}, {0}));
+  CHECK(Throws([&] { x->GetList(L, 1); }));
+  CHECK(x->GetList(nl + 1, 1).ids.size() == ones);
+
+  // A later owner gets partition 0 at version 1 and learns the new lists from its segment.
+  auto z = OpenNode(f, {}, false);
+  LinkPeers(z.get(), 3, {{1, x.get()}});
+  const std::string seg = JoinPath(TempDir(), "p0v1.seg");
+  x->SavePartition(0, 1, seg);
+  const auto miss = z->PQMissing({{seg}});
+  std::vector<uint8_t> mc(miss[0].size() * m);
+  x->PQGet(miss[0].data(), miss[0].size(), mc.data());
+  z->PQPut(miss[0].data(), miss[0].size(), mc.data());
+  z->LoadPartition(0, seg, PQSource::kPresent, 1);
+  for (uint32_t qi = 0; qi < 5; ++qi) CHECK(filter(*z, qi, {nl, nl + 1}, {1, 1}) == filter(*x, qi, {nl, nl + 1}, {1, 1}));
+  for (uint16_t h : z->GetList(nl, 1).holders) CHECK(h == 1);  // z holds none of them
+
+  // Merge S (partition 1, on x) into N (partition 2, on y): its postings move to another owner,
+  // with their codes, and name x as their vectors' holder.
+  const uint32_t S = shortest_of(1), N = shortest_of(2);
+  const ListPostings sp = x->GetList(S, 0);
+  const uint32_t ns = static_cast<uint32_t>(sp.ids.size());
+  std::vector<uint8_t> sc(static_cast<size_t>(ns) * m);
+  x->PQGet(sp.ids.data(), ns, sc.data());
+  y->PQPut(sp.ids.data(), ns, sc.data());
+  const std::vector<uint32_t> to_n(ns, N);
+  VersionEdits me;
+  me.lists = to_n.data();
+  me.ids = sp.ids.data();
+  me.locs = sp.locs.data();
+  me.holders = sp.holders.data();
+  me.nadds = ns;
+  const auto ry = y->StageVersions({{2, 0, 1}}, me);
+  CHECK(ry.size() == 1 && ry[0].changed && ry[0].added > 0 && ry[0].lengths.size() == 1 && ry[0].lengths[0].first == N);
+  VersionEdits rm;
+  rm.removed = &S;
+  rm.nremoved = 1;
+  const auto rx = x->StageVersions({{1, 0, 1}}, rm);
+  CHECK(rx.size() == 1 && rx[0].changed && rx[0].removed == ns);
+  // A vector of S that y lacks: re-ranked on y through N at version 1, fetched from x in one hop.
+  uint32_t v = ns;
+  for (uint32_t i = 0; i < ns && v == ns; ++i)
+    if (!y->RawAbsent(&sp.locs[i], 1).empty()) v = i;
+  CHECK(v < ns);
+  if (v < ns) {
+    const float* q = &f.queries[0];
+    uint32_t oy = 0, ox = 0;
+    float dy = 0, dx = 0;
+    RerankStats sty, stx;
+    const uint32_t vers1 = 1, vers0 = 0;
+    CHECK(y->Rerank(0, q, &sp.ids[v], 1, 1, &N, &vers1, 1, &oy, &dy, &sty) == 1);
+    CHECK(x->Rerank(0, q, &sp.ids[v], 1, 1, &S, &vers0, 1, &ox, &dx, &stx) == 1);
+    CHECK(oy == ox && dy == dx && sty.fetched == 1);
+    CHECK(y->RawAbsent(&sp.locs[v], 1).empty());
+  }
+
+  // Refused, with nothing changed.
+  const auto vy = y->ResidentVersions();
+  const auto vx = x->ResidentVersions();
+  VersionEdits again;  // a list that exists already
+  again.created = created.data();
+  again.created_parts = created_parts.data();
+  again.ncreated = 1;
+  CHECK(Throws([&] { x->StageVersions({{0, 1, 2}}, again); }));
+  VersionEdits to_gone;  // a posting for a list the base version no longer has
+  to_gone.lists = &S;
+  to_gone.ids = &sp.ids[0];
+  to_gone.locs = &sp.locs[0];
+  to_gone.nadds = 1;
+  CHECK(Throws([&] { x->StageVersions({{1, 1, 2}}, to_gone); }));
+  VersionEdits nowhere;  // a vector y lacks, with no holder
+  const uint32_t N3 = longest_of(3);
+  uint32_t absent = ns;
+  for (uint32_t i = 0; i < ns && absent == ns; ++i)
+    if (!y->RawAbsent(&sp.locs[i], 1).empty()) absent = i;
+  if (absent < ns) {
+    nowhere.lists = &N3;
+    nowhere.ids = &sp.ids[absent];
+    nowhere.locs = &sp.locs[absent];
+    nowhere.nadds = 1;
+    bool raw_missing = false;
+    try {
+      y->StageVersions({{3, 0, 1}}, nowhere);
+    } catch (const RawMissingError&) {
+      raw_missing = true;
+    }
+    CHECK(raw_missing);
+  }
+  VersionEdits beyond;  // a list beyond the room for lists
+  const uint32_t far = x->graph_state().capacity;
+  beyond.created = &far;
+  beyond.created_parts = created_parts.data();
+  beyond.ncreated = 1;
+  CHECK(Throws([&] { x->StageVersions({{0, 1, 2}}, beyond); }));
+  CHECK(y->ResidentVersions() == vy && x->ResidentVersions() == vx);
+}
+
 }  // namespace
 
 int main() {
@@ -1866,6 +2176,8 @@ int main() {
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"read_budget", TestReadBudget},
+      {"graph_patches", TestGraphPatches},
+      {"list_edits", TestListEdits},
       {"wire", TestWire},
   };
   int failed = 0;

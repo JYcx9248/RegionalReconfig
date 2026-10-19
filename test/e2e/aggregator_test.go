@@ -50,7 +50,7 @@ func TestAggregatorFromOwners(t *testing.T) {
 	for q := 0; q < numQueries; q++ {
 		for _, nprobe := range []int{1, 2, testNProbe} { // few lists: often on one node
 			req := &query.Request{Vec: f.queries.Row(q), Params: query.Params{K: testK, NProbe: nprobe, N: maxRerank}}
-			lists, err := nav.Navigate(cl.ctx, tbl.Epoch, req.Vec, nprobe, 0)
+			lists, err := nav.Navigate(cl.ctx, tbl.Epoch, tbl.Graph, req.Vec, nprobe, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

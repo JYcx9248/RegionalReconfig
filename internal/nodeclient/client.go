@@ -42,13 +42,26 @@ const (
 	opRerank         uint8 = 0x22
 	opSearchLocal    uint8 = 0x23
 	opAssign         uint8 = 0x24
+	opSplitList      uint8 = 0x25
+	opNearestHeads   uint8 = 0x26
+	opEditGraph      uint8 = 0x27
 	opStageVersions  uint8 = 0x30
 	opDropVersion    uint8 = 0x31
 	opForget         uint8 = 0x32
 	opSavePartition  uint8 = 0x33
 	opSetNodes       uint8 = 0x34
 	opRawHeldBy      uint8 = 0x35
+	opListGet        uint8 = 0x36
+	opPatchStage     uint8 = 0x37
+	opPatchLoad      uint8 = 0x38
+	opPatchMerge     uint8 = 0x39
+	opPatchDrop      uint8 = 0x3A
+	opPatchSave      uint8 = 0x3B
 )
+
+// NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
+// its graph's).
+const NewestGraph uint32 = 0xFFFFFFFF
 
 // Status codes (engine/node/wire.h).
 const (
@@ -169,11 +182,21 @@ type Info struct {
 	GraphLoaded   bool               `json:"graph_loaded"`
 	MaxEpochSeen  uint64             `json:"max_epoch_seen"`
 	IDCapacity    uint64             `json:"id_capacity"` // vector IDs, room for inserts included (U14)
+	Graph         GraphInfo          `json:"graph"`
 	Resident      []int              `json:"resident"`
 	Versions      [][2]uint32        `json:"versions"` // every resident (partition, version)
 	PQ            PQStats            `json:"pq"`
 	Raw           RawStats           `json:"raw"`
 	Ops           map[string]OpStats `json:"ops"`
+}
+
+// GraphInfo is the node's navigation graph (U14 major epochs patch it).
+type GraphInfo struct {
+	Version  uint32 `json:"version"`  // the version of its bytes
+	Patch    uint32 `json:"patch"`    // the staged patch's version, 0 = none
+	Count    uint64 `json:"count"`    // heads
+	Capacity uint64 `json:"capacity"` // room for heads
+	Deleted  uint64 `json:"deleted"`  // heads marked deleted (routing points, never a result)
 }
 
 // FilterStats accompany a FILTER reply.
@@ -623,16 +646,51 @@ type StageResult struct {
 	Changed   bool // false: the batch does not touch it, no version was installed
 	Added     uint32
 	Removed   uint32
+	// The lists of the next version whose length changed, and the ones it creates: what decides
+	// the next major epoch (U14).
+	Lengths []ListLength
+}
+
+// ListLength is a posting list's number of postings.
+type ListLength struct {
+	List     uint32
+	Postings uint32
+}
+
+// Edits is what StageVersions changes besides the base lists.
+type Edits struct {
+	// Postings to add: Lists[i] gets (IDs[i], Locs[i]). Holders[i] is the node holding the
+	// vector if it is not on this node (a posting that moves between owners); 0, or a nil
+	// Holders, means it must be here.
+	Lists, IDs, Locs []uint32
+	Holders          []uint16
+	Deleted          []uint32      // vector IDs deleted from every list
+	Created          []CreatedList // lists the next version creates
+	Removed          []uint32      // lists the next version no longer has
+}
+
+// CreatedList is a list a major epoch creates, in its partition.
+type CreatedList struct {
+	List      uint32
+	Partition int
+}
+
+// ListPostings is a posting list as its owner holds it: every posting's holder by node ID.
+type ListPostings struct {
+	IDs, Locs []uint32
+	Holders   []uint16
 }
 
 // StageVersions builds, for each of parts, the next version of its posting lists from the base
-// version: plus the postings (lists[i], ids[i], locs[i]) naming its lists, minus the deleted
-// IDs. Partitions the batch does not change get no new version. All or nothing: StatusPQAbsent
-// or StatusRawAbsent if an added vector's code or raw vector is not on the node yet (PQPut,
-// RawAdd), StatusNotResident if a base version is not there.
-func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, lists, ids, locs, deleted []uint32) ([]StageResult, error) {
-	if len(ids) != len(lists) || len(locs) != len(lists) {
-		return nil, fmt.Errorf("nodeclient: %d lists, %d IDs, %d locations", len(lists), len(ids), len(locs))
+// version: without the removed lists and with the created ones, plus the added postings naming
+// its lists, minus the deleted IDs. Partitions the batch does not change get no new version.
+// All or nothing: StatusPQAbsent or StatusRawAbsent if an added vector's code is not on the node
+// yet (PQPut) or its raw vector is neither there (RawAdd) nor held by the node its posting names,
+// StatusNotResident if a base version is not there.
+func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, e Edits) ([]StageResult, error) {
+	n := len(e.Lists)
+	if len(e.IDs) != n || len(e.Locs) != n || (e.Holders != nil && len(e.Holders) != n) {
+		return nil, fmt.Errorf("nodeclient: %d lists, %d IDs, %d locations, %d holders", n, len(e.IDs), len(e.Locs), len(e.Holders))
 	}
 	var w frame.Writer
 	w.U32(uint32(len(parts)))
@@ -641,12 +699,26 @@ func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, lists,
 		w.U32(p.Base)
 		w.U32(p.Next)
 	}
-	w.U32(uint32(len(lists)))
-	w.U32s(lists)
-	w.U32s(ids)
-	w.U32s(locs)
-	w.U32(uint32(len(deleted)))
-	w.U32s(deleted)
+	w.U32(uint32(n))
+	w.U32s(e.Lists)
+	w.U32s(e.IDs)
+	w.U32s(e.Locs)
+	for i := 0; i < n; i++ {
+		var h uint16
+		if e.Holders != nil {
+			h = e.Holders[i]
+		}
+		w.U16(h)
+	}
+	w.U32(uint32(len(e.Deleted)))
+	w.U32s(e.Deleted)
+	w.U32(uint32(len(e.Created)))
+	for _, cl := range e.Created {
+		w.U32(cl.List)
+		w.U32(uint32(cl.Partition))
+	}
+	w.U32(uint32(len(e.Removed)))
+	w.U32s(e.Removed)
 	b, err := c.do(ctx, opStageVersions, 0, w.B)
 	if err != nil {
 		return nil, err
@@ -658,8 +730,133 @@ func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, lists,
 		flags := r.U32() // u8 changed, u8[3] pad
 		out[i].Changed = flags&0xFF != 0
 		out[i].Added, out[i].Removed = r.U32(), r.U32()
+		nl := int(r.U32())
+		for j := 0; j < nl && r.Err == nil; j++ {
+			out[i].Lengths = append(out[i].Lengths, ListLength{List: r.U32(), Postings: r.U32()})
+		}
 	}
 	return out, r.Err
+}
+
+// ListGet returns a posting list of version v of its partition (StatusNotResident if the node
+// does not hold it), every posting's holder by node ID.
+func (c *Client) ListGet(ctx context.Context, list, v uint32) (ListPostings, error) {
+	var w frame.Writer
+	w.U32(list)
+	w.U32(v)
+	b, err := c.do(ctx, opListGet, 0, w.B)
+	if err != nil {
+		return ListPostings{}, err
+	}
+	r := frame.NewReader(b)
+	n := int(r.U32())
+	lp := ListPostings{IDs: r.U32s(n), Locs: r.U32s(n), Holders: make([]uint16, n)}
+	for i := range lp.Holders {
+		lp.Holders[i] = r.U16()
+	}
+	return lp, r.Err
+}
+
+// PatchStage stages a graph patch next to the node's graph (U14 major epochs): NAVIGATE of the
+// patch's version searches through it, of the graph's own version without it.
+func (c *Client) PatchStage(ctx context.Context, patch []byte) error {
+	_, err := c.do(ctx, opPatchStage, 0, patch)
+	return err
+}
+
+// PatchLoad stages the graph patch in a file on the node's machine.
+func (c *Client) PatchLoad(ctx context.Context, path string) error {
+	_, err := c.do(ctx, opPatchLoad, 0, []byte(path))
+	return err
+}
+
+// PatchMerge merges the staged patch of version v into the graph in place, after the grace
+// period of the epochs that searched the graph without it (a no-op if the graph is at v).
+func (c *Client) PatchMerge(ctx context.Context, v uint32) error {
+	var w frame.Writer
+	w.U32(v)
+	_, err := c.do(ctx, opPatchMerge, 0, w.B)
+	return err
+}
+
+// PatchDrop unstages the patch of version v; it reports whether it was staged.
+func (c *Client) PatchDrop(ctx context.Context, v uint32) (bool, error) {
+	var w frame.Writer
+	w.U32(v)
+	b, err := c.do(ctx, opPatchDrop, 0, w.B)
+	if err != nil {
+		return false, err
+	}
+	return len(b) == 1 && b[0] == 1, nil
+}
+
+// PatchSave writes the staged patch of version v to path on the node's machine.
+func (c *Client) PatchSave(ctx context.Context, v uint32, path string) error {
+	var w frame.Writer
+	w.U32(v)
+	w.Str(path)
+	_, err := c.do(ctx, opPatchSave, 0, w.B)
+	return err
+}
+
+// SplitList asks the router to split a list by the PQ codes of its members (m bytes each): side
+// 0 or 1 per member, balanced, and the member closest to each side's mean (the new heads).
+func (c *Client) SplitList(ctx context.Context, codes []byte, m int) ([]uint8, [2]uint32, error) {
+	var heads [2]uint32
+	if m <= 0 || len(codes)%m != 0 {
+		return nil, heads, fmt.Errorf("nodeclient: %d bytes of %d-byte codes", len(codes), m)
+	}
+	n := len(codes) / m
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(m))
+	w.Bytes(codes)
+	b, err := c.do(ctx, opSplitList, 0, w.B)
+	if err != nil {
+		return nil, heads, err
+	}
+	r := frame.NewReader(b)
+	heads[0], heads[1] = r.U32(), r.U32()
+	side := append([]uint8(nil), r.Bytes(n)...)
+	return side, heads, r.Err
+}
+
+// NearestHeads asks the router for the nearest live head of each decoded PQ code.
+func (c *Client) NearestHeads(ctx context.Context, codes []byte, m, ef int) ([]uint32, error) {
+	if m <= 0 || len(codes)%m != 0 {
+		return nil, fmt.Errorf("nodeclient: %d bytes of %d-byte codes", len(codes), m)
+	}
+	n := len(codes) / m
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(m))
+	w.U32(uint32(ef))
+	w.Bytes(codes)
+	b, err := c.do(ctx, opNearestHeads, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	lists := r.U32s(n)
+	return lists, r.Err
+}
+
+// EditGraph has the router insert the heads labels (vecs: one vector each, in the index's
+// element type) and mark the heads deleted deleted, taking its graph to version v; it returns
+// the patch from v-1 to v.
+func (c *Client) EditGraph(ctx context.Context, v uint32, labels []uint32, vecs []byte, deleted []uint32) ([]byte, error) {
+	var w frame.Writer
+	w.U32(v)
+	w.U32(uint32(len(labels)))
+	w.U32s(labels)
+	w.Bytes(vecs)
+	w.U32(uint32(len(deleted)))
+	w.U32s(deleted)
+	b, err := c.do(ctx, opEditGraph, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), b...), nil
 }
 
 // DropVersion evicts version v of partition p (after the grace period of the epochs that saw
@@ -789,11 +986,13 @@ func (c *Client) EvictPartition(ctx context.Context, p int) (bool, error) {
 	return len(b) == 1 && b[0] == 1, nil
 }
 
-// Navigate returns the query's nprobe closest lists (closest first).
-func (c *Client) Navigate(ctx context.Context, epoch uint64, q []byte, nprobe, ef int) ([]uint32, error) {
+// Navigate returns the query's nprobe closest lists (closest first) on graph version graph (its
+// epoch's; NewestGraph: the newest the node has).
+func (c *Client) Navigate(ctx context.Context, epoch uint64, graph uint32, q []byte, nprobe, ef int) ([]uint32, error) {
 	var w frame.Writer
 	w.U32(uint32(nprobe))
 	w.U32(uint32(ef))
+	w.U32(graph)
 	w.Bytes(q)
 	b, err := c.do(ctx, opNavigate, epoch, w.B)
 	if err != nil {

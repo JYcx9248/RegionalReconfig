@@ -19,9 +19,8 @@
 //     online without them (U9): RERANK fetches the ones a query needs from the partition's old
 //     owner on demand, and only those -- the rest stay with the old owner, which keeps every
 //     vector it has held (the lazy-stream baseline streams them in too: RawMissing, RawPut).
-//     There is no vector -> page map: the posting lists carry each vector's location, and the
-//     node keeps one source per posting list (the old owner of its partition), so any list
-//     that names a missing vector says where to fetch it -- lists overlap, no per-vector table;
+//     There is no vector -> page map: the posting lists carry each vector's location and the
+//     node that holds it (its holder: this node, or a peer), so a missing vector is one hop away;
 //   * the query pipeline is exposed as primitives, so that the Go aggregator can spread one
 //     query over several nodes:
 //       Navigate    navigation graph -> the query's top-m list IDs        (needs the graph)
@@ -30,8 +29,10 @@
 //                                                                          first if missing)
 //       SearchLocal all of the above on this node (single-node baseline and correctness oracle)
 //
-// The navigation graph is large (tens of GB at billion scale) and immutable. It can be loaded
-// after startup (LoadGraph), so a new node can join as a data node before its graph is staged.
+// The navigation graph is large (tens of GB at billion scale). It can be loaded after startup
+// (LoadGraph), so a new node can join as a data node before its graph is staged. A node holds it
+// once: a major epoch (U14) changes it by a patch staged next to it and merged in place later
+// (fusion/graph_patch.h), and the graph is loaded with headroom for the heads patches add.
 //
 // Every result list is ordered by (distance, id): results do not depend on the order in which
 // candidates were produced, which is what lets rtier compare distributed and single-node runs.
@@ -95,7 +96,14 @@ struct NodeOptions {
   // Longest posting list a request may gather (0 = the manifest's): inserts make lists longer,
   // and the filter's candidate buffers are sized by it.
   uint32_t max_list_len = 0;
+  // Room for the heads and lists that major epochs add (U14), as a fraction of the build's: the
+  // graph is loaded with capacity for that many more elements, and list IDs up to the same
+  // number are accepted.
+  double graph_headroom = 0.2;
 };
+
+// Navigate's graph version: the newest the node has (a staged patch's, else the graph's).
+constexpr uint32_t kNewestGraph = 0xFFFFFFFFu;
 
 // One partition of a StageVersions call: its next version is built from `base`.
 struct VersionStage {
@@ -109,6 +117,48 @@ struct StageResult {
   bool changed = false;  // false: nothing named it, no version was installed
   uint64_t added = 0;    // postings added and removed
   uint64_t removed = 0;
+  // (list, postings) of every list of the next version whose length changed, and of every list
+  // it creates: what decides the next major epoch (U14).
+  std::vector<std::pair<uint32_t, uint32_t>> lengths;
+};
+
+// What StageVersions changes besides the base lists (parallel arrays; null when empty).
+struct VersionEdits {
+  // Postings to add: lists[i] gets (ids[i], locs[i]). holders[i] is the node that holds the
+  // vector when it is not here (a posting that moves between owners: fetched from there when a
+  // query needs it); kNoHolder, or this node's ID, means it must be here. holders may be null.
+  const uint32_t* lists = nullptr;
+  const uint32_t* ids = nullptr;
+  const uint32_t* locs = nullptr;
+  const uint16_t* holders = nullptr;
+  size_t nadds = 0;
+  // Vector IDs deleted from every list.
+  const uint32_t* deleted = nullptr;
+  size_t ndeleted = 0;
+  // Lists the next version creates (a major epoch's split children), with their partitions.
+  const uint32_t* created = nullptr;
+  const uint32_t* created_parts = nullptr;
+  size_t ncreated = 0;
+  // Lists the next version no longer has (a split parent, a merged list), postings and all.
+  const uint32_t* removed = nullptr;
+  size_t nremoved = 0;
+};
+
+// One posting list as its owner holds it (GetList): every posting's holder, this node by its ID
+// for the vectors it holds.
+struct ListPostings {
+  std::vector<uint32_t> ids;
+  std::vector<uint32_t> locs;
+  std::vector<uint16_t> holders;
+};
+
+struct GraphState {
+  bool loaded = false;
+  uint32_t version = 0;   // the version of the graph's bytes
+  uint32_t patch = 0;     // the staged patch's version (0: none)
+  uint64_t count = 0;     // elements (heads)
+  uint64_t capacity = 0;  // room for elements
+  uint64_t deleted = 0;   // marked deleted (removed heads stay as routing points)
 };
 
 // Where LoadPartition takes what the node does not hold yet.
@@ -190,9 +240,41 @@ class NodeEngine {
   static std::unique_ptr<NodeEngine> Open(const NodeOptions& opts);
   virtual ~NodeEngine() = default;
 
-  // Staging. LoadGraph/LoadPartition may run concurrently with queries.
+  // Staging. LoadGraph/LoadPartition may run concurrently with queries. LoadGraph loads the
+  // build's graph (version 0) with room for graph_headroom more elements.
   virtual void LoadGraph(const std::string& path) = 0;
   virtual bool has_graph() const = 0;
+  virtual GraphState graph_state() const = 0;
+
+  // Graph patches (U14 major epochs, fusion/graph_patch.h). StageGraphPatch stages a patch from
+  // the graph's version to the next one next to the graph, which it leaves alone: Navigate of the
+  // next version searches through the patch, Navigate of the current one the graph alone. A
+  // patch staged again replaces the staged one.
+  virtual void StageGraphPatch(const uint8_t* patch, size_t n) = 0;
+  // Merges the staged patch of `version` into the graph in place, once no search of the version
+  // before it can come any more (the grace period): searches through the patch go on meanwhile,
+  // and searches of the old version are refused from then on. A no-op if the graph is at
+  // `version` already.
+  virtual void MergeGraphPatch(uint32_t version) = 0;
+  // Unstages the patch of `version`; false if it was not staged.
+  virtual bool DropGraphPatch(uint32_t version) = 0;
+  // Writes the staged patch of `version` as a file, for a graph transfer to a later entry.
+  virtual void SaveGraphPatch(uint32_t version, const std::string& path) const = 0;
+  // The router's side (the update controller's own node, which holds the authoritative graph and
+  // stages no patch): inserts the heads `labels` (list IDs; vecs: dim() elements of dtype() each)
+  // and marks the heads `deleted` deleted -- they stay as routing points, never a result -- then
+  // returns the patch from the graph's version to `version` (the next one). Refused, with
+  // nothing changed, if the graph has no room left (graph_headroom), a label exists, or a
+  // deleted head is unknown or deleted already.
+  virtual std::vector<uint8_t> EditGraph(uint32_t version, const uint32_t* labels, const void* vecs,
+                                         uint32_t nnew, const uint32_t* deleted, uint32_t ndeleted) = 0;
+  // The router's decisions for a major epoch, on PQ codes (pq_m() bytes each), so that no raw
+  // vector is read. SplitCodes: a balanced 2-means of n codes (n >= 2); side[i] is 0 or 1, and
+  // heads[s] the index of the member closest to side s's mean, the child's head as the build
+  // chooses heads. NearestHeads: the nearest head of each code on the graph (deleted heads are
+  // never a result), searched with width ef.
+  virtual void SplitCodes(const uint8_t* codes, uint32_t n, uint8_t* side, uint32_t heads[2]) const = 0;
+  virtual void NearestHeads(const uint8_t* codes, uint32_t n, uint32_t ef, uint32_t* lists) const = 0;
   // Loads version `version` of partition p's posting lists, replacing that version if it is
   // resident; the partition's other versions stay. Every vector they name must end up with a PQ
   // code on this node (see PQSource); the partition's postings then hold references on those
@@ -212,19 +294,33 @@ class NodeEngine {
   virtual std::vector<uint32_t> ResidentPartitions() const = 0;
   // Every resident (partition, version), ascending.
   virtual std::vector<std::pair<uint32_t, uint32_t>> ResidentVersions() const = 0;
+  // A posting list of a resident version (NotResidentError if it is not here).
+  virtual ListPostings GetList(uint32_t list, uint32_t version) const = 0;
   // Update batches (U14). For each of `parts` (resident at its base version), builds the next
-  // version of its posting lists: the base lists, plus the postings (lists[i], ids[i],
-  // locs[i]) that name its lists, minus the IDs in deleted. Each list stays sorted by ID; a
-  // posting already there is skipped. A partition the batch does not change gets no new
-  // version (changed = false); the others are installed as version `next`, replacing that
+  // version of its posting lists: the base lists without the removed ones and with the created
+  // ones, plus the added postings that name its lists, minus the deleted IDs. Each list stays
+  // sorted by ID; a posting already there is skipped. A partition the batch does not change gets
+  // no new version (changed = false); the others are installed as version `next`, replacing that
   // version if it is resident, next to the base version, which keeps serving queries of the
   // current epoch. All or nothing: NotResidentError, PQMissingError (an added vector's code
-  // must be here, PQPut), RawMissingError (its raw vector too, RawAdd) or a list longer than
-  // max_list_len leave every partition as it was. A posting may only name a list of `parts`.
+  // must be here, PQPut), RawMissingError (its raw vector must be here, RawAdd, unless the
+  // posting names another holder) or a list longer than max_list_len leave every partition as
+  // it was. A posting may only name a list of `parts`.
   virtual std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts,
-                                                 const uint32_t* lists, const uint32_t* ids,
-                                                 const uint32_t* locs, size_t nadds,
-                                                 const uint32_t* deleted, size_t ndeleted) = 0;
+                                                 const VersionEdits& edits) = 0;
+  // A minor batch: postings added (held here) and IDs deleted.
+  std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts, const uint32_t* lists,
+                                         const uint32_t* ids, const uint32_t* locs, size_t nadds,
+                                         const uint32_t* deleted, size_t ndeleted) {
+    VersionEdits e;
+    e.lists = lists;
+    e.ids = ids;
+    e.locs = locs;
+    e.nadds = nadds;
+    e.deleted = deleted;
+    e.ndeleted = ndeleted;
+    return StageVersions(parts, e);
+  }
   // Evicts one version of a partition (after the grace period of the epoch that used it);
   // returns false if it was not resident.
   virtual bool DropVersion(uint32_t partition, uint32_t version) = 0;
@@ -299,12 +395,13 @@ class NodeEngine {
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;
 
   // Primitives. `query` points to dim() elements of dtype(). Worker `w` must be used by one
-  // thread at a time. ef = 0 means 2 * nprobe (as in fusion::Engine). In Filter and Rerank,
-  // versions[i] is the version of lists[i]'s partition that the query sees (its epoch's);
-  // NotResidentError if that version is not resident. versions = nullptr means each partition's
-  // newest resident version.
-  virtual uint32_t Navigate(const void* query, uint32_t nprobe, uint32_t ef,
-                            uint32_t* lists) = 0;
+  // thread at a time. ef = 0 means 2 * nprobe (as in fusion::Engine). Navigate searches the
+  // graph version the query's epoch names (NotResidentError if this node does not have it). In
+  // Filter and Rerank, versions[i] is the version of lists[i]'s partition that the query sees
+  // (its epoch's); NotResidentError if that version is not resident. versions = nullptr means
+  // each partition's newest resident version.
+  virtual uint32_t Navigate(const void* query, uint32_t nprobe, uint32_t ef, uint32_t* lists,
+                            uint32_t graph = kNewestGraph) = 0;
   virtual uint32_t Filter(int w, const void* query, const uint32_t* lists, const uint32_t* versions,
                           uint32_t nlists, uint32_t topn, uint32_t* ids, float* dists,
                           FilterStats* st) = 0;

@@ -43,6 +43,7 @@ const (
 	EvictM           = "Evict"           // drop partitions and their files
 	SavePartitionsM  = "SavePartitions"  // write versions of resident partitions as segment files (U14)
 	DropVersionsM    = "DropVersions"    // drop versions an update batch replaced, and their files (U14)
+	GraphPatchM      = "GraphPatch"      // merge (or drop) a staged graph patch (U14 major epochs)
 	SetAdmissionM    = "SetAdmission"    // pause/resume client queries (stop-and-copy baseline)
 	WaitIdleM        = "WaitIdle"        // no query in flight at all
 	NodeStatusM      = "Status"
@@ -160,6 +161,18 @@ type DrainRawReq struct {
 type StageGraphReq struct {
 	Source   Source `json:"source"`
 	Priority string `json:"priority,omitempty"`
+	// Graph is the version to load: the build's graph, then the patches 1..Graph that major
+	// epochs made (U14), from the same source.
+	Graph uint32 `json:"graph,omitempty"`
+}
+
+// GraphPatchReq: once no query searches the graph without the patch of graph version Version
+// (the grace period), the entry keeps the patch as a file next to the graph -- a later entry's
+// graph transfer takes the graph and its patches from there -- and merges it in place. With
+// Drop (a commit that did not flip) it unstages the patch instead.
+type GraphPatchReq struct {
+	Version uint32 `json:"version"`
+	Drop    bool   `json:"drop,omitempty"`
 }
 
 type InstallEpochReq struct {
@@ -212,6 +225,10 @@ type NodeStatus struct {
 	RawFetchedBytes uint64 `json:"raw_fetched_bytes"`
 	// Versions: every version of a partition's lists the data node holds (U14).
 	Versions []PartitionVersion `json:"versions,omitempty"`
+	// Graph: the version of the data node's graph; GraphPatch: the version of the patch staged
+	// next to it, 0 if none (U14 major epochs).
+	Graph      uint32 `json:"graph,omitempty"`
+	GraphPatch uint32 `json:"graph_patch,omitempty"`
 }
 
 // RescaleReq asks for a reconfiguration in one of two forms: DataNodes, a number of data
@@ -357,6 +374,10 @@ type CommitUpdateReq struct {
 	FromEpoch uint64             `json:"from_epoch"`
 	Versions  []PartitionVersion `json:"versions"`
 	Deleted   []uint32           `json:"deleted,omitempty"`
+	// A major epoch (U14) also patches the graph -- Graph is the version the patch makes, staged
+	// on every entry -- and creates posting lists, each in a partition.
+	Graph uint32         `json:"graph,omitempty"`
+	Lists map[uint32]int `json:"lists,omitempty"`
 }
 
 // UpdateReply summarizes a committed batch. ToEpoch is FromEpoch when it changed nothing, or
@@ -365,7 +386,8 @@ type UpdateReply struct {
 	FromEpoch uint64             `json:"from_epoch"`
 	ToEpoch   uint64             `json:"to_epoch"`
 	Changed   []int              `json:"changed"` // partitions at a new version
-	Phases    map[string]float64 `json:"phases"`  // seconds per phase
+	Graph     uint32             `json:"graph,omitempty"`
+	Phases    map[string]float64 `json:"phases"` // seconds per phase
 }
 
 // AbortUpdateReq ends a lease without a flip. What the batch staged is the update

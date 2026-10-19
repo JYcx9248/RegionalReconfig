@@ -109,7 +109,7 @@ func (a *Agent) entry(ctx context.Context, req *query.Request) (query.Result, er
 
 func (a *Agent) navigateAndAggregate(ctx context.Context, t *epoch.Table, req *query.Request) (query.Result, error) {
 	nav := time.Now()
-	lists, err := a.local.Navigate(ctx, t.Epoch, req.Vec, req.Params.NProbe, req.Params.EF)
+	lists, err := a.local.Navigate(ctx, t.Epoch, t.Graph, req.Vec, req.Params.NProbe, req.Params.EF)
 	if err != nil {
 		return query.Result{}, err
 	}

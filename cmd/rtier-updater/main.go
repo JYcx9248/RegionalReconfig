@@ -5,7 +5,8 @@
 // version of the lists the batch changes, and asks the controller to flip and reclaim.
 //
 //	rtier-updater -api ADDR -partitions DIR [-state FILE] [-inserts V.fbin] [-deletes IDS]
-//	              [-router ADDR | -index DIR [-node-bin PATH]]
+//	              [-router ADDR [-graph PATH] | -index DIR [-node-bin PATH]] [-patches DIR]
+//	              [-split L,L,... -merge L,L,... | -split-len N -merge-len N [-major-max K]]
 //
 // Inserts are routed by the update controller's own rtier_node, which holds the index's
 // navigation graph and codebook and nothing else -- never by a serving node, whose navigation
@@ -20,6 +21,14 @@
 // -deletes is a text file of vector IDs (one per line, # comments) or a .bin file in the engine's
 // u32 array format. The vector file must be in the index's element type. The controller must run
 // with allow_updates.
+//
+// Major epochs split and merge posting lists, and patch the navigation graph to match: -split and
+// -merge name lists for one, which runs after the batch, if any; with -split-len and -merge-len,
+// one runs after the batch when the owners report a list longer or shorter than that (at most
+// -major-max lists). The router's graph is the authoritative one: the major epoch edits it, and
+// DIR (-patches, by default next to FILE) keeps the patch of every committed graph version, with
+// which a router started later is brought to the cluster's version. -graph names the build's
+// graph as a -router reads it, to reload it when an edit did not commit (-index: its graph.hnsw).
 package main
 
 import (
@@ -46,13 +55,16 @@ import (
 
 // state is where the next batch's IDs and locations start.
 type state struct {
-	NextID  uint64 `json:"next_id"`
-	NextLoc uint64 `json:"next_loc"`
+	NextID   uint64 `json:"next_id"`
+	NextLoc  uint64 `json:"next_loc"`
+	NextList uint64 `json:"next_list,omitempty"` // the first list ID no major epoch took
 }
 
 type options struct {
 	api, parts, statePath, inserts, deletes string
-	router, index, nodeBin                  string
+	router, index, nodeBin, graph, patches  string
+	split, merge                            string
+	splitLen, mergeLen, majorMax            int
 	timeout                                 time.Duration
 }
 
@@ -66,9 +78,16 @@ func main() {
 	flag.StringVar(&o.router, "router", "", "the update controller's running router (an rtier_node with the graph)")
 	flag.StringVar(&o.index, "index", "", "index directory: start a router on its graph for this batch")
 	flag.StringVar(&o.nodeBin, "node-bin", "", "rtier_node to start with -index (default: engine/build next to bin/)")
+	flag.StringVar(&o.graph, "graph", "", "the build's graph as the -router reads it, reloaded when an edit did not commit")
+	flag.StringVar(&o.patches, "patches", "", "where the patches of committed graph versions are kept (default: next to -state)")
+	flag.StringVar(&o.split, "split", "", "lists to split in a major epoch (comma-separated)")
+	flag.StringVar(&o.merge, "merge", "", "lists to merge in a major epoch (comma-separated)")
+	flag.IntVar(&o.splitLen, "split-len", 0, "after the batch, split the lists longer than this (0: never)")
+	flag.IntVar(&o.mergeLen, "merge-len", 0, "after the batch, merge the lists shorter than this (0: never)")
+	flag.IntVar(&o.majorMax, "major-max", 0, "at most this many lists per major epoch (0: no limit)")
 	flag.DurationVar(&o.timeout, "timeout", 30*time.Minute, "")
 	flag.Parse()
-	if o.parts == "" || (o.inserts == "" && o.deletes == "") {
+	if o.parts == "" || (o.inserts == "" && o.deletes == "" && o.split == "" && o.merge == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -143,10 +162,30 @@ func run(o options) error {
 	if err != nil {
 		return err
 	}
+	alloc.SetNextList(s.NextList)
+	splits, err := parseLists(o.split)
+	if err != nil {
+		return err
+	}
+	merges, err := parseLists(o.merge)
+	if err != nil {
+		return err
+	}
+	major := len(splits)+len(merges) > 0 || o.splitLen > 0 || o.mergeLen > 0
 
-	u := &update.Updater{Controller: update.Remote{Conn: conn}, Manifest: m, Alloc: alloc}
+	u := &update.Updater{Controller: update.Remote{Conn: conn}, Manifest: m, Alloc: alloc,
+		GraphPath: o.graph, PatchDir: o.patches}
+	if u.PatchDir == "" {
+		u.PatchDir = filepath.Join(filepath.Dir(o.statePath), "graph-patches")
+	}
+	if u.GraphPath == "" && o.index != "" {
+		u.GraphPath = filepath.Join(o.index, "graph.hnsw")
+	}
 	defer u.Close()
-	if n > 0 {
+	if n > 0 || major {
+		if o.router == "" && o.index == "" {
+			return errors.New("inserts and major epochs need a router: -router ADDR, or -index DIR to start one")
+		}
 		addr := o.router
 		if addr == "" {
 			bin := o.nodeBin
@@ -167,17 +206,55 @@ func run(o options) error {
 		u.Router = nodeclient.New(addr, 2)
 		defer u.Router.Close()
 	}
+	if n > 0 || len(del) > 0 {
+		start := time.Now()
+		b, err := u.Prepare(ctx, vecs, vecBytes, del)
+		// Whatever happened: what was taken is never handed out again.
+		if serr := saveState(o.statePath, alloc); serr != nil {
+			return errors.Join(err, serr)
+		}
+		if err != nil {
+			return err
+		}
+		decided := time.Since(start)
+		reply, err := u.Execute(ctx, b)
+		if reply != nil {
+			out, _ := json.MarshalIndent(reply, "", "  ")
+			fmt.Println(string(out))
+		}
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			fmt.Printf("inserted %d vectors: IDs [%d, %d), locations [%d, %d)\n", n, b.Inserts[0].ID,
+				uint64(b.Inserts[n-1].ID)+1, b.Inserts[0].Loc, uint64(b.Inserts[n-1].Loc)+1)
+		}
+		lists, _, _ := b.Postings()
+		fmt.Printf("%d postings added, %d IDs deleted; epoch %d -> %d, %d partitions at new versions; "+
+			"decided in %.2f s, applied in %.2f s\n", len(lists), len(b.Deleted), reply.FromEpoch, reply.ToEpoch,
+			len(reply.Changed), decided.Seconds(), time.Since(start).Seconds()-decided.Seconds())
+		if len(splits)+len(merges) == 0 && (o.splitLen > 0 || o.mergeLen > 0) {
+			splits, merges = update.MajorDue(b.Lengths, uint32(max(o.splitLen, 0)), uint32(max(o.mergeLen, 0)), o.majorMax)
+		}
+	}
+	if len(splits)+len(merges) == 0 {
+		return nil
+	}
+	return runMajor(ctx, u, o.statePath, alloc, splits, merges)
+}
+
+// runMajor runs one major epoch that splits and merges those lists.
+func runMajor(ctx context.Context, u *update.Updater, statePath string, alloc *update.Allocator, splits, merges []uint32) error {
 	start := time.Now()
-	b, err := u.Prepare(ctx, vecs, vecBytes, del)
-	// Whatever happened: what was taken is never handed out again.
-	if serr := saveState(o.statePath, alloc); serr != nil {
+	mj, err := u.PrepareMajor(ctx, splits, merges)
+	if serr := saveState(statePath, alloc); serr != nil {
 		return errors.Join(err, serr)
 	}
 	if err != nil {
 		return err
 	}
 	decided := time.Since(start)
-	reply, err := u.Execute(ctx, b)
+	reply, err := u.ExecuteMajor(ctx, mj)
 	if reply != nil {
 		out, _ := json.MarshalIndent(reply, "", "  ")
 		fmt.Println(string(out))
@@ -185,20 +262,42 @@ func run(o options) error {
 	if err != nil {
 		return err
 	}
-	if n > 0 {
-		fmt.Printf("inserted %d vectors: IDs [%d, %d), locations [%d, %d)\n", n, b.Inserts[0].ID,
-			uint64(b.Inserts[n-1].ID)+1, b.Inserts[0].Loc, uint64(b.Inserts[n-1].Loc)+1)
+	for _, sp := range mj.Splits {
+		fmt.Printf("list %d (partition %d) split into %d and %d: %d and %d postings, heads vectors %d and %d\n",
+			sp.List, sp.Partition, sp.Children[0], sp.Children[1], sp.Sizes[0], sp.Sizes[1], sp.Heads[0], sp.Heads[1])
 	}
-	lists, _, _ := b.Postings()
-	fmt.Printf("%d postings added, %d IDs deleted; epoch %d -> %d, %d partitions at new versions; "+
-		"decided in %.2f s, applied in %.2f s\n", len(lists), len(b.Deleted), reply.FromEpoch, reply.ToEpoch,
-		len(reply.Changed), decided.Seconds(), time.Since(start).Seconds()-decided.Seconds())
+	for _, mg := range mj.Merges {
+		fmt.Printf("list %d (partition %d) merged: %d postings to their nearest heads' lists\n", mg.List, mg.Partition, mg.Postings)
+	}
+	moved := 0
+	for _, cs := range mj.Codes {
+		moved += len(cs.IDs)
+	}
+	fmt.Printf("major epoch: epoch %d -> %d, graph version %d (%d-byte patch), %d postings moved to another owner; "+
+		"decided in %.2f s, applied in %.2f s\n", reply.FromEpoch, reply.ToEpoch, reply.Graph, len(mj.Patch), moved,
+		decided.Seconds(), time.Since(start).Seconds()-decided.Seconds())
 	return nil
+}
+
+// parseLists reads comma-separated list IDs.
+func parseLists(s string) ([]uint32, error) {
+	var out []uint32
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(f, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("list %q: %v", f, err)
+		}
+		out = append(out, uint32(v))
+	}
+	return out, nil
 }
 
 func saveState(path string, a *update.Allocator) error {
 	id, loc := a.Next()
-	b, _ := json.Marshal(state{NextID: id, NextLoc: loc})
+	b, _ := json.Marshal(state{NextID: id, NextLoc: loc, NextList: a.NextList()})
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
 		return err

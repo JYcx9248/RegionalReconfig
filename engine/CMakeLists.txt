@@ -70,6 +70,7 @@ add_library(fusion STATIC
   src/rerank.cpp
   src/engine.cpp
   src/partition.cpp
+  src/graph_patch.cpp
   src/node_engine.cpp
   src/pq_store.cpp
   src/raw_store.cpp

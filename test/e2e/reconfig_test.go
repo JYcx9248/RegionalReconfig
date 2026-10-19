@@ -892,7 +892,7 @@ func TestNodeShutdownUnderLoad(t *testing.T) {
 			defer nc.Close()
 			for i := 0; ctx.Err() == nil; i++ {
 				q := f.queries.Row((w + i) % numQueries)
-				lists, err := nc.Navigate(ctx, 1, q, testNProbe, 0)
+				lists, err := nc.Navigate(ctx, 1, nodeclient.NewestGraph, q, testNProbe, 0)
 				if err != nil {
 					return // the node is going away
 				}

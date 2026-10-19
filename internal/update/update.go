@@ -25,6 +25,7 @@ import (
 type Allocator struct {
 	nextID, idEnd   uint64
 	nextLoc, locEnd uint64
+	nextList        uint64 // the first list ID major epochs have not handed out (0: none yet)
 }
 
 // NewAllocator starts at the first free ID and location (the index's vector count and
@@ -57,6 +58,24 @@ func (a *Allocator) Take(n int) (ids, locs []uint32, err error) {
 
 // Next is the first ID and the first location not handed out yet.
 func (a *Allocator) Next() (id, loc uint64) { return a.nextID, a.nextLoc }
+
+// TakeLists reserves the next n list IDs for the lists a major epoch creates, from floor at the
+// least (above every list that exists). Like vector IDs, list IDs are never handed out twice.
+func (a *Allocator) TakeLists(n int, floor uint32) []uint32 {
+	if a.nextList < uint64(floor) {
+		a.nextList = uint64(floor)
+	}
+	out := make([]uint32, n)
+	for i := range out {
+		out[i] = uint32(a.nextList + uint64(i))
+	}
+	a.nextList += uint64(n)
+	return out
+}
+
+// NextList is the first list ID not handed out yet (0 if none was); SetNextList restores it.
+func (a *Allocator) NextList() uint64     { return a.nextList }
+func (a *Allocator) SetNextList(v uint64) { a.nextList = v }
 
 // Insert is one routed insert: its ID and location, the posting lists it joins and its PQ code.
 type Insert struct {
@@ -106,7 +125,7 @@ func ByOwner(ins []Insert, m *partitioning.Manifest, t *epoch.Table) map[placeme
 	for i, in := range ins {
 		var owners []placement.NodeID
 		for _, l := range in.Lists {
-			o := t.Owner(m.PartitionOf(l))
+			o := t.Owner(t.PartitionOf(l, m))
 			if !containsNode(owners, o) {
 				owners = append(owners, o)
 			}

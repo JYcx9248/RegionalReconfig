@@ -35,6 +35,7 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	c.Handle(protocol.EvictM, a.handleEvict)
 	c.Handle(protocol.SavePartitionsM, a.handleSavePartitions)
 	c.Handle(protocol.DropVersionsM, a.handleDropVersions)
+	c.Handle(protocol.GraphPatchM, a.handleGraphPatch)
 	c.Handle(protocol.SetAdmissionM, a.handleSetAdmission)
 	c.Handle(protocol.WaitIdleM, a.handleWaitIdle)
 	c.Handle(protocol.NodeStatusM, a.handleStatus)
@@ -619,9 +620,63 @@ func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any
 	if err := a.localBulk.LoadGraph(ctx, path); err != nil {
 		return nil, err
 	}
+	// The patches major epochs made since the build (U14), in order, from the same source: the
+	// graph is then at the version the epoch searches.
+	for v := uint32(1); v <= req.Graph; v++ {
+		file := patchName(v)
+		if req.Source.Kind != "peer" {
+			return nil, fmt.Errorf("graph version %d: a %s graph source has no patches", req.Graph, req.Source.Kind)
+		}
+		pst, err := transfer.Pull(ctx, req.Source.Addr, []string{filepath.Join("graph", file)}, a.cfg.WorkDir, a.cfg.ChunkBytes, class)
+		if err != nil {
+			return nil, err
+		}
+		st.Bytes += pst.Bytes
+		st.Elapsed += pst.Elapsed
+		pp, _ := filepath.Abs(filepath.Join(a.graphDir(), file))
+		if err := a.localBulk.PatchLoad(ctx, pp); err != nil {
+			return nil, err
+		}
+		if err := a.localBulk.PatchMerge(ctx, v); err != nil {
+			return nil, err
+		}
+	}
 	a.setReady(config.RoleEntry)
 	a.reg.Counter("bulk.bytes_received").Add(st.Bytes)
 	return protocol.StageReply{Bytes: st.Bytes, Seconds: st.Elapsed.Seconds()}, nil
+}
+
+// patchName is the file a graph patch is kept in, in the graph directory.
+func patchName(v uint32) string { return fmt.Sprintf("patch-%d.bin", v) }
+
+// GraphPatch (U14 major epochs): once no query searches the graph without the patch -- the
+// controller calls this after the grace period -- the entry writes the patch next to the graph,
+// where a later entry's graph transfer takes it, and merges it in place: queries searching
+// through the patch go on meanwhile. With Drop (a commit that did not flip), it unstages it.
+func (a *Agent) handleGraphPatch(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := ctrl.Decode[protocol.GraphPatchReq](body)
+	if err != nil {
+		return nil, err
+	}
+	if req.Drop {
+		_, err := a.localBulk.PatchDrop(ctx, req.Version)
+		return struct{}{}, err
+	}
+	info, err := a.localBulk.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if info.Graph.Version >= req.Version {
+		return struct{}{}, nil // merged already (a retry): its file was written first
+	}
+	if err := os.MkdirAll(a.graphDir(), 0o755); err != nil {
+		return nil, err
+	}
+	path, _ := filepath.Abs(filepath.Join(a.graphDir(), patchName(req.Version)))
+	if err := a.localBulk.PatchSave(ctx, req.Version, path); err != nil {
+		return nil, err
+	}
+	return struct{}{}, a.localBulk.PatchMerge(ctx, req.Version)
 }
 
 func (a *Agent) handleInstallEpoch(ctx context.Context, body json.RawMessage) (any, error) {
@@ -780,6 +835,7 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 	sort.Ints(st.Resident)
 	if info, err := a.localBulk.Info(ctx); err == nil {
 		st.GraphLoaded = info.GraphLoaded
+		st.Graph, st.GraphPatch = info.Graph.Version, info.Graph.Patch
 		st.RawFetched = info.Raw.FetchedOnDemand()
 		st.RawFetchedBytes = st.RawFetched * uint64(info.Raw.VecBytes)
 		for _, pv := range info.Versions {

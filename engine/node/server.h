@@ -82,6 +82,7 @@ class NodeServer {
   void ReleaseWorker(int w);
   std::string InfoJson(bool settle) const;
   std::string OpsJson() const;
+  std::string GraphJson() const;
   std::string FetchJson() const;
 
   fusion::NodeEngine* engine_;

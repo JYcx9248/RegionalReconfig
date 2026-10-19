@@ -473,7 +473,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 			defer graphWG.Done()
 			var st protocol.StageReply
 			err := n.call(ctx, c.stageTimeout(), protocol.StageGraphM,
-				protocol.StageGraphReq{Source: graphSrcs[n.ID], Priority: c.cfg.GraphPriority}, &st)
+				protocol.StageGraphReq{Source: graphSrcs[n.ID], Priority: c.cfg.GraphPriority, Graph: cur.Graph}, &st)
 			graphBytes.Add(st.Bytes)
 			graphs <- graphDone{n, err}
 		}(n)

@@ -153,11 +153,36 @@ A failed staging is undone before the lease is given up, and a commit that fails
 drops what was staged. A partition at a later version moves with its current lists: its owner
 writes them as a segment file when it moves. With `lazy`, a vector inserted into a partition
 stays with the owner that added it when the partition moves on (the postings name that node as
-its holder), and a scale-in that removes the node drains it first. Not there yet: splits and
-merges in major epochs with a rebuilt graph, the health check that triggers them, growing the ID
-and location spaces, a response to a batch over budget (it fails before anything is sent), and a
-log to replay batches from. `test/e2e/update_test.go` checks every answer against an oracle that
-applies the same decisions, across batches, a failed batch and rescales.
+its holder), and a scale-in that removes the node drains it first.
+
+**Major epochs** split and merge posting lists, as a batch with its own lease
+(`internal/update/major.go`). Only minor batches come from outside: the owners report the
+lengths of the lists a batch changes, and `MajorDue` splits the lists over one length and merges
+the ones under another (`rtier-updater -split-len`, `-merge-len`; `-split`, `-merge` by hand).
+The update controller decides on PQ codes, so no raw vector is read but the new heads':
+
+- a split is a balanced 2-means of a list's members; each child's head is the member closest to
+  its mean, as the build chooses heads, and both children stay in the parent's partition;
+- a merge sends each member to the list of its nearest live head, whatever its partition. A
+  posting that changes owner moves as (vector ID, location, holder) with its PQ code, and its raw
+  vector follows on demand from the node that holds it, as after a migration.
+
+The graph changes without any node holding two versions of it. The update controller's router
+inserts the new heads and marks the removed ones deleted (routing points, never a result), and
+exports the bytes that changed: a patch (`engine/include/fusion/graph_patch.h`). Every entry
+stages the patch next to its graph. Queries of the epoch after the flip search through it -- a
+changed element is read from the patch, every other one from the graph, so the search is the
+patched graph's, step by step -- and those of the epoch before it search the graph alone. After
+the grace period every entry keeps the patch as a file, where a later entry's graph transfer takes
+it, and merges it in place without a pause; the lease ends after that. The epoch table names the
+graph version and the lists major epochs created; data nodes leave room for heads and lists
+(`rtier_node --graph-headroom`, 20% by default).
+
+Not there yet: growing the ID and location spaces, a response to a batch over budget (it fails
+before anything is sent), reassigning the vectors of neighboring lists in a split (SPFresh's
+LIRE), the full rebuild, and a log to replay batches from. `test/e2e/update_test.go` and
+`test/e2e/major_test.go` check every answer against an oracle that applies the same decisions,
+across batches, a failed batch, a major epoch and rescales.
 
 ## Layout
 

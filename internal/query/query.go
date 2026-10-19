@@ -65,7 +65,7 @@ func GroupByOwner(lists []uint32, m *partitioning.Manifest, t *epoch.Table) []Gr
 	idx := map[placement.NodeID]int{}
 	var gs []Group
 	for _, c := range lists {
-		p := m.PartitionOf(c)
+		p := t.PartitionOf(c, m)
 		o := t.Owner(p)
 		i, ok := idx[o]
 		if !ok {

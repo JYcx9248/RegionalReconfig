@@ -8,19 +8,24 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "fusion/assignment.h"
 #include "fusion/dataset.h"
 #include "fusion/distance.h"
 #include "fusion/filter.h"
+#include "fusion/graph_patch.h"
 #include "fusion/hnsw_space.h"
 #include "fusion/index_meta.h"
 #include "fusion/layout.h"
@@ -200,6 +205,12 @@ class NodeEngineImpl : public NodeEngine {
     FUSION_CHECK(o.max_nprobe >= 1 && o.max_rerank >= 1, "max_nprobe and max_rerank must be >= 1");
     space_ = MakeL2Space(DTypeOf<T>(), dim_);
     segs_.resize(man_.num_partitions);
+    // Lists: the build's, then room for the ones major epochs add (U14), each registered as it
+    // arrives -- created by StageVersions, or in a segment loaded from a peer.
+    list_capacity_ = HeadCapacity();
+    list_part_.reset(new std::atomic<uint32_t>[list_capacity_]);
+    for (uint32_t c = 0; c < list_capacity_; ++c)
+      list_part_[c].store(c < man_.num_lists ? man_.list_part[c] : kInvalidId, std::memory_order_relaxed);
     index_pages_path_ = path(files::LayoutVectors(man_.layout));
     // Inserts make lists longer (U14): o.max_list_len leaves room for them.
     max_list_len_ = std::max<uint32_t>(std::max(o.max_list_len, man_.max_list_len), 1);
@@ -273,19 +284,254 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // ------------------------------------------------------------------ staging
+  // The build's graph (version 0), with room for the heads major epochs add.
   void LoadGraph(const std::string& path) override {
-    auto g = std::make_shared<HnswIndex>(space_.get(), path);
+    auto g = std::make_shared<HnswIndex>(space_.get(), path, false, HeadCapacity());
     FUSION_CHECK(g->getCurrentElementCount() == man_.num_lists,
                  "graph has %zu heads but the partition manifest has %u lists",
                  static_cast<size_t>(g->getCurrentElementCount()), man_.num_lists);
     g->setEf(1);  // the search width is passed per call (see NavigateImpl)
     std::lock_guard<std::mutex> l(graph_mu_);
     graph_ = std::move(g);
+    graph_version_ = 0;
+    patch_.reset();
+    graph_busy_ = false;
   }
 
   bool has_graph() const override {
     std::lock_guard<std::mutex> l(graph_mu_);
     return graph_ != nullptr;
+  }
+
+  GraphState graph_state() const override {
+    GraphState st;
+    std::lock_guard<std::mutex> l(graph_mu_);
+    if (!graph_) return st;
+    st.loaded = true;
+    st.version = graph_version_;
+    st.patch = patch_ ? patch_->patch.version : 0;
+    st.count = graph_->cur_element_count;
+    st.capacity = graph_->max_elements_;
+    st.deleted = graph_->num_deleted_;
+    return st;
+  }
+
+  // ------------------------------------------------------- graph patches (U14)
+  void StageGraphPatch(const uint8_t* data, size_t n) override {
+    GraphPatch p = GraphPatch::Parse(data, n);
+    std::shared_ptr<HnswIndex> g;
+    uint32_t v = 0;
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      if (!graph_) throw NoGraphError("navigation graph is not loaded on this node");
+      FUSION_CHECK(!graph_busy_, "the graph is being changed");
+      g = graph_;
+      v = graph_version_;
+    }
+    FUSION_CHECK(p.base_version == v && p.version == v + 1,
+                 "graph patch from version %u to %u, the graph is at version %u", p.base_version, p.version, v);
+    auto sp = std::make_shared<const StagedPatch>(StagePatch(*g, std::move(p)));
+    std::lock_guard<std::mutex> l(graph_mu_);
+    FUSION_CHECK(graph_ == g && graph_version_ == v && !graph_busy_, "the graph changed while a patch was staged");
+    patch_ = std::move(sp);
+  }
+
+  void MergeGraphPatch(uint32_t version) override {
+    std::shared_ptr<HnswIndex> g;
+    std::shared_ptr<const StagedPatch> sp;
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      if (!graph_) throw NoGraphError("navigation graph is not loaded on this node");
+      if (!patch_ || patch_->patch.version != version) {
+        if (graph_version_ == version) return;  // merged already
+        throw NotResidentError(StrFormat("graph patch %u is not staged (the graph is at version %u)", version,
+                                         graph_version_));
+      }
+      FUSION_CHECK(!graph_busy_, "the graph is being changed");
+      graph_busy_ = true;  // searches of the version before the patch are refused from here on
+      g = graph_;
+      sp = patch_;
+    }
+    WaitPlainSearches();
+    // Searches through the patch go on: they read the elements written here from the patch. If
+    // the merge fails half way the graph stays busy (no search of it alone) until a LoadGraph.
+    ApplyPatch(*g, *sp);
+    std::lock_guard<std::mutex> l(graph_mu_);
+    graph_version_ = version;
+    patch_.reset();
+    graph_busy_ = false;
+  }
+
+  bool DropGraphPatch(uint32_t version) override {
+    std::lock_guard<std::mutex> l(graph_mu_);
+    if (!patch_ || patch_->patch.version != version) return false;
+    patch_.reset();
+    return true;
+  }
+
+  void SaveGraphPatch(uint32_t version, const std::string& path) const override {
+    std::shared_ptr<const StagedPatch> sp;
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      sp = patch_;
+    }
+    if (!sp || sp->patch.version != version)
+      throw NotResidentError(StrFormat("graph patch %u is not staged", version));
+    const std::vector<uint8_t> b = sp->patch.Serialize();
+    WriteFile(path, b.data(), b.size());
+  }
+
+  std::vector<uint8_t> EditGraph(uint32_t version, const uint32_t* labels, const void* vecs, uint32_t nnew,
+                                 const uint32_t* deleted, uint32_t ndeleted) override {
+    std::shared_ptr<HnswIndex> g;
+    uint32_t base = 0;
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      if (!graph_) throw NoGraphError("navigation graph is not loaded on this node");
+      FUSION_CHECK(!patch_ && !graph_busy_, "the graph has a staged patch or is being changed");
+      FUSION_CHECK(version == graph_version_ + 1, "an edit to version %u of a graph at version %u", version,
+                   graph_version_);
+      g = graph_;
+      base = graph_version_;
+    }
+    // Refused before anything changes.
+    FUSION_CHECK(g->cur_element_count + nnew <= g->max_elements_,
+                 "the graph has room for %zu heads, it holds %zu and the edit adds %u (rtier_node --graph-headroom)",
+                 g->max_elements_, static_cast<size_t>(g->cur_element_count), nnew);
+    std::vector<hnswlib::tableint> dead(ndeleted);
+    {
+      std::lock_guard<std::mutex> l(g->label_lookup_lock);
+      std::unordered_set<uint32_t> seen;
+      for (uint32_t i = 0; i < nnew; ++i)
+        FUSION_CHECK(g->label_lookup_.count(labels[i]) == 0 && seen.insert(labels[i]).second,
+                     "head %u exists already", labels[i]);
+      for (uint32_t i = 0; i < ndeleted; ++i) {
+        const auto it = g->label_lookup_.find(deleted[i]);
+        FUSION_CHECK(it != g->label_lookup_.end(), "head %u is not in the graph", deleted[i]);
+        FUSION_CHECK(!g->isMarkedDeleted(it->second) && seen.insert(deleted[i]).second,
+                     "head %u is deleted already", deleted[i]);
+        dead[i] = it->second;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      FUSION_CHECK(graph_ == g && !patch_ && !graph_busy_, "the graph changed meanwhile");
+      graph_busy_ = true;
+    }
+    WaitPlainSearches();
+    // The elements an insert changes: the new one, and the neighbors it links to at every level
+    // (hnswlib rewrites exactly those lists, in mutuallyConnectNewElement). If an insert fails
+    // half way the graph stays busy (no search) until a LoadGraph.
+    std::vector<uint32_t> changed;
+    const T* x = static_cast<const T*>(vecs);
+    for (uint32_t i = 0; i < nnew; ++i) {
+      g->addPoint(x + static_cast<size_t>(i) * dim_, labels[i]);
+      hnswlib::tableint id;
+      {
+        std::lock_guard<std::mutex> l(g->label_lookup_lock);
+        id = g->label_lookup_.at(labels[i]);
+      }
+      changed.push_back(id);
+      for (int level = 0; level <= g->element_levels_[id]; ++level) {
+        hnswlib::linklistsizeint* ll = level == 0 ? g->get_linklist0(id) : g->get_linklist(id, level);
+        const unsigned short k = g->getListCount(ll);
+        for (unsigned short j = 0; j < k; ++j) changed.push_back(ll[1 + j]);
+      }
+    }
+    for (hnswlib::tableint id : dead) {
+      g->markDeletedInternal(id);
+      changed.push_back(id);
+    }
+    GraphPatch p = CapturePatch(*g, std::move(changed), base, version);
+    {
+      std::lock_guard<std::mutex> l(graph_mu_);
+      graph_version_ = version;
+      graph_busy_ = false;
+    }
+    return p.Serialize();
+  }
+
+  // Seeds: the member farthest from the mean, then the member farthest from it (ties: the first
+  // found). Then a 2-means whose assignment splits the members in halves -- ordered by how much
+  // closer they are to one center than to the other -- until it stops changing.
+  void SplitCodes(const uint8_t* codes, uint32_t n, uint8_t* side, uint32_t heads[2]) const override {
+    FUSION_CHECK(n >= 2, "a list of %u postings cannot split", n);
+    const uint32_t m = codebook_->m();
+    std::vector<float> x(static_cast<size_t>(n) * dim_);
+    for (uint32_t i = 0; i < n; ++i)
+      codebook_->Decode(codes + static_cast<size_t>(i) * m, x.data() + static_cast<size_t>(i) * dim_);
+    auto row = [&](uint32_t i) { return x.data() + static_cast<size_t>(i) * dim_; };
+    auto d2 = [&](const float* a, const float* b) { return L2Sqr(a, b, dim_); };
+    std::vector<float> c0(dim_, 0.f), c1(dim_, 0.f);
+    for (uint32_t i = 0; i < n; ++i)
+      for (uint32_t d = 0; d < dim_; ++d) c0[d] += row(i)[d] / static_cast<float>(n);
+    auto farthest = [&](const float* from, uint32_t skip) {
+      uint32_t best = n;
+      float bd = -1.f;
+      for (uint32_t i = 0; i < n; ++i) {
+        if (i == skip) continue;
+        const float d = d2(row(i), from);
+        if (d > bd) {
+          bd = d;
+          best = i;
+        }
+      }
+      return best;
+    };
+    const uint32_t a = farthest(c0.data(), n);
+    const uint32_t b = farthest(row(a), a);
+    c0.assign(row(a), row(a) + dim_);
+    c1.assign(row(b), row(b) + dim_);
+    std::vector<uint8_t> cur(n, 2);
+    std::vector<std::pair<float, uint32_t>> order(n);
+    const uint32_t half = (n + 1) / 2;
+    std::vector<float>* cs[2] = {&c0, &c1};
+    for (int it = 0; it < 32; ++it) {
+      for (uint32_t i = 0; i < n; ++i) order[i] = {d2(row(i), c0.data()) - d2(row(i), c1.data()), i};
+      std::sort(order.begin(), order.end());
+      bool same = true;
+      for (uint32_t k = 0; k < n; ++k) {
+        const uint8_t s = k < half ? 0 : 1;
+        same = same && cur[order[k].second] == s;
+        cur[order[k].second] = s;
+      }
+      for (int s = 0; s < 2; ++s) {
+        std::fill(cs[s]->begin(), cs[s]->end(), 0.f);
+        const float cnt = static_cast<float>(s == 0 ? half : n - half);
+        for (uint32_t i = 0; i < n; ++i)
+          if (cur[i] == s)
+            for (uint32_t d = 0; d < dim_; ++d) (*cs[s])[d] += row(i)[d] / cnt;
+      }
+      if (same) break;
+    }
+    for (int s = 0; s < 2; ++s) {
+      float bd = 0.f;
+      heads[s] = n;
+      for (uint32_t i = 0; i < n; ++i) {
+        if (cur[i] != s) continue;
+        const float d = d2(row(i), cs[s]->data());
+        if (heads[s] == n || d < bd) {
+          bd = d;
+          heads[s] = i;
+        }
+      }
+    }
+    std::copy(cur.begin(), cur.end(), side);
+  }
+
+  void NearestHeads(const uint8_t* codes, uint32_t n, uint32_t ef, uint32_t* lists) const override {
+    const GraphRef r = Graph(kNewestGraph);
+    const uint32_t m = codebook_->m();
+    std::vector<float> xf(dim_);
+    std::vector<T> q(dim_);
+    for (uint32_t i = 0; i < n; ++i) {
+      codebook_->Decode(codes + static_cast<size_t>(i) * m, xf.data());
+      for (uint32_t d = 0; d < dim_; ++d) q[d] = FromFloat(xf[d]);
+      auto res = r.Search(q.data(), std::max<uint32_t>(ef, 1));
+      FUSION_CHECK(!res.empty(), "the graph has no head left");
+      while (res.size() > 1) res.pop();
+      lists[i] = static_cast<uint32_t>(res.top().second);
+    }
   }
 
   void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq, uint32_t version,
@@ -392,9 +638,7 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // ------------------------------------------------------------ update batches (U14)
-  std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts, const uint32_t* lists,
-                                         const uint32_t* ids, const uint32_t* locs, size_t nadds,
-                                         const uint32_t* deleted, size_t ndeleted) override {
+  std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts, const VersionEdits& e) override {
     std::unordered_map<uint32_t, size_t> which;  // partition -> index in parts
     for (size_t i = 0; i < parts.size(); ++i) {
       const VersionStage& vs = parts[i];
@@ -402,23 +646,65 @@ class NodeEngineImpl : public NodeEngine {
       FUSION_CHECK(vs.next != vs.base, "partition %u: the next version must differ from the base", vs.partition);
       FUSION_CHECK(which.emplace(vs.partition, i).second, "partition %u is listed twice", vs.partition);
     }
-    const uint64_t space = raw_->layout().locations();
-    // The postings to add, by partition and list: (ID, location).
-    std::vector<std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>> adds(parts.size());
-    for (size_t a = 0; a < nadds; ++a) {
-      FUSION_CHECK(lists[a] < man_.num_lists, "list %u out of range", lists[a]);
-      FUSION_CHECK(ids[a] < ids_, "vector ID %u out of range", ids[a]);
-      FUSION_CHECK(locs[a] < space, "location %u out of range", locs[a]);
-      const auto it = which.find(man_.list_part[lists[a]]);
-      FUSION_CHECK(it != which.end(), "a posting names list %u of partition %u, which is not staged",
-                   lists[a], man_.list_part[lists[a]]);
-      // An added vector is served by this node from now on: its raw vector must be here.
-      if (!Held(locs[a]))
-        throw RawMissingError(StrFormat("vector %u at location %u is not on this node (RAW_ADD it first)",
-                                        ids[a], locs[a]));
-      adds[it->second][lists[a]].emplace_back(ids[a], locs[a]);
+    auto staged = [&](uint32_t part, const char* what, uint32_t list) {
+      const auto it = which.find(part);
+      FUSION_CHECK(it != which.end(), "%s list %u of partition %u, which is not staged", what, list, part);
+      return it->second;
+    };
+    // The lists a major epoch creates and removes, by index in parts.
+    std::vector<std::vector<uint32_t>> created(parts.size()), removed(parts.size());
+    std::unordered_map<uint32_t, size_t> created_in;  // list -> index in parts
+    std::unordered_set<uint32_t> gone;               // the removed lists
+    for (size_t c = 0; c < e.ncreated; ++c) {
+      const uint32_t list = e.created[c], part = e.created_parts[c];
+      FUSION_CHECK(list < list_capacity_, "list %u is beyond the room for lists (%u; rtier_node --graph-headroom)",
+                   list, list_capacity_);
+      const uint32_t known = list_part_[list].load(std::memory_order_acquire);
+      FUSION_CHECK(known == kInvalidId || known == part, "list %u is in partition %u, not %u", list, known, part);
+      const size_t i = staged(part, "the batch creates", list);
+      FUSION_CHECK(created_in.emplace(list, i).second, "list %u is created twice", list);
+      created[i].push_back(list);
     }
-    std::vector<uint32_t> del(deleted, deleted + ndeleted);
+    for (size_t r = 0; r < e.nremoved; ++r) {
+      const uint32_t list = e.removed[r];
+      const size_t i = staged(PartOf(list), "the batch removes", list);
+      FUSION_CHECK(gone.insert(list).second && created_in.count(list) == 0,
+                   "list %u is removed twice, or created and removed", list);
+      removed[i].push_back(list);
+    }
+    const uint64_t space = raw_->layout().locations();
+    const uint16_t me = self_id_.load();
+    // The postings to add, by partition and list.
+    struct Post {
+      uint32_t id, loc;
+      uint16_t holder;
+    };
+    std::vector<std::map<uint32_t, std::vector<Post>>> adds(parts.size());
+    for (size_t a = 0; a < e.nadds; ++a) {
+      const uint32_t list = e.lists[a];
+      FUSION_CHECK(e.ids[a] < ids_, "vector ID %u out of range", e.ids[a]);
+      FUSION_CHECK(e.locs[a] < space, "location %u out of range", e.locs[a]);
+      size_t i;
+      const auto ci = created_in.find(list);
+      if (ci != created_in.end()) {
+        i = ci->second;
+      } else {
+        i = staged(PartOf(list), "a posting names", list);
+        FUSION_CHECK(gone.count(list) == 0, "a posting names list %u, which the batch removes", list);
+      }
+      // The posting's holder: this node if the raw vector is here (an insert was RAW_ADDed, a
+      // posting moves within this node), else the node the posting names (it moves between
+      // owners: the vector is fetched from there when a query needs it).
+      uint16_t h = e.holders ? e.holders[a] : kNoHolder;
+      if (Held(e.locs[a])) {
+        h = kSelfHolder;
+      } else if (!Fetchable(h) || h == me) {
+        throw RawMissingError(StrFormat("vector %u at location %u is not on this node and its posting names no "
+                                        "other holder (RAW_ADD it first)", e.ids[a], e.locs[a]));
+      }
+      adds[i][list].push_back({e.ids[a], e.locs[a], h});
+    }
+    std::vector<uint32_t> del(e.deleted, e.deleted + e.ndeleted);
     std::sort(del.begin(), del.end());
     del.erase(std::unique(del.begin(), del.end()), del.end());
     auto is_deleted = [&](uint32_t id) { return std::binary_search(del.begin(), del.end(), id); };
@@ -440,35 +726,52 @@ class NodeEngineImpl : public NodeEngine {
       if (!base)
         throw NotResidentError(StrFormat("partition %u is not resident at version %u", vs.partition, vs.base));
       const ListSegment& b = base->seg;
+      auto in_base = [&](uint32_t list) { return std::binary_search(b.list_ids.begin(), b.list_ids.end(), list); };
+      for (uint32_t list : removed[i])
+        FUSION_CHECK(in_base(list), "list %u is not in partition %u's segment", list, vs.partition);
+      for (uint32_t list : created[i])
+        FUSION_CHECK(!in_base(list), "list %u is in partition %u's segment already", list, vs.partition);
       for (const auto& kv : adds[i])
-        FUSION_CHECK(std::binary_search(b.list_ids.begin(), b.list_ids.end(), kv.first),
+        FUSION_CHECK(in_base(kv.first) || created_in.count(kv.first) != 0,
                      "list %u is not in partition %u's segment", kv.first, vs.partition);
+      // The next version's lists: the base's without the removed ones, with the created ones.
+      std::vector<uint32_t> next_lists;
+      for (uint32_t list : b.list_ids)
+        if (gone.count(list) == 0) next_lists.push_back(list);
+      next_lists.insert(next_lists.end(), created[i].begin(), created[i].end());
+      std::sort(next_lists.begin(), next_lists.end());
+      for (uint32_t list : removed[i]) {
+        uint32_t len = 0;
+        b.Find(list, &len);
+        out[i].removed += len;
+      }
       auto rs = std::make_unique<ResidentSegment>();
       ListSegment& seg = rs->seg;
       seg.partition = vs.partition;
-      seg.list_ids = b.list_ids;
+      seg.list_ids = next_lists;
       seg.offsets.assign(1, 0);
-      // A kept posting keeps its holder; an added one is held here (its vector was RAW_ADDed).
-      struct Post {
-        uint32_t id, loc;
-        uint16_t holder;
-      };
+      // A kept posting keeps its holder; an added one is held here, or by the node it names.
       std::vector<Post> post;
       std::vector<uint16_t> holders;
-      for (size_t li = 0; li < b.list_ids.size(); ++li) {
+      for (uint32_t list : next_lists) {
         post.clear();
-        for (uint64_t j = b.offsets[li]; j < b.offsets[li + 1]; ++j) {
-          if (is_deleted(b.ids[j])) {
-            ++out[i].removed;
-            continue;
+        uint32_t base_len = 0;
+        const uint32_t* bv = in_base(list) ? b.Find(list, &base_len) : nullptr;
+        if (bv) {
+          const size_t at = static_cast<size_t>(bv - b.ids.data());
+          for (size_t j = at; j < at + base_len; ++j) {
+            if (is_deleted(b.ids[j])) {
+              ++out[i].removed;
+              continue;
+            }
+            post.push_back({b.ids[j], b.locs[j], base->Holder(j)});
           }
-          post.push_back({b.ids[j], b.locs[j], base->Holder(j)});
         }
-        const auto it = adds[i].find(b.list_ids[li]);
+        const auto it = adds[i].find(list);
         if (it != adds[i].end()) {
           const size_t kept = post.size();
-          for (const auto& pl : it->second)
-            if (!is_deleted(pl.first)) post.push_back({pl.first, pl.second, kSelfHolder});
+          for (const Post& x : it->second)
+            if (!is_deleted(x.id)) post.push_back(x);
           std::stable_sort(post.begin(), post.end(), [](const Post& x, const Post& y) { return x.id < y.id; });
           post.erase(std::unique(post.begin(), post.end(), [](const Post& x, const Post& y) { return x.id == y.id; }),
                      post.end());
@@ -476,16 +779,20 @@ class NodeEngineImpl : public NodeEngine {
         }
         FUSION_CHECK(post.size() <= max_list_len_,
                      "list %u would hold %zu postings, more than the %u a request may gather (--max-list-len)",
-                     b.list_ids[li], post.size(), max_list_len_);
+                     list, post.size(), max_list_len_);
         for (const Post& pl : post) {
           seg.ids.push_back(pl.id);
           seg.locs.push_back(pl.loc);
           holders.push_back(pl.holder);
         }
         seg.offsets.push_back(seg.ids.size());
+        if (!bv || post.size() != base_len) out[i].lengths.emplace_back(list, static_cast<uint32_t>(post.size()));
       }
-      out[i].changed = out[i].added + out[i].removed > 0;
-      if (!out[i].changed) continue;
+      out[i].changed = out[i].added + out[i].removed > 0 || !created[i].empty() || !removed[i].empty();
+      if (!out[i].changed) {
+        out[i].lengths.clear();
+        continue;
+      }
       rs->holders.reset(new std::atomic<uint16_t>[holders.size()]);
       for (size_t j = 0; j < holders.size(); ++j) rs->SetHolder(j, holders[j]);
       rs->version = vs.next;
@@ -494,6 +801,8 @@ class NodeEngineImpl : public NodeEngine {
       store_->Ref(seg.ids.data(), seg.ids.size(), rs->slots.data(), seg.locs.data());
       built[i].reset(rs.release(), [reclaimer](const ResidentSegment* r) { reclaimer->Push(r); });
     }
+    // Every version could be built: the lists the batch creates belong to their partitions now.
+    for (const auto& kv : created_in) RegisterList(kv.first, parts[kv.second].partition);
     std::vector<std::shared_ptr<const ResidentSegment>> replaced;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
@@ -511,6 +820,31 @@ class NodeEngineImpl : public NodeEngine {
       }
     }
     resident_version_.fetch_add(1);
+    return out;
+  }
+
+  ListPostings GetList(uint32_t list, uint32_t version) const override {
+    const uint32_t p = PartOf(list);
+    std::shared_ptr<const ResidentSegment> s;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      s = SegmentLocked(p, &version);
+    }
+    if (!s) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
+    uint32_t len = 0;
+    const uint32_t* v = s->seg.Find(list, &len);
+    if (!v) throw NotResidentError(StrFormat("list %u is not in partition %u at version %u", list, p, version));
+    const size_t at = static_cast<size_t>(v - s->seg.ids.data());
+    const uint16_t me = self_id_.load();
+    ListPostings out;
+    for (size_t j = at; j < at + len; ++j) {
+      out.ids.push_back(s->seg.ids[j]);
+      out.locs.push_back(s->seg.locs[j]);
+      const uint16_t h = s->Holder(j);
+      FUSION_CHECK(h != kSelfHolder || me != kNoHolder,
+                   "list %u: this node holds vectors of it but does not know its own node ID (SetNodes)", list);
+      out.holders.push_back(h == kSelfHolder ? me : h);
+    }
     return out;
   }
 
@@ -810,12 +1144,7 @@ class NodeEngineImpl : public NodeEngine {
   // ef 1 (see NavigateImpl), so asking for max(ef, candidates) and keeping the best candidates
   // runs the same search.
   void Assign(const void* vecs, uint32_t n, uint32_t* lists, uint8_t* codes) override {
-    std::shared_ptr<HnswIndex> g;
-    {
-      std::lock_guard<std::mutex> l(graph_mu_);
-      g = graph_;
-    }
-    if (!g) throw NoGraphError("navigation graph is not loaded on this node");
+    const GraphRef g = Graph(kNewestGraph);
     FUSION_CHECK(!assign_.rng, "the index was built with RNG pruning, which Assign does not reproduce");
     const uint32_t r = assign_.replicas;
     const float closure = (1.f + assign_.closure_eps) * (1.f + assign_.closure_eps);
@@ -824,7 +1153,7 @@ class NodeEngineImpl : public NodeEngine {
     std::vector<std::pair<float, uint32_t>> cand;
     for (uint32_t i = 0; i < n; ++i) {
       const T* v = x + static_cast<size_t>(i) * dim_;
-      auto res = g->searchKnn(v, width);
+      auto res = g.Search(v, width);
       while (res.size() > assign_.candidates) res.pop();
       cand.clear();
       while (!res.empty()) {
@@ -860,8 +1189,7 @@ class NodeEngineImpl : public NodeEngine {
     std::map<uint32_t, std::shared_ptr<const ResidentSegment>> segs;  // by partition: the newest
     for (size_t i = 0; i < n; ++i) {
       if (!std::binary_search(absent.begin(), absent.end(), locs[i])) continue;
-      FUSION_CHECK(lists[i] < man_.num_lists, "list %u out of range", lists[i]);
-      const uint32_t p = man_.list_part[lists[i]];
+      const uint32_t p = PartOf(lists[i]);
       auto it = segs.find(p);
       if (it == segs.end()) {
         std::lock_guard<std::mutex> l(seg_mu_);
@@ -941,8 +1269,8 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // --------------------------------------------------------------- primitives
-  uint32_t Navigate(const void* query, uint32_t nprobe, uint32_t ef, uint32_t* lists) override {
-    return NavigateImpl(static_cast<const T*>(query), nprobe, ef, lists);
+  uint32_t Navigate(const void* query, uint32_t nprobe, uint32_t ef, uint32_t* lists, uint32_t graph) override {
+    return NavigateImpl(static_cast<const T*>(query), nprobe, ef, graph, lists);
   }
 
   uint32_t Filter(int wi, const void* query, const uint32_t* lists, const uint32_t* versions,
@@ -1055,7 +1383,7 @@ class NodeEngineImpl : public NodeEngine {
 
     Timer t;
     w.lists.resize(p.nprobe);
-    const uint32_t nl = NavigateImpl(q, p.nprobe, p.graph_ef, w.lists.data());
+    const uint32_t nl = NavigateImpl(q, p.nprobe, p.graph_ef, kNewestGraph, w.lists.data());
     st->graph_us = t.Us();
     st->lists = nl;
 
@@ -1178,8 +1506,11 @@ class NodeEngineImpl : public NodeEngine {
     FUSION_CHECK(s.partition < man_.num_partitions, "%s: partition %u out of range", path.c_str(),
                  s.partition);
     for (uint32_t c : s.list_ids)
-      FUSION_CHECK(c < man_.num_lists && man_.list_part[c] == s.partition,
+      FUSION_CHECK(c < list_capacity_ && (c >= man_.num_lists || man_.list_part[c] == s.partition),
                    "%s: list %u does not belong to partition %u", path.c_str(), c, s.partition);
+    // A list a major epoch created (U14) is learned from the segment that holds it.
+    for (uint32_t c : s.list_ids)
+      if (c >= man_.num_lists) RegisterList(c, s.partition);
     return s;
   }
 
@@ -1250,6 +1581,91 @@ class NodeEngineImpl : public NodeEngine {
   // A holder a vector can be fetched from: a peer's ID.
   static bool Fetchable(uint16_t holder) { return holder != kNoHolder && holder != kSelfHolder; }
 
+  // Room for heads and lists: the build's, and graph_headroom more (U14 major epochs).
+  uint32_t HeadCapacity() const {
+    const double extra = std::ceil(static_cast<double>(man_.num_lists) * std::max(0.0, opts_.graph_headroom));
+    const uint64_t cap = static_cast<uint64_t>(man_.num_lists) + static_cast<uint64_t>(extra);
+    FUSION_CHECK(cap < kInvalidId, "graph headroom %.2f is too large", opts_.graph_headroom);
+    return static_cast<uint32_t>(cap);
+  }
+
+  // What one search reads: the graph alone, or the graph through the staged patch. A search of
+  // the graph alone is counted while it runs, so that a merge or an edit in place can wait for
+  // it; a search through the patch reads the elements those write from the patch.
+  struct GraphRef {
+    std::shared_ptr<HnswIndex> g;
+    std::shared_ptr<const StagedPatch> patch;
+    std::atomic<int>* plain = nullptr;
+    GraphRef() = default;
+    GraphRef(const GraphRef&) = delete;
+    GraphRef& operator=(const GraphRef&) = delete;
+    GraphRef(GraphRef&& o) noexcept : g(std::move(o.g)), patch(std::move(o.patch)), plain(o.plain) { o.plain = nullptr; }
+    ~GraphRef() {
+      if (plain) plain->fetch_sub(1, std::memory_order_release);
+    }
+    std::priority_queue<std::pair<float, hnswlib::labeltype>> Search(const void* q, size_t k) const {
+      return patch ? SearchPatched(*g, *patch, q, k) : g->searchKnn(q, k);
+    }
+  };
+
+  // The graph at `version` (kNewestGraph: the staged patch's version if there is one, else the
+  // graph's). NotResidentError if this node does not have it.
+  GraphRef Graph(uint32_t version) const {
+    GraphRef r;
+    std::lock_guard<std::mutex> l(graph_mu_);
+    if (!graph_) throw NoGraphError("navigation graph is not loaded on this node");
+    if (version == kNewestGraph) version = patch_ ? patch_->patch.version : graph_version_;
+    if (patch_ && version == patch_->patch.version) {
+      r.g = graph_;
+      r.patch = patch_;
+      return r;
+    }
+    if (version == graph_version_ && !graph_busy_) {
+      r.g = graph_;
+      plain_searches_.fetch_add(1, std::memory_order_acquire);
+      r.plain = &plain_searches_;
+      return r;
+    }
+    const std::string staged = patch_ ? StrFormat(", a patch to version %u is staged", patch_->patch.version) : "";
+    throw NotResidentError(StrFormat("graph version %u is not here (the graph is at version %u%s)", version,
+                                     graph_version_, staged.c_str()));
+  }
+
+  // Waits for the searches of the graph alone that started before it became busy.
+  void WaitPlainSearches() const {
+    while (plain_searches_.load(std::memory_order_acquire) != 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+
+  // A decoded PQ vector as a query of the graph's element type.
+  static T FromFloat(float v) {
+    if constexpr (std::is_floating_point<T>::value) {
+      return v;
+    } else {
+      const float lo = static_cast<float>(std::numeric_limits<T>::min());
+      const float hi = static_cast<float>(std::numeric_limits<T>::max());
+      return static_cast<T>(std::min(hi, std::max(lo, std::nearbyint(v))));
+    }
+  }
+
+  // The partition of `list`; NotResidentError if this node does not know the list.
+  uint32_t PartOf(uint32_t list) const {
+    if (list >= list_capacity_) throw NotResidentError(StrFormat("list %u out of range (%u)", list, list_capacity_));
+    const uint32_t p = list_part_[list].load(std::memory_order_acquire);
+    if (p == kInvalidId) throw NotResidentError(StrFormat("list %u is not known on this node", list));
+    return p;
+  }
+
+  // Records that `list`, created by a major epoch, belongs to partition `part`.
+  void RegisterList(uint32_t list, uint32_t part) const {
+    FUSION_CHECK(list < list_capacity_, "list %u is beyond the room for lists (%u; rtier_node --graph-headroom)",
+                 list, list_capacity_);
+    FUSION_CHECK(part < man_.num_partitions, "partition %u out of range", part);
+    uint32_t was = kInvalidId;
+    if (!list_part_[list].compare_exchange_strong(was, part, std::memory_order_acq_rel) && was != part)
+      throw std::invalid_argument(StrFormat("list %u is in partition %u, not %u", list, was, part));
+  }
+
   // Fetches the vectors at locs (sorted, unique) from the data node `holder` into *buf.
   // RawMissingError if the node does not know where that holder is, or the fetch fails.
   void FetchFrom(uint16_t holder, const std::vector<uint32_t>& locs, std::vector<uint8_t>* buf) {
@@ -1289,8 +1705,7 @@ class NodeEngineImpl : public NodeEngine {
     {
       std::lock_guard<std::mutex> l(seg_mu_);
       for (uint32_t i = 0; i < nlists; ++i) {
-        FUSION_CHECK(lists[i] < man_.num_lists, "list %u out of range", lists[i]);
-        segs[i] = SegmentLocked(man_.list_part[lists[i]], versions ? &versions[i] : nullptr);
+        segs[i] = SegmentLocked(PartOf(lists[i]), versions ? &versions[i] : nullptr);
       }
     }
     size_t left = miss.size();
@@ -1598,20 +2013,15 @@ class NodeEngineImpl : public NodeEngine {
     st->pending = pending;
   }
 
-  uint32_t NavigateImpl(const T* q, uint32_t nprobe, uint32_t ef, uint32_t* lists) const {
+  uint32_t NavigateImpl(const T* q, uint32_t nprobe, uint32_t ef, uint32_t graph, uint32_t* lists) const {
     FUSION_CHECK(nprobe >= 1 && nprobe <= opts_.max_nprobe, "nprobe %u outside [1, %u]", nprobe,
                  opts_.max_nprobe);
-    std::shared_ptr<HnswIndex> g;
-    {
-      std::lock_guard<std::mutex> l(graph_mu_);
-      g = graph_;
-    }
-    if (!g) throw NoGraphError("navigation graph is not loaded on this node");
+    const GraphRef g = Graph(graph);
     // hnswlib searches with width max(ef_, k) and keeps the k best; ef_ is 1 here, so asking
     // for k' = max(ef, nprobe) and keeping the nprobe best equals setEf(ef) + searchKnn(nprobe)
     // (what fusion::Engine does) without mutating shared state.
     const uint32_t width = std::max(ef ? ef : 2 * nprobe, nprobe);
-    auto res = g->searchKnn(q, width);
+    auto res = g.Search(q, width);
     while (res.size() > nprobe) res.pop();
     const uint32_t n = static_cast<uint32_t>(res.size());
     for (uint32_t i = n; i-- > 0;) {  // max-heap: farthest first -> fill from the back
@@ -1634,9 +2044,7 @@ class NodeEngineImpl : public NodeEngine {
     {
       std::lock_guard<std::mutex> l(seg_mu_);
       for (uint32_t i = 0; i < nlists; ++i) {
-        const uint32_t c = lists[i];
-        if (c >= man_.num_lists) throw std::runtime_error(StrFormat("list %u out of range", c));
-        w.held[i] = SegmentLocked(man_.list_part[c], versions ? &versions[i] : nullptr);
+        w.held[i] = SegmentLocked(PartOf(lists[i]), versions ? &versions[i] : nullptr);
       }
     }
     uint64_t nc = 0;
@@ -1645,9 +2053,8 @@ class NodeEngineImpl : public NodeEngine {
       if (!w.held[i]) {
         if (versions)
           throw NotResidentError(StrFormat("list %u: partition %u is not resident at version %u", c,
-                                           man_.list_part[c], versions[i]));
-        throw NotResidentError(
-            StrFormat("list %u: partition %u is not resident", c, man_.list_part[c]));
+                                           PartOf(c), versions[i]));
+        throw NotResidentError(StrFormat("list %u: partition %u is not resident", c, PartOf(c)));
       }
       const ResidentSegment& rs = *w.held[i];
       uint32_t len = 0;
@@ -1676,8 +2083,19 @@ class NodeEngineImpl : public NodeEngine {
   std::unique_ptr<PQCodebook> codebook_;
   uint32_t max_candidates_ = 0;
   std::unique_ptr<hnswlib::SpaceInterface<float>> space_;
+  // The navigation graph, at graph_version_, and the patch to the next version if one is staged
+  // (U14 major epochs). graph_busy_: being patched or edited in place -- no search of the graph
+  // alone may start, and the ones running are waited for (plain_searches_).
   mutable std::mutex graph_mu_;
   std::shared_ptr<HnswIndex> graph_;
+  uint32_t graph_version_ = 0;
+  std::shared_ptr<const StagedPatch> patch_;
+  bool graph_busy_ = false;
+  mutable std::atomic<int> plain_searches_{0};
+  // List -> partition (kInvalidId: unknown here), read without locks: the build's lists, then
+  // up to list_capacity_ the ones major epochs add.
+  uint32_t list_capacity_ = 0;
+  std::unique_ptr<std::atomic<uint32_t>[]> list_part_;
   ReadOnlyFile pq_file_;
   std::unique_ptr<FilterBackend> filter_;
   std::unique_ptr<PQStore> store_;

@@ -33,7 +33,14 @@ type Table struct {
 	// an update batch (U14) stages the next version on the owner while the current one serves,
 	// and both stay until the old epoch drains. Empty means every partition at version 0, which
 	// is what a dataset without updates keeps.
-	Versions    []uint32                      `json:"versions,omitempty"`
+	Versions []uint32 `json:"versions,omitempty"`
+	// Graph is the version of the navigation graph that queries of this epoch search: a major
+	// epoch (U14) patches the graph, and entries hold the patch next to the graph until the
+	// epochs before it drain. 0 is the build's graph.
+	Graph uint32 `json:"graph,omitempty"`
+	// Lists maps the posting lists that major epochs created to their partitions; the build's
+	// lists are in the partition manifest. A list ID is never reused.
+	Lists       map[uint32]int                `json:"lists,omitempty"`
 	Nodes       map[placement.NodeID]NodeInfo `json:"nodes"`
 	Entries     []placement.NodeID            `json:"entries"`     // accept client queries; hold the graph
 	Aggregators []placement.NodeID            `json:"aggregators"` // may run a query's scatter/gather
@@ -48,6 +55,18 @@ func (t *Table) Version(p int) uint32 {
 		return 0
 	}
 	return t.Versions[p]
+}
+
+// ListPartitions is how the build's lists map to partitions (partitioning.Manifest).
+type ListPartitions interface{ PartitionOf(list uint32) int }
+
+// PartitionOf returns the partition of list c in this epoch: one a major epoch created, or the
+// build's.
+func (t *Table) PartitionOf(c uint32, base ListPartitions) int {
+	if p, ok := t.Lists[c]; ok {
+		return p
+	}
+	return base.PartitionOf(c)
 }
 
 // Node looks up a node's addresses.
@@ -67,6 +86,12 @@ func (t *Table) Clone() *Table {
 	c := *t
 	c.Placement = t.Placement.Clone()
 	c.Versions = append([]uint32(nil), t.Versions...)
+	if t.Lists != nil {
+		c.Lists = make(map[uint32]int, len(t.Lists))
+		for k, v := range t.Lists {
+			c.Lists[k] = v
+		}
+	}
 	c.Nodes = make(map[placement.NodeID]NodeInfo, len(t.Nodes))
 	for k, v := range t.Nodes {
 		c.Nodes[k] = v
@@ -85,6 +110,11 @@ func (t *Table) Validate() error {
 	if n := len(t.Versions); n != 0 && n != t.Placement.NumPartitions() {
 		return fmt.Errorf("epoch %d: versions for %d partitions, the placement has %d",
 			t.Epoch, n, t.Placement.NumPartitions())
+	}
+	for c, p := range t.Lists {
+		if p < 0 || p >= t.Placement.NumPartitions() {
+			return fmt.Errorf("epoch %d: list %d in partition %d of %d", t.Epoch, c, p, t.Placement.NumPartitions())
+		}
 	}
 	check := func(what string, id placement.NodeID) error {
 		if _, ok := t.Nodes[id]; !ok {

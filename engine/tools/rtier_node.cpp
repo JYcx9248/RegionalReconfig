@@ -50,6 +50,8 @@ static void Usage() {
   --update-write-mbps N  MB/s the writer spends on inserted vectors (default 0 = no limit)
   --max-list-len N       longest posting list a request may gather, with room for inserts
                          (default: the partitions' longest)
+  --graph-headroom F     room for the heads and lists major epochs add, as a fraction of the
+                         build's (default 0.2)
   --gpu G                GPU device (default 0)
   --stats-file PATH      append a stats line (JSON) every --stats-ms: per-operation counters, the
                          on-demand fetch path's and the read budget's, stamped with
@@ -87,6 +89,7 @@ int main(int argc, char** argv) {
     o.update_buffer_bytes = a.U64("update-buffer-mb", 256) << 20;
     o.update_write_bps = a.U64("update-write-mbps", 0) * 1000000;
     o.max_list_len = static_cast<uint32_t>(a.U64("max-list-len", 0));
+    o.graph_headroom = a.Has("graph-headroom") ? std::stod(a.Str("graph-headroom", "0.2")) : 0.2;
     o.gpu_device = static_cast<int>(a.U64("gpu", 0));
     const std::string listen = a.Str("listen", "127.0.0.1:0");
     const std::string unix_path = a.Str("unix", "");

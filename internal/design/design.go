@@ -210,44 +210,63 @@ var Open = map[string]Question{
 			"and the PQ codebook is fixed, so cached PQ codes and raw vectors on former owners stay " +
 			"valid; what remains is maintaining posting lists and the graph. The design under " +
 			"discussion (periodic batches, each a content epoch) is in " +
-			"docs/drafts/dataset-updates-discussion.md. In code, minor batches (inserts and deletes, " +
-			"no splits). Partition versions: the epoch table names a version of each partition's " +
-			"lists, a data node holds several versions of a partition side by side, and FILTER/RERANK " +
-			"name the one their epoch sees. Inserts: data nodes leave room for inserted IDs and " +
-			"locations (rtier_node --max-vectors, --max-pages; both only appended) and for longer " +
-			"lists (--max-list-len); ASSIGN routes a vector by the build's own rule and gives its PQ " +
-			"code; RAW_ADD serves inserted vectors from memory and writes them after fetched ones, " +
-			"never while paused (PAUSE_UPDATES), within --update-write-mbps -- writes are not " +
-			"charged to the read budget yet. Batches run only with the controller's allow_updates " +
-			"(off by default: a static experiment refuses them; run_local.py's \"Updates\" turns it on, " +
-			"leaves room on the data nodes and requires an explicit PQ budget, since the default " +
-			"budget is the whole ID space, headroom included). The update controller " +
-			"(internal/update, rtier-updater) takes the controller's lease (BeginUpdate: no " +
-			"reconfiguration and no other batch until the commit or the abort, or until update_lease " +
-			"expires; the agents first release PQ codes left staged by a staging that never ended), " +
-			"routes the inserts with its own router (an rtier_node with the graph and codebook only, " +
-			"never a serving node), checks the owners' room, sends the PQ codes and raw vectors to " +
-			"the owners, and " +
-			"has every data node stage the next version of the partitions the batch changes " +
-			"(STAGE_VERSIONS: inserts appended, deleted IDs dropped; deletes are broadcast and each " +
-			"node finds its copies); CommitUpdate checks the staged versions, flips (all entries at " +
-			"once), waits out the grace period, and reclaims: every node frees the deleted vectors' " +
-			"PQ codes (FORGET, deleted: copies nothing names go at once, the others are marked) and " +
-			"then the owners drop the replaced versions, so a deleted vector's code goes with its " +
-			"last version and never becomes a cached one -- a deleted vector is no cache. A staging " +
-			"that fails is undone before the lease is given up; a commit that fails before the " +
-			"flip drops the staged versions. A partition at a later version moves with its current lists: its owner writes " +
-			"them as a segment file for the move (SAVE_PARTITION). Not implemented: growing the ID " +
-			"and location spaces at an epoch boundary; the response to a batch over budget (splitting " +
-			"partitions, scaling out first -- the batch fails before anything is sent); splits, " +
-			"merges and major epochs (the graph rebuild); the health check that triggers them; the " +
-			"decision log and replay; freeing the pages of deleted vectors. An inserted vector stays " +
-			"with the owner that added it when its partition moves on (the postings name that node " +
-			"as its holder), and a node that leaves is drained first (U9). Open: versions staged " +
-			"under a lease that expired stay on their owner until a later batch replaces them or " +
-			"the partition moves",
-		"internal/epoch/table.go (Versions), engine/include/fusion/node_engine.h (partition versions, " +
-			"Assign, RawAdd, StageVersions), internal/update (batch.go), internal/controller/update.go, " +
+			"docs/drafts/dataset-updates-discussion.md. In code, minor batches (inserts and deletes) " +
+			"and major epochs (splits and merges). Partition versions: the epoch table names a " +
+			"version of each partition's lists, a data node holds several versions of a partition " +
+			"side by side, and FILTER/RERANK name the one their epoch sees. Inserts: data nodes leave " +
+			"room for inserted IDs and locations (rtier_node --max-vectors, --max-pages; both only " +
+			"appended) and for longer lists (--max-list-len); ASSIGN routes a vector by the build's " +
+			"own rule and gives its PQ code; RAW_ADD serves inserted vectors from memory and writes " +
+			"them after fetched ones, never while paused (PAUSE_UPDATES), within --update-write-mbps " +
+			"-- writes are not charged to the read budget yet. Batches run only with the controller's " +
+			"allow_updates (off by default: a static experiment refuses them; run_local.py's " +
+			"\"Updates\" turns it on, leaves room on the data nodes and requires an explicit PQ " +
+			"budget, since the default budget is the whole ID space, headroom included). The update " +
+			"controller (internal/update, rtier-updater) takes the controller's lease (BeginUpdate: " +
+			"no reconfiguration and no other batch until the commit or the abort, or until " +
+			"update_lease expires; the agents first release PQ codes left staged by a staging that " +
+			"never ended), routes the inserts with its own router (an rtier_node with the graph and " +
+			"codebook only, never a serving node), checks the owners' room, sends the PQ codes and " +
+			"raw vectors to the owners, and has every data node stage the next version of the " +
+			"partitions the batch changes (STAGE_VERSIONS: inserts appended, deleted IDs dropped; " +
+			"deletes are broadcast and each node finds its copies); CommitUpdate checks the staged " +
+			"versions, flips (all entries at once), waits out the grace period, and reclaims: every " +
+			"node frees the deleted vectors' PQ codes (FORGET, deleted: copies nothing names go at " +
+			"once, the others are marked) and then the owners drop the replaced versions, so a " +
+			"deleted vector's code goes with its last version and never becomes a cached one -- a " +
+			"deleted vector is no cache. A staging that fails is undone before the lease is given up; " +
+			"a commit that fails before the flip drops the staged versions. A partition at a later " +
+			"version moves with its current lists: its owner writes them as a segment file for the " +
+			"move (SAVE_PARTITION). Major epochs (internal/update/major.go) split and merge posting " +
+			"lists as a batch with its own lease, decided on PQ codes: a split is a balanced 2-means " +
+			"of a list's members, each child's head the member closest to its mean, both children in " +
+			"the parent's partition; a merge sends each member to the list of its nearest live head " +
+			"on the edited graph, whatever its partition -- a posting that changes owner moves as " +
+			"(vector ID, location, holder) with its PQ code, its raw vector following on demand. The " +
+			"update controller's router edits its graph (new heads in, removed heads marked deleted, " +
+			"routing points but never a result) and exports the bytes that changed as a patch " +
+			"(fusion/graph_patch.h). No node holds two versions of the graph: every entry stages the " +
+			"patch next to its graph, queries of the epoch after the flip search through it (step by " +
+			"step the patched graph's search), and after the grace period every entry keeps it as a " +
+			"file -- a later entry's graph transfer brings the build's graph and the patches -- and " +
+			"merges it in place, before the lease ends. The epoch table names the graph version and " +
+			"the lists major epochs created (list IDs, like vector IDs, are never reused); data nodes " +
+			"leave room for heads and lists (rtier_node --graph-headroom, 20% by default). Trigger " +
+			"(decided 2026-10-16): only minor batches come from outside; the owners report the " +
+			"lengths of the lists a batch changes, and MajorDue splits the lists over one length and " +
+			"merges the ones under another (rtier-updater -split-len, -merge-len; -split, -merge by " +
+			"hand). Not implemented: growing the ID and location spaces at an epoch boundary; the " +
+			"response to a batch over budget (splitting partitions, scaling out first -- the batch " +
+			"fails before anything is sent); reassigning the vectors of neighboring lists in a split " +
+			"(SPFresh's LIRE, a recall matter); the full rebuild and its probe-set trigger; a graph " +
+			"patch over one frame (256 MB); the decision log and replay; freeing the pages of deleted " +
+			"vectors. An inserted vector stays with the owner that added it when its partition moves " +
+			"on (the postings name that node as its holder), and a node that leaves is drained first " +
+			"(U9). Open: versions staged under a lease that expired stay on their owner until a later " +
+			"batch replaces them or the partition moves",
+		"internal/epoch/table.go (Versions, Graph, Lists), engine/include/fusion/node_engine.h (partition " +
+			"versions, Assign, RawAdd, StageVersions, graph patches), engine/include/fusion/graph_patch.h, " +
+			"internal/update (batch.go, major.go), internal/controller/update.go, " +
 			"internal/controller/reconfig.go (copyThenFlip, drainRaw), engine/include/fusion/pq_store.h " +
 			"(cached codes, Forget), cmd/rtier-updater, scripts/run_local.py (\"Updates\")"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
@@ -272,7 +291,10 @@ var Open = map[string]Question{
 			"codes, not the graph, and navigation is the smallest share of a query that any " +
 			"existing entry can do meanwhile -- so the graph only gets the bandwidth the segment " +
 			"and PQ transfers leave unused and never delays the flip. Pairs with U6's warmup " +
-			"selector, which moves aggregation to the new node before its graph arrives",
+			"selector, which moves aggregation to the new node before its graph arrives. After " +
+			"major epochs (U14), the transfer brings the build's graph and then, from the same " +
+			"source, the patch of every later graph version, merged in order before the node " +
+			"takes the role",
 		"internal/controller/reconfig.go (graphSources, StageGraph, promoteEntries), " +
 			"internal/transfer/tokenbucket.go (classes), engine/src/node_engine.cpp (LoadGraph)"},
 	"U17": {"U17", "Where the client-facing availability list lives",

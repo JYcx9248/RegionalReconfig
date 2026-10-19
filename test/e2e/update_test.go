@@ -366,7 +366,7 @@ func applyOracle(t *testing.T, ctx context.Context, nc *nodeclient.Client, b *up
 		vs[p] = nodeclient.VersionStage{Partition: p, Base: v, Next: v + 1}
 	}
 	lists, ids, locs := b.Postings()
-	res, err := nc.StageVersions(ctx, vs, lists, ids, locs, b.Deleted)
+	res, err := nc.StageVersions(ctx, vs, nodeclient.Edits{Lists: lists, IDs: ids, Locs: locs, Deleted: b.Deleted})
 	if err != nil {
 		t.Fatal(err)
 	}

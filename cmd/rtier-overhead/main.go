@@ -136,7 +136,7 @@ func main() {
 	var navWall time.Duration
 	for q := 0; q < qs.N; q++ {
 		t := time.Now()
-		lists[q], err = c.Navigate(ctx, 0, qs.Row(q), *nprobe, 0)
+		lists[q], err = c.Navigate(ctx, 0, nodeclient.NewestGraph, qs.Row(q), *nprobe, 0)
 		navWall += time.Since(t)
 		check(err)
 	}

@@ -33,6 +33,13 @@ import (
 //  3. AbortUpdate gives the lease up without a flip. Dropping what was staged is the update
 //     controller's job: it knows what it staged.
 //
+// A major epoch (splits and merges of posting lists) is a batch too. Besides the lists' next
+// versions, it creates lists and patches the navigation graph: the update controller stages
+// the patch next to the graph on every entry, CommitUpdate checks it there, the flip names the
+// new graph version and lists, and after the grace period every entry merges the patch into
+// its graph in place, before the lease ends -- so a later reconfiguration or major epoch starts
+// from the merged graph.
+//
 // A lease that sees neither a commit nor an abort for update_lease expires, so that an update
 // controller that died does not block reconfigurations for good; a later commit is refused.
 // Batches run only with allow_updates.
@@ -175,6 +182,26 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 	if len(next.Versions) == 0 {
 		next.Versions = make([]uint32, np)
 	}
+	// A major epoch: the graph's next version, and the lists it creates (never an existing one).
+	if req.Graph != 0 && req.Graph != cur.Graph+1 {
+		return reply, fmt.Errorf("controller: the batch patches the graph to version %d, the graph is at version %d", req.Graph, cur.Graph)
+	}
+	if req.Graph != 0 {
+		next.Graph = req.Graph
+	}
+	for l, p := range req.Lists {
+		if p < 0 || p >= np {
+			return reply, fmt.Errorf("controller: the batch creates list %d in partition %d of %d", l, p, np)
+		}
+		if _, ok := cur.Lists[l]; ok {
+			return reply, fmt.Errorf("controller: the batch creates list %d, which exists", l)
+		}
+		if next.Lists == nil {
+			next.Lists = map[uint32]int{}
+		}
+		next.Lists[l] = p
+	}
+	reply.Graph = next.Graph
 	// By owner: the versions to check before the flip, and the ones to drop after the grace
 	// period. Versions only grow, so a version number never names two different list sets.
 	staged := map[placement.NodeID][]protocol.PartitionVersion{}
@@ -197,15 +224,23 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 		reply.Changed = append(reply.Changed, p)
 	}
 	sort.Ints(reply.Changed)
-	if len(reply.Changed) == 0 {
+	if len(reply.Changed) == 0 && req.Graph == 0 {
 		return reply, nil // the batch changed no list: nothing to flip
 	}
-	// Before the flip, a failure drops the staged versions: no epoch names them, and the batch's
-	// lease has ended, so the update controller may no longer touch the nodes.
+	entries, err := c.managed(cur.Entries)
+	if err != nil {
+		return reply, err
+	}
+	if req.Graph == 0 {
+		entries = nil
+	}
+	// Before the flip, a failure drops the staged versions and patches: no epoch names them, and
+	// the batch's lease has ended, so the update controller may no longer touch the nodes.
 	flipped := false
 	defer func() {
 		if !flipped && err != nil {
 			c.dropVersions(staged)
+			c.graphPatch(entries, protocol.GraphPatchReq{Version: req.Graph, Drop: true})
 		}
 	}()
 	c.event("update.start", float64(cur.Epoch))
@@ -230,6 +265,19 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 			if !have[pv] {
 				return fmt.Errorf("node %d does not hold partition %d at version %d", n.ID, pv.Partition, pv.Version)
 			}
+		}
+		return nil
+	}); err != nil {
+		return reply, fmt.Errorf("controller: update batch not staged: %w", err)
+	}
+	if err := forEach(entries, func(n *ManagedNode) error {
+		var st protocol.NodeStatus
+		if err := n.call(ctx, c.callTimeout(), protocol.NodeStatusM, struct{}{}, &st); err != nil {
+			return err
+		}
+		if st.Graph != cur.Graph || st.GraphPatch != req.Graph {
+			return fmt.Errorf("node %d has its graph at version %d and a patch to %d staged, the batch patches %d to %d",
+				n.ID, st.Graph, st.GraphPatch, cur.Graph, req.Graph)
 		}
 		return nil
 	}); err != nil {
@@ -291,10 +339,26 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 			log.Printf("controller: freeing the PQ codes of deleted vectors on former owners: %v", err)
 		}
 	}
+	// No query searches the graph without the patch any more: every entry merges it in place.
+	if err := forEach(entries, func(n *ManagedNode) error {
+		return n.call(ctx, c.stageTimeout(), protocol.GraphPatchM, protocol.GraphPatchReq{Version: req.Graph}, nil)
+	}); err != nil {
+		return reply, afterFlip(err)
+	}
 	phase("reclaim")
 	log.Printf("controller: update batch done: epoch %d -> %d, partitions %v at new versions, phases %v",
 		reply.FromEpoch, reply.ToEpoch, reply.Changed, reply.Phases)
 	return reply, nil
+}
+
+// graphPatch sends req to nodes (best effort: a patch left staged only takes memory, and the
+// next major epoch's patch replaces it).
+func (c *Controller) graphPatch(nodes []*ManagedNode, req protocol.GraphPatchReq) {
+	if err := forEach(nodes, func(n *ManagedNode) error {
+		return n.call(context.Background(), c.callTimeout(), protocol.GraphPatchM, req, nil)
+	}); err != nil {
+		log.Printf("controller: graph patch %d on the entries: %v", req.Version, err)
+	}
 }
 
 // dropVersions has the owners drop versions no epoch names (best effort: what stays only takes

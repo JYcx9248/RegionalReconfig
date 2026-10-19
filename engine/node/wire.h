@@ -68,7 +68,9 @@
 //                   the background after fetched ones; blocks while the update buffer is full)
 //   PAUSE_UPDATES   u8 paused                                 -> -
 //                   (holds back, or resumes, writing inserted vectors)
-//   NAVIGATE        u32 nprobe, u32 ef, query                 -> u32 n, u32 lists[n]
+//   NAVIGATE        u32 nprobe, u32 ef, u32 graph, query      -> u32 n, u32 lists[n]
+//                   (graph: the graph version of the query's epoch, 0xFFFFFFFF = the newest
+//                   here; NOT_RESIDENT if this node does not have it)
 //   FILTER          u32 topn, u32 nlists, u32 lists[nlists],  -> u32 n, u32 ids[n], f32 dists[n],
 //                   u32 versions[nlists], query                  u32 gathered, u32 unique
 //                   (versions[i]: the version of lists[i]'s partition in the query's epoch;
@@ -86,10 +88,34 @@
 //                   0xFFFFFFFF, and its PQ code: the routing of inserted vectors, U14)
 //   STAGE_VERSIONS  u32 nparts, (u32 partition, u32 base,     -> u32 nparts, (u32 partition,
 //                   u32 next)[nparts], u32 nadds,                u8 changed, u8[3] pad,
-//                   u32 lists[nadds], u32 ids[nadds],            u32 added, u32 removed)[nparts]
-//                   u32 locs[nadds], u32 ndel, u32 deleted[ndel]
-//                   (an update batch, U14: each partition's next version = base + the postings
-//                   naming its lists - the deleted IDs; all or nothing)
+//                   u32 lists[nadds], u32 ids[nadds],            u32 added, u32 removed,
+//                   u32 locs[nadds], u16 holders[nadds],         u32 nlens, (u32 list,
+//                   u32 ndel, u32 deleted[ndel], u32 ncreated,   u32 postings)[nlens])[nparts]
+//                   (u32 list, u32 partition)[ncreated],
+//                   u32 nremoved, u32 removed[nremoved]
+//                   (an update batch, U14: each partition's next version = base - the removed
+//                   lists + the created ones + the postings naming its lists - the deleted IDs;
+//                   all or nothing. holders[i]: the node holding the vector if it is not here,
+//                   0 = it must be here. The reply names the lists whose length changed.)
+//   LIST_GET        u32 list, u32 version                     -> u32 n, u32 ids[n], u32 locs[n],
+//                                                                u16 holders[n]
+//                   (a posting list of a resident version, every holder by node ID)
+//   PATCH_STAGE     patch                                     -> -
+//                   (a graph patch, fusion/graph_patch.h, staged next to the graph: NAVIGATE of
+//                   its version searches through it, of the graph's own version without it)
+//   PATCH_LOAD      path                                      -> - (the same, from a file)
+//   PATCH_MERGE     u32 version                               -> - (merged into the graph in place,
+//                                                                after the old version's grace)
+//   PATCH_DROP      u32 version                               -> u8 was_staged
+//   PATCH_SAVE      u32 version, path                         -> - (the staged patch as a file)
+//   SPLIT_LIST      u32 n, u32 m, u8 codes[n * m]             -> u32 head0, u32 head1, u8 side[n]
+//                   (the router: a balanced 2-means of PQ codes; head s = the member closest to
+//                   side s's mean)
+//   NEAREST_HEADS   u32 n, u32 m, u32 ef, u8 codes[n * m]     -> u32 lists[n]
+//                   (the router: the nearest live head of each decoded code)
+//   EDIT_GRAPH      u32 version, u32 nnew, u32 labels[nnew],  -> patch (version - 1 -> version)
+//                   vectors[nnew], u32 ndel, u32 deleted[ndel]
+//                   (the router: heads inserted and marked deleted in its own graph)
 //   DROP_VERSION    u32 partition, u32 version                -> u8 was_resident
 //   FORGET          u32 flags, u32 n, u32 ids[n]              -> u64 freed (PQ codes no version
 //                                                                names; flags bit 0: the vectors
@@ -138,12 +164,21 @@ enum Op : uint8_t {
   kRerank = 0x22,
   kSearchLocal = 0x23,
   kAssign = 0x24,
+  kSplitList = 0x25,
+  kNearestHeads = 0x26,
+  kEditGraph = 0x27,
   kStageVersions = 0x30,
   kDropVersion = 0x31,
   kForget = 0x32,
   kSavePartition = 0x33,
   kSetNodes = 0x34,
   kRawHeldBy = 0x35,
+  kListGet = 0x36,
+  kPatchStage = 0x37,
+  kPatchLoad = 0x38,
+  kPatchMerge = 0x39,
+  kPatchDrop = 0x3A,
+  kPatchSave = 0x3B,
 };
 
 enum Status : uint16_t {
