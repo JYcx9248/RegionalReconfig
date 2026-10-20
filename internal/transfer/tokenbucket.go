@@ -22,15 +22,17 @@ import (
 // the smallest share of a query's work, which any existing entry can do meanwhile. So what the
 // first step needs goes first: the graph never slows a data transfer down, and gets whatever
 // bandwidth the data transfers leave unused. Raw vectors are not needed for the first step
-// either -- RERANK fetches the ones it lacks from the old owner on demand (U9) -- so the stream
-// that brings the rest after the flip is background too by default ("raw_priority").
+// either: RERANK fetches the ones it lacks from their holders on demand (U9), data node to data
+// node and outside this bucket. Only a raw-vector pull that runs through the agents (raw_path
+// "agent") takes a class here: a baseline's stream after the flip and a scale-in's drain at
+// "raw_priority", background by default, and an eager baseline's copy before the flip as data.
 type Class int
 
 const (
 	// Data is what a node needs before it can own partitions: segment files and PQ codes.
 	Data Class = iota
-	// Background is the navigation graph, needed only for the entry role, and the raw vectors
-	// streamed in after the flip.
+	// Background is the navigation graph, needed only for the entry role, and, through the
+	// agents, the raw vectors a baseline streams in after the flip or a drain takes over.
 	Background
 )
 

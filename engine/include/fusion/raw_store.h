@@ -7,12 +7,14 @@
 // presence bit per location. A page may also have room for vectors of lists the node does not
 // own (the bucket layout packs list tails together); those slots stay empty and are never read.
 //
-// Vectors arrive three ways: copied from the index's page file when a partition is bootstrapped
-// (the initial deployment), streamed by the agent after a migration (RAW_PUT), or fetched on
-// demand from the old owner when a query needs one before the stream brought it (NodeEngine,
-// U9). Nothing is dropped: the vectors of partitions that move away stay as a cache, as PQ codes
-// do (the dataset is static; U14), so a partition that comes back moves no vector, and a node
-// that gave a partition away can still serve its vectors to the new owner.
+// Vectors arrive four ways: copied from the index's page file when a partition is bootstrapped
+// (the initial deployment); fetched on demand from their holder when a query needs one
+// (NodeEngine, U9: the default lazy protocol moves nothing else); pulled in bulk by a baseline's
+// stream or a scale-in's drain (RAW_PULL, or RAW_PUT through the agents); and added by an update
+// batch (RAW_ADD, U14). Nothing is dropped: the vectors of partitions that move away stay as a
+// cache, as PQ codes do (vectors are immutable, and even a deleted vector's page stays), so a
+// partition that comes back moves no vector, and a node that gave a partition away can still
+// serve its vectors to the peers whose postings name it.
 //
 // Re-ranking reads whole pages through pages(), with O_DIRECT when the file system supports it.
 // Installs run one at a time. Fetched vectors -- a few scattered vectors per page, installed by

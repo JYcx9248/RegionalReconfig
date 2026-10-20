@@ -7,7 +7,7 @@
         results/e2e/rep*/stop-and-copy --window 0.02      # repetitions pooled per protocol
 
 Each directory holds a latency.csv and, optionally, a reconfigurations.json, as written by
-run_local.py (one run per protocol, same config) or by TestReconfigUnderLoad with
+run_local.py or run_cluster.py (one run per protocol, same config) or by TestReconfigUnderLoad with
 RTIER_E2E_TIMELINE set. A run is labelled with its directory name unless --labels is given,
 and runs that share a label are pooled into one line: their queries are merged, so a window's
 mean covers every run's queries sent in it. Pool only runs with the same schedule (the

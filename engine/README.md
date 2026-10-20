@@ -13,18 +13,20 @@ description. Where the paper leaves details open, the choice made is listed unde
 
 - The CPU pipeline is covered by unit tests and end-to-end runs, and is clean under
   AddressSanitizer and UBSan.
-- The GPU backend has run on one GPU so far (RTX 3060 Laptop, sm_86, CUDA 12.6, under WSL2):
-  `fusion_selftest` matches the CPU backend on synthetic codes and on 1000 BIGANN-1M queries,
-  `fusion_search` gives the same recall on both backends, and the end-to-end tests pass with the
-  cluster's nodes on the GPU (`RTIER_E2E_BACKEND=gpu`). On a new GPU, run `fusion_selftest` first.
-- The GPU filter does not scale with concurrent queries there: on BIGANN-1M (nprobe 64, n 200)
-  its time per query grows from 0.38 ms at 1 thread to 3.4 ms at 8, while the CPU filter stays
-  near 0.6 ms up to 8 threads. Each query issues its own small transfers and kernels (LUT,
-  dedup + ADC, a 64-bit radix sort) on its own stream, with no lock on the path, so the
-  submissions serialize somewhere below: WSL2's GPU paravirtualization is the first suspect.
-  Not yet measured on native Linux.
-- Real data so far: a 1M prefix of BIGANN (`scripts/download_subset.py` also fetches SPACEV1B
-  and DEEP1B prefixes).
+- The GPU backend has run on an RTX 3060 Laptop (sm_86, CUDA 12.6, under WSL2) and on A100s
+  (native Linux): `fusion_selftest` matches the CPU backend on synthetic codes, on 1000
+  BIGANN-1M queries and on a real 1024-dimensional index (identical candidates), `fusion_search`
+  gives the same recall on both backends, and the end-to-end tests pass with the cluster's nodes
+  on the GPU (`RTIER_E2E_BACKEND=gpu`). On a new GPU, run `fusion_selftest` first.
+- On the A100 (a 1M-vector Wikipedia index, nprobe 64, n 200) the GPU filter scales with
+  concurrent queries: 164 us per query at 1 thread, 175 us at 16 (the CPU filter 646 -> 810 us).
+  It is a small part of a query there -- re-ranking's 200 page reads take 2.6-3.7 ms, navigation
+  1.1-1.9 ms -- so the GPU backend adds 15-20% QPS on one node. Under WSL2 it did not scale (0.38
+  ms at 1 thread, 3.4 ms at 8): each query issues its own small transfers and kernels on its own
+  stream with no lock on the path, and the GPU paravirtualization serialized them.
+- Real data so far: BIGANN prefixes (1M, 10M, 20M) and Wikipedia chunks embedded at 1024
+  dimensions (15.5M float32 vectors, one per page); `scripts/download_subset.py` also fetches
+  SPACEV1B and DEEP1B prefixes.
 
 ## What is implemented
 
@@ -57,7 +59,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 | File | What |
 |---|---|
 | `include/fusion/partition.h`, `src/partition.cpp` | partition directory: manifest (with the page geometry), list -> partition map, per-partition posting-list segments (version 3: each posting is a vector ID, its raw vector's canonical location and the node that holds the vector; version 2 still loads) with CRC-32 |
-| `include/fusion/node_engine.h`, `src/node_engine.cpp` | `NodeEngine`: posting lists held per partition (load/evict while queries run), each partition possibly at several versions (`Filter` / `Rerank` name the version their epoch sees), update batches (U14: `StageVersions` builds a partition's next version next to the current one -- inserts appended, deleted IDs dropped, all or nothing; `DropVersion`; `ForgetVectors`; `SavePartition` writes a version as a segment file for a move), room for inserted vectors (`--max-vectors`, `--max-pages`) and longer lists (`--max-list-len`; a segment with a longer list is refused at load), major epochs (U14: `StageVersions` also creates and removes lists, and adds postings that name another holder; `GetList`; lists created later are learned from staging or from the segments that hold them; the router's `EditGraph`, `SplitCodes` and `NearestHeads`; graph patches staged, searched through, merged, saved; `Navigate` of a graph version; room for heads and lists, `--graph-headroom`), full rebuilds (U14: `SwitchGeneration` moves a node that holds no partition to another generation of the index -- the generation's manifest, list registry, PQ code file and assignment rule replace the current ones, refused unless the codebook and page geometry match; `RawBitmap`; `PQSource::kGenIndex` loads a generation's partition with the PQ codes from its index and the raw vectors from the holders), `Assign` (routes a vector by the build's own rule and gives its PQ code) and `RawAdd` (inserted vectors served from memory, written by the background writer after fetched ones, pausable), node-level PQ codes and raw vectors (fetched on demand from the old owner after a migration), navigation graph loadable after startup, primitives `Navigate` / `Filter` / `Rerank` / `SearchLocal` |
+| `include/fusion/node_engine.h`, `src/node_engine.cpp` | `NodeEngine`: posting lists held per partition (load/evict while queries run), each partition possibly at several versions (`Filter` / `Rerank` name the version their epoch sees), update batches (U14: `StageVersions` builds a partition's next version next to the current one -- inserts appended, deleted IDs dropped, all or nothing; `DropVersion`; `ForgetVectors`; `SavePartition` writes a version as a segment file for a move), room for inserted vectors (`--max-vectors`, `--max-pages`) and longer lists (`--max-list-len`; a segment with a longer list is refused at load), major epochs (U14: `StageVersions` also creates and removes lists, and adds postings that name another holder; `GetList`; lists created later are learned from staging or from the segments that hold them; the router's `EditGraph`, `SplitCodes` and `NearestHeads`; graph patches staged, searched through, merged, saved; `Navigate` of a graph version; room for heads and lists, `--graph-headroom`), full rebuilds (U14: `SwitchGeneration` moves a node that holds no partition to another generation of the index -- the generation's manifest, list registry, PQ code file and assignment rule replace the current ones, refused unless the codebook and page geometry match; `RawBitmap`; `PQSource::kGenIndex` loads a generation's partition with the PQ codes from its index and the raw vectors from the holders), `Assign` (routes a vector by the build's own rule and gives its PQ code) and `RawAdd` (inserted vectors served from memory, written by the background writer after fetched ones, pausable), node-level PQ codes and raw vectors (fetched on demand, after a migration, from the holder each posting records), navigation graph loadable after startup, primitives `Navigate` / `Filter` / `Rerank` / `SearchLocal` |
 | `include/fusion/graph_patch.h`, `src/graph_patch.cpp` | graph patches (U14 major epochs): the bytes a graph edit changed (whole level-0 records and upper link lists of the changed elements, and the graph's globals), a search through a patch staged next to the graph that is step by step hnswlib's search of the patched graph, and the merge in place |
 | `include/fusion/pq_store.h`, `src/pq_store.cpp` | node-level PQ store: one code per vector, reference-counted by resident postings, capacity = the node's PQ budget (`Forget` frees deleted vectors' codes, and marks the ones a version still names so that they are freed with it, never cached); also where a vector's raw-vector location is looked up |
 | `include/fusion/raw_store.h`, `src/raw_store.cpp` | node-level raw vectors: a sparse local copy of the page file at the canonical offsets, one presence bit per location |
@@ -81,8 +83,9 @@ U1): a data node holds one code per vector named by its resident posting lists, 
 buffer sized to its budget (`--pq-capacity`, the HBM budget). Postings hold references, so a
 code shared by several resident lists or partitions is stored once. A code is live while a
 resident posting names it, staged while a staging needs it, and cached after its partitions
-moved away: the dataset is static, so it stays valid and is kept until a later `PQ_PUT` needs
-the room (then cached codes are dropped in slot order; live and staged ones never are).
+moved away: vectors are immutable, so it stays valid and is kept until a later `PQ_PUT` needs
+the room (then cached codes are dropped in slot order; live and staged ones never are). A
+deleted vector's code is freed with its last version instead (`Forget`, U14).
 Codes arrive through `PQ_MISSING` / `PQ_PUT` (a peer's `PQ_GET`) or, when bootstrapping, from
 the index's `pq_codes.bin`. Both filter backends address codes by slot in this mode
 (`FilterConfig::slot_addressed`) and still order results by (distance, id); `fusion_selftest`
@@ -198,8 +201,8 @@ Known limits of the raw-vector path:
 - `RAW_MISSING` answers in one frame, like `PQ_MISSING`.
 - Presence is not persisted: a restarted node starts with an empty raw-vector file.
 
-`rtier_node_tests` and the rtier end-to-end tests (run against an ASan/UBSan build of
-`rtier_node`, including a shutdown under load) are clean under the sanitizers.
+`fusion_tests`, `rtier_node_tests` and the rtier end-to-end tests (run against an ASan/UBSan
+build of `rtier_node`, including a shutdown under load) are clean under the sanitizers.
 
 ## Build
 
@@ -323,10 +326,11 @@ check, the PQ implementation's error matches Faiss's `ProductQuantizer` on the s
 
 ## Limitations
 
-- L2 distance only; vectors of at most 4 KB (at least one per page). Updates (U14) are only
-  partly there: batches of inserts and deletes work, but lists are never split or merged (they
-  only grow, up to `--max-list-len`), the ID and location spaces do not grow, inserted vectors'
-  writes are not charged to the read budget, and deleted vectors' pages are not freed.
+- L2 distance only; vectors of at most 4 KB (at least one per page). Updates (U14): batches of
+  inserts and deletes, major epochs (splits and merges, with graph patches) and full rebuilds to
+  a next generation work, but the ID and location spaces do not grow beyond the room left at
+  startup (`--max-vectors`, `--max-pages`), inserted vectors' writes are not charged to the read
+  budget, and deleted vectors' pages are not freed.
 - One GPU per engine.
 - The builder keeps N × 8 assignment IDs in RAM during the build.
 - hnswlib stores a hash map entry per head, which adds several GB at 100M heads.

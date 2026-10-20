@@ -13,8 +13,10 @@
 //
 // A role is active once the controller installs an epoch that lists the node in that role. The
 // raw vectors of a data node's new partitions are not a readiness condition: its rtier_node
-// fetches the ones a query needs from the old owner on demand, and StageRaw streams the rest in
-// (after the flip with the lazy protocol, before it with copy-then-flip).
+// fetches the ones a query needs on demand from the holders their postings record (the lazy
+// protocol, which moves nothing else); the baselines stream the rest in with StageRaw
+// (lazy-stream after the flip, copy-then-flip before it), and DrainRaw takes over, before a
+// scale-in returns, what only the nodes that leave hold.
 package agent
 
 import (

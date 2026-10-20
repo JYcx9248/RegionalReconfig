@@ -283,8 +283,8 @@ type rawMode int
 
 const (
 	// rawOnDemand (protocol "lazy", the default): only the ones queries need, fetched by RERANK
-	// from the old owner when it first needs them; the rest stay with the old owner, which keeps
-	// every vector it has held.
+	// from their holders when a query first needs them; the rest stay where they are, since no
+	// node drops a raw vector it has held -- except that a scale-in drains the nodes that leave.
 	rawOnDemand rawMode = iota
 	// rawStreamAfterFlip ("lazy-stream", a baseline): on demand, and a stream brings the rest
 	// after the flip.

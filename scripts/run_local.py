@@ -67,9 +67,9 @@ GPUs than nodes; the log records each node's card (model, bus id, UUID). Indices
 the hardware (they did on the lab server), a bus id stays with a slot, and only a UUID stays with
 a card. Without cluster.gpus every node uses the first GPU.
 
-cluster.raw: {streams: 4, batch_bytes: 1048576} (the agent's defaults) set how a raw-vector
-stream (copy-then-flip's copy, lazy-stream's stream) pulls from each source: over that many
-connections at once, that many bytes of vectors per request. cluster.raw.path: node (the default
+cluster.raw: {streams: 2, batch_bytes: 1048576} (the agent's defaults) set how a raw-vector
+stream (copy-then-flip's copy, lazy-stream's stream, a scale-in's drain) pulls from each source:
+over that many connections at once, that many bytes of vectors per request. cluster.raw.path: node (the default
 without cluster.transfer_rate_bytes_per_sec) runs it data node to data node, as lazy fetches;
 agent through both agents, the only path the transfer rate paces. path: agent with streams: 1
 and batch_bytes: 65536 is the stream as it was before 2026-10-09: one 64 KB request in flight
@@ -104,8 +104,8 @@ by the same factor and change what the run measures. Without updates the dataset
 room, and the controller refuses update batches.
 
 Open design questions this script depends on (see `bin/rtier-client design`):
-  U5  queries need a strategy (cluster.strategy); both production strategies are placeholders,
-      so queries fail with "undecided" until one is implemented.
+  U5  queries need a strategy (cluster.strategy): two-phase is the implemented one, exactly the
+      single-node answer; proportional-quota is a placeholder and fails with "undecided".
   U11 load.arrivals: semdn is a placeholder; poisson works.
 
 With cluster.emulation: {netns: true, delay: 100us, rate: 10gbit} (run as root), every node

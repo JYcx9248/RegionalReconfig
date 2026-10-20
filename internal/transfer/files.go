@@ -41,7 +41,7 @@ type pullDone struct {
 // Server serves files under Root, and PQ codes and raw vectors read through PQ and Raw
 // (records.go), to pulling peers. All connections share one token bucket: it caps this node's
 // outgoing background bandwidth, and within it data transfers (segments, PQ codes) go before
-// background ones (the graph, and by default the raw vectors streamed after the flip).
+// background ones (the graph, and raw vectors pulled through the agents at raw_priority).
 type Server struct {
 	Root       string
 	PQ         PQSource     // nil = PULL_PQ is refused

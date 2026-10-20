@@ -86,7 +86,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 - **Epoch** = versioned routing table: partition owners, entries, aggregators, addresses; with
   U14 also each partition's version, the graph version and the index generation. A query runs
   under the one epoch its entry pinned; a forwarded aggregation carries that epoch and the lists
-  grouped by owner, and the aggregator neither pins nor checks an epoch of its own.
+  grouped by owner, and the aggregator neither routes with nor checks an epoch of its own: it
+  counts the work under the query's epoch (`Tracker.Pin`), so its own drain waits for it too.
 - **Query**: entry NAVIGATEs → groups the lists by owner → the `owner` selector picks the
   aggregator → `TwoPhase`: FILTER (local top-n by PQ) at each owner, global top-n merge, RERANK
   of each candidate at one owner that reported it, top-k merge. Equal to the single-node answer.
@@ -97,9 +98,12 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   Alongside grace and reclaim, `promoteEntries` flips every `entry_flip_interval` to make
   entries of the new nodes whose graph has loaded; the rescale waits for it. Raw vectors do
   not move with a scale-out: `lazy` fetches one only when a query needs it (below). Baselines:
-  `lazy-stream` also streams the rest in after the flip (`StageRaw`, `raw_priority`; the rescale
-  waits for it), `copy-then-flip` and `stop-and-copy` stream them before the flip (eager). A
-  rescale to a plan (`rtier-client rescale -plan`) carries out any target placement.
+  `lazy-stream` also streams the rest in after the flip (`StageRaw`; the rescale waits for it),
+  `copy-then-flip` and `stop-and-copy` stream them before the flip (eager). A rescale to a plan
+  (`rtier-client rescale -plan`) carries out any target placement. The token bucket paces only
+  what goes through the agents -- segments and PQ codes (data class) and the graph (background);
+  raw vectors move data node to data node (`RAW_GET`, `RAW_PULL`), unpaced, unless
+  `raw_path: agent` (then at `raw_priority`, U8).
 - **PQ codes** are stored per node, once per vector, with a cache of codes of partitions that
   moved away (`engine/include/fusion/pq_store.h`); placement `even-reversible-graph` (the
   default) returns partitions to former owners so a scale-in moves no PQ code.
@@ -160,7 +164,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 
 - `README.md`: overview, the decided part of each open question, how to run.
 - `docs/design.md`: the design doc (Chinese), exported from claude.ai at rev 123 and brought up
-  to date here since (last on 2026-10-19); not synced with the claude.ai copy.
+  to date here since (last on 2026-10-20); not synced with the claude.ai copy.
 - `docs/handoff.md`: a snapshot of 2026-09-27, context from the conversations that built rtier
   -- GitHub issue drafts and diagrams; its section 5 is the case analysis of queries during a
   reconfiguration.
@@ -168,7 +172,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   correctness evidence, placement). `docs/server-runbook.md`: runs on the lab server.
 - `engine/README.md`: engine additions and known limits.
 
-## Current state and next steps (2026-10-19)
+## Current state and next steps (2026-10-20)
 
 Done since late September:
 - Raw vectors: a holder per posting instead of a source per list, one-hop fetches, a scale-in
@@ -184,32 +188,49 @@ Done since late September:
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current
-   behavior, tests, open edges (entry timing out while a forwarded aggregation still runs; slow
-   queries holding the grace period; the warm-up cost of lazy fetch). Stale entry lists are
-   settled on the client side (U17). Draft of the case analysis in `docs/handoff.md`, section 5.
+   behavior, tests. Accepted (2026-10-16): the grace period waits for every old-epoch query, so
+   a slow one holds it; a stale entry list costs one refusal, after which the client reads the
+   list (U17); lazy's fetches stay on the query path. Open edge (U7, a placeholder): an entry
+   whose client gave up releases its pin while its forward may still be on the way, and a
+   forward that reaches its aggregator after that node's drain returned meets a reclaimed
+   partition. Proposed, to be confirmed: reject it explicitly, or keep the entry's pin until the
+   forward has ended. Draft of the case analysis in `docs/handoff.md`, section 5.
 2. A real cluster: `run_cluster.py` has run only through `fake_ssh` on one machine. Then
    scaling curves on a multi-node GPU testbed.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline, or `--pq-capacity` for a smaller HBM, to argue for partitioning.
-4. Skew: per-partition read counts in `rtier-overhead`, a plan computed from them, carried out
-   at a fixed node count.
-5. Full rebuild and updates, measured: affinity against random placement, warm-up on and off,
-   stop-the-world; updates from the difference of two Wikipedia snapshots. Not implemented: the
-   rebuild's probe-set trigger, a generation that includes inserted vectors, a priority between
-   the warm-up's fetches and the spares'.
-6. More data and scale: GP on real datasets (U2: the number of partitions), non-repeating real
+4. Full rebuild and updates, measured: affinity against random placement, warm-up on and off,
+   stop-the-world; updates from the difference of two Wikipedia snapshots. The rebuild's
+   figures still need an in-place baseline that holds both generations' graph and lists on
+   every node (or memory accounting in its place), compare_runs.py's transfer breakdown for
+   rebuilds, and per-node memory curves in the plots. Not implemented: the rebuild's probe-set
+   trigger, a generation that includes inserted vectors, a priority between the warm-up's
+   fetches and the spares'.
+5. More data and scale: GP on real datasets (U2: the number of partitions), non-repeating real
    query streams (MS MARCO), BIGANN-100M, SPACEV-100M.
+6. Skew mitigation, the last experiment: once the workload is final, each partition's load is
+   known from it, and a custom plan built from it runs at a fixed node count (`rtier-client
+   rescale -plan`). We show that any plan runs without disruption and with exact answers; the
+   skew policy is not part of our design.
 7. Small code items: fill the whole connection pool during pre-connect and let entries
    pre-connect to aggregators; heap merge in `MergeTopK`; raw path (see `engine/README.md`,
    known limits): pulls (stream, drain) do not join the queries' fetches.
-8. Design topics under discussion: chunk storage (U12), aggregator outsourcing (U6), rerank
-   policy (U5), PQ compression level, the entry list outside the epoch table (U17), weighting
-   placement by bytes and heat (U3).
+8. Open design questions (the registry has them all):
+   - on the protocol: U7 (item 1); the entry list outside the epoch table (U17); rate adaptation
+     and whether to pace the drain (U8); placement by per-tier bytes, and which nodes leave or
+     join a rescale by node count (U3); the graph's transfer mode, eager or stream (U16);
+   - on updates (U14): the update interface (a log, LSNs, visibility; batch size and period are
+     set aside); a batch over budget (scale out first?); writes against queries during a
+     scale-out; freeing deleted vectors' pages; staged versions left by an expired lease;
+   - elsewhere: rerank policy (U5), aggregator outsourcing (U6), chunk storage (U12), a disk
+     budget for raw vectors (U1), the host copy of the PQ codes (U15), the number of partitions
+     (U2), the PQ compression level.
 
 ## Working with the user
 
 The user writes in Chinese or English; answer in the language of the message. Code, comments,
 commit messages and GitHub issues are in English; the design doc is in Chinese. The user
-commits: Claude writes a commit message and the list of files to stage (`results/<topic>/`).
-Changes under `docs/` are not committed.
+commits: Claude writes a commit message and the list of files to stage (`results/<topic>/`),
+and a doc change goes in the same commit as the code it describes. Changes under `docs/` are not
+committed.

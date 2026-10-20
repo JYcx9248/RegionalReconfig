@@ -5,12 +5,13 @@
     python3 scripts/plot_run.py results/run1 --window 0.2
     python3 scripts/plot_run.py results/run1 --latency tail   # p50 and p99 instead of the mean
 
-Reads what run_local.py leaves in the results directory:
+Reads what run_local.py (or run_cluster.py) leaves in the results directory:
 
   latency.csv            one row per query: sched_ms, latency_us, status, epoch, recall,
                          attempts (older runs have no attempts column)
-  reconfigurations.json  one entry per rescale: when it was triggered, how long it took, what
-                         it moved (written by run_local.py; older runs hold the bare replies)
+  reconfigurations.json  one entry per reconfiguration (a rescale, a plan or a full rebuild):
+                         when it was triggered, how long it took, what it moved (older runs hold
+                         the bare replies)
 
 and writes, over the same time axis:
 

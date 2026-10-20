@@ -6,8 +6,8 @@ C++ data nodes built on the FusionANNS reimplementation.
 
 **Status:** skeleton. The settled parts of the design are implemented and covered by tests.
 Open design questions (U1–U17, without U4) are placeholders: on a code path they fail with
-`design decision pending [Un ...]`; the few without a code path yet (U12, U15, U17) are
-recorded in the registry with what the code does meanwhile. U4 (replicas of hot partitions) is
+`design decision pending [Un ...]`; the few without a code path yet (U12, U15, and U17's
+list outside the epoch) are recorded in the registry with what the code does meanwhile. U4 (replicas of hot partitions) is
 out of scope: rtier keeps one owner per partition and handles skew by placement -- a plan
 reassigns partitions, at the same node count if need be (U3). Serverless-style read capacity, how
 streaming systems serve a hot key, would not relieve a disk-bound hot spot: its data is on its
@@ -27,8 +27,10 @@ ever dropped: a scale-out only takes partitions away and a reversible scale-in o
 what it took, so a node's resident set stays what it held at the initial cluster size -- which
 is why the budget is dimensioned by the *smallest* cluster size, not the current one. The
 end-to-end tests assert it (no eviction); it stops holding if the cluster shrinks below its
-initial size or placement starts moving partitions to nodes that never held them. The initial
-deployment reads codes from the index. Known limits of this path are listed in
+initial size or placement moves partitions to nodes that never held them, as a full rebuild's
+placement or a custom plan may. Inserts add to the resident set, so with updates the budget needs
+their headroom too, and a deleted vector's code is freed with its last version (U14). The
+initial deployment reads codes from the index. Known limits of this path are listed in
 `engine/README.md`.
 
 **Raw vectors (the other decided part of U1):** addressed by a *canonical global offset*. The
@@ -41,8 +43,9 @@ location, and finds a candidate's location through its PQ store. The same vector
 two lists names the same offset, so dedup is free, and the transfer unit is a single vector (list
 tails share pages). Only the initial deployment reads the index's page file; the end-to-end tests
 run every node that joins later on a copy of the index without it. Old owners keep the vectors of
-partitions that moved away, like PQ codes. Still open: tail-page space amplification, a disk
-budget, versioning under U14, and where RAG chunks live. Partition directories written before
+partitions that moved away, like PQ codes. Raw vectors need no versions under updates: vectors are
+immutable, and IDs and locations are only appended. Still open: tail-page space amplification, a
+disk budget (the pages of deleted vectors are not freed either), and where RAG chunks live. Partition directories written before
 locations existed (payload `lists-only`) are refused: rerun `rtier_segment`.
 
 **Raw vectors after a migration (decided part of U9):** a new owner goes online with posting
@@ -65,9 +68,12 @@ leaving node holds (the drain; `drain_vectors` and `drain_seconds` in the reply)
 that leave can go offline -- lazy fetches as little as possible, it does not forbid fetching.
 Holders stay valid because no node drops a raw vector it has held; a disk budget would need the
 same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
-(`StageRaw`, `"raw_priority": "background"` by default; the rescale waits for it and reports
-`raw_vectors` / `raw_seconds`), `"copy-then-flip"` streams them before the flip, `"stop-and-copy"`
-while paused.
+(`StageRaw`; the rescale waits for it and reports `raw_vectors` / `raw_seconds`),
+`"copy-then-flip"` streams them before the flip, `"stop-and-copy"` while paused. Streams and the
+drain run data node to data node by default (`RAW_PULL`), unpaced like the queries' fetches;
+only through the agents (`raw_path: agent`, the default when the agents are paced) do they take a
+token-bucket class: `"raw_priority"` (background by default) after the flip and for the drain,
+data for the eager baselines' copy before the flip (U8).
 
 **Placement (decided part of U3):** `"placement": "even-reversible-graph"` (the default) keeps
 partition counts even and moves partitions only from existing to new nodes on scale-out -- each
@@ -93,7 +99,8 @@ GP generators (U2) number along their bisection: close to the best at power-of-t
 Koala's policy (`"even"`,
 kept as the baseline) is not reversible: after 4 -> 8 -> 4 none of the partitions that moved is
 home again. It has no reason to care, because its state changes with every input, so a copy left
-behind is stale; with a static dataset the copy stays valid, which is what makes this worth doing.
+behind is stale; with immutable vectors the copy stays valid (a deleted vector's code goes with
+it, U14), which is what makes this worth doing.
 
 **Graph transfer (decided part of U16):** a new node needs posting lists and PQ codes to own
 partitions and answer FILTER and RERANK -- the steps that take load off the old owners -- and
@@ -104,11 +111,14 @@ background priority on its source (`"graph_priority": "background"`, the default
 that is also sending segments or PQ codes, the graph only takes bandwidth those leave unused,
 so it never delays the flip. `"data"` shares the bucket equally, as a baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
-are arriving, the controller flips every `"entry_flip_interval"` (1 s by default, about how
-often clients refresh their entry list) to add all the nodes that are ready, and adds the last
-ones at once when every pull has ended. These flips change only the entries, so they run
-alongside the grace period of the data flip. A node whose graph fails to load stays a data
-node and aggregator without holding up the others, and the rescale returns an error naming it.
+are arriving, the controller flips every `"entry_flip_interval"` (1 s by default) to add all the
+nodes that are ready, and adds the last ones at once when every pull has ended. These flips
+change only the entries, so they run alongside the grace period of the data flip. A node whose
+graph fails to load stays a data node and aggregator without holding up the others, and the
+rescale returns an error naming it. With `lazy` the graph is the only transfer in the background
+class. No node ever holds two copies of the graph: a major epoch patches it in place and a full
+rebuild moves the roles to spares (U14). How large the replica grows with the dataset is outside
+this work: an assumption, with smaller routing state as future work (U16).
 
 **Clients' entry lists (decided part of U17):** a client (`rtier-loadgen`) reads the entries
 from the controller's epoch table every 500 ms, and at once when an entry refuses a query under a
@@ -128,8 +138,10 @@ the entry (the baseline). `"warmup"` hands the scatter/gather to a node that may
 not an entry yet -- during a scale-out, a new node whose navigation graph is still arriving.
 `rtier-overhead -owners` reports how often each case occurs for a dataset and partitioning.
 A query runs under one epoch, the one its entry pinned: a forwarded query carries that epoch and
-its lists grouped by owner, and the aggregator runs it as is -- it neither pins nor checks an
-epoch of its own, since the entry keeps the pin until the answer is back. Epochs are installed
+its lists grouped by owner, and the aggregator runs it as is -- it neither routes with nor checks
+an epoch of its own. It counts the work under the query's epoch (`Tracker.Pin`), so its own drain
+waits for it, while the grace period relies on the entry, which keeps its pin until the answer is
+back. Epochs are installed
 on the nodes in parallel, so this is what lets a joining node aggregate for an entry that
 installed the new epoch before it did, and a leaving node finish the queries it was handed just
 before the flip (`test/e2e/flip_race_test.go` holds an install or a query to reproduce both).
@@ -153,7 +165,8 @@ nodes carry it out:
    index's navigation graph and codebook and nothing else, never a serving node, whose navigation
    CPU queries need. Then it checks that every owner has room.
 3. It sends the codes and raw vectors to the owners' data nodes (`PQ_PUT`, `RAW_ADD`), which
-   serve the vectors from memory and write them at the lowest I/O priority.
+   serve the vectors from memory and write them after the fetched ones, within
+   `--update-write-mbps` (writes are not charged to the read budget yet).
 4. It has every data node stage the next version of the partitions the batch changes
    (`STAGE_VERSIONS`): inserts appended, deleted IDs dropped. Deletes go to every node, and each
    finds its own copies.
@@ -228,7 +241,7 @@ and a priority between the warm-up's fetches and the spares' (only the warm-up's
 
 Not there yet for updates: growing the ID and location spaces, a response to a batch over budget
 (it fails before anything is sent), reassigning the vectors of neighboring lists in a split
-(SPFresh's LIRE), and a log to replay batches from. `test/e2e/update_test.go`,
+(SPFresh's LIRE), a log to replay batches from, and freeing the pages of deleted vectors. `test/e2e/update_test.go`,
 `test/e2e/major_test.go` and `test/e2e/rebuild_test.go` check every answer against an oracle that
 applies the same decisions, across batches, a failed batch, a major epoch, a full rebuild and
 rescales.
@@ -240,18 +253,18 @@ rescales.
 | `cmd/rtier-controller` | control plane: registration, placement, epochs, reconfiguration, metrics sink |
 | `cmd/rtier-agent` | per-node agent next to `rtier_node`: staging, epochs, entry + aggregator roles |
 | `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline |
-| `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time), with a rate schedule |
-| `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14), routing inserts with its own router (`-router`, or `-index` to start one) |
+| `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time) with a rate schedule, or closed-loop users; follows the entry list (U17) |
+| `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14), routing inserts with its own router (`-router`, or `-index` to start one), and runs major epochs (`-split-len`, `-merge-len`; `-split`, `-merge`) |
 | `cmd/rtier-overhead` | cost of fan-out: emulates N owners on one data node holding every partition and reports what the two-phase query adds over N = 1 (owners per query, duplicate PQ scoring, extra page reads, per-call and merge time); `-compare` sets two-phase against local re-ranking (recall with `-gt`), `-owners` shows how queries spread over owners |
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |
-| `test/e2e` | real `rtier_node` processes; scale-out and scale-in under query load |
+| `test/e2e` | real `rtier_node` processes under query load: scale-out and scale-in, plans, update batches, major epochs, full rebuilds, diagnostics forwarding |
 | `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; YAML configurations of a base and overrides, `experiment_config.py`; `convert_configs.py` turns the old JSON ones into them), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `emulation/netns.sh`, metrics → SQLite, Python API client |
 
 ## Build and test
 
 Needs Linux, CMake ≥ 3.18, a C++17 compiler with OpenMP, Go ≥ 1.24 (standard library only),
-Python 3 for the scripts. CUDA ≥ 11 and liburing are optional.
+Python 3 with numpy and PyYAML for the scripts. CUDA ≥ 11 and liburing are optional.
 
 ```sh
 make                 # engine + bin/rtier-*; CUDA=AUTO builds the GPU backend when nvcc is found
@@ -299,10 +312,11 @@ of `paths.work_dir`, as if each node had its machine; keep the sum below what th
 The controller and the load generator get the CPUs after the nodes'. `memory_max` and
 `io_read_bandwidth_max` work the same way. Each node's and each agent's cgroup is then sampled
 once a second into `cgroups.jsonl` (CPU time, reads and writes on the data disk, dirty and
-writeback page cache, pressure stall times), and every run writes each data node's stats log, `stats-<node>.jsonl`
-(`rtier_node --stats-file`: operation counts and times, time spent waiting for an engine
-worker, the fetch cache and its writer); both are stamped with the monotonic clock of
-`clock.json`, whose `load_start` is the load's time 0.
+writeback page cache, pressure stall times). Every run also collects each data node's stats log,
+`stats-<node>.jsonl` (`rtier_node --stats-file`: operation counts and times, time spent waiting
+for an engine worker, the fetch cache and its writer), which its agent forwards to the controller
+and the controller stamps on arrival (`"t"`; the node's own time stays as `"node_t"`). Both are on
+the monotonic clock of `clock.json`, whose `load_start` is the load's time 0.
 
 Without root (a shared server), `cluster.resources` uses what systemd delegates to users: each
 node and its agent are pinned to their CPUs with `taskset` and run in a user scope
@@ -336,8 +350,11 @@ when there are fewer GPUs than nodes). With `cluster.resources`, the `"host"` re
 included.
 
 `cluster.protocol` in an experiment configuration picks the reconfiguration protocol (`lazy`, the
-default; `lazy-stream`, `copy-then-flip` and `stop-and-copy` as baselines) and `cluster.raw_priority` the class of
-the lazy-stream raw-vector stream; each node keeps its raw vectors in `<WorkDir>/<node>/raw.pages`.
+default; `lazy-stream`, `copy-then-flip` and `stop-and-copy` as baselines). `cluster.raw` sets how
+a stream pulls (`streams`, `batch_bytes`, and `path`: `node`, or `agent`, the default only when
+`cluster.transfer_rate_bytes_per_sec` paces the agents), and
+`cluster.raw_priority` its class on the agent path. Each node keeps its raw vectors in
+`<WorkDir>/<node>/raw.pages`.
 
 ## Run on a cluster
 
