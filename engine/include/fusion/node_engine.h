@@ -430,12 +430,20 @@ class NodeEngine {
   // Every ID must be named by a partition loaded here (NotResidentError). `lists` are the
   // query's lists on this node (those its FILTER gathered from): a raw vector not on the node
   // is fetched first, through a list among them that names it, from the holder that posting
-  // records (RawMissingError if that fails), and the posting names this node from then on. A vector another query is fetching already is waited for, not fetched twice. The worker
-  // waits for the fetch, not for the write: fetched vectors are re-ranked from memory, kept for
-  // other queries until a background writer has put them on the SSD.
+  // records (RawMissingError if that fails), and the posting names this node from then on. A
+  // vector another query is fetching already is waited for, not fetched twice. Fetched vectors
+  // are re-ranked from memory, kept for other queries until a background writer has put them on
+  // the SSD: a fetch waits for the holder, not for the write. The server fetches before it takes
+  // the worker (FetchForRerank), so that the worker waits for neither.
   virtual uint32_t Rerank(int w, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
                           const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
                           uint32_t* out_ids, float* out_dists, RerankStats* st) = 0;
+  // Rerank's fetch on its own, with no engine worker (same arguments, same errors). A re-ranking
+  // whose vectors are elsewhere waits for their holders, and a worker held meanwhile would be
+  // lost to the node's FILTERs and other RERANKs -- all of a new node's warm-up (U9). Returns how
+  // many vectors it installed; *fetch_us (may be null) gets the time it waited.
+  virtual uint32_t FetchForRerank(const uint32_t* ids, uint32_t n, const uint32_t* lists,
+                                  const uint32_t* versions, uint32_t nlists, double* fetch_us) = 0;
   // The posting lists the index's build would have given each of n vectors (`vecs`, dim()
   // elements of dtype() each), and their PQ codes: the routing of inserted vectors (U14), by
   // the build's own rule and parameters (index meta: replicas, closure_eps, the assignment's

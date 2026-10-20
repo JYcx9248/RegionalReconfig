@@ -68,7 +68,7 @@ This copy of the engine is part of rtier (see the repository root). Additions:
 | `node/wire.h`, `node/server.{h,cpp}` | rtier wire protocol server (same framing as the Go side, `internal/frame`), and `PeerPool`, the connections a data node uses to fetch raw vectors from another (`RAW_GET`); INFO also reports the node's generation and process ID (its agent samples the process) |
 | `tools/rtier_node.cpp` | data-node service; prints `READY tcp=<port>` when listening; `--raw-file` for its raw vectors; `--stats-file` appends a JSON line of counters every `--stats-ms` (CLOCK_MONOTONIC); `--read-iops` sets the read budget |
 | `tools/rtier_segment.cpp` | applies a list -> partition assignment (choosing it is open question U2); writes every posting's location in `--layout` |
-| `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), partition versions, inserted vectors (`Assign` == the build's lists and codes, new IDs and locations, paused writes, backpressure), update batches (next version next to the current one, all or nothing, saved, dropped, deleted codes freed with their last version, never cached), PQ store (with deleted codes), PQ migration between two nodes, raw store, raw-vector migration (on demand from the holder each posting records, from two holders at once, coalesced, streamed, a leaving node drained, on nodes whose index has no page file), read budget (pacing, what is charged, same answers under a binding budget), wire protocol, graph patches (the patch's version searched through it == the router's edited graph, the graph's version alone; merged in place under queries; a later entry from the file; refused patches and edits change nothing; the router's split and nearest heads), list edits (a split inside the partition == the parent's FILTER answer, a merge into another owner's list re-ranked there by a one-hop fetch, new lists learned from a segment, refused edits change nothing), generations (two nodes switch to a second generation built with the first one's codebook and layout -- refused while a partition is resident or for another codebook -- keep their PQ codes and raw vectors, load the new partitions with holders, and answer as a node built on the second generation, fetching from each other) |
+| `tests/test_node.cpp` | partition files, primitives (two-node split == single-node answer), partition versions, inserted vectors (`Assign` == the build's lists and codes, new IDs and locations, paused writes, backpressure), update batches (next version next to the current one, all or nothing, saved, dropped, deleted codes freed with their last version, never cached), PQ store (with deleted codes), PQ migration between two nodes, raw store, raw-vector migration (on demand from the holder each posting records, from two holders at once, coalesced, streamed, a leaving node drained, on nodes whose index has no page file), a RERANK's fetch holding no worker (a FILTER runs on a one-worker node meanwhile), read budget (pacing, what is charged, same answers under a binding budget), wire protocol, graph patches (the patch's version searched through it == the router's edited graph, the graph's version alone; merged in place under queries; a later entry from the file; refused patches and edits change nothing; the router's split and nearest heads), list edits (a split inside the partition == the parent's FILTER answer, a merge into another owner's list re-ranked there by a one-hop fetch, new lists learned from a segment, refused edits change nothing), generations (two nodes switch to a second generation built with the first one's codebook and layout -- refused while a partition is resident or for another codebook -- keep their PQ codes and raw vectors, load the new partitions with holders, and answer as a node built on the second generation, fetching from each other) |
 
 Behavior changes to the original engine, both for deterministic results across nodes:
 
@@ -179,12 +179,15 @@ Known limits of the raw-vector path:
   over the resident postings); INFO counts with a word-wise pass over it and the presence bits.
   INFO waits for nothing: fetched vectors still in memory count as `cached`, and the settle flag
   (tests) first waits for the writer.
-- A re-ranking that must fetch holds its engine worker for the round trip -- the slowest one
-  when its misses lie at several holders, since those requests run at once (a short-lived thread
-  for each holder but the first) -- and so does one that waits for another query's fetch of the
-  same vector. With the lazy protocol this lasts for as
-  long as queries meet vectors that have not moved. Pulls (stream, drain) do not join the
-  queries' fetches: a vector both need at once comes twice.
+- A re-ranking that must fetch waits for the round trip -- the slowest one when its misses lie
+  at several holders, since those requests run at once (a short-lived thread for each holder but
+  the first) -- and so does one that waits for another query's fetch of the same vector. A
+  RERANK waits on its connection's thread and takes an engine worker only once it has the
+  vectors (`FetchForRerank`, 2026-10-20), so the node's FILTERs and other RERANKs keep the
+  workers meanwhile; `SEARCH_LOCAL` (tests, a single node) still fetches holding its worker,
+  since its candidates come from its own FILTER. With the lazy protocol this lasts for as long
+  as queries meet vectors that have not moved. Pulls (stream, drain) do not join the queries'
+  fetches: a vector both need at once comes twice.
 - A peer's `RAW_GET` puts its device reads in flight together (2026-10-20): a read-ahead hint
   (`POSIX_FADV_WILLNEED`) for each page the cache lacks, then the buffered reads, at most 256 per
   request at a time. 200 vectors on random uncached pages take about 3 ms, against 29-38 ms read

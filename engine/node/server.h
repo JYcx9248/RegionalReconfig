@@ -2,7 +2,9 @@
 //
 // One thread per connection; each connection handles one request at a time (clients keep a
 // pool of connections for concurrency). Requests that touch the engine's per-worker state
-// (FILTER, RERANK, SEARCH_LOCAL) borrow one of the engine's workers for their duration.
+// (FILTER, RERANK, SEARCH_LOCAL) borrow one of the engine's workers for their duration -- a
+// RERANK only once it has the raw vectors it lacks, fetched on its connection's thread, so that
+// a new node's workers do not wait on the network while its FILTERs queue for them.
 // Serve() returns only after every connection thread has finished, so the engine may be
 // destroyed right after it.
 //

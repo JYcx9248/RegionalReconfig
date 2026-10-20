@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <map>
 #include <mutex>
 #include <random>
@@ -178,11 +179,11 @@ Fixture& GetFixture() {
 
 std::unique_ptr<NodeEngine> OpenNode(const Fixture& f, const std::vector<uint32_t>& parts,
                                      bool graph, const std::string& index_dir = "",
-                                     uint64_t read_iops = 0) {
+                                     uint64_t read_iops = 0, int workers = 2) {
   NodeOptions o;
   o.index_dir = index_dir.empty() ? f.index : index_dir;
   o.partitions_dir = f.parts;
-  o.num_workers = 2;
+  o.num_workers = workers;
   o.max_nprobe = 64;
   o.max_rerank = 4096;
   o.direct_io = false;
@@ -1936,6 +1937,104 @@ void TestWire() {
   serve.join();
 }
 
+// A RERANK fetches the raw vectors it lacks before it takes an engine worker: on a node with one
+// worker, a FILTER completes while a RERANK waits at the holder. Holding the worker, the RERANK
+// would keep it until the holder answered.
+void TestFetchHoldsNoWorker() {
+  Fixture& f = GetFixture();
+  static const PartitionManifest man = PartitionManifest::Load(f.parts);
+  auto src = OpenNode(f, {0, 1, 2, 3}, true);
+  src->SetNodes(1, {});
+  auto dst = OpenNode(f, {}, false, f.index_nopages, 0, 1);
+  dst->SetNodes(2, {{1, "node-1"}});
+  StageFrom(f, dst.get(), src.get(), {2, 3});
+  // A query's lists in the moved partitions, its candidates from dst's FILTER and the old
+  // owner's answer, before the server shares dst's only worker.
+  const float* q = &f.queries[0];
+  std::vector<uint32_t> lists(16), mine;
+  const uint32_t nl = src->Navigate(q, 16, 0, lists.data());
+  for (uint32_t i = 0; i < nl; ++i)
+    if (man.list_part[lists[i]] >= 2) mine.push_back(lists[i]);
+  const uint32_t nm = static_cast<uint32_t>(mine.size());
+  const std::vector<uint32_t> versions(nm, 0);
+  std::vector<uint32_t> cand(200), want_ids(10);
+  std::vector<float> pqd(200), want_d(10);
+  FilterStats fs;
+  const uint32_t nc = dst->Filter(0, q, mine.data(), nullptr, nm, 200, cand.data(), pqd.data(), &fs);
+  RerankStats rs;
+  const uint32_t nw =
+      src->Rerank(0, q, cand.data(), nc, 10, mine.data(), nullptr, nm, want_ids.data(), want_d.data(), &rs);
+  CHECK(nm > 0 && nc > 0 && nw == 10);
+
+  rtier::NodeServer server(dst.get());
+  // The holder answers only when let go. (This fetcher replaces the server's.)
+  std::mutex mu;
+  std::condition_variable cv;
+  bool waiting = false, go = false;
+  dst->SetRawFetcher([&](const std::string&, const uint32_t* locs, size_t n, uint8_t* out) {
+    {
+      std::unique_lock<std::mutex> l(mu);
+      waiting = true;
+      cv.notify_all();
+      cv.wait(l, [&] { return go; });
+    }
+    src->RawGet(locs, n, out);
+  });
+  const int port = server.ListenTcp("127.0.0.1", 0);
+  std::thread serve([&] { server.Serve(); });
+  const int a = Connect(port), b = Connect(port);
+
+  rtier::BodyWriter rr;
+  rr.Put<uint32_t>(10);
+  rr.Put<uint32_t>(nc);
+  rr.PutBytes(cand.data(), nc * 4);
+  rr.Put<uint32_t>(nm);
+  rr.PutBytes(mine.data(), nm * 4);
+  rr.PutBytes(versions.data(), nm * 4);
+  rr.PutBytes(q, f.dim * sizeof(float));
+  rtier::Frame reranked;
+  std::thread first([&] { reranked = Call(a, rtier::kRerank, rr, 1); });
+  {
+    std::unique_lock<std::mutex> l(mu);
+    CHECK(cv.wait_for(l, std::chrono::seconds(30), [&] { return waiting; }));
+  }
+  rtier::BodyWriter fr;
+  fr.Put<uint32_t>(200);
+  fr.Put<uint32_t>(nm);
+  fr.PutBytes(mine.data(), nm * 4);
+  fr.PutBytes(versions.data(), nm * 4);
+  fr.PutBytes(q, f.dim * sizeof(float));
+  std::promise<rtier::Frame> filtered;
+  std::future<rtier::Frame> done = filtered.get_future();
+  std::thread second([&] { filtered.set_value(Call(b, rtier::kFilter, fr, 2)); });
+  const bool worker_free = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    go = true;
+  }
+  cv.notify_all();
+  first.join();
+  second.join();
+  CHECK(worker_free && done.get().status == rtier::kOk);
+
+  // The RERANK answers as the old owner does, and counts what it fetched before the worker.
+  CHECK(reranked.status == rtier::kOk);
+  rtier::BodyReader br(reranked.body.data(), reranked.body.size());
+  const uint32_t cnt = br.Get<uint32_t>();
+  std::vector<uint32_t> got_ids(cnt);
+  std::vector<float> got_d(cnt);
+  std::memcpy(got_ids.data(), br.Bytes(cnt * 4), cnt * 4);
+  std::memcpy(got_d.data(), br.Bytes(cnt * 4), cnt * 4);
+  br.Get<uint32_t>();  // pages read
+  const uint32_t fetched = br.Get<uint32_t>();
+  CHECK(cnt == nw && got_ids == want_ids && got_d == want_d && fetched > 0 &&
+        fetched == dst->raw_stats(true).fetched);
+  ::close(a);
+  ::close(b);
+  server.Stop();
+  serve.join();
+}
+
 // The navigation graph's lists for every query at `graph`.
 std::vector<std::vector<uint32_t>> NavigateAll(const Fixture& f, NodeEngine& e, uint32_t graph) {
   std::vector<std::vector<uint32_t>> out;
@@ -2432,6 +2531,7 @@ int main() {
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
       {"wire", TestWire},
+      {"fetch_holds_no_worker", TestFetchHoldsNoWorker},
   };
   int failed = 0;
   for (const auto& t : tests) {

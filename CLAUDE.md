@@ -116,7 +116,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   records: one hop, data node to data node (`RAW_GET`, `PeerPool`; nodes know each other by ID,
   `SET_NODES`), and that posting then names the fetching node. A fetch brings only what its
   query needs, from every holder at once, no read-ahead: vectors move beyond that only in a
-  scale-in's drain (U9).
+  scale-in's drain (U9). A RERANK fetches before it takes an engine worker.
   Concurrent misses of one vector wait for one fetch. Fetched vectors are re-ranked from memory
   (fetch cache) until a background writer installs them with whole-page `O_DIRECT` writes
   (`WriterLoop`, `RawStore::PutPages`); INFO never waits for it (`nodeclient.InfoSettled` does,

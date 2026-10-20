@@ -59,8 +59,8 @@ its vector, the node that stores it (segment version 3), so each (list, vector) 
 holder: the list's owner if it has the vector, else the node its posting names. Only the owner's
 copy of a list counts: a partition moves as its owner saves it, holders included. From the flip
 on, a RERANK that meets a vector not there fetches it from the holder that one of the query's
-lists on that node records -- one hop, data node to data node -- waits for that fetch only, and
-makes that posting name itself; queries that miss the same vector meanwhile wait for the one
+lists on that node records -- one hop, data node to data node -- waits for that fetch only,
+holding no engine worker meanwhile, and makes that posting name itself; queries that miss the same vector meanwhile wait for the one
 fetch. Fetched vectors are re-ranked from memory, and a background writer installs them on the
 SSD with whole-page direct writes, off the query path. Nothing else moves and a scale-out does
 not wait for raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it

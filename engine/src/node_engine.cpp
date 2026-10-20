@@ -1363,32 +1363,29 @@ class NodeEngineImpl : public NodeEngine {
     return nt;
   }
 
+  uint32_t FetchForRerank(const uint32_t* ids, uint32_t n, const uint32_t* lists, const uint32_t* versions,
+                          uint32_t nlists, double* fetch_us) override {
+    std::vector<uint32_t> locs(n);
+    LocateCandidates(ids, n, nlists, locs.data());
+    Timer t;
+    const size_t fetched = n ? EnsureRawInLists(locs.data(), n, lists, versions, nlists) : 0;
+    if (fetch_us) *fetch_us = t.Us();
+    return static_cast<uint32_t>(fetched);
+  }
+
   uint32_t Rerank(int wi, const void* query, const uint32_t* ids, uint32_t n, uint32_t k,
                   const uint32_t* lists, const uint32_t* versions, uint32_t nlists,
                   uint32_t* out_ids, float* out_dists, RerankStats* st) override {
-    FUSION_CHECK(n <= opts_.max_rerank, "rerank input %u exceeds max_rerank %u", n,
-                 opts_.max_rerank);
-    FUSION_CHECK(nlists <= opts_.max_nprobe, "%u lists exceed max_nprobe %u", nlists,
-                 opts_.max_nprobe);
     FUSION_CHECK(k >= 1, "k must be >= 1");
-    for (uint32_t i = 0; i < n; ++i)
-      FUSION_CHECK(ids[i] < ids_, "vector ID %u out of range", ids[i]);
     Worker& w = *workers_.at(static_cast<size_t>(wi));
     RerankParams rp;
     rp.k = k;
     rp.heuristic = false;  // fixed n: every given candidate is re-ranked
     rp.batch = std::max<uint32_t>(std::min<uint32_t>(n, opts_.io_depth), 1);
     *st = RerankStats();
-    if (n == 0) return 0;
-    // A candidate comes from a FILTER of this node, so a partition loaded here names it and the
-    // PQ store knows its location.
     uint32_t* locs = w.locs.data();
-    if (store_->Locate(ids, n, locs) != 0) {
-      uint32_t i = 0;
-      while (locs[i] != PQStore::kNoLoc) ++i;
-      throw NotResidentError(
-          StrFormat("vector %u is not named by any partition loaded on this node", ids[i]));
-    }
+    LocateCandidates(ids, n, nlists, locs);
+    if (n == 0) return 0;
     Timer t;
     st->fetched = static_cast<uint32_t>(EnsureRawInLists(locs, n, lists, versions, nlists));
     st->fetch_us = t.Us();
@@ -1831,6 +1828,19 @@ class NodeEngineImpl : public NodeEngine {
       throw RawMissingError(StrFormat("fetching %zu raw vectors from node %u (%s): %s", locs.size(),
                                       holder, addr.c_str(), e.what()));
     }
+  }
+
+  // Checks a re-ranking's candidates and writes their raw-vector locations to locs. A candidate
+  // comes from a FILTER of this node, so a partition loaded here names it and the PQ store knows
+  // its location.
+  void LocateCandidates(const uint32_t* ids, uint32_t n, uint32_t nlists, uint32_t* locs) const {
+    FUSION_CHECK(n <= opts_.max_rerank, "rerank input %u exceeds max_rerank %u", n, opts_.max_rerank);
+    FUSION_CHECK(nlists <= opts_.max_nprobe, "%u lists exceed max_nprobe %u", nlists, opts_.max_nprobe);
+    for (uint32_t i = 0; i < n; ++i) FUSION_CHECK(ids[i] < ids_, "vector ID %u out of range", ids[i]);
+    if (n == 0 || store_->Locate(ids, n, locs) == 0) return;
+    uint32_t i = 0;
+    while (locs[i] != PQStore::kNoLoc) ++i;
+    throw NotResidentError(StrFormat("vector %u is not named by any partition loaded on this node", ids[i]));
   }
 
   // Makes the raw vectors at locs[0..n) present, the missing ones fetched through the query's

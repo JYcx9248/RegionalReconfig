@@ -254,10 +254,13 @@ var Open = map[string]Question{
 			"keep their holder, which still has it; queries that miss the same vector meanwhile " +
 			"wait for that one fetch. The RERANK waits for the fetch only: fetched vectors are " +
 			"re-ranked from memory and a background writer installs them with whole-page direct " +
-			"writes. A scale-out does not wait for raw vectors. A scale-in drains the nodes that " +
-			"leave first (DrainRaw: each remaining node takes over the vectors its postings say " +
-			"only a leaving node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so " +
-			"they can go offline when it returns. Holders stay valid because no node drops a raw " +
+			"writes. It waits holding no engine worker (2026-10-20): the data node fetches on " +
+			"the request's connection thread and takes a worker only once the vectors are there, " +
+			"so the node's FILTERs and other RERANKs keep the workers meanwhile. A scale-out " +
+			"does not wait for raw vectors. A scale-in drains the nodes that leave first " +
+			"(DrainRaw: each remaining node takes over the vectors its postings say only a " +
+			"leaving node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so they " +
+			"can go offline when it returns. Holders stay valid because no node drops a raw " +
 			"vector it has held (vectors are immutable, and even a deleted vector's page is not " +
 			"freed); a disk budget would need the same hand-off first. Baselines: \"lazy-stream\" " +
 			"also streams the rest in after the flip (StageRaw at raw_priority; RAW_MISSING " +
@@ -276,7 +279,7 @@ var Open = map[string]Question{
 		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw), " +
 			"internal/agent/control.go (StageRaw, DrainRaw), engine/src/node_engine.cpp " +
 			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull), engine/node/server.cpp " +
-			"(PeerPool)"},
+			"(PeerPool, RERANK)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
 			"single-machine prototype uses. What happens when the controller fails mid-flip is out of " +

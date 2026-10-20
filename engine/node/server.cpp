@@ -669,9 +669,14 @@ Frame NodeServer::Handle(const Frame& req) {
         std::vector<uint32_t> out_ids(k);
         std::vector<float> out_d(k);
         fusion::RerankStats rs;
+        // The vectors first, holding no worker: Rerank then finds them here.
+        double fetch_us = 0;
+        const uint32_t fetched = e.FetchForRerank(ids.data(), n, lists.data(), versions.data(), nlists, &fetch_us);
         worker = AcquireWorker(&st);
         const uint32_t cnt = e.Rerank(worker, q.data(), ids.data(), n, k, lists.data(),
                                       versions.data(), nlists, out_ids.data(), out_d.data(), &rs);
+        rs.fetched += fetched;
+        rs.fetch_us += fetch_us;
         w.Put(cnt);
         w.PutBytes(out_ids.data(), cnt * 4);
         w.PutBytes(out_d.data(), cnt * 4);
