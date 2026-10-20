@@ -1,0 +1,27 @@
+# Raw-stream check (branch raw-stream-parallel): copy-then-flip 2 -> 4 at 30 s under a light load
+# (100 q/s, ~30% of C2 at 40K), so the sources have reads to spare and the copy runs at the
+# stream's own speed. Overrides to compare (stage_raw in reconfigurations.json): {"RawPath":
+# "agent", "RawStreams": 1, "RawBatchBytes": 65536} (the stream before 2026-10-09), {"RawPath":
+# "agent"} (4 x 1 MiB through the agents) and the defaults (4 x 1 MiB data node to data node)
+
+base: base/wiki-c1024.yaml
+cluster:
+  nodes: 4
+  initial_nodes: 2
+  protocol: copy-then-flip
+  transfer_rate_bytes_per_sec: 0
+  backend: gpu
+  gpus: [3, 4, 5, 6]
+  resources:
+    cpus_per_node: 8
+    read_iops_per_node: 40000
+load:
+  nprobe: 64
+  n: 200
+  rate: 100
+  retry_for_seconds: 30
+  duration_seconds: 420
+  warmup_seconds: 10
+reconfigurations:
+- at: 30
+  data_nodes: 4

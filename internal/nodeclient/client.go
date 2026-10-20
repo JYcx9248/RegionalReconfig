@@ -57,6 +57,8 @@ const (
 	opPatchMerge     uint8 = 0x39
 	opPatchDrop      uint8 = 0x3A
 	opPatchSave      uint8 = 0x3B
+	opSwitchGen      uint8 = 0x3C
+	opRawBitmap      uint8 = 0x3D
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -183,6 +185,8 @@ type Info struct {
 	MaxEpochSeen  uint64             `json:"max_epoch_seen"`
 	IDCapacity    uint64             `json:"id_capacity"` // vector IDs, room for inserts included (U14)
 	Graph         GraphInfo          `json:"graph"`
+	Generation    uint32             `json:"generation"` // the index generation (U14 full rebuild)
+	PID           int                `json:"pid"`        // the data node's process, for the agent's samples
 	Resident      []int              `json:"resident"`
 	Versions      [][2]uint32        `json:"versions"` // every resident (partition, version)
 	PQ            PQStats            `json:"pq"`
@@ -354,25 +358,80 @@ func (c *Client) LoadGraph(ctx context.Context, path string) error {
 	return err
 }
 
+// LoadMode is where LoadPartition takes what the node lacks.
+type LoadMode uint8
+
+const (
+	// LoadPeer: the PQ codes must have been installed with PQPut (or the load fails with
+	// StatusPQAbsent), and a raw vector the node lacks is fetched, when a query needs it, from
+	// the holder its posting records (a segment saved at a hand-off records one for every
+	// posting; StatusRawAbsent if one is missing with no holder recorded).
+	LoadPeer LoadMode = 0
+	// LoadIndex (bootstrap): the PQ codes and raw vectors the node lacks are copied from the
+	// index.
+	LoadIndex LoadMode = 1
+	// LoadGeneration (a full rebuild's partitions, U14): the PQ codes the node lacks are copied
+	// from the generation's index -- one codebook, the same codes -- and raw vectors come from
+	// the holders, as with LoadPeer.
+	LoadGeneration LoadMode = 2
+)
+
 // LoadPartition makes the node load version v of partition p from the segment at path,
-// replacing that version if it is resident (the partition's other versions stay). With fromIndex, the PQ
-// codes and raw vectors the node lacks are copied from the index (bootstrap). Otherwise the PQ
-// codes must have been installed with PQPut (or the load fails with StatusPQAbsent), and a raw
-// vector the node lacks is fetched, when a query needs it, from the holder its posting records
-// (a segment saved at a hand-off records one for every posting; StatusRawAbsent if one is
-// missing with no holder recorded).
-func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string, fromIndex bool) error {
+// replacing that version if it is resident (the partition's other versions stay).
+func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string, mode LoadMode) error {
 	var w frame.Writer
 	w.U32(uint32(p))
 	w.U32(v)
-	if fromIndex {
-		w.U8(1)
-	} else {
-		w.U8(0)
-	}
+	w.U8(uint8(mode))
 	w.Bytes([]byte(path))
 	_, err := c.do(ctx, opLoadPartition, 0, w.B)
 	return err
+}
+
+// SwitchGeneration moves the node to generation gen of the index (U14 full rebuild): the index
+// at indexDir (fusion_build's output), partitioned as in partitionsDir (rtier_segment's). The
+// node must hold no partition; its graph is dropped, its PQ codes and raw vectors stay. Refused
+// unless the generation has the node's codebook and page geometry.
+func (c *Client) SwitchGeneration(ctx context.Context, gen uint32, indexDir, partitionsDir string) error {
+	var w frame.Writer
+	w.U32(gen)
+	for _, s := range []string{indexDir, partitionsDir} {
+		w.U32(uint32(len(s)))
+		w.Str(s)
+	}
+	_, err := c.do(ctx, opSwitchGen, 0, w.B)
+	return err
+}
+
+// Bitmap is a set of raw-vector locations, one bit each (64 per word).
+type Bitmap struct {
+	Locations uint64
+	Words     []uint64
+}
+
+// Has reports whether loc is in the set.
+func (b Bitmap) Has(loc uint32) bool {
+	w := int(loc >> 6)
+	return w < len(b.Words) && b.Words[w]>>(loc&63)&1 != 0
+}
+
+// RawBitmap returns the raw vectors the node holds (on its SSD, or fetched and not written yet).
+func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
+	b, err := c.do(ctx, opRawBitmap, 0, nil)
+	if err != nil {
+		return Bitmap{}, err
+	}
+	r := frame.NewReader(b)
+	out := Bitmap{Locations: r.U64()}
+	words := int((out.Locations + 63) / 64)
+	if r.Remaining() != 8*words {
+		return Bitmap{}, fmt.Errorf("RAW_BITMAP: %d bytes for %d locations", r.Remaining(), out.Locations)
+	}
+	out.Words = make([]uint64, words)
+	for i := range out.Words {
+		out.Words[i] = r.U64()
+	}
+	return out, r.Err
 }
 
 // PQMissing returns, for each group of segment files (paths on the node's host), the vector

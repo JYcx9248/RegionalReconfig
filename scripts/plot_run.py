@@ -146,6 +146,8 @@ def reconfigurations(path):
         label = "rescale to %s" % e.get("data_nodes", "?")
         if e.get("plan"):  # a placement of its own, possibly at the same size
             label += " (plan)"
+        if e.get("rebuild"):  # a full rebuild (U14): the next index generation
+            label = "full rebuild"
         out.append((float(e["trigger_seconds"]), float(e.get("elapsed_seconds", 0)), label, reply))
     return out
 
@@ -326,6 +328,12 @@ def main():
     for t, e in epoch_marks(rows):
         print("flip: %s at %.3f s" % (e, t))
     for t0, dur, label, reply in rcs:
+        if "generation" in reply:  # a full rebuild: what its placement found in place, and fetched
+            print("%s: triggered at %.3f s, took %.3f s, %s of %s vectors local, %s segment bytes, warm-up %s "
+                  "queries fetched %s vectors, phases %s"
+                  % (label, t0, dur, reply.get("local"), reply.get("vectors"), reply.get("segment_bytes"),
+                     reply.get("warmup_queries"), reply.get("warmup_fetched"), reply.get("phases")))
+            continue
         print("%s: triggered at %.3f s, took %.3f s, %s bytes, %s PQ codes, phases %s"
               % (label, t0, dur, reply.get("bytes"), reply.get("pq_codes"), reply.get("phases")))
     # The transition's cost: the highest windowed mean and p99 while an epoch was changing.

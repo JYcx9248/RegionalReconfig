@@ -101,6 +101,7 @@ func (a *Agent) entry(ctx context.Context, req *query.Request) (query.Result, er
 		return query.Result{Epoch: t.Epoch}, fmt.Errorf("%w: node %d is not an entry in epoch %d",
 			query.ErrUnavailable, a.ID(), t.Epoch)
 	}
+	a.keep(req)
 	start := time.Now()
 	res, err := a.navigateAndAggregate(ctx, t, req)
 	a.observe("entry", start, err)
@@ -118,7 +119,11 @@ func (a *Agent) navigateAndAggregate(ctx context.Context, t *epoch.Table, req *q
 	// The nodes the query has to reach, under this entry's epoch t: the aggregator is chosen
 	// among them, and runs the query with these groups under t -- here, or on the node it is
 	// forwarded to -- while this entry keeps t pinned.
-	groups := query.GroupByOwner(lists, a.manifest, t)
+	m, err := a.manifestFor(t)
+	if err != nil {
+		return query.Result{Epoch: t.Epoch}, err
+	}
+	groups := query.GroupByOwner(lists, m, t)
 	target, err := a.selector.Pick(t, a.ID(), req, groups)
 	if err != nil {
 		return query.Result{}, err

@@ -1,0 +1,22 @@
+base: base/wiki-c1024.yaml
+cluster:
+  nodes: 4
+  initial_nodes: 2
+  protocol: lazy
+  transfer_rate_bytes_per_sec: 0
+  backend: gpu
+  gpus: [0, 1, 4, 5]
+  resources:
+    cpus_per_node: 8
+    read_iops_per_node: 40000
+load:
+  nprobe: 64
+  n: 200
+  rate: SET_ME
+  rate_steps: 60:SET_ME
+  retry_for_seconds: 30
+  duration_seconds: 360
+  warmup_seconds: 30
+reconfigurations:
+- at: 90
+  data_nodes: 4

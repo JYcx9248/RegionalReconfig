@@ -58,6 +58,7 @@ type state struct {
 	NextID   uint64 `json:"next_id"`
 	NextLoc  uint64 `json:"next_loc"`
 	NextList uint64 `json:"next_list,omitempty"` // the first list ID no major epoch took
+	ListGen  uint32 `json:"list_gen,omitempty"`  // in this index generation (U14 full rebuild)
 }
 
 type options struct {
@@ -162,7 +163,7 @@ func run(o options) error {
 	if err != nil {
 		return err
 	}
-	alloc.SetNextList(s.NextList)
+	alloc.SetNextList(s.NextList, s.ListGen)
 	splits, err := parseLists(o.split)
 	if err != nil {
 		return err
@@ -297,7 +298,8 @@ func parseLists(s string) ([]uint32, error) {
 
 func saveState(path string, a *update.Allocator) error {
 	id, loc := a.Next()
-	b, _ := json.Marshal(state{NextID: id, NextLoc: loc, NextList: a.NextList()})
+	next, gen := a.NextList()
+	b, _ := json.Marshal(state{NextID: id, NextLoc: loc, NextList: next, ListGen: gen})
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
 		return err

@@ -38,6 +38,10 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	c.Handle(protocol.GraphPatchM, a.handleGraphPatch)
 	c.Handle(protocol.SetAdmissionM, a.handleSetAdmission)
 	c.Handle(protocol.WaitIdleM, a.handleWaitIdle)
+	c.Handle(protocol.SwitchGenerationM, a.handleSwitchGeneration)
+	c.Handle(protocol.RawBitmapM, a.handleRawBitmap)
+	c.Handle(protocol.QuerySampleM, a.handleQuerySample)
+	c.Handle(protocol.WarmupM, a.handleWarmup)
 	c.Handle(protocol.NodeStatusM, a.handleStatus)
 	c.Handle(protocol.ShutdownM, func(context.Context, json.RawMessage) (any, error) {
 		time.AfterFunc(100*time.Millisecond, a.Stop)
@@ -189,7 +193,7 @@ func checkVersions(sources []protocol.Source) error {
 func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, error) {
 	var names []string
 	for i, p := range src.Partitions {
-		files, err := partitioning.FilesAt(a.manifest, p, src.VersionOf(i))
+		files, err := partitioning.FilesAt(a.manifest.Load(), p, src.VersionOf(i))
 		if err != nil {
 			return 0, err
 		}
@@ -197,10 +201,23 @@ func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, 
 	}
 	var st transfer.Stats
 	var err error
-	switch src.Kind {
-	case "local":
+	switch {
+	case src.Kind == "gen" && src.Addr != "":
+		// From the controller's bulk port, under src.Dir there; then where the loads look.
+		remote := make([]string, len(names))
+		for i, n := range names {
+			remote[i] = filepath.Join(src.Dir, n)
+		}
+		if st, err = transfer.Pull(ctx, src.Addr, remote, a.cfg.WorkDir, a.cfg.ChunkBytes, transfer.Data); err == nil {
+			for i, n := range names {
+				if err = os.Rename(filepath.Join(a.cfg.WorkDir, remote[i]), filepath.Join(a.partDir(), n)); err != nil {
+					break
+				}
+			}
+		}
+	case src.Kind == "local" || src.Kind == "gen":
 		st, err = transfer.CopyLocal(src.Dir, names, a.partDir())
-	case "peer":
+	case src.Kind == "peer":
 		remote := make([]string, len(names))
 		for i, n := range names {
 			remote[i] = filepath.Join("partitions", n)
@@ -296,8 +313,14 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 	var pending []protocol.Source
 	for _, src := range sources {
 		if src.Kind != "peer" {
-			for i, p := range src.Partitions { // bootstrap: the node copies what it lacks from the index
-				if err := a.loadPartition(ctx, p, src.VersionOf(i), true); err != nil {
+			// Bootstrap: the node copies what it lacks from the index. A full rebuild's partitions
+			// (U14): the PQ codes from the generation's index, the raw vectors from their holders.
+			mode := nodeclient.LoadIndex
+			if src.Kind == "gen" {
+				mode = nodeclient.LoadGeneration
+			}
+			for i, p := range src.Partitions {
+				if err := a.loadPartition(ctx, p, src.VersionOf(i), mode); err != nil {
 					return err
 				}
 			}
@@ -320,7 +343,7 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				err := a.loadPartition(ctx, p, src.VersionOf(i), false)
+				err := a.loadPartition(ctx, p, src.VersionOf(i), nodeclient.LoadPeer)
 				if err != nil && nodeclient.IsPQAbsent(err) && round < maxPQRounds {
 					again, againV = append(again, p), append(againV, src.VersionOf(i))
 					continue
@@ -374,8 +397,8 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 }
 
 // loadPartition loads the segment file of version v of partition p as that version.
-func (a *Agent) loadPartition(ctx context.Context, p int, v uint32, fromIndex bool) error {
-	if err := a.localBulk.LoadPartition(ctx, p, v, a.segmentPath(p, v), fromIndex); err != nil {
+func (a *Agent) loadPartition(ctx context.Context, p int, v uint32, mode nodeclient.LoadMode) error {
+	if err := a.localBulk.LoadPartition(ctx, p, v, a.segmentPath(p, v), mode); err != nil {
 		return fmt.Errorf("load partition %d at version %d: %w", p, v, err)
 	}
 	a.mu.Lock()
@@ -726,7 +749,7 @@ func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, err
 		if _, err := a.localBulk.EvictPartition(ctx, p); err != nil {
 			return nil, err
 		}
-		files, err := partitioning.Files(a.manifest, p)
+		files, err := partitioning.Files(a.manifest.Load(), p)
 		if err != nil {
 			return nil, err
 		}
@@ -836,6 +859,7 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 	if info, err := a.localBulk.Info(ctx); err == nil {
 		st.GraphLoaded = info.GraphLoaded
 		st.Graph, st.GraphPatch = info.Graph.Version, info.Graph.Patch
+		st.Generation = info.Generation
 		st.RawFetched = info.Raw.FetchedOnDemand()
 		st.RawFetchedBytes = st.RawFetched * uint64(info.Raw.VecBytes)
 		for _, pv := range info.Versions {

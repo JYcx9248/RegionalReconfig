@@ -1,0 +1,21 @@
+#!/bin/sh
+# A stand-in for ssh that runs the remote command on this machine, as the remote login shell
+# would, so that scripts/run_cluster.py (and the rsync it runs over ssh) can be tried without an
+# SSH server:
+#
+#   PATH=$PWD/scripts/testing/fake_ssh:$PATH python3 scripts/run_cluster.py CONFIG.yaml OUT
+#
+# ssh's options are skipped, the first other argument is the destination, and the rest, joined
+# with spaces as ssh joins them, is the command. Its input is this process's: closing it ends a
+# "session" as it ends a real one. Test-only.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -[46AaCfGgKkMNnqsTtVvXxYy]*) shift ;;  # flags
+    -?) shift 2 ;;                         # an option and its value: -o X, -p N, -i F, ...
+    -*) shift ;;                           # an option with its value attached: -oX
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "fake ssh: no destination" >&2; exit 255; }
+shift
+exec sh -c "$*"

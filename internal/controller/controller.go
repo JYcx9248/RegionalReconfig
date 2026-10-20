@@ -10,6 +10,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +27,7 @@ import (
 	"rtier/internal/placement"
 	"rtier/internal/protocol"
 	"rtier/internal/syncflag"
+	"rtier/internal/transfer"
 )
 
 // Controller is the control plane.
@@ -47,6 +52,12 @@ type Controller struct {
 	ctrlAddr  string
 	apiAddr   string
 	lease     *updateLease // the update batch holding reconfigRunning, if any (update.go)
+	statsMu   sync.Mutex   // appends to stats_dir
+	bulkAddr  string       // where nodes pull the files the controller makes (bulk_listen)
+
+	// BeforeGenerationFlip, when set, runs just before a full rebuild flips to the next index
+	// generation, with the epoch it flips to (tests: the answers expected from it on).
+	BeforeGenerationFlip func(epoch uint64)
 }
 
 // New validates cfg and loads the partition manifest.
@@ -79,26 +90,9 @@ func New(cfg config.Controller) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The default policy reads the partition graph off the index's navigation graph (U3). The
-	// file is large (one record per head, vector included), so the load starts now and the
-	// first reconfiguration -- which comes after the initial deployment -- waits for it only if
-	// it is still running.
-	graph := sync.OnceValues(func() (placement.Adjacency, error) {
-		start := time.Now()
-		g, err := partitioning.PartitionGraph(cfg.IndexDir, m)
-		if err != nil {
-			log.Printf("controller: partition graph: %v", err)
-			return nil, err
-		}
-		log.Printf("controller: partition graph of %d partitions loaded in %.1f s", len(g), time.Since(start).Seconds())
-		return placement.Adjacency(g), nil
-	})
-	policy, err := placement.NewPolicy(cfg.Placement, graph)
+	policy, err := newPolicy(cfg.Placement, cfg.IndexDir, m)
 	if err != nil {
 		return nil, err
-	}
-	if _, ok := policy.(placement.GraphPolicy); ok {
-		go graph()
 	}
 	store, err := epoch.NewStore(cfg.EpochStore)
 	if err != nil {
@@ -114,6 +108,31 @@ func New(cfg config.Controller) (*Controller, error) {
 		}
 	}
 	return c, nil
+}
+
+// newPolicy makes the placement policy for an index generation's partitions. The default policy
+// reads the partition graph off the index's navigation graph (U3). The file is large (one record
+// per head, vector included), so the load starts now and the first reconfiguration -- which
+// comes after the initial deployment -- waits for it only if it is still running.
+func newPolicy(name, indexDir string, m *partitioning.Manifest) (placement.Policy, error) {
+	graph := sync.OnceValues(func() (placement.Adjacency, error) {
+		start := time.Now()
+		g, err := partitioning.PartitionGraph(indexDir, m)
+		if err != nil {
+			log.Printf("controller: partition graph: %v", err)
+			return nil, err
+		}
+		log.Printf("controller: partition graph of %d partitions loaded in %.1f s", len(g), time.Since(start).Seconds())
+		return placement.Adjacency(g), nil
+	})
+	policy, err := placement.NewPolicy(name, graph)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := policy.(placement.GraphPolicy); ok {
+		go graph()
+	}
+	return policy, nil
 }
 
 // Addrs returns the bound control-plane and API addresses (after Listening).
@@ -135,6 +154,23 @@ func (c *Controller) Run(ctx context.Context) error {
 		return err
 	}
 	defer api.Close()
+	if c.cfg.BulkListen != "" {
+		// The files the controller makes for the nodes, served over the bulk protocol: a
+		// node pulls them as it pulls a peer's segments, so no filesystem is shared.
+		if c.cfg.WorkDir == "" {
+			return fmt.Errorf("controller: bulk_listen needs work_dir")
+		}
+		if err := os.MkdirAll(c.cfg.WorkDir, 0o755); err != nil {
+			return err
+		}
+		bln, err := net.Listen("tcp", c.cfg.BulkListen)
+		if err != nil {
+			return err
+		}
+		defer bln.Close()
+		c.bulkAddr = advertised(bln.Addr().String(), ln.Addr().String())
+		go (&transfer.Server{Root: c.cfg.WorkDir}).Serve(bln)
+	}
 	c.mu.Lock()
 	c.ctrlAddr, c.apiAddr = ln.Addr().String(), api.Addr().String()
 	c.mu.Unlock()
@@ -155,6 +191,21 @@ func (c *Controller) Run(ctx context.Context) error {
 	return nil
 }
 
+// advertised is addr as nodes reach it: a listener on every interface gets the host the
+// control plane is reached at.
+func advertised(addr, control string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
+		if h, _, err := net.SplitHostPort(control); err == nil {
+			host = h
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
 func (c *Controller) setupAgentConn(conn *ctrl.Conn) {
 	conn.Handle(protocol.RegisterM, func(ctx context.Context, body json.RawMessage) (any, error) {
 		req, err := ctrl.Decode[protocol.Register](body)
@@ -169,9 +220,58 @@ func (c *Controller) setupAgentConn(conn *ctrl.Conn) {
 	conn.OnNotify(protocol.MetricsN, func(body json.RawMessage) {
 		rep, err := ctrl.Decode[metrics.Report](body)
 		if err == nil && c.sink != nil {
+			// Stamped on arrival, as Koala's metric collector does: one clock for the whole run,
+			// whatever machines the nodes run on (their own clocks differ by an unknown offset).
+			rep.Time = time.Now()
 			c.sink.Write(rep)
 		}
 	})
+	conn.OnNotify(protocol.NodeStatsN, func(body json.RawMessage) { c.nodeLines(body, "stats-%s.jsonl") })
+	conn.OnNotify(protocol.NodeSamplesN, func(body json.RawMessage) { c.nodeLines(body, "cgroups.jsonl") })
+}
+
+// nodeLines appends the records a node forwarded to file (a pattern of the node's name) in
+// stats_dir, each stamped with the controller's CLOCK_MONOTONIC on arrival ("t"; the node's own
+// stamp, if any, becomes "node_t"): the clock of clock.json when the controller runs next to
+// the experiment script, so the analysis scripts read every node's records on one time axis.
+func (c *Controller) nodeLines(body json.RawMessage, file string) {
+	if c.cfg.StatsDir == "" {
+		return
+	}
+	req, err := ctrl.Decode[protocol.NodeLines](body)
+	if err != nil || len(req.Lines) == 0 {
+		return
+	}
+	now := metrics.Monotonic()
+	name := file
+	if strings.Contains(file, "%s") {
+		name = fmt.Sprintf(file, req.Node)
+	}
+	var buf []byte
+	for _, l := range req.Lines {
+		var rec map[string]json.RawMessage
+		if json.Unmarshal(l, &rec) != nil {
+			continue
+		}
+		if t, ok := rec["t"]; ok {
+			rec["node_t"] = t
+		}
+		rec["t"] = json.RawMessage(strconv.FormatFloat(now, 'f', 3, 64))
+		b, err := json.Marshal(rec)
+		if err != nil {
+			continue
+		}
+		buf = append(append(buf, b...), '\n')
+	}
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	f, err := os.OpenFile(filepath.Join(c.cfg.StatsDir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("controller: node records: %v", err)
+		return
+	}
+	f.Write(buf)
+	f.Close()
 }
 
 func (c *Controller) setupAPIConn(conn *ctrl.Conn) {
@@ -217,6 +317,13 @@ func (c *Controller) setupAPIConn(conn *ctrl.Conn) {
 			return nil, err
 		}
 		return struct{}{}, c.AbortUpdate(ctx, req)
+	})
+	conn.Handle(protocol.RebuildA, func(ctx context.Context, body json.RawMessage) (any, error) {
+		req, err := ctrl.Decode[protocol.RebuildReq](body)
+		if err != nil {
+			return nil, err
+		}
+		return c.Rebuild(ctx, req)
 	})
 	conn.Handle(protocol.DesignA, func(ctx context.Context, _ json.RawMessage) (any, error) {
 		var qs []design.Question

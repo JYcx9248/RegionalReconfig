@@ -1,0 +1,25 @@
+# 2 -> 4 with each agent's transfers paced at 100 MB/s (a NIC, scaled). Not paced: lazy's on-
+# demand raw fetches (data node to data node)
+
+base: base/wiki-c1024.yaml
+cluster:
+  nodes: 4
+  initial_nodes: 2
+  protocol: lazy
+  transfer_rate_bytes_per_sec: 100000000
+  backend: gpu
+  gpus: [3, 4, 5, 6]
+  resources:
+    cpus_per_node: 8
+    read_iops_per_node: 40000
+load:
+  nprobe: 64
+  n: 200
+  rate: 210
+  rate_steps: 60:420
+  retry_for_seconds: 30
+  duration_seconds: 360
+  warmup_seconds: 30
+reconfigurations:
+- at: 90
+  data_nodes: 4

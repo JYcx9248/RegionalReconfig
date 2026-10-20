@@ -340,6 +340,13 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	c.event("reconfig.start", float64(cur.Epoch))
 	log.Printf("controller: reconfiguration %s: epoch %d, add %v, remove %v, move %d partitions",
 		c.cfg.Protocol, cur.Epoch, reply.Added, reply.Removed, len(reply.Moved))
+	// A node that joins runs the epoch's index generation (U14 full rebuild): one that registered
+	// with the deployed build's configuration switches first (a spare a rebuild released has).
+	if cur.Generation > 0 {
+		if err := c.toGeneration(ctx, added, cur); err != nil {
+			return reply, err
+		}
+	}
 
 	// Draft of epoch e+1: the new placement; added nodes aggregate right away and become
 	// entries only after their graph is loaded; removed nodes lose every role.
@@ -857,9 +864,10 @@ func (c *Controller) graphSources(t *epoch.Table, adds []*ManagedNode) (map[plac
 	for i, n := range adds {
 		addIDs[i] = n.ID
 	}
+	index, _ := c.genDirs(t)
 	for dst, i := range roundRobin(addIDs, len(liveIDs), start) {
 		if i < 0 {
-			srcs[dst] = protocol.Source{Kind: "local", Dir: c.cfg.IndexDir}
+			srcs[dst] = protocol.Source{Kind: "local", Dir: index}
 			continue
 		}
 		srcs[dst] = protocol.Source{Kind: "peer", Addr: live[i].Info.BulkAddr, File: "graph/graph.hnsw"}

@@ -227,7 +227,12 @@ func startNode(f *fixture, extra ...string) (string, func() error, error) {
 
 // startNodeOn is startNode on another index directory (f.indexNoPages).
 func startNodeOn(f *fixture, index string, extra ...string) (string, func() error, error) {
-	args := append([]string{"--index", index, "--partitions", f.parts, "--listen", "127.0.0.1:0",
+	return startNodeWith(f, index, f.parts, extra...)
+}
+
+// startNodeWith is startNode on another index and partition directory (a later generation).
+func startNodeWith(f *fixture, index, parts string, extra ...string) (string, func() error, error) {
+	args := append([]string{"--index", index, "--partitions", parts, "--listen", "127.0.0.1:0",
 		"--workers", "2", "--max-nprobe", "64", "--max-rerank", fmt.Sprint(maxRerank), "--no-direct"}, extra...)
 	cmd := exec.Command(filepath.Join(f.bin, "rtier_node"), args...)
 	stdout, err := cmd.StdoutPipe()
@@ -312,6 +317,9 @@ type cluster struct {
 
 	cmu      sync.Mutex
 	contents []contentVersion // the answers once update batches change the data (U14)
+
+	// agentCfg, when set, adjusts each agent's configuration before it starts.
+	agentCfg func(name string, c *config.Agent)
 }
 
 // contentVersion: the exact answers to the fixture's queries from epoch from on, until the
@@ -413,6 +421,9 @@ func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...stri
 		cfg.RawPath = p
 	}
 	cfg.MetricsInterval = config.Duration{Duration: 200 * time.Millisecond}
+	if cl.agentCfg != nil {
+		cl.agentCfg(name, &cfg)
+	}
 	a, err := agent.New(cfg, opts)
 	if err != nil {
 		cl.t.Fatal(err)

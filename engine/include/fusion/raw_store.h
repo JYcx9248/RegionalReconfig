@@ -97,6 +97,8 @@ class RawStore {
   // Locations set in `mask` (one bit per location, 64 per word, as many words as there are
   // locations / 64 rounded up) whose vector is not here.
   uint64_t CountAbsent(const std::vector<uint64_t>& mask) const;
+  // The presence bits, in that form.
+  std::vector<uint64_t> Bitmap() const;
   // Copies n vectors out (vec_bytes each, in the order of locs). Throws RawMissingError, having
   // copied nothing, if one is not here.
   void Get(const uint32_t* locs, size_t n, uint8_t* out);

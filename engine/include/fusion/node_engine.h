@@ -34,6 +34,11 @@
 // once: a major epoch (U14) changes it by a patch staged next to it and merged in place later
 // (fusion/graph_patch.h), and the graph is loaded with headroom for the heads patches add.
 //
+// A full rebuild (U14) moves a node, once it holds no partition, to another generation of the
+// index (SwitchGeneration): new lists, partitions and graph, built outside the system with the
+// same codebook, vector IDs and raw-vector locations -- so the PQ codes and raw vectors the node
+// holds stay valid and are reused, and the node never holds two generations' lists or graphs.
+//
 // Every result list is ordered by (distance, id): results do not depend on the order in which
 // candidates were produced, which is what lets rtier compare distributed and single-node runs.
 #pragma once
@@ -169,6 +174,10 @@ enum class PQSource {
   // Bootstrap (the initial deployment, --load): PQ codes and raw vectors are copied from the
   // index's pq_codes.bin and vectors_<layout>.bin.
   kIndex,
+  // A generation's partitions after a full rebuild (U14): the codes the node lacks are copied
+  // from the generation's pq_codes.bin (one codebook: the same codes), and raw vectors come from
+  // the holders the postings record, as with kPresent.
+  kGenIndex,
 };
 
 struct PQPutResult {
@@ -243,6 +252,15 @@ class NodeEngine {
   // Staging. LoadGraph/LoadPartition may run concurrently with queries. LoadGraph loads the
   // build's graph (version 0) with room for graph_headroom more elements.
   virtual void LoadGraph(const std::string& path) = 0;
+  // Full rebuild (U14): moves the node to `generation`, the index at index_dir (fusion_build's
+  // output) partitioned as in partitions_dir (rtier_segment's). The node must hold no partition;
+  // its graph and a staged patch are dropped, and the generation's manifest, PQ code file and
+  // assignment rule replace the current ones -- the PQ codes and raw vectors stay. Refused, with
+  // nothing changed, unless the generation has the same codebook, dimensions and page geometry
+  // and its lists fit max_list_len.
+  virtual void SwitchGeneration(uint32_t generation, const std::string& index_dir,
+                                const std::string& partitions_dir) = 0;
+  virtual uint32_t generation() const = 0;
   virtual bool has_graph() const = 0;
   virtual GraphState graph_state() const = 0;
 
@@ -386,6 +404,9 @@ class NodeEngine {
   // them as RawPut does (counted as streamed, not as fetched on demand), and makes those
   // postings name this node. RawMissingError if one has no holder.
   virtual RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) = 0;
+  // Which raw vectors the node holds (on the SSD, or fetched and not written yet): one bit per
+  // location, 64 per word -- what a full rebuild places the new partitions by (U14).
+  virtual std::vector<uint64_t> RawBitmap() const = 0;
   // A snapshot that waits for nothing, or (settle) one taken once the vectors fetched before
   // the call are on the SSD: with no query fetching, cached is then 0.
   virtual RawStats raw_stats(bool settle) const = 0;

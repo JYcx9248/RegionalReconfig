@@ -5,6 +5,15 @@
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] N           # N data nodes, placed by the policy
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] -plan FILE  # the placement FILE names
 //	rtier-client [-api ADDR] design             # open design questions (placeholders)
+//	rtier-client [-api ADDR] rebuild -index DIR -partitions DIR [-spares N] [-placement affinity|random]
+//	             [-warmup N] [-warmup-concurrency C] [-stop-the-world] [-work-dir DIR]
+//
+// rebuild moves the cluster to the next index generation (U14 full rebuild): DIR holds
+// fusion_build's output, built with the current codebook and page layout (seed its output
+// directory with pq_codebook.bin, pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the
+// partitions rtier_segment made of it. Spares (idle nodes, as many as the data nodes by default)
+// serve the queries meanwhile; -warmup N replays the N most recent queries the entries kept
+// (0: all of them, -1: none) before the next generation goes online.
 //
 // A plan file is a protocol.Plan: {"from_epoch": E, "owners": {"NODE": [partitions], ...}},
 // NODE a node ID or name; "from_epoch" is optional. -dry-run changes nothing and prints the
@@ -39,7 +48,7 @@ import (
 func main() {
 	api := flag.String("api", "127.0.0.1:7101", "controller API address")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | design | query ... | search-local ...")
+		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ...")
 	}
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -90,6 +99,26 @@ func main() {
 				log.Fatal(err)
 			}
 		}
+		printJSON(rep)
+	case "rebuild":
+		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		var req protocol.RebuildReq
+		req.Source.Kind = "dir"
+		fs.StringVar(&req.Source.IndexDir, "index", "", "the next generation's index (fusion_build's output)")
+		fs.StringVar(&req.Source.PartsDir, "partitions", "", "its partitions (rtier_segment's output)")
+		fs.IntVar(&req.Spares, "spares", 0, "idle nodes that serve the queries meanwhile (0: as many as the data nodes)")
+		fs.StringVar(&req.Placement, "placement", "affinity", "where the new partitions go: affinity | random")
+		fs.Int64Var(&req.Seed, "seed", 0, "seed of the random placement")
+		fs.IntVar(&req.Warmup, "warmup", 0, "recent queries replayed before going online (0: all kept, -1: none)")
+		fs.IntVar(&req.WarmupConcurrency, "warmup-concurrency", 0, "replayed queries at once per node (0: 4)")
+		fs.BoolVar(&req.StopTheWorld, "stop-the-world", false, "baseline: no spares, admission paused while every node switches")
+		fs.StringVar(&req.WorkDir, "work-dir", "", "where the new segments are written with their holders")
+		fs.Parse(args)
+		if req.Source.IndexDir == "" || req.Source.PartsDir == "" {
+			log.Fatal("usage: rebuild -index DIR -partitions DIR [...]")
+		}
+		var rep protocol.RebuildReply
+		call(ctx, *api, protocol.RebuildA, req, &rep, 24*time.Hour)
 		printJSON(rep)
 	case "design":
 		for _, id := range design.IDs() {

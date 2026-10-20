@@ -62,14 +62,16 @@ type Options struct {
 
 // Agent is one node's agent.
 type Agent struct {
-	cfg      config.Agent
-	manifest *partitioning.Manifest
-	tracker  *epoch.Tracker
-	agg      *query.Aggregator
-	selector query.Selector
-	limiter  *transfer.TokenBucket
-	bulk     *transfer.Server
-	reg      *metrics.Registry
+	cfg config.Agent
+	// The manifest of the index generation the node runs (U14 full rebuild: SwitchGeneration).
+	manifest   atomic.Pointer[partitioning.Manifest]
+	generation atomic.Uint32
+	tracker    *epoch.Tracker
+	agg        *query.Aggregator
+	selector   query.Selector
+	limiter    *transfer.TokenBucket
+	bulk       *transfer.Server
+	reg        *metrics.Registry
 	// The local data node, twice. Queries (NAVIGATE, and FILTER/RERANK through peer) use local;
 	// everything else -- serving peers' pulls, installing what arrives, loads, evictions, INFO --
 	// uses localBulk, so that it never waits for one of local's connections behind a backlog of
@@ -96,6 +98,10 @@ type Agent struct {
 	peers    map[string]*nodeclient.Client // data-node clients by address
 	aggs     map[string]*query.Client      // remote aggregators by query address
 	stagings map[*stagingRun]struct{}      // StagePartitions calls in flight
+
+	sampleMu   sync.Mutex // recent client queries, for a full rebuild's warm-up (keep)
+	sample     []protocol.SampledQuery
+	sampleNext int
 }
 
 // stagingRun is one StagePartitions call in flight; a rollback stops it before cleaning up.
@@ -147,7 +153,6 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 	}
 	a := &Agent{
 		cfg:           cfg,
-		manifest:      m,
 		tracker:       epoch.NewTracker(),
 		selector:      selector,
 		beforeInstall: opts.BeforeInstall,
@@ -163,6 +168,7 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 		aggs:          map[string]*query.Client{},
 		stagings:      map[*stagingRun]struct{}{},
 	}
+	a.manifest.Store(m)
 	a.agg = &query.Aggregator{Nodes: a, Strategy: strategy}
 	a.bulk = &transfer.Server{Root: cfg.WorkDir, Limiter: a.limiter, ChunkBytes: cfg.ChunkBytes}
 	return a, nil
@@ -196,9 +202,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if info.NumPartitions != a.manifest.NumPartitions || info.Payload != a.manifest.Payload {
+	if m := a.manifest.Load(); info.NumPartitions != m.NumPartitions || info.Payload != m.Payload {
 		return fmt.Errorf("agent: data node %s serves %d partitions (%s), manifest says %d (%s)",
-			a.cfg.NodeAddr, info.NumPartitions, info.Payload, a.manifest.NumPartitions, a.manifest.Payload)
+			a.cfg.NodeAddr, info.NumPartitions, info.Payload, m.NumPartitions, m.Payload)
 	}
 
 	qln, err := net.Listen("tcp", a.cfg.QueryListen)
@@ -250,6 +256,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.Registered.Signal()
 
 	go a.reportMetrics(ctx)
+	go a.forwardStats(ctx)
+	go a.sampleLoop(ctx)
 	select {
 	case <-ctx.Done():
 		return nil

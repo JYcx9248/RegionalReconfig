@@ -78,10 +78,12 @@ func TestTakeLists(t *testing.T) {
 		t.Fatalf("first lists: %v", got)
 	}
 	// Never handed out twice, even when the floor (the lists that exist) is below.
-	if got := a.TakeLists(1, 800); !reflect.DeepEqual(got, []uint32{802}) || a.NextList() != 803 {
-		t.Fatalf("second take: %v, next %d", got, a.NextList())
+	if got := a.TakeLists(1, 800); !reflect.DeepEqual(got, []uint32{802}) || first(a.NextList()) != 803 {
+		t.Fatalf("second take: %v, next %d", got, first(a.NextList()))
 	}
 	if got := a.TakeLists(1, 900); !reflect.DeepEqual(got, []uint32{900}) {
 		t.Fatalf("a floor above: %v", got)
 	}
 }
+
+func first(next uint64, _ uint32) uint64 { return next }

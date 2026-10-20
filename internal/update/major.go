@@ -154,9 +154,31 @@ func (mj *Major) Edits(p int) nodeclient.Edits {
 	return e
 }
 
-// PatchPath is where dir keeps the patch that makes graph version v.
-func PatchPath(dir string, v uint32) string {
+// PatchPath is where dir keeps the patch that makes graph version v of index generation gen
+// (graph versions count within a generation: a full rebuild brings a graph of its own).
+func PatchPath(dir string, gen, v uint32) string {
+	if gen > 0 {
+		dir = filepath.Join(dir, fmt.Sprintf("gen-%d", gen))
+	}
 	return filepath.Join(dir, fmt.Sprintf("patch-%d.bin", v))
+}
+
+// follow makes the updater work on t's index generation (U14 full rebuild): the generation's
+// manifest, and list IDs counted above its lists. Generations only move forward.
+func (u *Updater) follow(t *epoch.Table) error {
+	u.Alloc.generation(t.Generation)
+	if t.Generation == u.gen {
+		return nil
+	}
+	if t.Generation < u.gen {
+		return fmt.Errorf("update: epoch %d runs index generation %d, the updater %d", t.Epoch, t.Generation, u.gen)
+	}
+	m, err := partitioning.LoadManifest(t.GenParts)
+	if err != nil {
+		return fmt.Errorf("update: index generation %d: %w", t.Generation, err)
+	}
+	u.Manifest, u.gen = m, t.Generation
+	return nil
 }
 
 // PrepareMajor begins a major epoch that splits the lists splits and merges the lists merges:
@@ -185,13 +207,16 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 	defer func() {
 		if err != nil {
 			if edited {
-				err = errors.Join(err, u.syncRouter(context.WithoutCancel(ctx), lease.Table.Graph))
+				err = errors.Join(err, u.syncRouter(context.WithoutCancel(ctx), lease.Table))
 			}
 			err = errors.Join(err, u.abort(ctx, lease))
 		}
 	}()
 	t := lease.Table
-	if err := u.syncRouter(ctx, t.Graph); err != nil {
+	if err := u.follow(t); err != nil {
+		return nil, err
+	}
+	if err := u.syncRouter(ctx, t); err != nil {
 		return nil, err
 	}
 	mj = &Major{Lease: lease, Graph: t.Graph + 1, Lists: map[uint32]int{}, Parts: map[int]*PartEdits{},
@@ -325,7 +350,7 @@ func (u *Updater) ExecuteMajor(ctx context.Context, mj *Major) (*protocol.Update
 	if err == nil && u.PatchDir != "" {
 		// Kept before the commit: a router started later is brought to the committed version
 		// from these files.
-		err = savePatch(u.PatchDir, mj.Graph, mj.Patch)
+		err = savePatch(PatchPath(u.PatchDir, mj.Lease.Table.Generation, mj.Graph), mj.Patch)
 	}
 	if err != nil {
 		u.undoMajor(ctx, mj)
@@ -438,28 +463,45 @@ func (u *Updater) undoMajor(ctx context.Context, mj *Major) {
 			log.Printf("update: undo: releasing PQ codes on node %d: %v", o, err)
 		}
 	}
-	if err := u.syncRouter(ctx, t.Graph); err != nil {
+	if err := u.syncRouter(ctx, t); err != nil {
 		log.Printf("update: undo: the router's graph: %v", err)
 	}
 }
 
-// syncRouter brings the router's graph to version want: the patches up to it from PatchDir,
-// after reloading the build's graph (GraphPath) if the router is ahead -- an edit of a major
-// epoch that did not commit.
-func (u *Updater) syncRouter(ctx context.Context, want uint32) error {
+// syncRouter brings the router to t's index generation and graph version: the generation's
+// graph after a full rebuild (U14), then the patches up to t.Graph from PatchDir, after
+// reloading the generation's graph (GraphPath for the deployed build) if the router is ahead --
+// an edit of a major epoch that did not commit.
+func (u *Updater) syncRouter(ctx context.Context, t *epoch.Table) error {
 	in, err := u.Router.Info(ctx)
 	if err != nil {
 		return fmt.Errorf("update: router: %w", err)
 	}
-	have := in.Graph.Version
-	if have == want && in.Graph.Patch == 0 {
-		return nil
+	want := t.Graph
+	graph := u.GraphPath
+	if t.Generation > 0 {
+		graph = filepath.Join(t.GenIndex, "graph.hnsw")
 	}
-	if have > want || in.Graph.Patch != 0 {
-		if u.GraphPath == "" {
+	have := in.Graph.Version
+	switch {
+	case in.Generation != t.Generation:
+		if in.Generation > t.Generation {
+			return fmt.Errorf("update: the router runs index generation %d, epoch %d generation %d", in.Generation, t.Epoch, t.Generation)
+		}
+		if err := u.Router.SwitchGeneration(ctx, t.Generation, t.GenIndex, t.GenParts); err != nil {
+			return fmt.Errorf("update: moving the router to index generation %d: %w", t.Generation, err)
+		}
+		if err := u.Router.LoadGraph(ctx, graph); err != nil {
+			return fmt.Errorf("update: loading index generation %d's graph on the router: %w", t.Generation, err)
+		}
+		have = 0
+	case have == want && in.Graph.Patch == 0:
+		return nil
+	case have > want || in.Graph.Patch != 0:
+		if graph == "" {
 			return fmt.Errorf("update: the router's graph is at version %d, the epoch's at %d, and there is no graph to reload", have, want)
 		}
-		if err := u.Router.LoadGraph(ctx, u.GraphPath); err != nil {
+		if err := u.Router.LoadGraph(ctx, graph); err != nil {
 			return fmt.Errorf("update: reloading the router's graph: %w", err)
 		}
 		have = 0
@@ -468,7 +510,7 @@ func (u *Updater) syncRouter(ctx context.Context, want uint32) error {
 		if u.PatchDir == "" {
 			return fmt.Errorf("update: the router's graph is at version %d, the epoch's at %d, and there is no patch directory", have, want)
 		}
-		path, err := filepath.Abs(PatchPath(u.PatchDir, v))
+		path, err := filepath.Abs(PatchPath(u.PatchDir, t.Generation, v))
 		if err != nil {
 			return err
 		}
@@ -503,11 +545,10 @@ func listFloor(t *epoch.Table, m *partitioning.Manifest) uint32 {
 	return n
 }
 
-func savePatch(dir string, v uint32, patch []byte) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func savePatch(path string, patch []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	path := PatchPath(dir, v)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, patch, 0o644); err != nil {
 		return err

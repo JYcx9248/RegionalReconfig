@@ -132,6 +132,8 @@ const char* OpName(uint8_t op) {
     case kPatchMerge: return "patch_merge";
     case kPatchDrop: return "patch_drop";
     case kPatchSave: return "patch_save";
+    case kSwitchGeneration: return "switch_generation";
+    case kRawBitmap: return "raw_bitmap";
     default: return nullptr;
   }
 }
@@ -441,9 +443,26 @@ Frame NodeServer::Handle(const Frame& req) {
         const uint32_t p = r.Get<uint32_t>();
         const uint32_t version = r.Get<uint32_t>();
         const uint8_t src = r.Get<uint8_t>();
-        Require(src <= 1, "unknown PQ source");
-        e.LoadPartition(p, r.Rest(), src == 1 ? fusion::PQSource::kIndex : fusion::PQSource::kPresent,
+        Require(src <= 2, "unknown PQ source");
+        e.LoadPartition(p, r.Rest(),
+                        src == 1   ? fusion::PQSource::kIndex
+                        : src == 2 ? fusion::PQSource::kGenIndex
+                                   : fusion::PQSource::kPresent,
                         version);
+        break;
+      }
+      case kSwitchGeneration: {
+        const uint32_t gen = r.Get<uint32_t>();
+        const std::string index_dir = TakeStr(&r);
+        const std::string partitions_dir = TakeStr(&r);
+        Require(r.remaining() == 0, "trailing bytes in SWITCH_GENERATION");
+        e.SwitchGeneration(gen, index_dir, partitions_dir);
+        break;
+      }
+      case kRawBitmap: {
+        const std::vector<uint64_t> bits = e.RawBitmap();
+        w.Put<uint64_t>(e.raw_stats(false).locations);
+        w.PutBytes(bits.data(), bits.size() * sizeof(uint64_t));
         break;
       }
       case kEvictPartition:
@@ -888,12 +907,14 @@ std::string NodeServer::InfoJson(bool settle) const {
   s += fusion::StrFormat(
       "\"dtype\":\"%s\",\"dim\":%u,\"num_vectors\":%llu,\"num_lists\":%u,\"num_partitions\":%u,"
       "\"max_nprobe\":%u,\"max_rerank\":%u,\"workers\":%d,\"filter\":\"%s\",\"payload\":\"%s\","
-      "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,\"id_capacity\":%llu,\"graph\":%s,",
+      "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,\"id_capacity\":%llu,\"graph\":%s,"
+      "\"generation\":%u,\"pid\":%d,",
       fusion::DTypeName(e.dtype()), e.dim(), static_cast<unsigned long long>(e.size()),
       e.num_lists(), e.num_partitions(), o.max_nprobe, o.max_rerank, e.num_workers(),
       e.filter_name(), e.payload().c_str(), e.has_graph() ? "true" : "false",
       static_cast<unsigned long long>(max_epoch_seen_.load()),
-      static_cast<unsigned long long>(e.id_capacity()), GraphJson().c_str());
+      static_cast<unsigned long long>(e.id_capacity()), GraphJson().c_str(), e.generation(),
+      static_cast<int>(::getpid()));
   s += "\"resident\":[";
   const auto res = e.ResidentPartitions();
   for (size_t i = 0; i < res.size(); ++i) s += (i ? "," : "") + std::to_string(res[i]);

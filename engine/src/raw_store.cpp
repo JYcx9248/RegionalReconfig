@@ -319,6 +319,12 @@ void RawStore::PutBuffered(const uint32_t* locs, const uint8_t* vecs, const std:
   });
 }
 
+std::vector<uint64_t> RawStore::Bitmap() const {
+  std::vector<uint64_t> out(CeilDiv(layout_.locations(), 64));
+  for (size_t w = 0; w < out.size(); ++w) out[w] = bits_[w].load(std::memory_order_acquire);
+  return out;
+}
+
 uint64_t RawStore::CountAbsent(const std::vector<uint64_t>& mask) const {
   const uint64_t words = CeilDiv(layout_.locations(), 64);
   FUSION_CHECK(mask.size() == words, "location mask has %zu words, want %llu", mask.size(),

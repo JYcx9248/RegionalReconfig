@@ -75,6 +75,16 @@ type Controller struct {
 	// commit or abort (U14) before the controller gives the lease up -- an update controller that
 	// died must not block reconfigurations for good. Default 10 min.
 	UpdateLease Duration `json:"update_lease"`
+	// StatsDir: where the nodes' diagnostics arrive -- each data node's stats log
+	// (stats-<node>.jsonl) and the agents' process and host samples (cgroups.jsonl), stamped with
+	// the controller's clock when they arrive. "" drops them.
+	StatsDir string `json:"stats_dir"`
+	// WorkDir and BulkListen: the files the controller makes for the nodes (a full rebuild's
+	// segments with their holders, U14) go under WorkDir, and with BulkListen the nodes pull
+	// them from there over the bulk protocol, whatever machine they run on. Without BulkListen
+	// they read them from the controller's filesystem (one machine).
+	WorkDir    string `json:"work_dir"`
+	BulkListen string `json:"bulk_listen"`
 }
 
 // DefaultController returns the controller defaults.
@@ -118,6 +128,17 @@ type Agent struct {
 	RawBatchBytes   int      `json:"raw_batch_bytes"` // raw vectors per request of such a stream, in bytes
 	RawPath         string   `json:"raw_path"`        // "node" | "agent" | "" (node unless TransferRate paces the agents)
 	MetricsInterval Duration `json:"metrics_interval"`
+	// QuerySample: how many recent client queries an entry keeps, for a full rebuild's warm-up to
+	// replay under the next generation (U14; 0: none).
+	QuerySample int `json:"query_sample"`
+	// NodeStatsFile: the data node's stats log (rtier_node --stats-file), which the agent
+	// forwards line by line to the controller (its stats_dir), stamped there on arrival -- one
+	// clock however many machines the cluster spans. "" forwards nothing.
+	NodeStatsFile string `json:"node_stats_file"`
+	// SampleInterval: every interval the agent samples its data node, itself and its machine
+	// (CPU, disk, memory, pressure; the node's GPU) for the controller's cgroups.jsonl. 0 = off:
+	// on one machine the experiment script samples every node itself.
+	SampleInterval Duration `json:"sample_interval"`
 }
 
 // DefaultAgent returns the agent defaults.
@@ -134,6 +155,7 @@ func DefaultAgent() Agent {
 		RawStreams:      2,
 		RawBatchBytes:   1 << 20,
 		MetricsInterval: Duration{5 * time.Second},
+		QuerySample:     1024,
 	}
 }
 

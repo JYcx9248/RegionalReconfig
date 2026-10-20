@@ -67,6 +67,9 @@ type Updater struct {
 	GraphPath string
 	PatchDir  string
 	MergeEF   int
+	// gen is the index generation Manifest belongs to (U14 full rebuild): the updater follows
+	// the lease's epoch to the next one (follow).
+	gen uint32
 
 	mu      sync.Mutex
 	clients map[string]*nodeclient.Client
@@ -145,10 +148,13 @@ func (u *Updater) Prepare(ctx context.Context, vecs []byte, vecBytes int, delete
 		}
 	}()
 	t := lease.Table
+	if err = u.follow(t); err != nil {
+		return nil, err
+	}
 	var ins []Insert
 	if len(vecs) > 0 {
-		// Routed on the epoch's graph: the router's is brought to its version first.
-		if err = u.syncRouter(ctx, t.Graph); err != nil {
+		// Routed on the epoch's graph: the router's is brought to its generation and version first.
+		if err = u.syncRouter(ctx, t); err != nil {
 			return nil, err
 		}
 		if ins, err = Route(ctx, u.Router, u.Alloc, vecs, vecBytes); err != nil {

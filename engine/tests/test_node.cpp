@@ -2160,6 +2160,173 @@ void TestListEdits() {
   CHECK(y->ResidentVersions() == vy && x->ResidentVersions() == vx);
 }
 
+// A second generation of the fixture's index (U14 full rebuild): re-clustered with another seed
+// into 3 partitions, with the first generation's codebook, codes and page layout -- what
+// fusion_build reuses when those files are already in its output directory.
+struct Generation {
+  std::string index, parts;
+};
+
+const Generation& GetGeneration2() {
+  static Generation g = [] {
+    const Fixture& f = GetFixture();
+    const std::string dir = f.index.substr(0, f.index.rfind('/'));
+    Generation x;
+    x.index = dir + "/index-g2";
+    MakeDirs(x.index);
+    for (const std::string& name : {std::string(files::kPQCodebook), std::string(files::kPQCodes),
+                                    files::LayoutMap("bucket"), files::LayoutVectors("bucket")})
+      CHECK(::symlink(JoinPath(f.index, name).c_str(), JoinPath(x.index, name).c_str()) == 0);
+    BuildParams bp;
+    bp.base_path = dir + "/base.fbin";
+    bp.out_dir = x.index;
+    bp.pq_m = 8;
+    bp.pq_train_n = 4000;
+    bp.seed = 7;
+    bp.clustering.seed = 7;
+    BuildIndex(bp);
+    PostingLists pl = PostingLists::Load(JoinPath(x.index, files::kPostings));
+    std::vector<uint32_t> assign(pl.num_lists());
+    for (uint32_t c = 0; c < pl.num_lists(); ++c) assign[c] = static_cast<uint32_t>(uint64_t(c) * 3 / pl.num_lists());
+    x.parts = dir + "/parts-g2";
+    WritePartitions(pl, assign, 3, x.parts, LayoutMap::Load(JoinPath(x.index, files::LayoutMap("bucket"))), "bucket");
+    return x;
+  }();
+  return g;
+}
+
+std::unique_ptr<NodeEngine> OpenOn(const std::string& index, const std::string& parts) {
+  NodeOptions o;
+  o.index_dir = index;
+  o.partitions_dir = parts;
+  o.num_workers = 2;
+  o.max_nprobe = 64;
+  o.max_rerank = 4096;
+  o.max_list_len = 4096;  // room for either generation's lists
+  o.direct_io = false;
+  return NodeEngine::Open(o);
+}
+
+// Full rebuild (U14): two nodes that served the first generation move to the second without a
+// restart. They keep their PQ codes and raw vectors -- the new partitions' codes come from the
+// generation's index, a vector that only the other node holds is fetched from it, as after a
+// migration -- and answer as a node built on the second generation does.
+void TestGenerations() {
+  const Fixture& f = GetFixture();
+  const Generation& g2 = GetGeneration2();
+  const PartitionManifest man2 = PartitionManifest::Load(g2.parts);
+  CHECK(man2.num_partitions == 3);
+
+  // The second generation's oracle: one node built on it.
+  auto oracle = OpenOn(g2.index, g2.parts);
+  oracle->LoadGraph(JoinPath(g2.index, files::kGraph));
+  for (uint32_t p = 0; p < 3; ++p)
+    oracle->LoadPartition(p, JoinPath(g2.parts, partfiles::SegmentName(p)), PQSource::kIndex);
+
+  // Generation 0 on two nodes: a holds partitions 0-1, b 2-3, each with their raw vectors.
+  auto a = OpenOn(f.index, f.parts), b = OpenOn(f.index, f.parts);
+  for (uint32_t p = 0; p < 4; ++p)
+    (p < 2 ? a : b)->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
+  a->LoadGraph(JoinPath(f.index, files::kGraph));
+  LinkPeers(a.get(), 1, {{2, b.get()}});
+  LinkPeers(b.get(), 2, {{1, a.get()}});
+  // The bitmap: what the node holds.
+  const std::vector<uint64_t> bits_a = a->RawBitmap(), bits_b = b->RawBitmap();
+  auto popcount = [](const std::vector<uint64_t>& v) {
+    uint64_t n = 0;
+    for (uint64_t w : v) n += static_cast<uint64_t>(__builtin_popcountll(w));
+    return n;
+  };
+  CHECK(popcount(bits_a) == a->raw_stats(true).present && popcount(bits_b) == b->raw_stats(true).present);
+  auto has = [](const std::vector<uint64_t>& v, uint32_t loc) { return (v[loc >> 6] >> (loc & 63)) & 1; };
+  for (uint32_t loc : Named(f, {0, 1}).second) CHECK(has(bits_a, loc));
+
+  // Refused while a partition is resident; refused for another codebook. Nothing changes.
+  CHECK(Throws([&] { a->SwitchGeneration(1, g2.index, g2.parts); }));
+  CHECK(a->generation() == 0 && a->num_partitions() == 4 && a->has_graph());
+  for (uint32_t p = 0; p < 4; ++p) (p < 2 ? a : b)->EvictPartition(p);
+  const std::string other = TempDir() + "/index-other";
+  MakeDirs(other);
+  for (const char* name : {files::kMeta, files::kGraph, files::kPQCodes})
+    CHECK(::symlink(JoinPath(g2.index, name).c_str(), JoinPath(other, name).c_str()) == 0);
+  std::vector<uint8_t> cb = ReadFile(JoinPath(g2.index, files::kPQCodebook));
+  cb[cb.size() - 1] ^= 0x40;  // one centroid differs
+  WriteFile(JoinPath(other, files::kPQCodebook), cb.data(), cb.size());
+  CHECK(Throws([&] { a->SwitchGeneration(1, other, g2.parts); }));
+  CHECK(a->generation() == 0 && a->num_partitions() == 4 && a->has_graph());
+
+  // The switch: the graph goes, the codes and raw vectors stay.
+  const uint64_t codes_a = a->pq_stats().resident, present_a = a->raw_stats(true).present;
+  a->SwitchGeneration(1, g2.index, g2.parts);
+  b->SwitchGeneration(1, g2.index, g2.parts);
+  CHECK(a->generation() == 1 && a->num_partitions() == 3 && a->num_lists() == man2.num_lists && !a->has_graph());
+  CHECK(a->pq_stats().resident == codes_a && a->raw_stats(true).present == present_a);
+  a->LoadGraph(JoinPath(g2.index, files::kGraph));
+
+  // The second generation's partitions: 0-1 on a, 2 on b. A posting whose vector its owner
+  // lacks names the other node, which holds it: one hop.
+  const std::string staged = TempDir();
+  auto stage = [&](NodeEngine* owner, const std::vector<uint64_t>& mine, uint16_t other_id, uint32_t p) {
+    ListSegment s = ListSegment::Load(JoinPath(g2.parts, partfiles::SegmentName(p)));
+    s.holders.assign(s.ids.size(), kNoHolder);
+    for (size_t j = 0; j < s.ids.size(); ++j)
+      if (!has(mine, s.locs[j])) s.holders[j] = other_id;
+    const std::string path = JoinPath(staged, partfiles::SegmentName(p));
+    s.Save(path);
+    owner->LoadPartition(p, path, PQSource::kGenIndex);
+  };
+  // Without holders, a vector that is not here is refused before anything changes.
+  CHECK(Throws([&] { b->LoadPartition(2, JoinPath(g2.parts, partfiles::SegmentName(2)), PQSource::kGenIndex); }));
+  CHECK(b->ResidentPartitions().empty());
+  stage(a.get(), bits_a, 2, 0);
+  stage(a.get(), bits_a, 2, 1);
+  stage(b.get(), bits_b, 1, 2);
+  CHECK(a->ResidentPartitions() == std::vector<uint32_t>({0, 1}) && b->ResidentPartitions() == std::vector<uint32_t>({2}));
+
+  // Every answer is the second generation's: navigate on a, filter and re-rank at each owner.
+  const uint32_t k = 10, nprobe = 16;
+  bool same = true;
+  for (uint32_t qi = 0; qi < f.nq; ++qi) {
+    const float* q = &f.queries[qi * f.dim];
+    SearchParams sp;
+    sp.k = k;
+    sp.nprobe = nprobe;
+    sp.rerank = 4096;
+    sp.rr.heuristic = false;
+    std::vector<uint32_t> ids(k);
+    std::vector<float> d(k);
+    QueryStats qs;
+    const uint32_t n0 = oracle->SearchLocal(0, q, sp, ids.data(), d.data(), &qs);
+    Result want;
+    for (uint32_t i = 0; i < n0; ++i) want.emplace_back(d[i], ids[i]);
+    std::vector<uint32_t> lists(nprobe);
+    const uint32_t nl = a->Navigate(q, nprobe, 0, lists.data());
+    std::map<int, std::vector<uint32_t>> by_node;
+    for (uint32_t i = 0; i < nl; ++i) by_node[man2.list_part[lists[i]] < 2 ? 0 : 1].push_back(lists[i]);
+    std::map<uint32_t, float> merged;
+    for (auto& [node, ls] : by_node) {
+      NodeEngine* e = node == 0 ? a.get() : b.get();
+      std::vector<uint32_t> cand(4096), rid(k);
+      std::vector<float> pqd(4096), rd(k);
+      FilterStats fs;
+      const uint32_t nc = e->Filter(0, q, ls.data(), nullptr, static_cast<uint32_t>(ls.size()), 4096,
+                                    cand.data(), pqd.data(), &fs);
+      RerankStats rs;
+      const uint32_t nr = e->Rerank(1, q, cand.data(), nc, k, ls.data(), nullptr, static_cast<uint32_t>(ls.size()),
+                                    rid.data(), rd.data(), &rs);
+      for (uint32_t i = 0; i < nr; ++i) merged[rid[i]] = rd[i];
+    }
+    Result got;
+    for (const auto& [id, dist] : merged) got.emplace_back(dist, id);
+    std::sort(got.begin(), got.end());
+    if (got.size() > k) got.resize(k);
+    same = same && got == want;
+  }
+  CHECK(same);
+  // Some vectors came from the other node, and only on demand.
+  CHECK(a->raw_stats(true).fetched + b->raw_stats(true).fetched > 0);
+}
+
 }  // namespace
 
 int main() {
@@ -2178,6 +2345,7 @@ int main() {
       {"read_budget", TestReadBudget},
       {"graph_patches", TestGraphPatches},
       {"list_edits", TestListEdits},
+      {"generations", TestGenerations},
       {"wire", TestWire},
   };
   int failed = 0;

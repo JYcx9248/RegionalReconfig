@@ -21,9 +21,13 @@
 //	  (none)                                           update batches (U14): BeginUpdate, staging by the
 //	                                                   update controller, CommitUpdate (flip, grace,
 //	                                                   DropVersions)
+//	  (none)                                           full rebuild (U14): spares take every partition,
+//	                                                   the old nodes SwitchGeneration and stage the new
+//	                                                   one, Warmup, flip, the spares leave
 package protocol
 
 import (
+	"encoding/json"
 	"strconv"
 	"time"
 
@@ -46,15 +50,29 @@ const (
 	GraphPatchM      = "GraphPatch"      // merge (or drop) a staged graph patch (U14 major epochs)
 	SetAdmissionM    = "SetAdmission"    // pause/resume client queries (stop-and-copy baseline)
 	WaitIdleM        = "WaitIdle"        // no query in flight at all
-	NodeStatusM      = "Status"
-	ShutdownM        = "Shutdown"
+	// Full rebuild (U14).
+	SwitchGenerationM = "SwitchGeneration" // drop every partition and the graph, run another index generation
+	RawBitmapM        = "RawBitmap"        // the raw vectors the data node holds
+	QuerySampleM      = "QuerySample"      // recent client queries an entry kept
+	WarmupM           = "Warmup"           // run queries under a draft epoch, answers dropped
+	NodeStatusM       = "Status"
+	ShutdownM         = "Shutdown"
 )
 
 // Methods served by the controller, called by agents.
 const (
-	RegisterM = "Register"
-	MetricsN  = "Metrics" // notification: metrics.Report
+	RegisterM    = "Register"
+	MetricsN     = "Metrics"     // notification: metrics.Report
+	NodeStatsN   = "NodeStats"   // notification: NodeLines, lines of the data node's stats log
+	NodeSamplesN = "NodeSamples" // notification: NodeLines, process and host samples
 )
+
+// NodeLines are JSON records a node forwards to the controller, which stamps them with its own
+// clock ("t", CLOCK_MONOTONIC seconds) when they arrive and keeps the node's as "node_t".
+type NodeLines struct {
+	Node  string            `json:"node"`
+	Lines []json.RawMessage `json:"lines"`
+}
 
 // API methods served by the controller, called by rtier-client and the harness.
 const (
@@ -67,6 +85,8 @@ const (
 	BeginUpdateA  = "BeginUpdate"
 	CommitUpdateA = "CommitUpdate"
 	AbortUpdateA  = "AbortUpdate"
+	// Full rebuild (U14): the cluster moves to an index generation built outside the system.
+	RebuildA = "Rebuild"
 )
 
 // Register is an agent's first message (Koala's Registration: data-plane and state-comm
@@ -89,7 +109,12 @@ type StageAggregatorReq struct {
 // posting of a segment records the node holding its vector, and the destination fetches from
 // that node.
 type Source struct {
-	Kind       string `json:"kind"` // "peer": another agent's bulk port; "local": a directory
+	// "peer": another agent's bulk port; "local": a directory, loaded as a bootstrap (the PQ codes
+	// and raw vectors the node lacks come from the index); "gen": a full rebuild's segments (U14),
+	// loaded with the PQ codes from the generation's index and the raw vectors from the holders
+	// the postings record -- pulled from Addr's bulk port (the controller's) from under Dir, or
+	// without Addr read from the directory Dir.
+	Kind       string `json:"kind"`
 	Addr       string `json:"addr,omitempty"`
 	Dir        string `json:"dir,omitempty"`
 	Partitions []int  `json:"partitions,omitempty"`
@@ -211,6 +236,51 @@ type SetAdmissionReq struct {
 	Paused bool `json:"paused"`
 }
 
+// GenerationReq moves a node to an index generation (U14 full rebuild): the agent drops every
+// partition and the graph -- the data node keeps its PQ codes and raw vectors, which every
+// generation shares -- and from then on runs the generation's partitions and graph.
+type GenerationReq struct {
+	Generation uint32 `json:"generation"`
+	IndexDir   string `json:"index_dir"`
+	PartsDir   string `json:"parts_dir"`
+}
+
+// RawBitmapReply: the raw vectors the node's data node holds, one bit per location
+// (little-endian 64-bit words).
+type RawBitmapReply struct {
+	Locations uint64 `json:"locations"`
+	Bits      []byte `json:"bits"`
+}
+
+// SampledQuery is a client query an entry kept, for a warm-up to replay.
+type SampledQuery struct {
+	Vec    []byte `json:"vec"`
+	K      int    `json:"k"`
+	NProbe int    `json:"nprobe"`
+	N      int    `json:"n"`
+	EF     int    `json:"ef,omitempty"`
+}
+
+type QuerySampleReply struct {
+	Queries []SampledQuery `json:"queries"`
+}
+
+// WarmupReq: run Queries under Table, a draft epoch no client routes with yet, and drop the
+// answers. What re-ranking fetches on the way stays: the raw vectors those queries need are then
+// on their owners (U14 full rebuild, before the new generation goes online).
+type WarmupReq struct {
+	Table       *epoch.Table   `json:"table"`
+	Queries     []SampledQuery `json:"queries"`
+	Concurrency int            `json:"concurrency,omitempty"`
+}
+
+type WarmupReply struct {
+	Queries    int     `json:"queries"`
+	Failed     int     `json:"failed"`
+	FirstError string  `json:"first_error,omitempty"`
+	Seconds    float64 `json:"seconds"`
+}
+
 // NodeStatus is an agent's view of itself.
 type NodeStatus struct {
 	ID          placement.NodeID `json:"id"`
@@ -229,6 +299,8 @@ type NodeStatus struct {
 	// next to it, 0 if none (U14 major epochs).
 	Graph      uint32 `json:"graph,omitempty"`
 	GraphPatch uint32 `json:"graph_patch,omitempty"`
+	// Generation: the index generation the node runs (U14 full rebuild).
+	Generation uint32 `json:"generation,omitempty"`
 }
 
 // RescaleReq asks for a reconfiguration in one of two forms: DataNodes, a number of data
@@ -394,4 +466,70 @@ type UpdateReply struct {
 // controller's to drop.
 type AbortUpdateReq struct {
 	Token string `json:"token"`
+}
+
+// GenerationSource is where a full rebuild's next generation comes from: built outside the
+// system with the current codebook, vector IDs and raw-vector locations. Kind "dir" (the only
+// one so far): IndexDir holds fusion_build's output, PartsDir rtier_segment's, on a filesystem
+// every node reads.
+type GenerationSource struct {
+	Kind     string `json:"kind"`
+	IndexDir string `json:"index_dir"`
+	PartsDir string `json:"parts_dir"`
+}
+
+// RebuildReq asks for a full rebuild (U14). Idle nodes, the spares, take over every partition of
+// the current generation (a lazy reconfiguration); the old nodes, holding raw vectors only, move
+// to the next generation, are given its partitions where their raw vectors are, warm up, and
+// take over in one flip; the spares leave after the grace period. No node holds two
+// generations' lists or graphs at any time.
+type RebuildReq struct {
+	Source GenerationSource `json:"source"`
+	// Spares: how many idle nodes carry the queries meanwhile (0: as many as the data nodes).
+	Spares int `json:"spares,omitempty"`
+	// Placement of the next generation's partitions on the old nodes: "affinity" (default:
+	// where most of their raw vectors are already, count-balanced) or "random" (a baseline).
+	Placement string `json:"placement,omitempty"`
+	Seed      int64  `json:"seed,omitempty"` // for "random"
+	// Warmup: how many recent client queries (kept by the entries) the old nodes replay under the
+	// next generation before it goes online (0: every query kept; -1: no warm-up, a baseline), at
+	// most WarmupConcurrency at once on each old node (0: 4).
+	Warmup            int `json:"warmup,omitempty"`
+	WarmupConcurrency int `json:"warmup_concurrency,omitempty"`
+	// StopTheWorld: the baseline without spares -- admission paused on every entry while all
+	// nodes switch to the next generation in place.
+	StopTheWorld bool `json:"stop_the_world,omitempty"`
+	// WorkDir: where the next generation's segments are written with their holders, for the old
+	// nodes to load (default: next to Source.PartsDir).
+	WorkDir string `json:"work_dir,omitempty"`
+}
+
+// RebuildReply summarizes a full rebuild.
+type RebuildReply struct {
+	FromEpoch  uint64             `json:"from_epoch"`
+	ToEpoch    uint64             `json:"to_epoch"`
+	Generation uint32             `json:"generation"`
+	Nodes      []placement.NodeID `json:"nodes"`  // the data nodes, before and after
+	Spares     []placement.NodeID `json:"spares"` // the nodes that carried the queries meanwhile
+	// Evacuation: the reconfiguration that gave the spares every partition.
+	Evacuation *RescaleReply `json:"evacuation,omitempty"`
+	// Plan: the next generation's placement (Placement), for ToEpoch.
+	Plan *Plan `json:"plan,omitempty"`
+	// Vectors: the distinct vectors of each new partition, summed; Local: of those, the ones its
+	// owner held already. The others are fetched from the old nodes that hold them, when a query
+	// (or the warm-up) needs them.
+	Vectors int64 `json:"vectors"`
+	Local   int64 `json:"local"`
+	// SegmentBytes: the next generation's segments the old nodes loaded; GraphBytes: its graph.
+	SegmentBytes int64 `json:"segment_bytes"`
+	GraphBytes   int64 `json:"graph_bytes"`
+	// WarmupQueries replayed; WarmupFetched: the raw vectors that fetched on the old nodes.
+	WarmupQueries      int   `json:"warmup_queries"`
+	WarmupFetched      int64 `json:"warmup_fetched"`
+	WarmupFetchedBytes int64 `json:"warmup_fetched_bytes"`
+	// RawFetched: raw vectors fetched on demand anywhere while the rebuild ran (the spares'
+	// included).
+	RawFetched      int64              `json:"raw_fetched"`
+	RawFetchedBytes int64              `json:"raw_fetched_bytes"`
+	Phases          map[string]float64 `json:"phases"` // seconds per phase
 }

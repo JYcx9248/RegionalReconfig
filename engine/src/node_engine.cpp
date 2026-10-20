@@ -175,59 +175,50 @@ class ReadOnlyFile {
 template <class T>
 class NodeEngineImpl : public NodeEngine {
  public:
-  NodeEngineImpl(const NodeOptions& o, const IndexMeta& meta, PartitionManifest man)
-      : opts_(o), man_(std::move(man)) {
+  NodeEngineImpl(const NodeOptions& o, const IndexMeta& meta, PartitionManifest manifest)
+      : opts_(o), man_(std::make_shared<const PartitionManifest>(std::move(manifest))) {
+    const PartitionManifest& man = *man_;
     auto path = [&](const std::string& f) { return JoinPath(o.index_dir, f); };
     dim_ = static_cast<uint32_t>(meta.GetU64("dim"));
     n_ = meta.GetU64("num_vectors");
     ids_ = std::max<uint64_t>(n_, o.max_vectors);
-    // Inserted vectors are routed by the build's own rule (U14), so its parameters come from the
-    // index; the two the build did not record are its defaults (fusion_build --assign-*).
-    assign_.replicas = static_cast<uint32_t>(std::stoul(meta.GetOr("replicas", "8")));
-    assign_.closure_eps = std::stof(meta.GetOr("closure_eps", "10"));
-    assign_.rng = meta.GetOr("rng", "0") != "0";
-    assign_.candidates = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_candidates", "64")));
-    assign_.ef = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_ef", "128")));
-    FUSION_CHECK(man_.payload == kPayloadListsLocations,
+    assign_ = AssignOf(meta);
+    FUSION_CHECK(man.payload == kPayloadListsLocations,
                  "the partition directory %s has payload '%s': its posting lists carry no raw-vector "
                  "locations (rerun rtier_segment)",
-                 o.partitions_dir.c_str(), man_.payload.c_str());
-    FUSION_CHECK(o.layout.empty() || o.layout == man_.layout,
+                 o.partitions_dir.c_str(), man.payload.c_str());
+    FUSION_CHECK(o.layout.empty() || o.layout == man.layout,
                  "the partitions' locations refer to the '%s' layout, not '%s'",
-                 man_.layout.c_str(), o.layout.c_str());
+                 man.layout.c_str(), o.layout.c_str());
     const std::string layouts = meta.GetOr("layouts", "");
-    FUSION_CHECK(("," + layouts + ",").find("," + man_.layout + ",") != std::string::npos,
-                 "index has no '%s' layout (available: %s)", man_.layout.c_str(), layouts.c_str());
-    FUSION_CHECK(man_.raw.vec_bytes == dim_ * DTypeSize(DTypeOf<T>()),
+    FUSION_CHECK(("," + layouts + ",").find("," + man.layout + ",") != std::string::npos,
+                 "index has no '%s' layout (available: %s)", man.layout.c_str(), layouts.c_str());
+    FUSION_CHECK(man.raw.vec_bytes == dim_ * DTypeSize(DTypeOf<T>()),
                  "the partitions' page geometry has %u-byte vectors, the index %zu-byte ones",
-                 man_.raw.vec_bytes, dim_ * DTypeSize(DTypeOf<T>()));
+                 man.raw.vec_bytes, dim_ * DTypeSize(DTypeOf<T>()));
     FUSION_CHECK(o.num_workers >= 1, "need at least one worker");
     FUSION_CHECK(o.max_nprobe >= 1 && o.max_rerank >= 1, "max_nprobe and max_rerank must be >= 1");
+    geom_ = man.raw;
+    layout_name_ = man.layout;
+    payload_ = man.payload;
     space_ = MakeL2Space(DTypeOf<T>(), dim_);
-    segs_.resize(man_.num_partitions);
+    segs_.resize(man.num_partitions);
     // Lists: the build's, then room for the ones major epochs add (U14), each registered as it
     // arrives -- created by StageVersions, or in a segment loaded from a peer.
-    list_capacity_ = HeadCapacity();
-    list_part_.reset(new std::atomic<uint32_t>[list_capacity_]);
-    for (uint32_t c = 0; c < list_capacity_; ++c)
-      list_part_[c].store(c < man_.num_lists ? man_.list_part[c] : kInvalidId, std::memory_order_relaxed);
-    index_pages_path_ = path(files::LayoutVectors(man_.layout));
+    PublishLists(MakeLists(man));
+    index_pages_path_ = path(files::LayoutVectors(man.layout));
     // Inserts make lists longer (U14): o.max_list_len leaves room for them.
-    max_list_len_ = std::max<uint32_t>(std::max(o.max_list_len, man_.max_list_len), 1);
+    max_list_len_ = std::max<uint32_t>(std::max(o.max_list_len, man.max_list_len), 1);
     const uint64_t max_cand =
-        static_cast<uint64_t>(std::min<uint32_t>(o.max_nprobe, man_.num_lists)) * max_list_len_;
+        static_cast<uint64_t>(std::min<uint32_t>(o.max_nprobe, man.num_lists)) * max_list_len_;
     FUSION_CHECK(max_cand < 0xFFFFFFFFull, "max_nprobe too large");
     max_candidates_ = static_cast<uint32_t>(max_cand);
 
     // PQ codes: node-level store, filled as partitions arrive (fusion/pq_store.h). The index's
-    // pq_codes.bin is only read to bootstrap (PQSource::kIndex).
+    // pq_codes.bin is only read to bootstrap (PQSource::kIndex) and, after a full rebuild, for
+    // the codes a generation's partitions need (PQSource::kGenIndex).
     PQCodebook cb = PQCodebook::Load(path(files::kPQCodebook));
-    pq_file_.Open(path(files::kPQCodes));
-    uint64_t hdr[2] = {0, 0};  // u64 n, then u32 m + u32 reserved
-    pq_file_.ReadAt(hdr, sizeof(hdr), 0);
-    const uint32_t code_m = static_cast<uint32_t>(hdr[1] & 0xFFFFFFFFu);
-    FUSION_CHECK(hdr[0] == n_ && code_m == cb.m(), "PQ codes do not match the index");
-    FUSION_CHECK(pq_file_.Size() >= kPQFileHeader + n_ * code_m, "PQ code file is truncated");
+    pq_file_ = OpenPQFile(path(files::kPQCodes), n_, cb.m());
     const uint64_t cap = o.pq_capacity ? o.pq_capacity : ids_;
     FUSION_CHECK(cap <= ids_, "PQ capacity %llu exceeds the %llu vector IDs",
                  static_cast<unsigned long long>(cap), static_cast<unsigned long long>(ids_));
@@ -254,7 +245,7 @@ class NodeEngineImpl : public NodeEngine {
 
     // Raw vectors: node-level too, a sparse copy of the page file filled as partitions arrive
     // (fusion/raw_store.h). The index's page file is only read to bootstrap.
-    RawLayout raw_layout = man_.raw;  // with room for the locations of inserted vectors
+    RawLayout raw_layout = man.raw;  // with room for the locations of inserted vectors
     raw_layout.num_pages = std::max<uint64_t>(raw_layout.num_pages, o.max_pages);
     raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io);
     if (o.read_iops) {
@@ -265,7 +256,7 @@ class NodeEngineImpl : public NodeEngine {
       auto w = std::make_unique<Worker>();
       w->reader = MakePageReader(raw_->pages(), o.io, o.io_depth);
       if (budget_) w->reader = ChargedPageReader(std::move(w->reader), budget_.get());
-      w->scratch = std::make_unique<RerankScratch>(o.max_rerank, man_.raw.page_size);
+      w->scratch = std::make_unique<RerankScratch>(o.max_rerank, man.raw.page_size);
       w->qf.resize(dim_);
       w->locs.resize(o.max_rerank);
       workers_.push_back(std::move(w));
@@ -286,10 +277,11 @@ class NodeEngineImpl : public NodeEngine {
   // ------------------------------------------------------------------ staging
   // The build's graph (version 0), with room for the heads major epochs add.
   void LoadGraph(const std::string& path) override {
-    auto g = std::make_shared<HnswIndex>(space_.get(), path, false, HeadCapacity());
-    FUSION_CHECK(g->getCurrentElementCount() == man_.num_lists,
+    const uint32_t num_lists = Man()->num_lists;
+    auto g = std::make_shared<HnswIndex>(space_.get(), path, false, Lists()->capacity);
+    FUSION_CHECK(g->getCurrentElementCount() == num_lists,
                  "graph has %zu heads but the partition manifest has %u lists",
-                 static_cast<size_t>(g->getCurrentElementCount()), man_.num_lists);
+                 static_cast<size_t>(g->getCurrentElementCount()), num_lists);
     g->setEf(1);  // the search width is passed per call (see NavigateImpl)
     std::lock_guard<std::mutex> l(graph_mu_);
     graph_ = std::move(g);
@@ -314,6 +306,75 @@ class NodeEngineImpl : public NodeEngine {
     st.capacity = graph_->max_elements_;
     st.deleted = graph_->num_deleted_;
     return st;
+  }
+
+  // ----------------------------------------------------- generations (U14 full rebuild)
+  void SwitchGeneration(uint32_t generation, const std::string& index_dir,
+                        const std::string& partitions_dir) override {
+    // Everything the generation brings is read and checked before anything changes.
+    const IndexMeta meta = IndexMeta::Load(JoinPath(index_dir, files::kMeta));
+    FUSION_CHECK(meta.GetU64("dim") == dim_ && ParseDType(meta.Get("dtype")) == DTypeOf<T>(),
+                 "generation %u: %s holds %s vectors of %llu dimensions, this node %s ones of %u",
+                 generation, index_dir.c_str(), meta.Get("dtype").c_str(),
+                 static_cast<unsigned long long>(meta.GetU64("dim")), DTypeName(DTypeOf<T>()), dim_);
+    const uint64_t n = meta.GetU64("num_vectors");
+    FUSION_CHECK(n <= ids_, "generation %u has %llu vectors, this node has room for %llu IDs", generation,
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(ids_));
+    // One codebook for every generation: the PQ codes this node holds stay valid.
+    const PQCodebook cb = PQCodebook::Load(JoinPath(index_dir, files::kPQCodebook));
+    const size_t cb_floats = static_cast<size_t>(cb.m()) * kPQKsub * cb.dsub();
+    FUSION_CHECK(cb.m() == codebook_->m() && cb.dim() == codebook_->dim() &&
+                     std::memcmp(cb.centroids(), codebook_->centroids(), cb_floats * sizeof(float)) == 0,
+                 "generation %u: %s has another PQ codebook (a full rebuild keeps the codebook)", generation,
+                 index_dir.c_str());
+    auto man = std::make_shared<const PartitionManifest>(PartitionManifest::Load(partitions_dir));
+    FUSION_CHECK(man->payload == payload_ && man->layout == layout_name_ &&
+                     man->raw.page_size == geom_.page_size && man->raw.vec_bytes == geom_.vec_bytes &&
+                     man->raw.vectors_per_page == geom_.vectors_per_page &&
+                     man->raw.num_pages <= raw_->layout().num_pages,
+                 "generation %u: %s refers to another page file than this node's (a full rebuild keeps "
+                 "the vectors' locations)", generation, partitions_dir.c_str());
+    // A list longer than max_list_len_ is refused when its partition loads, as any other.
+    FUSION_CHECK(static_cast<uint64_t>(std::min<uint32_t>(opts_.max_nprobe, man->num_lists)) * max_list_len_ <=
+                     max_candidates_,
+                 "generation %u: %u lists of up to %u postings exceed the filter's candidate buffers", generation,
+                 man->num_lists, max_list_len_);
+    std::shared_ptr<ReadOnlyFile> pq = OpenPQFile(JoinPath(index_dir, files::kPQCodes), n, cb.m());
+    std::unique_ptr<ListMap> lm = MakeLists(*man);
+    std::shared_ptr<HnswIndex> old_graph;
+    {
+      std::lock_guard<std::mutex> sl(seg_mu_);
+      for (uint32_t p = 0; p < segs_.size(); ++p)
+        FUSION_CHECK(segs_[p].empty(), "generation %u: partition %u is still resident (evict every partition first)",
+                     generation, p);
+      std::lock_guard<std::mutex> gl(graph_mu_);
+      FUSION_CHECK(!graph_busy_, "the graph is being changed");
+      old_graph = std::move(graph_);  // searches still running keep their own reference
+      patch_.reset();
+      graph_version_ = 0;
+      segs_.assign(man->num_partitions, {});
+      std::lock_guard<std::mutex> l(gen_mu_);
+      man_ = man;
+      pq_file_ = pq;
+      n_ = n;
+      assign_ = AssignOf(meta);
+      lists_.store(lm.get(), std::memory_order_release);
+      list_maps_.push_back(std::move(lm));
+      generation_.store(generation);
+    }
+    {
+      std::lock_guard<std::mutex> l(index_pages_mu_);
+      index_pages_path_ = JoinPath(index_dir, files::LayoutVectors(layout_name_));
+      index_pages_.reset();
+    }
+    resident_version_.fetch_add(1);
+  }
+
+  std::vector<uint64_t> RawBitmap() const override {
+    std::lock_guard<std::mutex> l(cache_mu_);  // the writer moves a vector to the SSD under it
+    std::vector<uint64_t> bits = raw_->Bitmap();
+    for (const auto& kv : cache_) bits[kv.first >> 6] |= uint64_t{1} << (kv.first & 63);
+    return bits;
   }
 
   // ------------------------------------------------------- graph patches (U14)
@@ -536,8 +597,8 @@ class NodeEngineImpl : public NodeEngine {
 
   void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq, uint32_t version,
                      uint16_t fallback_holder) override {
-    FUSION_CHECK(p < man_.num_partitions, "partition %u out of range (%u partitions)", p,
-                 man_.num_partitions);
+    const uint32_t num_parts = Man()->num_partitions;
+    FUSION_CHECK(p < num_parts, "partition %u out of range (%u partitions)", p, num_parts);
     auto rs = std::make_unique<ResidentSegment>();
     rs->seg = LoadSegment(seg_path);
     FUSION_CHECK(rs->seg.partition == p, "%s holds partition %u, not %u", seg_path.c_str(),
@@ -557,6 +618,10 @@ class NodeEngineImpl : public NodeEngine {
       FillRawFromIndex(locs);
       for (size_t j = 0; j < ids.size(); ++j) rs->SetHolder(j, kSelfHolder);
     } else {
+      // A generation's partitions after a full rebuild (U14): the codes the node lacks come from
+      // the generation's pq_codes.bin (one codebook: the same codes), the raw vectors from the
+      // holders the postings record, as after a migration.
+      if (pq == PQSource::kGenIndex) FillFromIndex(ids);
       // Each key's holder: this node if the vector is here, else the one the posting records.
       // A missing vector with no holder could never be fetched: refused before anything changes.
       const std::vector<uint32_t> absent = RawAbsent(locs.data(), locs.size());
@@ -591,6 +656,7 @@ class NodeEngineImpl : public NodeEngine {
     std::shared_ptr<const ResidentSegment> old;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
+      FUSION_CHECK(p < segs_.size(), "partition %u out of range: the generation changed", p);
       auto& vs = segs_[p];  // ascending versions
       auto it = std::find_if(vs.begin(), vs.end(),
                              [&](const auto& r) { return r->version >= version; });
@@ -605,10 +671,10 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   bool EvictPartition(uint32_t p) override {
-    FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
     std::vector<std::shared_ptr<const ResidentSegment>> old;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
+      FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
       old.swap(segs_[p]);
     }
     const bool was = !old.empty();
@@ -642,7 +708,7 @@ class NodeEngineImpl : public NodeEngine {
     std::unordered_map<uint32_t, size_t> which;  // partition -> index in parts
     for (size_t i = 0; i < parts.size(); ++i) {
       const VersionStage& vs = parts[i];
-      FUSION_CHECK(vs.partition < man_.num_partitions, "partition %u out of range", vs.partition);
+      FUSION_CHECK(vs.partition < Man()->num_partitions, "partition %u out of range", vs.partition);
       FUSION_CHECK(vs.next != vs.base, "partition %u: the next version must differ from the base", vs.partition);
       FUSION_CHECK(which.emplace(vs.partition, i).second, "partition %u is listed twice", vs.partition);
     }
@@ -657,9 +723,10 @@ class NodeEngineImpl : public NodeEngine {
     std::unordered_set<uint32_t> gone;               // the removed lists
     for (size_t c = 0; c < e.ncreated; ++c) {
       const uint32_t list = e.created[c], part = e.created_parts[c];
-      FUSION_CHECK(list < list_capacity_, "list %u is beyond the room for lists (%u; rtier_node --graph-headroom)",
-                   list, list_capacity_);
-      const uint32_t known = list_part_[list].load(std::memory_order_acquire);
+      const ListMap* lm = Lists();
+      FUSION_CHECK(list < lm->capacity, "list %u is beyond the room for lists (%u; rtier_node --graph-headroom)",
+                   list, lm->capacity);
+      const uint32_t known = lm->part[list].load(std::memory_order_acquire);
       FUSION_CHECK(known == kInvalidId || known == part, "list %u is in partition %u, not %u", list, known, part);
       const size_t i = staged(part, "the batch creates", list);
       FUSION_CHECK(created_in.emplace(list, i).second, "list %u is created twice", list);
@@ -849,10 +916,10 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   bool DropVersion(uint32_t p, uint32_t version) override {
-    FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
     std::shared_ptr<const ResidentSegment> old;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
+      FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
       auto& vs = segs_[p];
       auto it = std::find_if(vs.begin(), vs.end(), [&](const auto& r) { return r->version == version; });
       if (it != vs.end()) {
@@ -875,10 +942,10 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   void SavePartition(uint32_t p, uint32_t version, const std::string& path) const override {
-    FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
     std::shared_ptr<const ResidentSegment> seg;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
+      FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
       seg = SegmentLocked(p, &version);
     }
     if (!seg) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
@@ -955,7 +1022,7 @@ class NodeEngineImpl : public NodeEngine {
     {
       std::lock_guard<std::mutex> l(seg_mu_);
       for (uint32_t p : partitions) {
-        FUSION_CHECK(p < man_.num_partitions, "partition %u out of range", p);
+        FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
         std::shared_ptr<const ResidentSegment> s = SegmentLocked(p, nullptr);
         if (!s) throw NotResidentError(StrFormat("partition %u is not resident", p));
         segs.push_back(std::move(s));
@@ -1145,16 +1212,17 @@ class NodeEngineImpl : public NodeEngine {
   // runs the same search.
   void Assign(const void* vecs, uint32_t n, uint32_t* lists, uint8_t* codes) override {
     const GraphRef g = Graph(kNewestGraph);
-    FUSION_CHECK(!assign_.rng, "the index was built with RNG pruning, which Assign does not reproduce");
-    const uint32_t r = assign_.replicas;
-    const float closure = (1.f + assign_.closure_eps) * (1.f + assign_.closure_eps);
-    const uint32_t width = std::max(assign_.ef, assign_.candidates);
+    const AssignParams ap = AssignNow();
+    FUSION_CHECK(!ap.rng, "the index was built with RNG pruning, which Assign does not reproduce");
+    const uint32_t r = ap.replicas;
+    const float closure = (1.f + ap.closure_eps) * (1.f + ap.closure_eps);
+    const uint32_t width = std::max(ap.ef, ap.candidates);
     const T* x = static_cast<const T*>(vecs);
     std::vector<std::pair<float, uint32_t>> cand;
     for (uint32_t i = 0; i < n; ++i) {
       const T* v = x + static_cast<size_t>(i) * dim_;
       auto res = g.Search(v, width);
-      while (res.size() > assign_.candidates) res.pop();
+      while (res.size() > ap.candidates) res.pop();
       cand.clear();
       while (!res.empty()) {
         cand.emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
@@ -1176,7 +1244,7 @@ class NodeEngineImpl : public NodeEngine {
     }
   }
 
-  uint32_t assign_replicas() const override { return assign_.replicas; }
+  uint32_t assign_replicas() const override { return AssignNow().replicas; }
   uint32_t pq_m() const override { return codebook_->m(); }
   uint64_t id_capacity() const override { return ids_; }
 
@@ -1431,13 +1499,14 @@ class NodeEngineImpl : public NodeEngine {
   DType dtype() const override { return DTypeOf<T>(); }
   uint32_t dim() const override { return dim_; }
   uint64_t size() const override { return n_; }
-  uint32_t num_lists() const override { return man_.num_lists; }
-  uint32_t num_partitions() const override { return man_.num_partitions; }
+  uint32_t num_lists() const override { return Man()->num_lists; }
+  uint32_t num_partitions() const override { return Man()->num_partitions; }
+  uint32_t generation() const override { return generation_.load(); }
   int num_workers() const override { return static_cast<int>(workers_.size()); }
   const NodeOptions& options() const override { return opts_; }
   const char* filter_name() const override { return filter_->name(); }
-  const std::string& payload() const override { return man_.payload; }
-  uint32_t vec_bytes() const override { return man_.raw.vec_bytes; }
+  const std::string& payload() const override { return payload_; }
+  uint32_t vec_bytes() const override { return geom_.vec_bytes; }
 
   std::string Describe() const override {
     const double mb = 1e6;
@@ -1452,13 +1521,14 @@ class NodeEngineImpl : public NodeEngine {
       }
     }
     const PQStats pq = store_->Stats();
+    const auto man = Man();
     std::string s;
-    s += StrFormat("  vectors          : %llu x %u (%s)\n", (unsigned long long)n_, dim_,
+    s += StrFormat("  vectors          : %llu x %u (%s)\n", (unsigned long long)n_.load(), dim_,
                    DTypeName(DTypeOf<T>()));
     s += StrFormat("  partitions       : %zu of %u resident, %.1f MB of posting lists "
-                   "(%u lists in total, payload %s)\n",
-                   resident, man_.num_partitions, seg_bytes / mb, man_.num_lists,
-                   man_.payload.c_str());
+                   "(%u lists in total, payload %s, generation %u)\n",
+                   resident, man->num_partitions, seg_bytes / mb, man->num_lists,
+                   man->payload.c_str(), generation_.load());
     s += StrFormat("  navigation graph : %s\n", has_graph() ? "loaded" : "not loaded");
     s += StrFormat("  %s tier          : PQ codes of %llu vectors (%.1f MB; %llu live, %llu cached), "
                    "one per vector, budget %llu codes (%.1f MB)\n",
@@ -1471,7 +1541,7 @@ class NodeEngineImpl : public NodeEngine {
                    "a sparse copy of the '%s' page file in %s (%s I/O)\n",
                    (unsigned long long)raw.present, (unsigned long long)raw.locations,
                    raw.present * raw.vec_bytes / mb, (unsigned long long)raw.pending,
-                   man_.layout.c_str(), raw_->path().c_str(),
+                   layout_name_.c_str(), raw_->path().c_str(),
                    raw_->pages().direct() ? "direct" : "buffered");
     if (budget_)
       s += StrFormat("  read budget      : %llu device reads/s\n", (unsigned long long)opts_.read_iops);
@@ -1503,20 +1573,35 @@ class NodeEngineImpl : public NodeEngine {
   // Loads a segment file and checks that its lists belong to its partition.
   ListSegment LoadSegment(const std::string& path) const {
     ListSegment s = ListSegment::Load(path);
-    FUSION_CHECK(s.partition < man_.num_partitions, "%s: partition %u out of range", path.c_str(),
+    const auto man = Man();
+    const ListMap* lm = Lists();
+    FUSION_CHECK(s.partition < man->num_partitions, "%s: partition %u out of range", path.c_str(),
                  s.partition);
     for (uint32_t c : s.list_ids)
-      FUSION_CHECK(c < list_capacity_ && (c >= man_.num_lists || man_.list_part[c] == s.partition),
+      FUSION_CHECK(c < lm->capacity && (c >= man->num_lists || man->list_part[c] == s.partition),
                    "%s: list %u does not belong to partition %u", path.c_str(), c, s.partition);
     // A list a major epoch created (U14) is learned from the segment that holds it.
     for (uint32_t c : s.list_ids)
-      if (c >= man_.num_lists) RegisterList(c, s.partition);
+      if (c >= man->num_lists) RegisterList(c, s.partition);
     return s;
   }
 
-  // Bootstrap: installs the codes of `ids` this node lacks from the index's pq_codes.bin (the
-  // ones it has are protected meanwhile, so making room never drops them).
-  void FillFromIndex(const std::vector<uint32_t>& ids) {
+  // Bootstrap (and a generation's partitions after a full rebuild): installs the codes of `ids`
+  // this node lacks from the index's pq_codes.bin (the ones it has are protected meanwhile, so
+  // making room never drops them). The file holds the index's vectors only: an inserted
+  // vector's code must be here already.
+  void FillFromIndex(const std::vector<uint32_t>& all) {
+    std::shared_ptr<ReadOnlyFile> file;
+    uint64_t n = 0;  // the vectors the file holds: read with it, a generation switch replaces both
+    {
+      std::lock_guard<std::mutex> l(gen_mu_);
+      file = pq_file_;
+      n = n_.load();
+    }
+    std::vector<uint32_t> ids;
+    ids.reserve(all.size());
+    for (uint32_t id : all)
+      if (id < n) ids.push_back(id);
     const std::vector<uint32_t> miss = store_->Reserve(ids.data(), ids.size());
     if (miss.empty()) return;
     const uint32_t m = store_->m();
@@ -1524,8 +1609,8 @@ class NodeEngineImpl : public NodeEngine {
     for (size_t i = 0; i < miss.size();) {  // one read per run of consecutive IDs
       size_t j = i + 1;
       while (j < miss.size() && miss[j] == miss[j - 1] + 1) ++j;
-      pq_file_.ReadAt(buf.data() + i * m, (j - i) * m,
-                      kPQFileHeader + static_cast<uint64_t>(miss[i]) * m);
+      file->ReadAt(buf.data() + i * m, (j - i) * m,
+                   kPQFileHeader + static_cast<uint64_t>(miss[i]) * m);
       i = j;
     }
     store_->Put(miss.data(), miss.size(), buf.data(), PQOrigin::kIndex);
@@ -1564,7 +1649,7 @@ class NodeEngineImpl : public NodeEngine {
     if (!index_pages_) {
       auto f = std::make_unique<ReadOnlyFile>();
       f->Open(index_pages_path_);
-      const RawLayout& L = man_.raw;  // the index's pages: the local store may have room for more
+      const RawLayout L = Man()->raw;  // the index's pages: the local store may have room for more
       FUSION_CHECK(f->Size() >= L.num_pages * L.page_size, "vector page file %s is truncated",
                    index_pages_path_.c_str());
       index_pages_ = std::move(f);
@@ -1582,9 +1667,9 @@ class NodeEngineImpl : public NodeEngine {
   static bool Fetchable(uint16_t holder) { return holder != kNoHolder && holder != kSelfHolder; }
 
   // Room for heads and lists: the build's, and graph_headroom more (U14 major epochs).
-  uint32_t HeadCapacity() const {
-    const double extra = std::ceil(static_cast<double>(man_.num_lists) * std::max(0.0, opts_.graph_headroom));
-    const uint64_t cap = static_cast<uint64_t>(man_.num_lists) + static_cast<uint64_t>(extra);
+  uint32_t HeadCapacity(uint32_t num_lists) const {
+    const double extra = std::ceil(static_cast<double>(num_lists) * std::max(0.0, opts_.graph_headroom));
+    const uint64_t cap = static_cast<uint64_t>(num_lists) + static_cast<uint64_t>(extra);
     FUSION_CHECK(cap < kInvalidId, "graph headroom %.2f is too large", opts_.graph_headroom);
     return static_cast<uint32_t>(cap);
   }
@@ -1650,20 +1735,74 @@ class NodeEngineImpl : public NodeEngine {
 
   // The partition of `list`; NotResidentError if this node does not know the list.
   uint32_t PartOf(uint32_t list) const {
-    if (list >= list_capacity_) throw NotResidentError(StrFormat("list %u out of range (%u)", list, list_capacity_));
-    const uint32_t p = list_part_[list].load(std::memory_order_acquire);
+    const ListMap* lm = Lists();
+    if (list >= lm->capacity) throw NotResidentError(StrFormat("list %u out of range (%u)", list, lm->capacity));
+    const uint32_t p = lm->part[list].load(std::memory_order_acquire);
     if (p == kInvalidId) throw NotResidentError(StrFormat("list %u is not known on this node", list));
     return p;
   }
 
   // Records that `list`, created by a major epoch, belongs to partition `part`.
   void RegisterList(uint32_t list, uint32_t part) const {
-    FUSION_CHECK(list < list_capacity_, "list %u is beyond the room for lists (%u; rtier_node --graph-headroom)",
-                 list, list_capacity_);
-    FUSION_CHECK(part < man_.num_partitions, "partition %u out of range", part);
+    const ListMap* lm = Lists();
+    FUSION_CHECK(list < lm->capacity, "list %u is beyond the room for lists (%u; rtier_node --graph-headroom)",
+                 list, lm->capacity);
+    FUSION_CHECK(part < Man()->num_partitions, "partition %u out of range", part);
     uint32_t was = kInvalidId;
-    if (!list_part_[list].compare_exchange_strong(was, part, std::memory_order_acq_rel) && was != part)
+    if (!lm->part[list].compare_exchange_strong(was, part, std::memory_order_acq_rel) && was != part)
       throw std::invalid_argument(StrFormat("list %u is in partition %u, not %u", list, was, part));
+  }
+
+  // List -> partition (kInvalidId: unknown here), read without locks: the generation's lists,
+  // then up to `capacity` the ones major epochs add. A full rebuild publishes another map; the
+  // ones it replaced stay until the engine goes, since a request may still be reading one.
+  struct ListMap {
+    uint32_t capacity = 0;
+    std::unique_ptr<std::atomic<uint32_t>[]> part;
+  };
+  const ListMap* Lists() const { return lists_.load(std::memory_order_acquire); }
+  std::unique_ptr<ListMap> MakeLists(const PartitionManifest& man) const {
+    auto lm = std::make_unique<ListMap>();
+    lm->capacity = HeadCapacity(man.num_lists);
+    lm->part.reset(new std::atomic<uint32_t>[lm->capacity]);
+    for (uint32_t c = 0; c < lm->capacity; ++c)
+      lm->part[c].store(c < man.num_lists ? man.list_part[c] : kInvalidId, std::memory_order_relaxed);
+    return lm;
+  }
+  void PublishLists(std::unique_ptr<ListMap> lm) {
+    std::lock_guard<std::mutex> l(gen_mu_);
+    lists_.store(lm.get(), std::memory_order_release);
+    list_maps_.push_back(std::move(lm));
+  }
+  std::shared_ptr<const PartitionManifest> Man() const {
+    std::lock_guard<std::mutex> l(gen_mu_);
+    return man_;
+  }
+  AssignParams AssignNow() const {
+    std::lock_guard<std::mutex> l(gen_mu_);
+    return assign_;
+  }
+  // The build's assignment rule (U14): inserted vectors are routed by it, so its parameters come
+  // from the index; the two the build did not record are its defaults (fusion_build --assign-*).
+  static AssignParams AssignOf(const IndexMeta& meta) {
+    AssignParams a;
+    a.replicas = static_cast<uint32_t>(std::stoul(meta.GetOr("replicas", "8")));
+    a.closure_eps = std::stof(meta.GetOr("closure_eps", "10"));
+    a.rng = meta.GetOr("rng", "0") != "0";
+    a.candidates = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_candidates", "64")));
+    a.ef = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_ef", "128")));
+    return a;
+  }
+  // An index's pq_codes.bin, checked against its vector count and the codebook.
+  static std::shared_ptr<ReadOnlyFile> OpenPQFile(const std::string& path, uint64_t n, uint32_t m) {
+    auto f = std::make_shared<ReadOnlyFile>();
+    f->Open(path);
+    uint64_t hdr[2] = {0, 0};  // u64 n, then u32 m + u32 reserved
+    f->ReadAt(hdr, sizeof(hdr), 0);
+    const uint32_t code_m = static_cast<uint32_t>(hdr[1] & 0xFFFFFFFFu);
+    FUSION_CHECK(hdr[0] == n && code_m == m, "PQ codes do not match the index (%s)", path.c_str());
+    FUSION_CHECK(f->Size() >= kPQFileHeader + n * code_m, "PQ code file is truncated (%s)", path.c_str());
+    return f;
   }
 
   // Fetches the vectors at locs (sorted, unique) from the data node `holder` into *buf.
@@ -2074,10 +2213,17 @@ class NodeEngineImpl : public NodeEngine {
   // the reclaimer, which frees them while the store is still there; the store's mirror uses
   // the filter, which outlives it.
   NodeOptions opts_;
-  PartitionManifest man_;
+  // The generation's partition manifest and what comes with it (a full rebuild replaces them,
+  // under gen_mu_, which is taken last whenever it nests): the index's vector count, its PQ code
+  // file, the assignment rule. The page geometry and the payload never change.
+  mutable std::mutex gen_mu_;
+  std::shared_ptr<const PartitionManifest> man_;
+  std::atomic<uint32_t> generation_{0};
+  RawLayout geom_;
+  std::string layout_name_, payload_;
   uint32_t dim_ = 0;
-  uint64_t n_ = 0;    // the index's vectors
-  uint64_t ids_ = 0;  // the vector-ID space: n_ and room for inserted vectors
+  std::atomic<uint64_t> n_{0};  // the index's vectors
+  uint64_t ids_ = 0;            // the vector-ID space: n_ and room for inserted vectors
   uint32_t max_list_len_ = 0;  // longest list a request may gather (room for inserts)
   AssignParams assign_;  // the build's, for Assign
   std::unique_ptr<PQCodebook> codebook_;
@@ -2092,11 +2238,9 @@ class NodeEngineImpl : public NodeEngine {
   std::shared_ptr<const StagedPatch> patch_;
   bool graph_busy_ = false;
   mutable std::atomic<int> plain_searches_{0};
-  // List -> partition (kInvalidId: unknown here), read without locks: the build's lists, then
-  // up to list_capacity_ the ones major epochs add.
-  uint32_t list_capacity_ = 0;
-  std::unique_ptr<std::atomic<uint32_t>[]> list_part_;
-  ReadOnlyFile pq_file_;
+  std::atomic<const ListMap*> lists_{nullptr};
+  std::vector<std::unique_ptr<ListMap>> list_maps_;  // under gen_mu_: every map published
+  std::shared_ptr<ReadOnlyFile> pq_file_;            // under gen_mu_
   std::unique_ptr<FilterBackend> filter_;
   std::unique_ptr<PQStore> store_;
   std::unique_ptr<Reclaimer> reclaimer_;
@@ -2107,6 +2251,7 @@ class NodeEngineImpl : public NodeEngine {
   // Partition p at *version, or at its newest version if version is null; null if not
   // resident. seg_mu_ must be held.
   std::shared_ptr<const ResidentSegment> SegmentLocked(uint32_t p, const uint32_t* version) const {
+    if (p >= segs_.size()) return nullptr;
     const auto& vs = segs_[p];
     if (vs.empty()) return nullptr;
     if (!version) return vs.back();

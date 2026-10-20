@@ -27,8 +27,16 @@ type NodeInfo struct {
 
 // Table is one epoch of routing state.
 type Table struct {
-	Epoch     uint64          `json:"epoch"`
-	Placement placement.Table `json:"placement"`
+	Epoch uint64 `json:"epoch"`
+	// Generation is the index generation queries of this epoch use (U14 full rebuild): its lists,
+	// partitions and graph, built outside the system with the codebook, vector IDs and raw-vector
+	// locations of the first one. 0 is the deployed build; a later one names its index directory
+	// (fusion_build's output) and partition directory (rtier_segment's). Every node with a role
+	// in the epoch runs its generation; graph versions and created lists count within it.
+	Generation uint32          `json:"generation,omitempty"`
+	GenIndex   string          `json:"gen_index,omitempty"`
+	GenParts   string          `json:"gen_parts,omitempty"`
+	Placement  placement.Table `json:"placement"`
 	// Versions[p] is the version of partition p's posting lists that queries of this epoch see:
 	// an update batch (U14) stages the next version on the owner while the current one serves,
 	// and both stay until the old epoch drains. Empty means every partition at version 0, which

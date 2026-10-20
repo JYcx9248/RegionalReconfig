@@ -31,6 +31,14 @@
 //                                the holder each posting records (a segment saved at a
 //                                hand-off records one for every posting)
 //                             1: bootstrap: copy the missing codes and raw vectors from the index
+//                             2: a generation's partition after a full rebuild (U14): copy the
+//                                missing codes from the generation's index; raw vectors as 0
+//   SWITCH_GENERATION u32 generation, str index_dir,         -> -
+//                   str partitions_dir
+//                   (full rebuild, U14: the node, holding no partition, moves to that generation
+//                   of the index; its graph is dropped, its PQ codes and raw vectors stay)
+//   RAW_BITMAP      -                                         -> u64 locations, u64 words[]
+//                   (the raw vectors the node holds, one bit per location)
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
 //                                                                version is evicted)
 //   PQ_MISSING      u32 groups, per group: u32 paths,         -> u32 groups, per group:
@@ -179,6 +187,8 @@ enum Op : uint8_t {
   kPatchMerge = 0x39,
   kPatchDrop = 0x3A,
   kPatchSave = 0x3B,
+  kSwitchGeneration = 0x3C,
+  kRawBitmap = 0x3D,
 };
 
 enum Status : uint16_t {

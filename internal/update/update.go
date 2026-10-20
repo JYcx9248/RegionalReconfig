@@ -26,6 +26,7 @@ type Allocator struct {
 	nextID, idEnd   uint64
 	nextLoc, locEnd uint64
 	nextList        uint64 // the first list ID major epochs have not handed out (0: none yet)
+	listGen         uint32 // the index generation nextList counts in (U14 full rebuild)
 }
 
 // NewAllocator starts at the first free ID and location (the index's vector count and
@@ -73,9 +74,18 @@ func (a *Allocator) TakeLists(n int, floor uint32) []uint32 {
 	return out
 }
 
-// NextList is the first list ID not handed out yet (0 if none was); SetNextList restores it.
-func (a *Allocator) NextList() uint64     { return a.nextList }
-func (a *Allocator) SetNextList(v uint64) { a.nextList = v }
+// NextList is the first list ID not handed out yet (0 if none was) in index generation gen;
+// SetNextList restores it. List IDs count within a generation: a full rebuild (U14) brings
+// lists of its own, and the count starts over above them.
+func (a *Allocator) NextList() (next uint64, gen uint32) { return a.nextList, a.listGen }
+func (a *Allocator) SetNextList(next uint64, gen uint32) { a.nextList, a.listGen = next, gen }
+
+// generation makes the allocator count list IDs in index generation gen.
+func (a *Allocator) generation(gen uint32) {
+	if a.listGen != gen {
+		a.nextList, a.listGen = 0, gen
+	}
+}
 
 // Insert is one routed insert: its ID and location, the posting lists it joins and its PQ code.
 type Insert struct {

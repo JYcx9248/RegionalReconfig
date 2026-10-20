@@ -1,89 +1,116 @@
 #!/usr/bin/env python3
 """Run one rtier experiment on a single machine.
 
-Adapted from Koala's scripts/runExperiment.py (config JSON -> deploy -> load -> timed
+Adapted from Koala's scripts/runExperiment.py (config -> deploy -> load -> timed
 reconfigurations -> collect results -> clean up), without Kafka and SSH:
 
-  1. build the index (fusion_build) and ground truth (fusion_gt) unless given
-  2. split the posting lists into partitions (rtier_segment) with the given assignment
+  1. build the index (fusion_build) and ground truth (fusion_gt) unless they are there
+  2. assign the posting lists to partitions (partition: a file, or a generator) and write the
+     partitions (rtier_segment)
   3. start the controller, then one rtier_node + rtier-agent per node
   4. wait for the initial deployment, start the open-loop load generator
-  5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale)
+  5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale, Rebuild)
   6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg; each
-     node's stats log (stats-<node>.jsonl) and, with "NodeResources", cgroups.jsonl, both on
-     the monotonic clock of clock.json
+     node's stats log (stats-<node>.jsonl) and, with cluster.resources, cgroups.jsonl, both on
+     the monotonic clock of clock.json; the configuration as it ran, merged with its bases
+     (experiment.yaml) and flat (experiment.json, which the analysis scripts read)
   7. stop everything
+
+    python3 scripts/run_local.py configs/experiment.example.yaml results/run1
+
+scripts/run_cluster.py runs the same configuration with the nodes on other machines (a hosts
+section; see its doc).
+
+The configuration is YAML: a base and overrides (scripts/experiment_config.py has the format and
+every key; `python3 scripts/experiment_config.py CONFIG.yaml` prints one merged). The stages
+record what they were made with: an index (build.index_dir, default WORK_DIR/index) built with
+other build flags stops the run instead of being rebuilt (that can take hours), and the
+partitions are made again when the index or the assignment changes.
+
+partition: {generator: gp, partitions: 64, gp: {kaminpar: PATH}} makes the assignment: GP on the
+list heads over the navigation graph, with unit weights, so that the initial split balances the
+number of lists per node (the decided part of U2; the gp_kaminpar binary is built from
+scripts/testing/gp). generator: spatial or range are placeholders; generator: file takes the
+assignment in partition.file (a file of u64 n, u32 partition[n]).
 
 Two things a capacity-driven scale-out run needs:
 
-  "Calibrate": {"Rates": [50, 100, 200, 400], "SecondsPerRate": 15} runs the load generator
-      once per rate and reports where the cluster stops keeping up. That number sets the rate
-      of the real run -- adding a node shows nothing under a load one node already serves.
-      A config with "Calibrate" measures capacity and stops: no reconfiguration in that run.
-  "Load": {"Rate": 200, "RateSteps": "30:600"} raises the offered load during the run (here to
+  calibrate: {rates: [50, 100, 200, 400], seconds_per_rate: 15} runs the load generator once per
+      rate and reports where the cluster stops keeping up. That number sets the rate of the
+      real run -- adding a node shows nothing under a load one node already serves. A
+      configuration with calibrate measures capacity and stops: no reconfiguration in that run.
+  load: {rate: 200, rate_steps: "30:600"} raises the offered load during the run (here to
       600 q/s at 30 s), which is the situation a scale-out answers.
 
-"Load": {"Users": 8, "UserSteps": "30:24,70:8"} replaces the arrival rate with closed-loop
-users: 8 concurrent users, 24 from 30 s, 8 again from 70 s, each sending its next query when
-the last one returned.
+load: {users: 8, user_steps: "30:24,70:8"} replaces the arrival rate with closed-loop users: 8
+concurrent users, 24 from 30 s, 8 again from 70 s, each sending its next query when the last
+one returned.
 
-"Load": {"WarmupSeconds": 15} marks the first 15 s of load as warm-up: scripts/compare_runs.py
+load: {warmup_seconds: 15} marks the first 15 s of load as warm-up: scripts/compare_runs.py
 leaves those queries out of its figures and numbers.
 
-"Load": {"DrainSeconds": 300} (the default) is how long a run waits after the load ended for
-the answers still due: an open-loop run that ends with a backlog drains it without new arrivals.
+load: {drain_seconds: 300} (the default) is how long a run waits after the load ended for the
+answers still due: an open-loop run that ends with a backlog drains it without new arrivals.
 
-"Load": {"RetryForSeconds": 30} makes the clients wait for their answers: a query refused as
-unavailable (an entry that left, admission paused by stop-and-copy) is retried for up to 30 s
-after its scheduled time, and the wait counts in its latency. Without it a refused query is
-retried three times and then fails, so it is missing from the mean latency; comparing
-protocols by their mean latency needs it (scripts/compare_runs.py).
+load: {retry_for_seconds: 30} makes the clients wait for their answers: a query refused as
+unavailable (admission paused by stop-and-copy) is retried for up to 30 s after its scheduled
+time, and the wait counts in its latency. Without it a refused query is retried three times and
+then fails, so it is missing from the mean latency; comparing protocols by their mean latency
+needs it (scripts/compare_runs.py). A query refused by an entry that left (a scale-in, a full
+rebuild) is retried on the entries of the newer epoch at once, with or without it: the
+refusal carries that epoch, and the client reads its list again (U17).
 
-"Backend": "gpu" runs the data nodes on the GPU filter backend (a CUDA build of the engine);
-"GPUs": [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi index, UUID
-("GPU-...") or PCI bus id ("06:00.0"), and nodes take turns when there are fewer GPUs than
-nodes; the log records each node's card (model, bus id, UUID). Indices can change with the
-hardware (they did on the lab server), a bus id stays with a slot, and only a UUID stays with a
-card. Without "GPUs" every node uses the first GPU.
+cluster: {backend: gpu} runs the data nodes on the GPU filter backend (a CUDA build of the
+engine); cluster.gpus: [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi
+index, UUID ("GPU-...") or PCI bus id ("06:00.0"), and nodes take turns when there are fewer
+GPUs than nodes; the log records each node's card (model, bus id, UUID). Indices can change with
+the hardware (they did on the lab server), a bus id stays with a slot, and only a UUID stays with
+a card. Without cluster.gpus every node uses the first GPU.
 
-"RawStreams": 4 and "RawBatchBytes": 1048576 (the agent's defaults) set how a raw-vector stream
-(copy-then-flip's copy, lazy-stream's stream) pulls from each source: over that many
-connections at once, that many bytes of vectors per request. "RawPath": "node" (the default
-without "TransferRateBytesPerSec") runs it data node to data node, as lazy fetches; "agent"
-through both agents, the only path the transfer rate paces. "RawPath": "agent" with
-"RawStreams": 1 and "RawBatchBytes": 65536 is the stream as it was before 2026-10-09: one 64 KB
-request in flight per source, ~80 MB/s per source on the lab server (internal/agent/control.go).
+cluster.raw: {streams: 4, batch_bytes: 1048576} (the agent's defaults) set how a raw-vector
+stream (copy-then-flip's copy, lazy-stream's stream) pulls from each source: over that many
+connections at once, that many bytes of vectors per request. cluster.raw.path: node (the default
+without cluster.transfer_rate_bytes_per_sec) runs it data node to data node, as lazy fetches;
+agent through both agents, the only path the transfer rate paces. path: agent with streams: 1
+and batch_bytes: 65536 is the stream as it was before 2026-10-09: one 64 KB request in flight
+per source, ~80 MB/s per source on the lab server (internal/agent/control.go).
 
-"Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}] rescales to 4 data nodes at
-90 s, placed by the controller's "Placement" policy. {"TriggerTimeSeconds": 90, "Plan": P} goes
-to the placement plan P names instead -- a scale-out, a scale-in or a rebalance at the same size:
-{"owners": {"n1": [0, 1, 2], "n3": [3, 4], ...}} gives each data node of the next epoch its
-partitions, nodes by name (n1, n2, ... as this script starts them) or ID; "from_epoch" is
-optional (protocol.Plan). P is the plan itself or the path of a JSON file with one, relative to
-the experiment file. `bin/rtier-client rescale -dry-run -save-plan plan.json N` writes the plan
-the policy would carry out, to start from.
+reconfigurations: [{at: 90, data_nodes: 4}] rescales to 4 data nodes at 90 s, placed by the
+controller's cluster.placement policy. {at: 90, plan: P} goes to the placement plan P names
+instead -- a scale-out, a scale-in or a rebalance at the same size: {owners: {n1: [0, 1, 2], n3:
+[3, 4], ...}} gives each data node of the next epoch its partitions, nodes by name (n1, n2, ...
+as this script starts them) or ID; from_epoch is optional (protocol.Plan). P is the plan itself
+or the path of a JSON file with one, relative to the experiment file. `bin/rtier-client rescale
+-dry-run -save-plan plan.json N` writes the plan the policy would carry out, to start from.
 
-"Updates": {"Headroom": 1.5, "PQCapacity": 200000} lets update batches (U14) run against the
-cluster (bin/rtier-updater; the controller gets "allow_updates"). Every data node leaves room for
-1.5 times the index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and
-for lists twice as long as the longest ("ListHeadroom": 2.0, or "MaxListLen": N; --max-list-len).
-The PQ budget has to be given ("PQCapacity", or --pq-capacity in "NodeArgs"): by default it is the
-whole ID space, so the headroom would grow every node's PQ buffer -- its GPU memory -- by the same
-factor and change what the run measures. Without "Updates" the dataset is static: no room, and
-the controller refuses update batches.
+{at: 90, rebuild: {index: DIR, partitions: DIR}} moves the cluster to the next index generation
+at 90 s (U14 full rebuild, bin/rtier-client rebuild): DIR holds fusion_build's output, built
+with this index's codebook and page layout (its output directory seeded with pq_codebook.bin,
+pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the partitions rtier_segment made of it;
+relative paths are relative to the experiment file. The nodes beyond cluster.initial_nodes are
+the spares (spares: how many, default as many as the data nodes). placement: affinity (default)
+or random, warmup: recent queries replayed before the next generation goes online (0: every one
+the entries kept, cluster.query_sample per entry, default 1024; -1: none), warmup_concurrency,
+and stop_the_world: true for the baseline without spares. The data nodes need room for the next
+generation's lists (--max-list-len in cluster.node_args, or updates.max_list_len).
 
-    python3 scripts/run_local.py configs/experiment.example.json results/run1
+updates: {headroom: 1.5, pq_capacity: 200000} lets update batches (U14) run against the cluster
+(bin/rtier-updater; the controller gets "allow_updates"). Every data node leaves room for 1.5
+times the index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and
+for lists twice as long as the longest (list_headroom: 2.0, or max_list_len: N; --max-list-len).
+The PQ budget has to be given (pq_capacity, or --pq-capacity in cluster.node_args): by default
+it is the whole ID space, so the headroom would grow every node's PQ buffer -- its GPU memory --
+by the same factor and change what the run measures. Without updates the dataset is static: no
+room, and the controller refuses update batches.
 
 Open design questions this script depends on (see `bin/rtier-client design`):
-  U2  the list -> partition assignment is an input ("Assignment"); for plumbing tests only,
-      scripts/testing/make_range_assignment.py writes a placeholder.
-  U5  queries need a strategy ("Strategy"); both production strategies are placeholders, so
-      queries fail with "undecided" until one is implemented.
-  U11 "Arrivals": "semdn" is a placeholder; "poisson" works.
+  U5  queries need a strategy (cluster.strategy); both production strategies are placeholders,
+      so queries fail with "undecided" until one is implemented.
+  U11 load.arrivals: semdn is a placeholder; poisson works.
 
-With "Emulation": {"Netns": true, "Delay": "100us", "Rate": "10gbit"} (run as root), every
-node runs in its own network namespace (scripts/emulation/netns.sh) and the controller
-listens on the bridge address 10.10.0.1. Delay and rate values are per-experiment choices.
+With cluster.emulation: {netns: true, delay: 100us, rate: 10gbit} (run as root), every node
+runs in its own network namespace (scripts/emulation/netns.sh) and the controller listens on the
+bridge address 10.10.0.1. Delay and rate values are per-experiment choices.
 """
 
 import json
@@ -97,6 +124,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import experiment_config  # noqa: E402
 from rtier_ctl import Controller  # noqa: E402
 from plot_run import read_latency, summarize  # noqa: E402
 
@@ -113,7 +141,7 @@ def run(cmd, **kw):
 
 
 def rate_steps(v) -> str:
-    """"RateSteps" as the load generator's -rate-steps: "30:400,90:800", a list of "30:400"
+    """load.rate_steps as the load generator's -rate-steps: "30:400,90:800", a list of "30:400"
     strings, or a list of [30, 400] pairs."""
     if not v:
         return ""
@@ -159,7 +187,7 @@ def read_kv(path: str) -> dict:
 
 
 def update_args(cfg: dict, index: str, parts: str, node_args: list) -> list:
-    """rtier_node flags for "Updates" (U14): room for inserted vectors, their locations and
+    """rtier_node flags for updates (U14): room for inserted vectors, their locations and
     longer lists, and the PQ budget, which must be explicit (see the module doc)."""
     upd = cfg.get("Updates")
     if upd is None:
@@ -167,22 +195,22 @@ def update_args(cfg: dict, index: str, parts: str, node_args: list) -> list:
     meta, man = read_kv(os.path.join(index, "meta.txt")), read_kv(os.path.join(parts, "manifest.txt"))
     head = float(upd.get("Headroom", 1.5))
     if head < 1:
-        raise RuntimeError('"Updates": "Headroom" must be at least 1')
+        raise RuntimeError("updates.headroom must be at least 1")
     max_len = upd.get("MaxListLen") or math.ceil(int(man["max_list_len"]) * float(upd.get("ListHeadroom", 2.0)))
     args = ["--max-vectors", str(math.ceil(int(meta["num_vectors"]) * head)),
             "--max-pages", str(math.ceil(int(man["num_pages"]) * head)),
             "--max-list-len", str(int(max_len))]
     if "--pq-capacity" not in node_args:
         if "PQCapacity" not in upd:
-            raise RuntimeError('"Updates" needs the PQ budget ("PQCapacity", or --pq-capacity in "NodeArgs"): '
-                               "by default it is the whole ID space, headroom included")
+            raise RuntimeError("updates needs the PQ budget (updates.pq_capacity, or --pq-capacity in "
+                               "cluster.node_args): by default it is the whole ID space, headroom included")
         args += ["--pq-capacity", str(int(upd["PQCapacity"]))]
     return args
 
 
 def check_load(cfg: dict) -> None:
     """Stops a run whose load is not numbers before the deployment, which takes minutes on a large
-    index: rates are filled in by hand from a calibration run ("SET_ME" in a template)."""
+    index: rates are filled in by hand from a calibration run (SET_ME in a template)."""
     if cfg.get("Calibrate"):
         return
     load = cfg.get("Load", {})
@@ -192,17 +220,30 @@ def check_load(cfg: dict) -> None:
             t, r = step.split(":")
             float(t), float(r)
     except (TypeError, ValueError):
-        sys.exit(f'"Load": "Rate" is {load.get("Rate")!r} and "RateSteps" {load.get("RateSteps")!r}: '
-                 'set them to numbers ("RateSteps": "seconds:rate,...")')
+        sys.exit(f'load.rate is {load.get("Rate")!r} and load.rate_steps {load.get("RateSteps")!r}: '
+                 'set them to numbers (rate_steps: "seconds:rate,...")')
 
 
 def reconfig_requests(cfg: dict, cfg_path: str) -> list:
-    """The "Reconfigurations" as Rescale requests, in trigger order. Plan files are read now, so a
+    """The reconfigurations as Rescale and Rebuild requests, in trigger order. Plan files are read now, so a
     missing or malformed one stops the run before the deployment."""
     out = []
+    here = os.path.dirname(os.path.abspath(cfg_path))
     for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
+        if "Rebuild" in rc:
+            rb = rc["Rebuild"]
+            if not rb.get("Index") or not rb.get("Partitions"):
+                sys.exit(f"reconfigurations: {rc}: a rebuild needs index and partitions")
+            src = {k: os.path.join(here, rb[key]) for k, key in (("index_dir", "Index"), ("parts_dir", "Partitions"))}
+            req = {"source": {"kind": "dir", **src}, "spares": rb.get("Spares", 0),
+                   "placement": rb.get("Placement", "affinity"), "seed": rb.get("Seed", 0),
+                   "warmup": rb.get("Warmup", 0), "warmup_concurrency": rb.get("WarmupConcurrency", 0),
+                   "stop_the_world": rb.get("StopTheWorld", False)}
+            out.append({"at": rc["TriggerTimeSeconds"], "method": "Rebuild", "request": req, "rebuild": True,
+                        "what": f"full rebuild to {src['parts_dir']}" + (" (stop-the-world)" if req["stop_the_world"] else "")})
+            continue
         if ("Plan" in rc) == ("DataNodes" in rc):
-            sys.exit(f'"Reconfigurations": {rc}: give "DataNodes" or "Plan", one of them')
+            sys.exit(f"reconfigurations: {rc}: give data_nodes, plan or rebuild, one of them")
         if "DataNodes" in rc:
             out.append({"at": rc["TriggerTimeSeconds"], "request": {"data_nodes": rc["DataNodes"]},
                         "data_nodes": rc["DataNodes"], "what": f"rescale to {rc['DataNodes']} data nodes"})
@@ -210,14 +251,14 @@ def reconfig_requests(cfg: dict, cfg_path: str) -> list:
         plan, name = rc["Plan"], "inline"
         if isinstance(plan, str):
             name = plan
-            path = plan if os.path.isabs(plan) else os.path.join(os.path.dirname(os.path.abspath(cfg_path)), plan)
+            path = plan if os.path.isabs(plan) else os.path.join(here, plan)
             try:
                 with open(path) as f:
                     plan = json.load(f)
             except (OSError, ValueError) as e:
-                sys.exit(f'"Reconfigurations": plan {path}: {e}')
+                sys.exit(f"reconfigurations: plan {path}: {e}")
         if not isinstance(plan, dict) or not plan.get("owners"):
-            sys.exit(f'"Reconfigurations": plan {name}: want {{"owners": {{"NODE": [partitions], ...}}}}')
+            sys.exit(f'reconfigurations: plan {name}: want {{"owners": {{"NODE": [partitions], ...}}}}')
         out.append({"at": rc["TriggerTimeSeconds"], "request": {"plan": plan}, "data_nodes": len(plan["owners"]),
                     "plan": name, "what": f"reconfigure to plan {name} ({len(plan['owners'])} data nodes)"})
     return out
@@ -282,12 +323,12 @@ def core_of(cpu: int) -> int:
 
 
 def cpu_groups(cfg: dict, nodes: int) -> tuple:
-    """The CPUs of each node (CPUsPerNode of them, from the FirstCPU-th on) and the ones left for
+    """The CPUs of each node (cpus_per_node of them, from the first_cpu-th on) and the ones left for
     the controller and the load generator. Counted among the CPUs this process may use
     (sched_getaffinity), not by CPU number -- a machine can have CPUs offline in the middle --
     and whole cores at a time: siblings are numbered next to each other on some machines
     (0-1, 2-3, ...) and a socket apart on others (0 and 192), and two nodes on the two threads of
-    one core would share it. With hyperthreads, an even CPUsPerNode gives every node whole
+    one core would share it. With hyperthreads, an even cpus_per_node gives every node whole
     cores."""
     res = cfg.get("NodeResources") or {}
     avail = sorted(os.sched_getaffinity(0), key=lambda c: (core_of(c), c))
@@ -316,17 +357,17 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
 
     On one machine every node reads the same SSD and runs on the same cores, so adding a node
     adds no capacity: the cluster stops at what the disk serves (the two-phase RERANK reads
-    ~150 pages per query). "NodeResources" emulates a node per machine instead -- each node,
+    ~150 pages per query). cluster.resources emulates a node per machine instead -- each node,
     with its agent, gets its own CPUs and its own read IOPS on the disk of WorkDir, so the total
     stays below what the disk serves:
 
-      "NodeResources": {"CPUsPerNode": 4, "IOReadIOPSMax": 40000, "MemoryMax": "2G"}
+      resources: {cpus_per_node: 4, io_read_iops_max: 40000, memory_max: 2G}
 
     As root these are cgroup limits (systemd scopes: cpuset, io, memory). Without root -- a
     shared server -- the CPUs are pinned with taskset, MemoryMax is a limit of the user's own
     scope (systemd-run --user), and the read IOPS come from the data node itself:
-    "ReadIOPSPerNode" (rtier_node --read-iops, fusion/read_budget.h; it works as root too).
-    "IOReadIOPSMax" then fails, since the io controller is not delegated to users. Pinning does
+    read_iops_per_node (rtier_node --read-iops, fusion/read_budget.h; it works as root too).
+    io_read_iops_max then fails, since the io controller is not delegated to users. Pinning does
     not keep other users' processes off a node's CPUs: cgroups.jsonl records how busy they were.
 
     Node i gets the i-th group of cpu_groups; the controller and the load generator get the
@@ -336,7 +377,7 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
         return []
     if ROOT_USER:
         if not shutil.which("systemd-run"):
-            raise RuntimeError('"NodeResources" needs systemd-run (cgroup v2 cpuset and io controllers)')
+            raise RuntimeError("cluster.resources needs systemd-run (cgroup v2 cpuset and io controllers)")
         props = ["-p", f"AllowedCPUs={cpu_list(cpus)}"] if cpus else []
         for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
             if res.get(key):
@@ -346,28 +387,28 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
         if res.get("MemoryMax"):
             props += ["-p", f"MemoryMax={res['MemoryMax']}"]
         return ["systemd-run", "--quiet", "--scope", "--collect"] + props
-    for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
+    for key, name in (("IOReadIOPSMax", "io_read_iops_max"), ("IOReadBandwidthMax", "io_read_bandwidth_max")):
         if res.get(key):
-            raise RuntimeError(f'"{key}" needs root (the cgroup io controller is not delegated to '
-                               'users); use "ReadIOPSPerNode", the data node\'s own read budget')
+            raise RuntimeError(f"cluster.resources.{name} needs root (the cgroup io controller is not delegated to "
+                               "users); use read_iops_per_node, the data node's own read budget")
     prefix = []
     if scopes:
         prefix = ["systemd-run", "--user", "--quiet", "--scope", "--collect"]
         if res.get("MemoryMax"):
             prefix += ["-p", f"MemoryMax={res['MemoryMax']}"]
     elif res.get("MemoryMax"):
-        raise RuntimeError('"MemoryMax" without root needs systemd-run --user (a user systemd '
+        raise RuntimeError('cluster.resources.memory_max without root needs systemd-run --user (a user systemd '
                            'instance), which does not work here')
     if cpus:
         prefix += ["taskset", "-c", cpu_list(cpus)]
     return prefix
 
 
-def gpu_table() -> list:
-    """The machine's GPUs as nvidia-smi lists them, [] without one."""
+def gpu_table(prefix=()) -> list:
+    """The machine's GPUs as nvidia-smi lists them, [] without one (prefix: run it elsewhere, ssh)."""
     try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,name,utilization.gpu,memory.used",
-                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+        out = subprocess.run(list(prefix) + ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,name,utilization.gpu,memory.used",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=15).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []
     keys = ("index", "uuid", "bus", "name", "util", "mem")
@@ -375,7 +416,7 @@ def gpu_table() -> list:
 
 
 def gpu_matches(g, row: dict) -> bool:
-    """A "GPUs" entry names a GPU by nvidia-smi index, UUID ("GPU-...") or PCI bus id ("06:00.0").
+    """A cluster.gpus entry names a GPU by nvidia-smi index, UUID ("GPU-...") or PCI bus id ("06:00.0").
     Indices are not stable: on the lab server they changed between two days, with the hardware."""
     g = str(g).lower()
     return g in (row["index"], row["uuid"].lower()) or (":" in g and row["bus"].lower().endswith(g))
@@ -392,7 +433,7 @@ def data_disk(path: str) -> str:
 
 
 class CgroupSampler:
-    """With "NodeResources", samples every node and every agent ("n1", "n1-agent", ...) once a
+    """With cluster.resources, samples every node and every agent ("n1", "n1-agent", ...) once a
     second into cgroups.jsonl, stamped with time.monotonic() (clock.json has the load's start
     on that clock): CPU time, I/O on the data disk, memory (anon, file, dirty and writeback page
     cache) and pressure stall times from the process's own cgroup (its systemd scope). A user
@@ -403,7 +444,7 @@ class CgroupSampler:
     One "host" record per sample has the data disk's counters (/proc/diskstats: everyone's I/O,
     other users' included), how busy each node's CPUs were (/proc/stat: its processes and anyone
     else's; compare with the node's and its agent's cpu_usec), the load average and, with
-    "GPUs", each of those GPUs' utilization and memory in use (nvidia-smi: other users' jobs on
+    cluster.gpus, each of those GPUs' utilization and memory in use (nvidia-smi: other users' jobs on
     them too): on a shared machine, what tells a quiet run from a disturbed one. Counters are
     cumulative; take differences between samples."""
 
@@ -564,6 +605,96 @@ def rest_cpus(cfg: dict, nodes: int) -> list:
     return ["taskset", "-c", cpu_list(rest)]
 
 
+def stage_record(path: str):
+    """The parameters a stage's output was made with (None if it has no record)."""
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return None
+
+
+def file_digest(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_index(cfg: dict, ecfg: dict, index: str, ebin: str) -> None:
+    """Stage 1: the index (fusion_build), with the build section's flags. An index that exists is
+    used if it was built with the same flags (rtier-build.json records them); with others the run
+    stops rather than rebuild it, which takes hours on a large dataset. An index built before the
+    records has none and is used as it is."""
+    want = {"vectors": os.path.abspath(cfg["Base"]), "args": experiment_config.build_args(ecfg.get("build"))}
+    rec_path = os.path.join(index, "rtier-build.json")
+    if os.path.exists(os.path.join(index, "meta.txt")):
+        rec = stage_record(rec_path)
+        if rec is None:
+            log(f"index {index}: no build record (built before run_local kept them): used as it is")
+        elif rec != want:
+            sys.exit(f"index {index} was built with {rec}, the configuration asks for {want}: remove it or "
+                     "set build.index_dir to another directory")
+        return
+    run([f"{ebin}/fusion_build", "--base", cfg["Base"], "--out", index] + want["args"])
+    json.dump(want, open(rec_path, "w"), indent=2)
+
+
+GENERATORS = {"range": "make_range_assignment.py", "spatial": "make_spatial_assignment.py",
+              "gp": "make_gp_assignment.py"}
+
+
+def make_assignment(ecfg: dict, cfg: dict, index: str, work: str) -> str:
+    """Stage 2a: the list -> partition assignment (U2). "file" takes the one partition.file
+    names; a generator (partition.generator: gp, the decided one; spatial or range, placeholders)
+    makes one with partition.partitions partitions, again when its parameters or the index change."""
+    p = ecfg.get("partition") or {}
+    gen = p.get("generator", "file")
+    if gen == "file":
+        if not cfg.get("Assignment"):
+            sys.exit('partition: generator "file" needs partition.file')
+        return cfg["Assignment"]
+    if gen not in GENERATORS:
+        sys.exit(f"partition.generator {gen!r}: want file, " + ", ".join(GENERATORS))
+    n = p.get("partitions")
+    if not n:
+        sys.exit(f"partition: generator {gen} needs partition.partitions")
+    cmd = [sys.executable, os.path.join(ROOT, "scripts/testing", GENERATORS[gen]), index, str(n)]
+    gp = p.get("gp") or {}
+    extra = []
+    if gen == "gp":
+        if not gp.get("kaminpar"):
+            sys.exit("partition.gp.kaminpar: the gp_kaminpar binary (scripts/testing/gp) is needed")
+        # The decided GP (U2): the heads, over the navigation graph, unit weights.
+        extra = ["--points", gp.get("points", "heads"), "--graph-source", gp.get("graph_source", "index"),
+                 "--weights", gp.get("weights", "unit"), "--kaminpar", gp["kaminpar"],
+                 "--threads", str(gp.get("threads", os.cpu_count()))]
+    out = os.path.join(work, f"assign-{gen}-{n}.bin")
+    want = {"generator": gen, "partitions": n, "args": extra,
+            "index_meta": file_digest(os.path.join(index, "meta.txt"))}
+    if os.path.exists(out) and stage_record(out + ".json") == want:
+        return out
+    run(cmd + [out] + extra)
+    json.dump(want, open(out + ".json", "w"), indent=2)
+    return out
+
+
+def segment(index: str, assignment: str, parts: str, ebin: str) -> None:
+    """Stage 2b: the partitions (rtier_segment), made again whenever the index or the
+    assignment differs from the ones they were made of (rtier-partition.json records them)."""
+    want = {"index": os.path.abspath(index), "index_meta": file_digest(os.path.join(index, "meta.txt")),
+            "assignment": file_digest(assignment)}
+    rec_path = os.path.join(parts, "rtier-partition.json")
+    if os.path.exists(os.path.join(parts, "manifest.txt")) and stage_record(rec_path) == want:
+        return
+    if os.path.exists(parts):
+        log(f"partitions {parts}: made of another index or assignment, made again")
+        shutil.rmtree(parts)
+    run([f"{ebin}/rtier_segment", "--index", index, "--assign", assignment, "--out", parts])
+    json.dump(want, open(rec_path, "w"), indent=2)
+
+
 def check_fresh(gbin: str) -> None:
     """Refuses to run Go binaries older than the Go sources: `go test` (and so `make test`
     before it built bin/ too) compiles the code under test without touching bin/, and an
@@ -577,30 +708,240 @@ def check_fresh(gbin: str) -> None:
                     sys.exit(f"{os.path.join(d, f)} is newer than the binaries in {gbin}: run `make` first")
 
 
-def main(cfg_path: str, out_dir: str) -> None:
-    cfg = json.load(open(cfg_path))
+def node_args_of(cfg: dict, index: str, parts: str) -> list:
+    """rtier_node's flags beyond the ones every node has: cluster.node_args, the read budget,
+    room for updates."""
+    res = cfg.get("NodeResources") or {}
+    args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
+                                      if res.get("ReadIOPSPerNode") else [])
+    return args + update_args(cfg, index, parts, args)
+
+
+def node_gpus(cfg: dict, nodes: int, table_of) -> dict:
+    """Node number -> the GPU it alone sees, named to CUDA by UUID (CUDA does not take bus ids, and
+    an index can name another card after a hardware change): node i gets the i-th of cluster.gpus,
+    in turns when there are fewer. table_of(i) is nvidia-smi's list on node i's machine; without
+    one, the entry as given. The log records which card each got."""
+    if cfg.get("Backend") != "gpu":
+        return {}
+    gpus = [str(g) for g in cfg.get("GPUs", [])]
+    if not gpus:
+        log("GPUs: none given (cluster.gpus): every data node uses the first one")
+        return {}
+    visible = {}
+    for i in range(1, nodes + 1):
+        g, table = gpus[(i - 1) % len(gpus)], table_of(i)
+        row = next((r for r in table if gpu_matches(g, r)), None)
+        if table and row is None:
+            raise RuntimeError(f'cluster.gpus entry {g} is none of the GPUs nvidia-smi lists for n{i}: '
+                               + "; ".join(f"{r['index']} {r['name']} {r['bus']} {r['uuid']}" for r in table))
+        visible[i] = row["uuid"] if row else g
+        log(f"GPU of n{i}: {g}" + (f" = {row['name']}, {row['bus']}, {row['uuid']}" if row else ""))
+    return visible
+
+
+def gpu_env(visible: dict, i: int) -> list:
+    """The prefix that shows node i its GPU only (without nvidia-smi, the cluster.gpus entry as
+    given, in PCI bus order: CUDA's default order puts the fastest first)."""
+    return ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={visible[i]}"] if i in visible else []
+
+
+def controller_config(cfg: dict, ctl_addr: str, api_addr: str, index: str, parts: str, work: str,
+                      out_dir: str) -> dict:
+    return {
+        "listen": ctl_addr,
+        "api_listen": api_addr,
+        "index_dir": index, "partitions_dir": parts,
+        "initial_nodes": cfg.get("InitialNodes", 1),
+        "protocol": cfg.get("Protocol", "lazy"),
+        "raw_priority": cfg.get("RawPriority", "background"),
+        "placement": cfg.get("Placement", ""),  # "" = the controller's default (U3)
+        "allow_updates": "Updates" in cfg,
+        "metrics_path": os.path.join(out_dir, "metrics.jsonl"),
+        # The nodes' stats logs arrive here through their agents, stamped on arrival.
+        "stats_dir": out_dir,
+        "work_dir": os.path.join(work, "controller"),
+    }
+
+
+def node_command(cfg: dict, ebin: str, index: str, parts: str, listen: str, node_dir: str,
+                 node_args: list) -> list:
+    # Each node keeps its raw vectors in its own sparse file (a subset of the index's page file);
+    # the ones it gets by migration arrive after the flip (U9).
+    return [f"{ebin}/rtier_node", "--index", index, "--partitions", parts, "--listen", listen,
+            "--backend", cfg.get("Backend", "cpu"), "--raw-file", os.path.join(node_dir, "raw.pages"),
+            "--stats-file", os.path.join(node_dir, "stats.jsonl")] + node_args
+
+
+def agent_config(cfg: dict, name: str, ctl_addr: str, listen_host: str, node_addr: str, node_dir: str,
+                 parts: str) -> dict:
+    return {
+        "name": name, "controller": ctl_addr,
+        "query_listen": f"{listen_host}:0", "bulk_listen": f"{listen_host}:0", "node_addr": node_addr,
+        "work_dir": node_dir, "partitions_dir": parts,
+        "strategy": cfg.get("Strategy", ""),
+        "transfer_rate_bytes_per_sec": cfg.get("TransferRateBytesPerSec", 0),
+        "metrics_interval": cfg.get("MetricsInterval", "1s"),
+        # Forwarded to the controller (stats-<node>.jsonl there), as on a cluster.
+        "node_stats_file": os.path.join(node_dir, "stats.jsonl"),
+        **{k: cfg[e] for k, e in (("raw_streams", "RawStreams"), ("raw_batch_bytes", "RawBatchBytes"),
+                                  ("raw_path", "RawPath"), ("query_sample", "QuerySample")) if e in cfg},
+    }
+
+
+def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir: str, procs, results: list,
+          prefix: list) -> None:
+    """Steps 4 and 5, wherever the nodes run: wait for the initial deployment, then either measure
+    capacity (calibrate) or run the load and trigger the reconfigurations on time. The load
+    generator runs on this machine, with prefix (the CPUs left by the nodes on one machine)."""
+    # 4. initial deployment, then load
+    api = Controller(api_addr)
+    # Bootstrapping copies every partition's PQ codes and raw vectors from the index: minutes
+    # on a 10M-vector index ("ReadyTimeoutSeconds").
+    deploy_start = time.monotonic()
+    st = api.call("WaitReady", {"timeout_seconds": cfg.get("ReadyTimeoutSeconds", 600)})
+    log(f"epoch {st['table']['epoch']} ready on {len(st['table']['placement']['owners'])} partitions "
+        f"after {time.monotonic() - deploy_start:.0f} s")
+    load = cfg.get("Load", {})
+    dur = load.get("DurationSeconds", 60)
+
+    def loadgen(rate, seconds, out_csv, steps=""):
+        cmd = [f"{gbin}/rtier-loadgen", "-api", api_addr, "-queries", cfg["Queries"],
+               "-rate", str(rate), "-duration", f"{seconds}s", "-k", str(load.get("K", 10)),
+               "-nprobe", str(load.get("NProbe", 64)), "-n", str(load.get("N", 200)),
+               "-arrivals", load.get("Arrivals", "poisson"), "-out", out_csv]
+        if steps:
+            cmd += ["-rate-steps", steps]
+        if load.get("Users"):  # closed loop: concurrent users instead of an arrival rate
+            cmd += ["-users", str(load["Users"])]
+            if load.get("UserSteps"):
+                cmd += ["-users-steps", rate_steps(load["UserSteps"])]
+        if load.get("RetryForSeconds"):
+            cmd += ["-retry-for", f"{load['RetryForSeconds']}s"]
+        if gt:
+            cmd += ["-gt", gt]
+        return cmd
+
+    # 4b. capacity first: how much this cluster serves before it falls behind. Scale-out is
+    # driven by load, so every later run's rate is set relative to this number.
+    calib = cfg.get("Calibrate")
+    if calib:
+        table = []
+        for rate in calib.get("Rates", [50, 100, 200, 400]):
+            path = os.path.join(out_dir, f"calib-{rate:g}.csv")
+            with open(os.path.join(out_dir, "calibration.log"), "a") as logf:
+                run(prefix + loadgen(rate, calib.get("SecondsPerRate", 15), path),
+                    stdout=logf, stderr=logf)
+            s = calibration_step(read_latency(path), rate)
+            table.append(s)
+            log(f"offered {rate:g}/s: answered {s['answered_in_window_per_s']}/s while sending "
+                f"({s['behind_at_end']} behind at the end), mean {s['mean_us']} us, "
+                f"p50 {s['p50_us']} us, p99 {s['p99_us']} us, {s['status']}")
+        json.dump(table, open(os.path.join(out_dir, "calibration.json"), "w"), indent=2)
+        log(f"saturation: served up to {saturation(table):g}/s without falling behind; "
+            f"set the reconfiguration run's rate from this")
+        return  # a calibration run measures capacity only: no reconfiguration in it
+
+    procs.start("loadgen", loadgen(load.get("Rate", 100), dur,
+                                   os.path.join(out_dir, "latency.csv"),
+                                   rate_steps(load.get("RateSteps"))), prefix=prefix)
+
+    # 5. timed reconfigurations (Koala: "Reconfigurations" with TriggerTimeSeconds; here reconfigurations: at)
+    # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
+    # seconds), and the load generator's times are monotonic too.
+    t0 = time.monotonic()
+    json.dump({"load_start": round(t0, 3)}, open(os.path.join(out_dir, "clock.json"), "w"))
+    for rc in reconfigs:
+        while time.monotonic() - t0 < rc["at"]:
+            procs.check()
+            time.sleep(0.2)
+        log(rc["what"])
+        started = time.monotonic()
+        reply = api.call(rc.get("method", "Rescale"), rc["request"])
+        results.append({"data_nodes": rc.get("data_nodes"), **({"plan": rc["plan"]} if "plan" in rc else {}),
+                        **({"rebuild": True} if rc.get("rebuild") else {}),
+                        "trigger_seconds": round(started - t0, 3),
+                        "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
+        log(json.dumps(results[-1]))
+    json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
+
+    # The load generator stops sending at the duration and exits once every query it sent is
+    # answered, writing latency.csv only then: an open-loop run that ends with a backlog
+    # needs the time to drain it, or its queries are lost ("DrainSeconds").
+    drain = load.get("DrainSeconds", 300)
+    while time.monotonic() - t0 < dur + drain and procs.procs[-1][1].poll() is None:
+        time.sleep(0.5)
+    if procs.procs[-1][1].poll() is None:
+        log(f"load generator still waiting for answers {drain} s after the load ended: stopped, "
+            "no latency.csv")
+
+
+def finish(out_dir: str) -> None:
+    """Step 6: the metrics as SQLite (Koala's layout) and the timeline."""
+    m = os.path.join(out_dir, "metrics.jsonl")
+    if os.path.exists(m):
+        subprocess.run([sys.executable, os.path.join(ROOT, "scripts/metrics_to_sqlite.py"), m,
+                        os.path.join(out_dir, "metricCollector.db")])
+    if os.path.exists(os.path.join(out_dir, "latency.csv")):
+        subprocess.run([sys.executable, os.path.join(ROOT, "scripts/plot_run.py"), out_dir])
+    log(f"results in {out_dir}")
+
+
+def load_config(cfg_path: str) -> tuple:
+    """The configuration merged with its bases, its flat form, and its reconfigurations as
+    requests; the binaries' directories must be newer than the sources."""
+    if not cfg_path.endswith((".yaml", ".yml")):
+        sys.exit(f"{cfg_path}: experiment configurations are YAML now (scripts/convert_configs.py converts "
+                 "the old JSON ones)")
+    ecfg = experiment_config.load(cfg_path)
+    cfg = experiment_config.flatten(ecfg)
     check_load(cfg)
     reconfigs = reconfig_requests(cfg, cfg_path)
-    work = os.path.abspath(cfg.get("WorkDir", "/tmp/rtier-run"))
-    ebin = os.path.join(ROOT, cfg.get("EngineBin", "engine/build"))
-    gbin = os.path.join(ROOT, cfg.get("GoBin", "bin"))
-    check_fresh(gbin)
-    os.makedirs(work, exist_ok=True)
-    os.makedirs(out_dir, exist_ok=True)
-    shutil.copy(cfg_path, os.path.join(out_dir, "experiment.json"))
+    check_fresh(paths_of(cfg)[2])
+    return ecfg, cfg, reconfigs
 
+
+def paths_of(cfg: dict) -> tuple:
+    """The work directory, the engine's binaries and the Go binaries, absolute."""
+    return (os.path.abspath(cfg.get("WorkDir", "/tmp/rtier-run")),
+            os.path.join(ROOT, cfg.get("EngineBin", "engine/build")), os.path.join(ROOT, cfg.get("GoBin", "bin")))
+
+
+def record(ecfg: dict, cfg: dict, cfg_path: str, out_dir: str) -> None:
+    """The configuration as it ran: merged with its bases (experiment.yaml), and flat
+    (experiment.json, what the analysis scripts read)."""
+    os.makedirs(out_dir, exist_ok=True)
+    open(os.path.join(out_dir, "experiment.yaml"), "w").write(
+        f"# {os.path.abspath(cfg_path)}, merged with its bases\n" + experiment_config.dump(ecfg))
+    json.dump(cfg, open(os.path.join(out_dir, "experiment.json"), "w"), indent=2)
+
+
+def stages(ecfg: dict, cfg: dict) -> tuple:
+    """Steps 1-2, on this machine wherever the nodes run: the index, the ground truth and the
+    partitions, made unless they are there. Returns the index, ground truth and partition paths."""
+    work, ebin, _ = paths_of(cfg)
+    os.makedirs(work, exist_ok=True)
     # 1. index and ground truth
-    index = cfg.get("IndexDir") or os.path.join(work, "index")
-    if not os.path.exists(os.path.join(index, "meta.txt")):
-        run([f"{ebin}/fusion_build", "--base", cfg["Base"], "--out", index] + cfg.get("BuildArgs", []))
+    index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
+    build_index(cfg, ecfg, index, ebin)
     gt = cfg.get("GroundTruth", "")
     if gt and not os.path.exists(gt):
         run([f"{ebin}/fusion_gt", "--base", cfg["Base"], "--queries", cfg["Queries"], "--out", gt, "--k", "100"])
 
-    # 2. partitions (the assignment is an input: U2)
+    # 2. partitions: the assignment (U2), then the segments
     parts = os.path.join(work, "partitions")
-    if not os.path.exists(os.path.join(parts, "manifest.txt")):
-        run([f"{ebin}/rtier_segment", "--index", index, "--assign", cfg["Assignment"], "--out", parts])
+    segment(index, make_assignment(ecfg, cfg, index, work), parts, ebin)
+    return index, gt, parts
+
+
+def main(cfg_path: str, out_dir: str) -> None:
+    ecfg, cfg, reconfigs = load_config(cfg_path)
+    if cfg.get("Hosts"):
+        sys.exit(f"{cfg_path}: hosts is for scripts/run_cluster.py (run_local.py runs every node on this "
+                 "machine): run that, or set hosts: null in an override")
+    work, ebin, gbin = paths_of(cfg)
+    record(ecfg, cfg, cfg_path, out_dir)
+    index, gt, parts = stages(ecfg, cfg)
 
     emu = cfg.get("Emulation", {})
     netns = bool(emu.get("Netns"))
@@ -618,27 +959,10 @@ def main(cfg_path: str, out_dir: str) -> None:
                                                       else "no user scopes (sampled from /proc)") +
             (f", {res['ReadIOPSPerNode']} reads/s per data node" if res.get("ReadIOPSPerNode") else
              ", no read-IOPS limit"))
-    node_args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
-                                           if res.get("ReadIOPSPerNode") else [])
-    node_args += update_args(cfg, index, parts, node_args)
+    node_args = node_args_of(cfg, index, parts)
     gpus = [str(g) for g in cfg.get("GPUs", [])] if cfg.get("Backend") == "gpu" else []
-    # Each data node sees only its GPU, named to CUDA by UUID (CUDA does not take bus ids, and an
-    # index can name another card after a hardware change). The log records which card each got.
-    visible = {}
-    if cfg.get("Backend") == "gpu":
-        table = gpu_table()
-        for i in range(1, nodes + 1):
-            if not gpus:
-                break
-            g = gpus[(i - 1) % len(gpus)]
-            row = next((r for r in table if gpu_matches(g, r)), None)
-            if table and row is None:
-                raise RuntimeError(f'"GPUs" entry {g} is none of the GPUs nvidia-smi lists: '
-                                   + "; ".join(f"{r['index']} {r['name']} {r['bus']} {r['uuid']}" for r in table))
-            visible[i] = row["uuid"] if row else g
-            log(f"GPU of n{i}: {g}" + (f" = {row['name']}, {row['bus']}, {row['uuid']}" if row else ""))
-        if not gpus:
-            log('GPUs: none given ("GPUs"): every data node uses the first one')
+    table = gpu_table() if gpus else []
+    visible = node_gpus(cfg, nodes, lambda i: table)
 
     procs = Procs(out_dir)
     results = []
@@ -652,17 +976,7 @@ def main(cfg_path: str, out_dir: str) -> None:
 
         # 3. controller, then nodes (spare nodes register idle and join at scale-out)
         ctl_cfg = os.path.join(work, "controller.json")
-        json.dump({
-            "listen": ctl_addr,
-            "api_listen": api_addr,
-            "index_dir": index, "partitions_dir": parts,
-            "initial_nodes": cfg.get("InitialNodes", 1),
-            "protocol": cfg.get("Protocol", "lazy"),
-            "raw_priority": cfg.get("RawPriority", "background"),
-            "placement": cfg.get("Placement", ""),  # "" = the controller's default (U3)
-            "allow_updates": "Updates" in cfg,
-            "metrics_path": os.path.join(out_dir, "metrics.jsonl"),
-        }, open(ctl_cfg, "w"), indent=2)
+        json.dump(controller_config(cfg, ctl_addr, api_addr, index, parts, work, out_dir), open(ctl_cfg, "w"), indent=2)
         procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg], prefix=rest_cpus(cfg, nodes))
         time.sleep(0.5)
 
@@ -672,31 +986,18 @@ def main(cfg_path: str, out_dir: str) -> None:
                 (["ip", "netns", "exec", f"rtier-{name}"] if netns else [])
             scoped = bool(prefix) and prefix[0] == "systemd-run"
             host = f"10.10.0.{10 + i}" if netns else "127.0.0.1"
-            # Each node keeps its raw vectors in its own sparse file (a subset of the index's
-            # page file); the ones it gets by migration arrive after the flip (U9).
-            os.makedirs(os.path.join(work, name), exist_ok=True)
-            # A data node sees only its own GPU (resolved above; without nvidia-smi, the "GPUs"
-            # entry as given, in PCI bus order: CUDA's default order puts the fastest first).
-            gpu = ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={visible[i]}"] if i in visible else []
-            ready = procs.start(f"node-{name}", [f"{ebin}/rtier_node", "--index", index, "--partitions", parts,
-                                                 "--listen", f"{host}:0", "--backend", cfg.get("Backend", "cpu"),
-                                                 "--raw-file", os.path.join(work, name, "raw.pages"),
-                                                 "--stats-file", os.path.join(out_dir, f"stats-{name}.jsonl")]
-                                + node_args, prefix=prefix + gpu, wait_line="READY tcp=")
+            node_dir = os.path.join(work, name)
+            os.makedirs(node_dir, exist_ok=True)
+            # The agent forwards this run's stats log from its start: none of an earlier run's.
+            if os.path.exists(os.path.join(node_dir, "stats.jsonl")):
+                os.remove(os.path.join(node_dir, "stats.jsonl"))
+            ready = procs.start(f"node-{name}", node_command(cfg, ebin, index, parts, f"{host}:0", node_dir, node_args),
+                                prefix=prefix + gpu_env(visible, i), wait_line="READY tcp=")
             if sampler:
                 sampler.add(name, procs.procs[-1][1].pid, scoped)
-            node_addr = f"{host}:{ready.split('=')[1]}"
             agent_cfg = os.path.join(work, f"agent-{name}.json")
-            json.dump({
-                "name": name, "controller": ctl_addr,
-                "query_listen": f"{host}:0", "bulk_listen": f"{host}:0", "node_addr": node_addr,
-                "work_dir": os.path.join(work, name), "partitions_dir": parts,
-                "strategy": cfg.get("Strategy", ""),
-                "transfer_rate_bytes_per_sec": cfg.get("TransferRateBytesPerSec", 0),
-                "metrics_interval": cfg.get("MetricsInterval", "1s"),
-                **{k: cfg[e] for k, e in (("raw_streams", "RawStreams"), ("raw_batch_bytes", "RawBatchBytes"),
-                                          ("raw_path", "RawPath")) if e in cfg},
-            }, open(agent_cfg, "w"), indent=2)
+            json.dump(agent_config(cfg, name, ctl_addr, host, f"{host}:{ready.split('=')[1]}", node_dir, parts),
+                      open(agent_cfg, "w"), indent=2)
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
             if sampler:
                 sampler.add(f"{name}-agent", procs.procs[-1][1].pid, scoped)
@@ -704,85 +1005,8 @@ def main(cfg_path: str, out_dir: str) -> None:
         if sampler:
             sampler.start()
 
-        # 4. initial deployment, then load
-        api = Controller(api_addr)
-        # Bootstrapping copies every partition's PQ codes and raw vectors from the index: minutes
-        # on a 10M-vector index ("ReadyTimeoutSeconds").
-        deploy_start = time.monotonic()
-        st = api.call("WaitReady", {"timeout_seconds": cfg.get("ReadyTimeoutSeconds", 600)})
-        log(f"epoch {st['table']['epoch']} ready on {len(st['table']['placement']['owners'])} partitions "
-            f"after {time.monotonic() - deploy_start:.0f} s")
-        load = cfg.get("Load", {})
-        dur = load.get("DurationSeconds", 60)
-
-        def loadgen(rate, seconds, out_csv, steps=""):
-            cmd = [f"{gbin}/rtier-loadgen", "-api", api_addr, "-queries", cfg["Queries"],
-                   "-rate", str(rate), "-duration", f"{seconds}s", "-k", str(load.get("K", 10)),
-                   "-nprobe", str(load.get("NProbe", 64)), "-n", str(load.get("N", 200)),
-                   "-arrivals", load.get("Arrivals", "poisson"), "-out", out_csv]
-            if steps:
-                cmd += ["-rate-steps", steps]
-            if load.get("Users"):  # closed loop: concurrent users instead of an arrival rate
-                cmd += ["-users", str(load["Users"])]
-                if load.get("UserSteps"):
-                    cmd += ["-users-steps", rate_steps(load["UserSteps"])]
-            if load.get("RetryForSeconds"):
-                cmd += ["-retry-for", f"{load['RetryForSeconds']}s"]
-            if gt:
-                cmd += ["-gt", gt]
-            return cmd
-
-        # 4b. capacity first: how much this cluster serves before it falls behind. Scale-out is
-        # driven by load, so every later run's rate is set relative to this number.
-        calib = cfg.get("Calibrate")
-        if calib:
-            table = []
-            for rate in calib.get("Rates", [50, 100, 200, 400]):
-                path = os.path.join(out_dir, f"calib-{rate:g}.csv")
-                with open(os.path.join(out_dir, "calibration.log"), "a") as logf:
-                    run(rest_cpus(cfg, nodes) + loadgen(rate, calib.get("SecondsPerRate", 15), path),
-                        stdout=logf, stderr=logf)
-                s = calibration_step(read_latency(path), rate)
-                table.append(s)
-                log(f"offered {rate:g}/s: answered {s['answered_in_window_per_s']}/s while sending "
-                    f"({s['behind_at_end']} behind at the end), mean {s['mean_us']} us, "
-                    f"p50 {s['p50_us']} us, p99 {s['p99_us']} us, {s['status']}")
-            json.dump(table, open(os.path.join(out_dir, "calibration.json"), "w"), indent=2)
-            log(f"saturation: served up to {saturation(table):g}/s without falling behind; "
-                f"set the reconfiguration run's rate from this")
-            return  # a calibration run measures capacity only: no reconfiguration in it
-
-        procs.start("loadgen", loadgen(load.get("Rate", 100), dur,
-                                       os.path.join(out_dir, "latency.csv"),
-                                       rate_steps(load.get("RateSteps"))), prefix=rest_cpus(cfg, nodes))
-
-        # 5. timed reconfigurations (Koala: "Reconfigurations" with TriggerTimeSeconds)
-        # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
-        # seconds), and the load generator's times are monotonic too.
-        t0 = time.monotonic()
-        json.dump({"load_start": round(t0, 3)}, open(os.path.join(out_dir, "clock.json"), "w"))
-        for rc in reconfigs:
-            while time.monotonic() - t0 < rc["at"]:
-                procs.check()
-                time.sleep(0.2)
-            log(rc["what"])
-            started = time.monotonic()
-            reply = api.call("Rescale", rc["request"])
-            results.append({"data_nodes": rc["data_nodes"], **({"plan": rc["plan"]} if "plan" in rc else {}),
-                            "trigger_seconds": round(started - t0, 3),
-                            "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
-            log(json.dumps(results[-1]))
-        json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
-
-        # The load generator stops sending at the duration and exits once every query it sent is
-        # answered, writing latency.csv only then: an open-loop run that ends with a backlog
-        # needs the time to drain it, or its queries are lost ("DrainSeconds").
-        drain = load.get("DrainSeconds", 300)
-        while time.monotonic() - t0 < dur + drain and procs.procs[-1][1].poll() is None:
-            time.sleep(0.5)
-        if procs.procs[-1][1].poll() is None:
-            log(f"load generator still waiting for answers {drain} s after the load ended: stopped, "
-                "no latency.csv")
+        # 4-5. initial deployment, load, timed reconfigurations
+        drive(cfg, reconfigs, api_addr, gbin, gt, out_dir, procs, results, rest_cpus(cfg, nodes))
     finally:
         # 7. clean up, then 6. results
         procs.stop()
@@ -790,16 +1014,10 @@ def main(cfg_path: str, out_dir: str) -> None:
             sampler.stop()
         if netns:
             subprocess.run([netns_sh, "down", str(nodes)])
-        m = os.path.join(out_dir, "metrics.jsonl")
-        if os.path.exists(m):
-            subprocess.run([sys.executable, os.path.join(ROOT, "scripts/metrics_to_sqlite.py"), m,
-                            os.path.join(out_dir, "metricCollector.db")])
-        if os.path.exists(os.path.join(out_dir, "latency.csv")):
-            subprocess.run([sys.executable, os.path.join(ROOT, "scripts/plot_run.py"), out_dir])
-        log(f"results in {out_dir}")
+        finish(out_dir)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        sys.exit("usage: run_local.py EXPERIMENT.json OUT_DIR")
+        sys.exit("usage: run_local.py EXPERIMENT.yaml OUT_DIR")
     main(sys.argv[1], sys.argv[2])

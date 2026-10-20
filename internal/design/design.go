@@ -3,12 +3,15 @@
 // Placeholders that sit on a code path return an error wrapping ErrUndecided and name one of
 // the open questions below, so a run that reaches an undecided path fails loudly instead of
 // silently picking an answer. A few questions have no code path yet (U12, U13's retry and
-// rollback, U14, U15, U17); for those the entry records what the code does meanwhile.
+// rollback, U15, U17's list outside the epoch); for those the entry records what the code does
+// meanwhile.
 // `rtier-client design` prints this list.
 //
-// U4 is deliberately absent: replicas of hot partitions are out of scope for rtier. Elastic
-// read capacity for a hot key is what streaming systems solve with serverless-style instances,
-// and rtier keeps one owner per partition. The number stays free so the other IDs do not move.
+// U4 is deliberately absent: replicas of hot partitions are out of scope for rtier, which keeps
+// one owner per partition and handles skew by placement (a plan reassigns partitions, U3).
+// Serverless-style read capacity, how streaming systems serve a hot key, would not relieve a
+// disk-bound hot spot: its data is on its owner's SSD. The number stays free so the other IDs
+// do not move.
 //
 // One rule cuts across U1, U2, U15 and U16: no per-node structure should be sized by the whole
 // dataset, because scaling out is supposed to make each node's share smaller. At a billion
@@ -76,46 +79,85 @@ var Open = map[string]Question{
 			"RAG chunks live (with U12)",
 		"engine/include/fusion/raw_store.h, engine/include/fusion/partition.h (locations), " +
 			"internal/partitioning/payload.go (chunks)"},
-	"U2": {"U2", "List -> partition assignment and the number of partitions",
+	"U2": {"U2", "List -> partition assignment (GP on the navigation graph is decided) and the number of partitions",
 		"the objective is r(P) = sum over partitions of |its vector set| / |their union|, the " +
 			"cross-partition overlap (1 without partitioning, approaching the list-level r ~ 7.3 " +
 			"under random grouping). It sets the PQ-code redundancy, the per-node residency, and " +
-			"whether PQStore::slot_of_ is worth replacing (see engine/README.md). Candidates: group " +
-			"lists by navigation-graph locality, by centroid k-means, or by hash (the baseline); the " +
-			"partition count follows from bytes per partition and fan-out. Measure r(P), recall and " +
-			"per-node residency together on real datasets",
-		"internal/partitioning/partitioner.go, engine/tools/rtier_segment.cpp"},
+			"whether PQStore::slot_of_ is worth replacing (see engine/README.md); the number of " +
+			"partitions follows from bytes per partition and fan-out. Decided (2026-10-19): the " +
+			"initial split balances the number of posting lists per partition -- and so per node " +
+			"under the even placement -- not their postings: list counts change only through a major " +
+			"epoch's splits and merges, list lengths with every update batch, and those splits and " +
+			"merges keep the lengths close while a full rebuild starts over. The partitioner is GP " +
+			"(Gottesbueren et al., VLDB '25) on the list heads over the navigation graph's level-0 " +
+			"edges -- all of them: the build's own graph, so no kNN graph is built -- with unit " +
+			"weights as in the paper (blocks within 5%): make_gp_assignment.py --points heads " +
+			"--graph-source index (gp/gp_kaminpar.cpp runs KaMinPar). BIGANN-1M, 64 partitions, " +
+			"nprobe 64: a query touches 7.63 partitions, against 8.03 with the paper's 10-NN graph of " +
+			"the heads and 8.88 for spatial bisection; owners at 8 nodes 2.96 / 3.03 / 3.15, at 16 " +
+			"nodes 4.20 / 4.35 / 4.62; the graph is read in 0.2 s, the kNN graph took 65 s for 101K " +
+			"heads (each head's first 10 links alone do no better than spatial: hnswlib does not keep " +
+			"them by distance). KaMinPar numbers its blocks along its recursive bisection, so " +
+			"consecutive partitions are neighbors and contiguous ranges suit the even placement (U3). " +
+			"The cost of balancing counts: list lengths at the build are heavy-tailed (mean 72, p99 " +
+			"181, max 543 -- the clustering's leaves hold 1-15 vectors, replication does the rest), " +
+			"so partitions differ in postings by up to 1.26x the average and nodes by 1.04 / 1.07 / " +
+			"1.15 at 4 / 8 / 16 nodes; weighting each head by its postings (--weights postings) would " +
+			"bring both to 1.05 at no loss in cut quality. The fullest node's share of the vectors, " +
+			"its PQ codes, stays below spatial's (0.235 against 0.252 at 8 nodes). Other generators " +
+			"(test-only): contiguous ranges of list IDs (make_range_assignment.py), spatial bisection " +
+			"of the heads (make_spatial_assignment.py), and the paper's own variant, GP on the " +
+			"vectors over a 10-NN graph of the dataset (--points vectors: a list goes to the " +
+			"plurality block of its postings, which keeps only 58% of the postings with their block). " +
+			"Open: the number of partitions; GP on real datasets. Set aside (2026-10-19), since it " +
+			"differs from dataset to dataset: the posting imbalance itself -- a list's length is " +
+			"about how many vectors count its head among their 8 nearest (90% of the vectors reach " +
+			"the cap of 8 replicas), which varies with the data's geometry (hubness), and the levers " +
+			"are the build's (SPANN's RNG pruning of replicas, which Assign does not reproduce yet; a " +
+			"length cap at the build; the replica count), not the partitioning",
+		"internal/partitioning/partitioner.go, engine/tools/rtier_segment.cpp, scripts/testing/ " +
+			"(make_range_assignment.py, make_spatial_assignment.py, make_gp_assignment.py, " +
+			"gp/gp_kaminpar.cpp)"},
 	"U3": {"U3", "Placement objective beyond even partition counts (reversibility and the graph choice are decided)",
 		"Decided: even partition counts; a scale-out moves partitions only from existing to new " +
-			"nodes, each donor giving its excess, and a scale-in returns every partition it can to " +
-			"a node that has owned it before (a matching), so scaling out and back in restores the " +
+			"nodes, each donor giving its excess, and a scale-in returns every partition it can to a " +
+			"node that has owned it before (a matching), so scaling out and back in restores the " +
 			"placement and the cached PQ codes make the scale-in free (Koala's even policy is not " +
 			"reversible -- after 4 -> 8 -> 4 none of the 32 moved partitions is home again). Which " +
-			"partitions a donor gives, and where one that cannot go home goes, follows the " +
-			"partition graph -- navigation-graph edges between the partitions' heads, read off the " +
-			"index, no queries -- so that the nodes cut as little of it as possible (placement " +
-			"\"even-reversible-graph\", the default; \"even-reversible\" and \"even-reversible-blocks\" " +
-			"give every donor's tail). BIGANN-10M, 64 spatial partitions, nprobe 64: 2 -> 3 gives " +
-			"1.71 owners per query against 1.83 for tails, one node at a time to 8 gives 3.31 " +
-			"against 3.81, doubling does as well as whole blocks (2 -> 4: 1.81 both; 2 -> 4 -> 8: " +
-			"2.69 against 2.76); end to end under a per-node read budget the capacity is the same, " +
-			"with 2-7% less CPU per query and 5-8% fewer PQ codes staged (neighboring partitions " +
-			"share replicated vectors). Open: the initial placement is still contiguous ranges, " +
-			"poor at sizes that are not powers of two (3 nodes: 1.82 owners, 4 nodes: 1.81); " +
-			"layouts reached by single-node steps nest -- with no data exchanged between old " +
-			"nodes each node's region only shrinks -- and drift from a fresh even split (3.31 " +
-			"against 2.76 at 8 nodes), which only bigger steps (doubling) avoid; weight by per-tier " +
-			"bytes (HBM is the binding tier; with partitions of unequal size donors send unequal " +
-			"bytes) and by access heat -- skew is left to custom plans (rtier-client rescale " +
-			"-plan), which the controller carries out whatever the policy; with node-level PQ " +
-			"codes a node's footprint depends on which partitions it holds together (boundary " +
-			"replication), and staging must fit each node's budget (--pq-capacity); rebalance " +
-			"without changing the node count; which nodes leave on scale-in (now: highest IDs) and " +
-			"which idle nodes join (now: lowest IDs) -- the cache invariant in U1 needs the node " +
-			"that left to be the one that comes back, so the join rule is part of that decision",
-		"internal/placement/graph.go (GraphPolicy), internal/partitioning/graph.go (PartitionGraph), " +
-			"internal/placement/policy.go (EvenPolicy, ReversiblePolicy, BlockPolicy), internal/placement/weighted.go, " +
-			"internal/controller/reconfig.go (rescale)"},
+			"partitions a donor gives, and where one that cannot go home goes, follows the partition " +
+			"graph -- navigation-graph edges between the partitions' heads, read off the index, no " +
+			"queries -- so that the nodes cut as little of it as possible (placement " +
+			"\"even-reversible-graph\", the default; \"even-reversible\" and " +
+			"\"even-reversible-blocks\" give every donor's tail). BIGANN-10M, 64 spatial partitions, " +
+			"nprobe 64: 2 -> 3 gives 1.71 owners per query against 1.83 for tails, one node at a time " +
+			"to 8 gives 3.31 against 3.81, doubling does as well as whole blocks (2 -> 4: 1.81 both; " +
+			"2 -> 4 -> 8: 2.69 against 2.76); end to end under a per-node read budget the capacity is " +
+			"the same, with 2-7% less CPU per query and 5-8% fewer PQ codes staged (neighboring " +
+			"partitions share replicated vectors). Decided (2026-10-19): the initial placement stays " +
+			"contiguous ranges of partition IDs, which the spatial and GP generators number along " +
+			"their bisection: close to the best at power-of-two sizes, a small gap otherwise (3 " +
+			"nodes: 1.82 owners per query, against 1.71 when 2 -> 3 picks by the graph). Accepted " +
+			"(2026-10-12): the plans the policies make move no data between old nodes (a scale-out " +
+			"old -> new only, a scale-in leaving -> remaining only; a custom plan may move anything), " +
+			"so layouts reached one node at a time nest -- each old node's region only shrinks -- and " +
+			"drift from a fresh even split: 3.31 owners against 2.76 at 8 nodes (BIGANN-1M, GP: 3.56 " +
+			"against 2.99, 18-23% from 4 to 8 nodes). The partition graph narrows the gap and " +
+			"doubling avoids it; partitioning (U2) cannot close it. To measure (offline counts " +
+			"suffice): whether the gap closes in larger clusters -- with nprobe and the partition " +
+			"count fixed it must as N approaches the partition count, since a query's owners are " +
+			"bounded by the partitions it probes whatever the placement, but not necessarily when the " +
+			"partition count grows with N. Open: weight by per-tier bytes (HBM is the binding tier; " +
+			"with partitions of unequal size donors send unequal bytes) and by access heat -- skew is " +
+			"left to custom plans (rtier-client rescale -plan), which the controller carries out " +
+			"whatever the policy; with node-level PQ codes a node's footprint depends on which " +
+			"partitions it holds together (boundary replication), and staging must fit each node's " +
+			"budget (--pq-capacity); rebalance without changing the node count; which nodes leave on " +
+			"scale-in (now: highest IDs) and which idle nodes join (now: lowest IDs) -- the cache " +
+			"invariant in U1 needs the node that left to be the one that comes back, so the join rule " +
+			"is part of that decision",
+		"internal/placement/graph.go (GraphPolicy), internal/partitioning/graph.go " +
+			"(PartitionGraph), internal/placement/policy.go (EvenPolicy, ReversiblePolicy, " +
+			"BlockPolicy), internal/placement/weighted.go, internal/controller/reconfig.go (rescale)"},
 	"U5": {"U5", "Global top-n under fixed-n re-ranking",
 		"two-phase is implemented (every owner filters for its own top-n, the aggregator merges " +
 			"the global top-n and re-ranks each candidate at the owner that reported it): exactly " +
@@ -157,53 +199,59 @@ var Open = map[string]Question{
 			"the two get weights",
 		"internal/transfer/adapter.go, internal/transfer/tokenbucket.go (classes)"},
 	"U9": {"U9", "Lazy fetch of raw vectors (and chunks) after a new node is online",
-		"Decided: a node goes online (the flip) only once it holds every posting list and PQ " +
-			"code of its partitions, so it can filter at once; a raw vector moves only when a " +
-			"query first needs it (protocol \"lazy\", the default) -- the point of being lazy " +
-			"is that queries touch a small working set of what moved. Every posting records the " +
-			"holder of its vector, the node that stores it (u16 node ID, segment version 3), so " +
-			"each key (list, vector) has one current holder: the list's owner if it holds the " +
-			"vector, else the node the posting names. Only the owner's copy of a list is valid: a " +
-			"partition moves as its owner saves it from memory, holders included (SAVE_PARTITION), " +
-			"and the next owner makes the postings of the vectors it holds name itself. A RERANK " +
-			"that meets a vector not there fetches it from the holder that a posting in one of the " +
-			"query's lists on that node records, data node to data node (RAW_GET, one hop: a " +
-			"holder has the vector; data nodes know each other by node ID, SET_NODES), and makes " +
-			"that one posting name itself -- other lists naming the vector keep their holder, " +
-			"which still has it; queries that miss the same vector meanwhile wait for that one " +
-			"fetch. The RERANK waits for the fetch only: fetched vectors are re-ranked from memory " +
-			"and a background writer installs them with whole-page direct writes. A scale-out " +
-			"does not wait for raw vectors. A scale-in drains the nodes that leave first " +
+		"Decided: a node goes online (the flip) only once it holds every posting list and PQ code " +
+			"of its partitions, so it can filter at once; a raw vector moves only when a query first " +
+			"needs it (protocol \"lazy\", the default) -- the point of being lazy is that queries " +
+			"touch a small working set of what moved. Every posting records the holder of its vector, " +
+			"the node that stores it (u16 node ID, segment version 3), so each key (list, vector) has " +
+			"one current holder: the list's owner if it holds the vector, else the node the posting " +
+			"names. Only the owner's copy of a list is valid: a partition moves as its owner saves it " +
+			"from memory, holders included (SAVE_PARTITION), and the next owner makes the postings of " +
+			"the vectors it holds name itself. A RERANK that meets a vector not there fetches it from " +
+			"the holder that a posting in one of the query's lists on that node records, data node to " +
+			"data node (RAW_GET, one hop: a holder has the vector; data nodes know each other by node " +
+			"ID, SET_NODES), and makes that one posting name itself -- other lists naming the vector " +
+			"keep their holder, which still has it; queries that miss the same vector meanwhile wait " +
+			"for that one fetch. The RERANK waits for the fetch only: fetched vectors are re-ranked " +
+			"from memory and a background writer installs them with whole-page direct writes. A " +
+			"scale-out does not wait for raw vectors. A scale-in drains the nodes that leave first " +
 			"(DrainRaw: each remaining node takes over the vectors its postings say only a leaving " +
-			"node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so they can go " +
-			"offline when it returns: lazy fetches as little as possible, it does not forbid " +
-			"streaming. Holders stay valid because no node drops a raw vector it has held (static " +
-			"dataset); a disk budget would need the same hand-off first. Baselines: " +
-			"\"lazy-stream\" also streams the rest in after the flip (StageRaw at raw_priority; " +
-			"RAW_MISSING groups each missing vector by its holder; the rescale waits for it); " +
-			"\"copy-then-flip\" streams before the flip, \"stop-and-copy\" while paused. Open: " +
-			"taking the fetch off the query path (re-rank the missing candidates at their holder, " +
-			"which has them, and fetch the ones used in the background); fetching more per fetch; " +
-			"the workload that decides the working set (U11); chunks (U12)",
-		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw), internal/agent/control.go " +
-			"(StageRaw, DrainRaw), engine/src/node_engine.cpp (EnsureRawInLists, FetchForQuery, " +
-			"RawHeldBy, RawPull), engine/node/server.cpp (PeerPool)"},
+			"node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so they can go offline " +
+			"when it returns: lazy fetches as little as possible, it does not forbid streaming. " +
+			"Holders stay valid because no node drops a raw vector it has held (static dataset); a " +
+			"disk budget would need the same hand-off first. Baselines: \"lazy-stream\" also streams " +
+			"the rest in after the flip (StageRaw at raw_priority; RAW_MISSING groups each missing " +
+			"vector by its holder; the rescale waits for it); \"copy-then-flip\" streams before the " +
+			"flip, \"stop-and-copy\" while paused. Decided (2026-10-16): the fetch stays on the query " +
+			"path -- taking it off (re-ranking a missing candidate at its holder, fetching in the " +
+			"background) is not a goal -- and the queries' locality is taken as given (U11). Open: " +
+			"fetching more per fetch; chunks (U12)",
+		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw), " +
+			"internal/agent/control.go (StageRaw, DrainRaw), engine/src/node_engine.cpp " +
+			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull), engine/node/server.cpp (PeerPool)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
-			"single-machine prototype uses; also what happens when the controller fails mid-flip",
+			"single-machine prototype uses. What happens when the controller fails mid-flip is out of " +
+			"scope with the other failures (U13, decided 2026-10-16)",
 		"internal/epoch/store.go"},
 	"U11": {"U11", "Workload model",
-		"Poisson open-loop arrivals (implemented) vs. replaying SemDN-style bursty, " +
-			"task-coherent query streams",
+		"Poisson open-loop arrivals (implemented) vs. replaying SemDN-style bursty, task-coherent " +
+			"query streams. Decided (2026-10-16): queries are taken to have locality, which is what " +
+			"makes the lazy protocol worth it; without any, lazy still moves at most what " +
+			"copy-then-flip copies, since a node fetches each vector at most once and concurrent " +
+			"misses of one vector wait for one fetch (Wikipedia 2 -> 4: 3.0 GB fetched against 51.2 " +
+			"GB copied). Open: a generator or a real query log with locality for the experiments (the " +
+			"SemDN-style generator is a placeholder)",
 		"cmd/rtier-loadgen/arrivals.go"},
 	"U12": {"U12", "Vector ID -> RAG chunk ID mapping returned to the caller",
 		"the tier returns vector IDs (no code path maps them yet); the chunk store and the " +
 			"fetch path are not designed",
 		"internal/query/query.go (Result)"},
 	"U13": {"U13", "Failures during a reconfiguration (node or controller)",
-		"retry the failed step, roll back, or finish without the failed node. Meanwhile: a failure " +
-			"before the flip drops the partitions already copied and keeps the old epoch; after " +
-			"the flip the protocol stops and keeps every old copy (safe, wasteful)",
+		"out of scope (decided 2026-10-16): this work handles no failure -- retrying the failed " +
+			"step, rolling back, or finishing without the failed node are future work. As it stands, " +
+			"a failure before the flip drops the partitions already copied and keeps the old epoch; " +
+			"after the flip the protocol stops and keeps every old copy (safe, wasteful)",
 		"internal/controller/reconfig.go (copyThenFlip)"},
 	"U14": {"U14", "Dataset updates",
 		"vectors are immutable (an update deletes a vector and inserts it again under a new ID) " +
@@ -255,20 +303,45 @@ var Open = map[string]Question{
 			"(decided 2026-10-16): only minor batches come from outside; the owners report the " +
 			"lengths of the lists a batch changes, and MajorDue splits the lists over one length and " +
 			"merges the ones under another (rtier-updater -split-len, -merge-len; -split, -merge by " +
-			"hand). Not implemented: growing the ID and location spaces at an epoch boundary; the " +
-			"response to a batch over budget (splitting partitions, scaling out first -- the batch " +
-			"fails before anything is sent); reassigning the vectors of neighboring lists in a split " +
-			"(SPFresh's LIRE, a recall matter); the full rebuild and its probe-set trigger; a graph " +
-			"patch over one frame (256 MB); the decision log and replay; freeing the pages of deleted " +
-			"vectors. An inserted vector stays with the owner that added it when its partition moves " +
-			"on (the postings name that node as its holder), and a node that leaves is drained first " +
-			"(U9). Open: versions staged under a lease that expired stay on their owner until a later " +
-			"batch replaces them or the partition moves",
-		"internal/epoch/table.go (Versions, Graph, Lists), engine/include/fusion/node_engine.h (partition " +
-			"versions, Assign, RawAdd, StageVersions, graph patches), engine/include/fusion/graph_patch.h, " +
-			"internal/update (batch.go, major.go), internal/controller/update.go, " +
-			"internal/controller/reconfig.go (copyThenFlip, drainRaw), engine/include/fusion/pq_store.h " +
-			"(cached codes, Forget), cmd/rtier-updater, scripts/run_local.py (\"Updates\")"},
+			"hand). Full rebuild (internal/controller/rebuild.go, decided 2026-10-19): the cluster " +
+			"moves to another generation of the index -- every head, list and partition and the graph " +
+			"-- built outside the system with the same codebook, vector IDs and raw-vector locations " +
+			"and handed over as files (a source interface; fusion_build reuses the codebook and page " +
+			"layout it finds in its output directory), so the PQ codes and raw vectors every node " +
+			"holds stay valid and no node ever holds two generations' lists or graphs. Spares (idle " +
+			"nodes, as many as the data nodes by default) take every partition by a lazy " +
+			"reconfiguration; the old nodes stay members that only serve raw vectors (not drained), " +
+			"lose the entry role once the spares have the graph, and switch to the next generation " +
+			"(SWITCH_GENERATION keeps their PQ codes and raw vectors); its partitions are placed by " +
+			"where their raw vectors are (presence bitmaps, a min-cost flow under the even policies' " +
+			"balance: placement.Affinity), every posting whose vector its owner lacks naming an old " +
+			"node that holds it (one hop); the old nodes load the partitions (PQ codes from the " +
+			"generation's index) and graph, replay the recent queries the entries kept under the " +
+			"draft epoch (what re-ranking fetches stays: the warm-up), and take over in one flip; " +
+			"after the grace period the spares, holding copies only, move to the next generation too " +
+			"and are idle. The epoch table names its generation (and its directories); a node that " +
+			"joins later and the update controller's router follow it. No update batch or " +
+			"reconfiguration runs meanwhile (assumed). Baselines: random placement, no warm-up, " +
+			"stop-the-world (admission paused while every node switches in place). Not implemented: " +
+			"growing the ID and location spaces at an epoch boundary; the response to a batch over " +
+			"budget (splitting partitions, scaling out first -- the batch fails before anything is " +
+			"sent); reassigning the vectors of neighboring lists in a split (SPFresh's LIRE, a recall " +
+			"matter); the full rebuild's trigger (manual only: rtier-client rebuild; the probe-set " +
+			"check is design only), a generation that includes inserted vectors (the builder would " +
+			"need their IDs and locations), a priority between the warm-up's fetches and the spares' " +
+			"(only the warm-up's pace is set); a graph patch over one frame (256 MB); the decision " +
+			"log and replay; freeing the pages of deleted vectors. An inserted vector stays with the " +
+			"owner that added it when its partition moves on (the postings name that node as its " +
+			"holder), and a node that leaves is drained first (U9). Open: versions staged under a " +
+			"lease that expired stay on their owner until a later batch replaces them or the " +
+			"partition moves",
+		"internal/epoch/table.go (Versions, Graph, Lists, Generation), " +
+			"engine/include/fusion/node_engine.h (partition versions, Assign, RawAdd, StageVersions, " +
+			"graph patches, SwitchGeneration), engine/include/fusion/graph_patch.h, internal/update " +
+			"(batch.go, major.go), internal/controller/update.go, internal/controller/rebuild.go, " +
+			"internal/placement/affinity.go, internal/controller/reconfig.go (copyThenFlip, " +
+			"drainRaw), engine/include/fusion/pq_store.h (cached codes, Forget), cmd/rtier-updater, " +
+			"scripts/run_local.py (\"Updates\")"},
 	"U16": {"U16", "The navigation graph as a global replica: size and transfer mode",
 		"every entry node needs the whole graph over the list heads, and a node that joins " +
 			"starts empty -- pre-staging it on spare nodes is not allowed, because a real " +
@@ -310,9 +383,16 @@ var Open = map[string]Question{
 			"exactly when the node set changes (ownership and the aggregator set do; entry " +
 			"availability does not), because what must be epoch-consistent is what decides where " +
 			"the data is and who must be drained -- a query sent to a node that should not have " +
-			"it costs one UNAVAILABLE and a retry. No code path yet",
+			"it costs one UNAVAILABLE and a retry. Decided (2026-10-19), how a client learns that " +
+			"its list changed: it reads the list every 500 ms, and at once when an entry refuses a " +
+			"query under a newer epoch than the list's (a refusal carries the entry's epoch). That " +
+			"entry has left the entry set, so the retry goes to the entries of that epoch, and the " +
+			"queries that find the list stale together share one read. A refusal under the list's " +
+			"epoch or an earlier one -- paused admission, an entry that has not installed the " +
+			"epoch yet -- reads nothing: a fresh list would be the same. Wherever the list lives, " +
+			"it needs a version for this. No code path yet for the list outside the epoch",
 		"internal/epoch/table.go (Table.Entries), internal/agent/serve.go (entry), " +
-			"internal/controller/reconfig.go (promoteEntries)"},
+			"internal/controller/reconfig.go (promoteEntries), cmd/rtier-loadgen/main.go (entries.catchUp)"},
 	"U15": {"U15", "The host copy of the PQ codes next to the GPU's",
 		"with the GPU backend a node holds every code twice: PQStore keeps the authoritative " +
 			"copy in host memory (capacity x m) and the filter a second one in device memory, " +

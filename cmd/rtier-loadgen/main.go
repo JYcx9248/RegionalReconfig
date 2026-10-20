@@ -3,14 +3,17 @@
 // Queries are sent at their scheduled arrival times whether or not earlier ones have
 // returned (open loop), and latency is measured from the scheduled time, so client-side
 // queueing during a reconfiguration shows up in the tail instead of hiding it. Entries are
-// discovered from the controller and refreshed, so new entries are used after a scale-out.
+// read from the controller's epoch table every 500 ms, so new entries are used after a
+// scale-out, and at once when an entry refuses a query under a newer epoch than the list's:
+// that entry has left the entry set, and the list is stale.
 //
 // With -users the load is closed loop instead: a number of concurrent users that follows a
 // schedule (-users-steps), each sending its next query when its last one returned; a query's
 // time is when it was sent, and the offered load adapts to how fast the cluster answers.
 //
 // An "unavailable" answer (an entry that left, or paused admission under stop-and-copy) is
-// retried three times by default, and the query fails after that. With -retry-for the client
+// retried three times by default, and the query fails after that; a retry after an entry that
+// left goes to the entries of its epoch. With -retry-for the client
 // waits for its answer instead: it keeps retrying until the answer comes or the time is up,
 // so a pause shows up as latency of the answered queries. Averages over answered queries
 // only compare protocols when no query fails, which is what -retry-for is for.
@@ -51,17 +54,31 @@ type record struct {
 	users    int // concurrent users when it was sent (closed loop; 0 in open loop)
 }
 
+// entries is the client's list of entry nodes, read from the controller's epoch table.
 type entries struct {
 	mu      sync.Mutex
 	clients []*query.Client
 	byAddr  map[string]*query.Client
+	epoch   uint64 // the epoch the list was read from (0 with -entries)
 	next    atomic.Uint64
 	conns   int
+
+	// Discovery, from the controller's API ("" with -entries). One read of it runs at a time,
+	// and rounds counts them, so that the queries that find the list stale together share one.
+	api    string
+	read   sync.Mutex
+	rounds atomic.Uint64
+	stale  atomic.Int64 // reads a refusal under a newer epoch asked for
 }
 
-func (e *entries) set(addrs []string) {
+// set makes addrs, the entries of an epoch, the list, unless the list is from a later epoch
+// already (a read that started before another one and ended after it).
+func (e *entries) set(addrs []string, epoch uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if epoch < e.epoch {
+		return
+	}
 	var cs []*query.Client
 	for _, a := range addrs {
 		c, ok := e.byAddr[a]
@@ -71,7 +88,47 @@ func (e *entries) set(addrs []string) {
 		}
 		cs = append(cs, c)
 	}
-	e.clients = cs
+	e.clients, e.epoch = cs, epoch
+}
+
+func (e *entries) listEpoch() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.epoch
+}
+
+// refresh reads the list from the controller: every 500 ms, whether or not it changed.
+func (e *entries) refresh(ctx context.Context) error {
+	e.read.Lock()
+	defer e.read.Unlock()
+	e.rounds.Add(1)
+	return e.load(ctx)
+}
+
+// catchUp brings the list up to epoch, the epoch an entry refused a query under: the list is
+// older, so that entry has left the entry set, and the entries to try are that epoch's. The
+// queries that find the list stale together wait for one read, the first one's: none reads
+// again once a read ran after it looked. It reports whether the list is now from that epoch or
+// a later one.
+func (e *entries) catchUp(ctx context.Context, epoch uint64) bool {
+	if e.api == "" {
+		return false
+	}
+	seen := e.rounds.Load()
+	e.read.Lock()
+	if e.rounds.Load() == seen && e.listEpoch() < epoch {
+		e.rounds.Add(1)
+		e.stale.Add(1)
+		if err := e.load(ctx); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("entry discovery: %v", err)
+			}
+		} else {
+			log.Printf("entries: a query refused under epoch %d, the list read again (epoch %d)", epoch, e.listEpoch())
+		}
+	}
+	e.read.Unlock()
+	return e.listEpoch() >= epoch
 }
 
 func (e *entries) pick() *query.Client {
@@ -136,15 +193,16 @@ func main() {
 	defer cancel()
 	ents := &entries{byAddr: map[string]*query.Client{}, conns: *conns}
 	if *fixed != "" {
-		ents.set(strings.Split(*fixed, ","))
+		ents.set(strings.Split(*fixed, ","), 0)
 	} else {
-		if err := refresh(ctx, *api, ents); err != nil {
+		ents.api = *api
+		if err := ents.refresh(ctx); err != nil {
 			log.Fatal(err)
 		}
 		go func() {
 			for ctx.Err() == nil {
 				time.Sleep(500 * time.Millisecond)
-				if err := refresh(ctx, *api, ents); err != nil && ctx.Err() == nil {
+				if err := ents.refresh(ctx); err != nil && ctx.Err() == nil {
 					log.Printf("entry discovery: %v", err)
 				}
 			}
@@ -235,7 +293,7 @@ func main() {
 	}
 	wg.Wait()
 	cancel()
-	summarize(recs, gt != nil)
+	summarize(recs, gt != nil, ents.stale.Load())
 	if *out != "" {
 		if err := writeCSV(*out, recs); err != nil {
 			log.Fatal(err)
@@ -265,6 +323,13 @@ func send(ctx context.Context, ents *entries, req *query.Request, until time.Tim
 		if err == nil || !errors.Is(err, query.ErrUnavailable) {
 			return res, attempt, err
 		}
+		// Refused under a newer epoch than the list's: the list is stale, and the next attempt
+		// goes to that epoch's entries at once. Refused under the list's epoch or an earlier one
+		// -- admission paused, or an entry that has not installed the list's epoch yet -- a
+		// fresh list would be the same: wait, then retry.
+		if res.Epoch > ents.listEpoch() && ents.catchUp(ctx, res.Epoch) {
+			continue
+		}
 		time.Sleep(min(time.Duration(attempt)*5*time.Millisecond, maxBackoff))
 	}
 	return res, attempt, err
@@ -284,8 +349,9 @@ func statusName(err error) string {
 	return "transport"
 }
 
-func refresh(ctx context.Context, api string, ents *entries) error {
-	c, err := ctrl.Dial(ctx, api)
+// load reads the entries of the controller's current epoch.
+func (e *entries) load(ctx context.Context) error {
+	c, err := ctrl.Dial(ctx, e.api)
 	if err != nil {
 		return err
 	}
@@ -306,7 +372,7 @@ func refresh(ctx context.Context, api string, ents *entries) error {
 			addrs = append(addrs, n.QueryAddr)
 		}
 	}
-	ents.set(addrs)
+	e.set(addrs, st.Table.Epoch)
 	return nil
 }
 
@@ -325,7 +391,7 @@ func report(ctx context.Context, start time.Time, sent, ok, failed *atomic.Int64
 	}
 }
 
-func summarize(recs []record, withRecall bool) {
+func summarize(recs []record, withRecall bool, staleReads int64) {
 	var lats []float64
 	var recall, sum float64
 	retried := 0
@@ -352,8 +418,9 @@ func summarize(recs []record, withRecall bool) {
 	if len(lats) > 0 {
 		mean = sum / float64(len(lats))
 	}
-	fmt.Printf("queries %d: %v, %d retried\nlatency us: mean %.0f  p50 %.0f  p99 %.0f  p99.9 %.0f  max %.0f\n",
-		len(recs), counts, retried, mean, q(0.5), q(0.99), q(0.999), q(1))
+	fmt.Printf("queries %d: %v, %d retried, the entry list read %d times after a refusal under a newer epoch\n"+
+		"latency us: mean %.0f  p50 %.0f  p99 %.0f  p99.9 %.0f  max %.0f\n",
+		len(recs), counts, retried, staleReads, mean, q(0.5), q(0.99), q(0.999), q(1))
 	if withRecall && len(lats) > 0 {
 		fmt.Printf("recall %.4f\n", recall/float64(len(lats)))
 	}
