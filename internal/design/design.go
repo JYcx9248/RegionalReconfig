@@ -80,10 +80,10 @@ var Open = map[string]Question{
 			"node runs without it); how the vectors arrive after a migration is U9. Old owners " +
 			"keep the vectors of partitions that moved away, like PQ codes. Raw vectors need no " +
 			"versions under U14: vectors are immutable, and IDs and locations are only appended, " +
-			"never reused. Open: the space amplification of tail pages shared between lists; a " +
-			"disk budget and eviction for raw vectors (none yet: a node keeps every vector it " +
-			"has held, and the pages of deleted vectors are not freed, U14); where RAG chunks " +
-			"live (with U12)",
+			"never reused. Decided (2026-10-20, for now): raw vectors are kept in full -- no " +
+			"disk budget and no eviction, and the pages of deleted vectors stay too, since disk " +
+			"is cheap; the space amplification of tail pages shared between lists is accepted " +
+			"with it. Open: where RAG chunks live (with U12, discussed last)",
 		"engine/include/fusion/raw_store.h, engine/include/fusion/partition.h (locations), " +
 			"internal/partitioning/payload.go (chunks)"},
 	"U2": {"U2", "List -> partition assignment (GP on the navigation graph is decided) and the number of partitions",
@@ -162,54 +162,58 @@ var Open = map[string]Question{
 			"by per-tier bytes (HBM is the binding tier; with partitions of unequal size donors " +
 			"send unequal bytes) -- with node-level PQ codes a node's footprint depends on which " +
 			"partitions it holds together (boundary replication), and staging must fit each " +
-			"node's budget (--pq-capacity); which nodes leave on scale-in (now: highest IDs) and " +
-			"which idle nodes join (now: lowest IDs) -- the cache invariant in U1 needs the node " +
-			"that left to be the one that comes back, so the join rule is part of that decision",
+			"node's budget (--pq-capacity); Decided (2026-10-20) for which nodes leave and join: " +
+			"a node removed by a scale-in is shut down, so a later scale-out brings a fresh node " +
+			"and a node coming back is not a case we handle; the highest IDs leave (the latest " +
+			"joiners, so partitions go home to their former owners) and any idle node joins " +
+			"(lowest IDs first)",
 		"internal/placement/graph.go (GraphPolicy), internal/partitioning/graph.go " +
 			"(PartitionGraph), internal/placement/policy.go (EvenPolicy, ReversiblePolicy, " +
 			"BlockPolicy), internal/placement/weighted.go, internal/controller/reconfig.go " +
 			"(rescale)"},
 	"U5": {"U5", "Global top-n under fixed-n re-ranking",
 		"two-phase is implemented (every owner filters for its own top-n, the aggregator merges " +
-			"the global top-n and re-ranks each candidate at the owner that reported it): exactly " +
-			"the single-node answer, for a second round trip. Open: whether to pay that round " +
-			"trip, or give each owner a quota of n * its share and re-rank in one, whose answer " +
-			"can differ from the global top-n",
+			"the global top-n and re-ranks each candidate at the owner that reported it): " +
+			"exactly the single-node answer, for a second round trip. Decided (2026-10-20, with " +
+			"the PI, for now): two-phase, so every answer equals the single-node answer; a quota " +
+			"of n * its share for each owner, re-ranked in one round trip (an answer that can " +
+			"differ from the global top-n), is not pursued",
 		"internal/query/query.go (TwoPhase implemented; ProportionalQuota placeholder)"},
 	"U6": {"U6", "Outsourcing the per-query aggregator to another node",
 		"Decided in the steady state: the entry chooses after navigating, among the nodes the " +
-			"query has to reach -- the owners of its probed lists (selector \"owner\", the default): " +
-			"itself when it owns some of them; the owner when one node holds them all (one network " +
-			"round trip instead of two, and the PQ candidates never leave that node); itself " +
-			"otherwise, because forwarding then adds a hop to save one of several parallel " +
-			"sub-queries and piles aggregation onto the owners of hot partitions. " +
+			"query has to reach -- the owners of its probed lists (selector \"owner\", the " +
+			"default): itself when it owns some of them; the owner when one node holds them all " +
+			"(one network round trip instead of two, and the PQ candidates never leave that " +
+			"node); itself otherwise, because forwarding then adds a hop to save one of several " +
+			"parallel sub-queries and piles aggregation onto the owners of hot partitions. " +
 			"Decided where it applies: the only window in which the nodes that may aggregate " +
 			"outnumber the nodes that may take client queries is a scale-out, while a new node's " +
 			"navigation graph is still arriving. Selector \"warmup\" hands the scatter/gather to " +
-			"those nodes and aggregates locally otherwise. Open: whether it pays for itself -- " +
-			"the aggregator's own work is the fan-out and the merge, while the entry keeps the " +
-			"navigation, which is the expensive part and the part that needs the graph (measured " +
-			"small on a CPU-only run: navigate 160 us of a 445 us server-side query); and a " +
-			"load-aware policy (selector \"outsource\") for entries that are hot for other " +
-			"reasons. Note that outsourcing and letting the new node take queries and forward the " +
-			"navigation (U16's \"stream\") split the work the same way, from opposite sides",
-		"internal/query/selector.go (OwnerSelector, WarmupSelector implemented; OutsourceSelector " +
-			"placeholder), internal/agent/serve.go (entry)"},
+			"those nodes and aggregates locally otherwise. Decided (2026-10-20, for now): the " +
+			"aggregator is not outsourced -- \"owner\" stays the default, \"warmup\" stays an option " +
+			"that is not the default, and a load-aware policy (selector \"outsource\") is not " +
+			"pursued. Outsourcing would save little anyway: the aggregator's own work is the " +
+			"fan-out and the merge, while the entry keeps the navigation, the expensive part and " +
+			"the part that needs the graph (measured small on a CPU-only run: navigate 160 us of " +
+			"a 445 us server-side query). Note that outsourcing and letting the new node take " +
+			"queries and forward the navigation (U16's \"stream\") split the work the same way, " +
+			"from opposite sides",
+		"internal/query/selector.go (OwnerSelector, WarmupSelector implemented; " +
+			"OutsourceSelector placeholder), internal/agent/serve.go (entry)"},
 	"U7": {"U7", "Sub-queries that arrive with a stale epoch",
-		"when it arises: an entry keeps its query's epoch pinned until the answer is back, and " +
-			"an aggregator pins the epoch of a forwarded aggregation as soon as it arrives, so " +
-			"the grace period covers every query of the epoch -- except in one window. When the " +
-			"entry stops waiting first (its client gave up or went away), it releases its pin " +
-			"while its forward may still be on the way; if the forward reaches the aggregator " +
-			"after that node's drain returned, the grace period can be over and its sub-queries " +
-			"meet a partition already reclaimed (NOT_RESIDENT). No wrong answer can come of it, " +
-			"since nobody waits for this one any more; only wasted work and an error. Options: " +
-			"serve locally while the data is still resident, forward to the new owner, or " +
-			"reject. Proposed, to be confirmed: reject explicitly; or keep the entry's pin until " +
-			"the forward has ended or been cancelled, which the rule that the grace period waits " +
-			"for every old-epoch query (2026-10-16) would then cover",
+		"Decided (2026-10-20): not handled -- it takes a failure, out of scope with the others " +
+			"(U13). An entry keeps its query's epoch pinned until its forward returns -- a " +
+			"client that gives up does not end it, since the agent serves queries under its own " +
+			"lifetime -- and an aggregator pins the epoch of a forwarded aggregation as soon as " +
+			"it reads it, so the grace period covers every query of the epoch. A stale sub-query " +
+			"needs an entry whose forward fails (the query client's 30 s timeout) before the " +
+			"aggregator has read it, and that then reaches the aggregator after its drain " +
+			"returned: only with a network or process failure. No wrong answer can come of it, " +
+			"only wasted work and an error: a sub-query that meets a partition no longer " +
+			"resident fails its query with a plain error (no placeholder). Not pursued: serving " +
+			"it while the data is still resident, or forwarding it to the new owner",
 		"internal/query/query.go (Aggregator.Run, NotResident), internal/agent/serve.go (entry, " +
-			"forwarded)"},
+			"forwarded), internal/query/wire.go (Client.Timeout)"},
 	"U8": {"U8", "Adaptive rate control for background transfer",
 		"a token bucket on a separate connection (implemented, fixed rate) with two priority " +
 			"classes on the sender (implemented): data -- segments and PQ codes, what a node " +
@@ -223,8 +227,13 @@ var Open = map[string]Question{
 			"only when the agents are paced) the drain and lazy-stream's stream after the flip " +
 			"take raw_priority (background by default, so the stream shares the class equally " +
 			"with a graph still arriving: a baseline's tuning, not a protocol question), and the " +
-			"eager baselines' copy before the flip takes the data class. Open: how to adapt the " +
-			"rate to foreground latency; whether the drain's pulls should be paced",
+			"eager baselines' copy before the flip takes the data class. Decided (2026-10-20, " +
+			"for now): the mechanism stays as it is. The aim is that a reconfiguration not cut " +
+			"the capacity much, and the current one is taken as enough for that: a fixed rate " +
+			"(transfer_rate, set per experiment, unpaced by default) with the two classes, no " +
+			"rate adapted to foreground latency, and no byte rate for the drain, whose pulls " +
+			"cluster.raw bounds (batch_bytes per request, streams in flight per source, shared " +
+			"with the baselines' streams) besides the source's read budget",
 		"internal/transfer/adapter.go, internal/transfer/tokenbucket.go (classes), " +
 			"internal/agent/control.go (rawViaNode, pullRaw), internal/controller/reconfig.go " +
 			"(stageRaw, drainRaw)"},
@@ -248,16 +257,22 @@ var Open = map[string]Question{
 			"writes. A scale-out does not wait for raw vectors. A scale-in drains the nodes that " +
 			"leave first (DrainRaw: each remaining node takes over the vectors its postings say " +
 			"only a leaving node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so " +
-			"they can go offline when it returns: lazy fetches as little as possible, it does " +
-			"not forbid streaming. Holders stay valid because no node drops a raw vector it has " +
-			"held (vectors are immutable, and even a deleted vector's page is not freed); a disk " +
-			"budget would need the same hand-off first. Baselines: \"lazy-stream\" also streams " +
-			"the rest in after the flip (StageRaw at raw_priority; RAW_MISSING groups each " +
-			"missing vector by its holder; the rescale waits for it); \"copy-then-flip\" streams " +
-			"before the flip, \"stop-and-copy\" while paused. Decided (2026-10-16): the fetch " +
-			"stays on the query path -- taking it off (re-ranking a missing candidate at its " +
-			"holder, fetching in the background) is not a goal -- and the queries' locality is " +
-			"taken as given (U11). Open: fetching more per fetch; chunks (U12)",
+			"they can go offline when it returns. Holders stay valid because no node drops a raw " +
+			"vector it has held (vectors are immutable, and even a deleted vector's page is not " +
+			"freed); a disk budget would need the same hand-off first. Baselines: \"lazy-stream\" " +
+			"also streams the rest in after the flip (StageRaw at raw_priority; RAW_MISSING " +
+			"groups each missing vector by its holder; the rescale waits for it); " +
+			"\"copy-then-flip\" streams before the flip, \"stop-and-copy\" while paused. Decided " +
+			"(2026-10-16): the fetch stays on the query path -- taking it off (re-ranking a " +
+			"missing candidate at its holder, fetching in the background) is not a goal -- and " +
+			"the queries' locality is taken as given (U11). Decided (2026-10-20): a fetch brings " +
+			"only the vectors its query needs, and nothing more -- no page or list read ahead -- " +
+			"with one request per holder, every holder at once. Under the graph placement a new " +
+			"node takes partitions from several donors, not one contiguous range, so a query's " +
+			"misses often lie at several holders, and the RERANK waits for the slowest request " +
+			"rather than their sum. Vectors move beyond what queries ask for only at a scale-in, " +
+			"where the drain hands over what only the leaving nodes hold (the baselines stream " +
+			"by design). Open: chunks (U12)",
 		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw), " +
 			"internal/agent/control.go (StageRaw, DrainRaw), engine/src/node_engine.cpp " +
 			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull), engine/node/server.cpp " +
@@ -374,11 +389,11 @@ var Open = map[string]Question{
 			"generation that includes inserted vectors (the builder would need their IDs and " +
 			"locations), a priority between the warm-up's fetches and the spares' (only the " +
 			"warm-up's pace is set); a graph patch over one frame (256 MB); the decision log and " +
-			"replay; freeing the pages of deleted vectors. An inserted vector stays with the " +
-			"owner that added it when its partition moves on (the postings name that node as its " +
-			"holder), and a node that leaves is drained first (U9). Open: versions staged under " +
-			"a lease that expired stay on their owner until a later batch replaces them or the " +
-			"partition moves",
+			"replay (the pages of deleted vectors are kept: U1). An inserted vector stays with " +
+			"the owner that added it when its partition moves on (the postings name that node as " +
+			"its holder), and a node that leaves is drained first (U9). Open: versions staged " +
+			"under a lease that expired stay on their owner until a later batch replaces them or " +
+			"the partition moves",
 		"internal/epoch/table.go (Versions, Graph, Lists, Generation), " +
 			"engine/include/fusion/node_engine.h (partition versions, Assign, RawAdd, " +
 			"StageVersions, graph patches, SwitchGeneration), " +
@@ -402,46 +417,56 @@ var Open = map[string]Question{
 			"and partitioning level 0 (which makes navigation distributed and changes recall). " +
 			"The user's claim (2026-10-16): no node ever holds two copies of the graph -- a " +
 			"major epoch patches it in place (U14) and a full rebuild moves the roles to spares. " +
-			"Open: transfer mode -- \"eager\" (today: fetch the whole replica during the rescale; " +
-			"each new node takes the entry role in a flip as soon as its graph has loaded, " +
-			"batched per entry_flip_interval) vs. \"stream\" (take the role at once, forward " +
-			"NAVIGATE to a node that has the graph, fill in behind). Only the eager mode exists " +
-			"in code. Decided for the transfer itself: each new entry's source is assigned when " +
-			"the reconfiguration starts, round-robin over the live entries with a cursor that " +
-			"carries over between reconfigurations (instead of every new node pulling from the " +
-			"first entry), and the pull runs at background priority on its source " +
-			"(graph_priority): FILTER and RERANK need posting lists and PQ codes, not the graph, " +
-			"and navigation is the smallest share of a query that any existing entry can do " +
-			"meanwhile -- so the graph only gets the bandwidth the segment and PQ transfers " +
-			"leave unused and never delays the flip. Pairs with U6's warmup selector, which " +
-			"moves aggregation to the new node before its graph arrives. After major epochs " +
-			"(U14), the transfer brings the build's graph and then, from the same source, the " +
-			"patch of every later graph version, merged in order before the node takes the role",
+			"Decided (2026-10-20): the transfer mode stays \"eager\" -- an entry without the whole " +
+			"graph serves no purpose, so each new node takes the entry role in a flip as soon as " +
+			"its graph has loaded (batched per entry_flip_interval); the \"stream\" mode (take the " +
+			"role at once, forward NAVIGATE, fill in behind) is not pursued. Decided for the " +
+			"transfer itself: each new entry's source is assigned when the reconfiguration " +
+			"starts, round-robin over the live entries with a cursor that carries over between " +
+			"reconfigurations (instead of every new node pulling from the first entry), and the " +
+			"pull runs at background priority on its source (graph_priority): FILTER and RERANK " +
+			"need posting lists and PQ codes, not the graph, and navigation is the smallest " +
+			"share of a query that any existing entry can do meanwhile -- so the graph only gets " +
+			"the bandwidth the segment and PQ transfers leave unused and never delays the flip. " +
+			"Pairs with U6's warmup selector, which moves aggregation to the new node before its " +
+			"graph arrives. After major epochs (U14), the transfer brings the build's graph and " +
+			"then, from the same source, the patch of every later graph version, merged in order " +
+			"before the node takes the role",
 		"internal/controller/reconfig.go (graphSources, StageGraph, promoteEntries), " +
 			"internal/transfer/tokenbucket.go (classes), engine/src/node_engine.cpp (LoadGraph)"},
 	"U17": {"U17", "Where the client-facing availability list lives",
 		"today the entry set is a field of the epoch table, so \"this node finished loading its " +
 			"graph\" -- a local event that has nothing to do with who owns what -- costs an epoch " +
 			"flip (batched: one per entry_flip_interval for the nodes ready by then, running " +
-			"alongside the grace period, so no node waits for the slowest graph), and the rescale " +
-			"still blocks until every graph transfer has ended. Proposed: the coordinator " +
-			"keeps the available list outside the epoch; a node is added once its graph is " +
-			"complete, and until then it only serves work forwarded to it (sub-queries, and " +
-			"aggregation under U6); a scale-in removes a node from the list first, drains, then " +
-			"flips. The rule this follows: a field belongs in the epoch table only if it changes " +
-			"exactly when the node set changes (ownership and the aggregator set do; entry " +
-			"availability does not), because what must be epoch-consistent is what decides where " +
-			"the data is and who must be drained -- a query sent to a node that should not have " +
-			"it costs one UNAVAILABLE and a retry. Decided (2026-10-19), how a client learns that " +
-			"its list changed: it reads the list every 500 ms, and at once when an entry refuses a " +
-			"query under a newer epoch than the list's (a refusal carries the entry's epoch). That " +
-			"entry has left the entry set, so the retry goes to the entries of that epoch, and the " +
-			"queries that find the list stale together share one read. A refusal under the list's " +
-			"epoch or an earlier one -- paused admission, an entry that has not installed the " +
-			"epoch yet -- reads nothing: a fresh list would be the same. Wherever the list lives, " +
-			"it needs a version for this. No code path yet for the list outside the epoch",
+			"alongside the grace period, so no node waits for the slowest graph), and the " +
+			"rescale still blocks until every graph transfer has ended. The alternative, not " +
+			"pursued for now: the coordinator keeps the available list outside the epoch; a node " +
+			"is added once its graph is complete, and until then it only serves work forwarded " +
+			"to it (sub-queries, and aggregation under U6); a scale-in removes a node from the " +
+			"list first, drains, then flips. The rule this follows: a field belongs in the epoch " +
+			"table only if it changes exactly when the node set changes (ownership and the " +
+			"aggregator set do; entry availability does not), because what must be " +
+			"epoch-consistent is what decides where the data is and who must be drained -- a " +
+			"query sent to a node that should not have it costs one UNAVAILABLE and a retry. " +
+			"Decided (2026-10-19), how a client learns that its list changed: it reads the list " +
+			"every 500 ms, and at once when an entry refuses a query under a newer epoch than " +
+			"the list's (a refusal carries the entry's epoch). That entry has left the entry " +
+			"set, so the retry goes to the entries of that epoch, and the queries that find the " +
+			"list stale together share one read. A refusal under the list's epoch or an earlier " +
+			"one -- paused admission, an entry that has not installed the epoch yet -- reads " +
+			"nothing: a fresh list would be the same. Wherever the list lives, it needs a " +
+			"version for this. Decided (2026-10-20, for now): the entry set stays in the epoch " +
+			"table, and the rescale returns once every new node is an entry. Moving the list out " +
+			"would not let a node work earlier: a new node owns its partitions and aggregates " +
+			"from the data flip on, its graph arriving apart from its lists and PQ codes, at " +
+			"background priority (U16), and it takes client queries once the graph is there -- " +
+			"its lists and PQ codes have been there since the flip. What it would change is when " +
+			"the rescale counts as done and how many flips a scale-out takes; the reply records " +
+			"the data flip and each entry flip apart (phases, entry_flips), so an experiment can " +
+			"report both. No code path for the list outside the epoch",
 		"internal/epoch/table.go (Table.Entries), internal/agent/serve.go (entry), " +
-			"internal/controller/reconfig.go (promoteEntries), cmd/rtier-loadgen/main.go (entries.catchUp)"},
+			"internal/controller/reconfig.go (promoteEntries), cmd/rtier-loadgen/main.go " +
+			"(entries.catchUp)"},
 	"U15": {"U15", "The host copy of the PQ codes next to the GPU's",
 		"with the GPU backend a node holds every code twice: PQStore keeps the authoritative " +
 			"copy in host memory (capacity x m) and the filter a second one in device memory, " +

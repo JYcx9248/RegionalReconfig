@@ -242,9 +242,10 @@ func (a *Aggregator) Run(ctx context.Context, e uint64, req *Request, groups []G
 	cands, err := a.Strategy.Execute(ctx, &Env{Epoch: e, Nodes: a.Nodes}, req, groups)
 	if nodeclient.IsNotResident(err) {
 		// With a correct grace period this cannot happen: owners keep partitions until every
-		// query pinned to an older epoch finished. What to do when it does anyway (a node
-		// restarted, a bug) is U7.
-		err = fmt.Errorf("%w (%v)", design.Undecided("U7", "sub-query reached a node that no longer holds the partition"), err)
+		// query pinned to an older epoch finished, and this node pinned e when it read the
+		// forward. It takes a failure -- a forward that outlived the entry's timeout, a node
+		// that restarted -- which this work does not handle (U7, U13): the query fails.
+		err = fmt.Errorf("query: a sub-query of epoch %d reached a node that no longer holds its partition: %w", e, err)
 	}
 	return Result{Epoch: e, Candidates: cands}, err
 }

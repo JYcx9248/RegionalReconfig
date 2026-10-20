@@ -9,12 +9,14 @@ load (run_local.py is the single-machine case):
      (Koala's cleanUp before a run)
   2. build the index, the ground truth and the partitions on this machine, the root
      (run_local.py's stages)
-  3. copy what the nodes read to every host, at this machine's paths (Koala's syncRepo):
-     rtier_node and rtier-agent, the index, the partitions, each rebuild's next generation. The
-     index's page file goes only where a node of the initial deployment runs: nothing but the
-     bootstrap reads it, and the other nodes get raw vectors from their peers. A next
-     generation goes without it too. A host that sees a directory at its path already (this
-     machine, a shared file system) gets no copy of it.
+  3. copy what the nodes open to every host, at this machine's paths (Koala's syncRepo):
+     rtier_node and rtier-agent; the index's meta, PQ codebook and PQ codes, and the
+     partitions' manifest; where a node of the initial deployment runs, also the index's page
+     file, its graph and the segments, which only the initial deployment reads -- the nodes
+     that join later get them from their peers; of each rebuild's next generation, its meta,
+     codebook, PQ codes, graph and manifest. The rest of an index is the build's own
+     (postings, centroids, layout maps). A host that sees a directory at its path already
+     (this machine, a shared file system) gets no copy of it.
   4. start the controller here, then each node in order over SSH -- its rtier_node, then its
      agent -- and wait for the agent's registration before the next: nodes n1, n2, ... get IDs
      1, 2, ..., and the first cluster.initial_nodes form the deployment (Koala starts its
@@ -121,17 +123,16 @@ class Host:
             raise RuntimeError(f"{what} failed ({r.returncode}): {r.stderr.strip()[-2000:]}")
         return r.stdout
 
-    def rsync(self, src: str, dst_dir: str, logf, exclude=(), delete=False) -> None:
-        """src (a file, or a directory's contents with a trailing /) into dst_dir on the host."""
+    def rsync(self, srcs: list, dst_dir: str, logf) -> None:
+        """Files srcs into dst_dir on the host."""
         # --copy-links: an index may link its files from elsewhere (its page file, say).
         cmd = ["rsync", "-a", "--copy-links", "--partial", "-e", " ".join(shlex.quote(a) for a in self.ssh_cmd)]
-        cmd += (["--delete"] if delete else []) + [f"--exclude={e}" for e in exclude]
-        cmd += [src, f"{self.dest}:{dst_dir.rstrip('/')}/"]
+        cmd += list(srcs) + [f"{self.dest}:{dst_dir.rstrip('/')}/"]
         logf.write("$ " + " ".join(cmd) + "\n")
         logf.flush()
         r = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT)
         if r.returncode != 0:
-            raise RuntimeError(f"rsync {src} to {self.dest} failed ({r.returncode}, see {logf.name})")
+            raise RuntimeError(f"rsync to {self.dest}:{dst_dir} failed ({r.returncode}, see {logf.name})")
 
 
 def hosts_of(cfg: dict) -> list:
@@ -335,16 +336,47 @@ def check_gpus(hosts: list, visible: dict, tables: dict, ebin: str) -> None:
 
 # ------------------------------------------------------------------- 3. copies
 
-def sync(hosts: list, initial: int, files: list, index: str, dirs: list, out_dir: str) -> None:
-    """Step 3: the copies, at the same paths, to every host in parallel. A directory a host already
-    sees at that path -- this machine itself, under any name, or a file system it shares -- is
-    left alone: a marker file put in it here shows there (Koala's syncRepo skips the local
-    machine by its addresses). rsync copies what changed only, so a host keeps the index from one
-    run to the next. The index's page file goes only where a node of the initial deployment runs
-    (it bootstraps from it)."""
+# What every node opens, wherever it runs: rtier_node checks the PQ codes at startup, though only
+# the bootstrap reads them.
+NODE_INDEX = ("meta.txt", "pq_codebook.bin", "pq_codes.bin")
+NODE_PARTS = ("manifest.txt", "list_part.bin")
+
+
+def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool) -> list:
+    """(directory, its files) for the nodes of one host. Every node opens the index's meta, PQ
+    codebook and PQ codes and the partitions' manifest. A node of the initial deployment also
+    reads the page file (its bootstrap), its segments and the graph (staged from the build
+    output): all the segments go, since the initial placement is the controller's. A node that
+    joins later gets these from its peers. Of each rebuild's next generation (gens: index and
+    partition directories), the meta, codebook, PQ codes, graph and manifest: every node in the
+    cluster at the rebuild switches to it, and its segments, with their holders, come from the
+    controller. The rest of an index (postings, centroids, heads, layout maps) is the build's
+    own. graph: rtier_node --graph index, every node loading the graph at startup."""
+    man = rl.read_kv(os.path.join(parts, "manifest.txt"))
+    idx, seg = list(NODE_INDEX), list(NODE_PARTS)
+    if bootstrap or graph:
+        idx.append("graph.hnsw")
+    if bootstrap:
+        idx.append(f"vectors_{man['layout']}.bin")
+        seg += [f"part-{p:05d}.seg" for p in range(int(man["num_partitions"]))]
+    out = [(index, idx), (parts, seg)]
+    for gi, gp in gens:
+        out += [(gi, list(NODE_INDEX) + ["graph.hnsw"]), (gp, list(NODE_PARTS))]
+    return out
+
+
+def sync(hosts: list, initial: int, binaries: list, index: str, parts: str, gens: list, graph: bool,
+         out_dir: str) -> None:
+    """Step 3: the copies, at the same paths, to every host in parallel: the binaries and what its
+    nodes open (node_files). A directory a host already sees at that path -- this machine itself,
+    under any name, or a file system it shares -- is left alone: a marker file put in it here
+    shows there (Koala's syncRepo skips the local machine by its addresses). rsync copies what
+    changed only, so a host keeps the index from one run to the next."""
     bootstrap = set(hosts[:initial])
     distinct = list(dict.fromkeys(hosts))
-    srcs = list(dict.fromkeys([os.path.dirname(f) for f in files] + [index] + dirs))
+    plans = {h: [(os.path.dirname(f), [os.path.basename(f)]) for f in binaries] +
+             node_files(index, parts, gens, h in bootstrap, graph) for h in distinct}
+    srcs = list(dict.fromkeys(d for plan in plans.values() for d, _ in plan))
     marker = f".rtier-same-{os.urandom(8).hex()}"
     marked = []
     for d in srcs:
@@ -364,18 +396,15 @@ def sync(hosts: list, initial: int, files: list, index: str, dirs: list, out_dir
         for d in marked:
             os.remove(os.path.join(d, marker))
 
+    def todo(h: Host) -> list:
+        return [[os.path.join(d, n) for n in names] for d, names in plans[h] if d not in same[h]]
+
     def copy(h: Host) -> None:
         with open(os.path.join(out_dir, f"sync-{h.ssh}.log"), "w") as logf:
-            for f in files:
-                if os.path.dirname(f) not in same[h]:
-                    h.rsync(f, os.path.dirname(f), logf)
-            if index not in same[h]:
-                h.rsync(index + "/", index, logf, exclude=() if h in bootstrap else ("vectors_*",), delete=True)
-            for d in dirs:
-                if d not in same[h]:
-                    h.rsync(d + "/", d, logf, exclude=("vectors_*",), delete=True)
+            for files in todo(h):
+                h.rsync(files, os.path.dirname(files[0]), logf)
 
-    far = [h for h in distinct if not set(srcs) <= same[h]]
+    far = [h for h in distinct if todo(h)]
     for h in distinct:
         if h not in far:
             log(f"{h.dest} has this machine's files already: nothing copied")
@@ -384,7 +413,12 @@ def sync(hosts: list, initial: int, files: list, index: str, dirs: list, out_dir
     missing = [h.dest for h in far if not h.rsync_ok]
     if missing:
         sys.exit(f"no rsync on {', '.join(missing)}: install it there")
-    log(f"copying the binaries, the index and the partitions to {', '.join(h.dest for h in far)}")
+    lost = sorted({f for h in far for files in todo(h) for f in files if not os.path.isfile(f)})
+    if lost:
+        sys.exit("the nodes open files this machine does not have: " + ", ".join(lost))
+    size = {h: sum(os.path.getsize(f) for files in todo(h) for f in files) for h in far}
+    log("copying the binaries, the index and the partitions: " +
+        ", ".join(f"{size[h] / 2**30:.2f} GiB to {h.dest}" for h in far))
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(far))) as ex:
         for f in [ex.submit(copy, h) for h in far]:
@@ -472,24 +506,26 @@ def main(cfg_path: str, out_dir: str) -> None:
     root = root_addr(cfg, hosts)
     index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
     parts = os.path.join(work, "partitions")
-    gens = [d for rc in reconfigs if rc.get("rebuild")
-            for d in (rc["request"]["source"]["index_dir"], rc["request"]["source"]["parts_dir"])]
-    for d in gens:
+    gens = [(rc["request"]["source"]["index_dir"], rc["request"]["source"]["parts_dir"])
+            for rc in reconfigs if rc.get("rebuild")]
+    gen_dirs = [d for g in gens for d in g]
+    for d in gen_dirs:
         if not os.path.isdir(d):
             sys.exit(f"reconfigurations: rebuild directory {d} does not exist")
     rl.record(ecfg, cfg, cfg_path, out_dir)
 
     # 1. hosts, before the stages: a build can take hours
     log(f"{nodes} nodes on {len(set(hosts))} hosts, the controller and the load here ({root})")
-    tables = preflight(hosts, nodes, [work, index, parts, gbin, ebin] + gens, work, ebin, cfg)
+    tables = preflight(hosts, nodes, [work, index, parts, gbin, ebin] + gen_dirs, work, ebin, cfg)
     visible = rl.node_gpus(cfg, nodes, lambda i: tables.get(hosts[i - 1], []))
     check_gpus(hosts, visible, tables, ebin)
 
     # 2. index, ground truth, partitions; 3. copies
     index, gt, parts = rl.stages(ecfg, cfg)
-    sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")],
-         index, [parts] + gens, out_dir)
     node_args = rl.node_args_of(cfg, index, parts)
+    graph = any(a == "--graph" and b == "index" for a, b in zip(node_args, node_args[1:]))
+    sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")],
+         index, parts, gens, graph, out_dir)
 
     ctl_addr = cfg.get("ControllerAddr", f"{root}:7100")
     api_addr = cfg.get("APIAddr", f"{root}:7101")

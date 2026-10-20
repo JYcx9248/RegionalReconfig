@@ -7,11 +7,12 @@ C++ data nodes built on the FusionANNS reimplementation.
 **Status:** skeleton. The settled parts of the design are implemented and covered by tests.
 Open design questions (U1–U17, without U4) are placeholders: on a code path they fail with
 `design decision pending [Un ...]`; the few without a code path yet (U12, U15, and U17's
-list outside the epoch) are recorded in the registry with what the code does meanwhile. U4 (replicas of hot partitions) is
-out of scope: rtier keeps one owner per partition and handles skew by placement -- a plan
-reassigns partitions, at the same node count if need be (U3). Serverless-style read capacity, how
-streaming systems serve a hot key, would not relieve a disk-bound hot spot: its data is on its
-owner's SSD. List them with `bin/rtier-client design` (source: `internal/design/design.go`).
+list outside the epoch) are recorded in the registry with what the code does meanwhile. U4
+(replicas of hot partitions) is out of scope: rtier keeps one owner per partition and handles
+skew by placement -- a plan reassigns partitions, at the same node count if need be (U3).
+Serverless-style read capacity, how streaming systems serve a hot key, would not relieve a
+disk-bound hot spot: its data is on its owner's SSD. List them with `bin/rtier-client design`
+(source: `internal/design/design.go`).
 
 **PQ codes (decided part of U1):** node-level. A data node keeps one PQ code per vector named by
 its resident posting lists, however many lists or partitions name it. When partitions move, the
@@ -44,9 +45,11 @@ two lists names the same offset, so dedup is free, and the transfer unit is a si
 tails share pages). Only the initial deployment reads the index's page file; the end-to-end tests
 run every node that joins later on a copy of the index without it. Old owners keep the vectors of
 partitions that moved away, like PQ codes. Raw vectors need no versions under updates: vectors are
-immutable, and IDs and locations are only appended. Still open: tail-page space amplification, a
-disk budget (the pages of deleted vectors are not freed either), and where RAG chunks live. Partition directories written before
-locations existed (payload `lists-only`) are refused: rerun `rtier_segment`.
+immutable, and IDs and locations are only appended. Decided for now: raw vectors are kept in full
+-- no disk budget, no eviction, and deleted vectors' pages stay -- since disk is cheap, and the
+tail pages' space amplification is accepted with it. Still open: where RAG chunks live (U12).
+Partition directories written before locations existed (payload `lists-only`) are refused: rerun
+`rtier_segment`.
 
 **Raw vectors after a migration (decided part of U9):** a new owner goes online with posting
 lists and PQ codes only -- all it needs to filter -- and gets a raw vector only when a query first
@@ -65,7 +68,11 @@ ran, and each node reports `raw.fetched` (installed or still in memory), `raw.pe
 its partitions, not needed so far) and `raw.present` in its metrics. A scale-in does stream:
 before it returns, each remaining node takes over the vectors that its postings say only a
 leaving node holds (the drain; `drain_vectors` and `drain_seconds` in the reply), so the nodes
-that leave can go offline -- lazy fetches as little as possible, it does not forbid fetching.
+that leave can go offline. That is the only time vectors move beyond what queries ask for: a
+fetch brings the query's missing vectors and nothing more -- no page or list read ahead (decided
+2026-10-20) -- with one request per holder, every holder at once. A new node takes partitions
+from several donors, chosen by the partition graph, so a query's misses often lie at several
+holders, and the RERANK waits for the slowest request, not for their sum.
 Holders stay valid because no node drops a raw vector it has held; a disk budget would need the
 same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
 (`StageRaw`; the rescale waits for it and reports `raw_vectors` / `raw_seconds`),
@@ -73,7 +80,9 @@ same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after t
 drain run data node to data node by default (`RAW_PULL`), unpaced like the queries' fetches;
 only through the agents (`raw_path: agent`, the default when the agents are paced) do they take a
 token-bucket class: `"raw_priority"` (background by default) after the flip and for the drain,
-data for the eager baselines' copy before the flip (U8).
+data for the eager baselines' copy before the flip. The pacing stays as it is, for now (U8): a
+fixed rate, not adapted to foreground latency, and no byte rate for the drain beyond what
+`cluster.raw` and the source's read budget allow.
 
 **Placement (decided part of U3):** `"placement": "even-reversible-graph"` (the default) keeps
 partition counts even and moves partitions only from existing to new nodes on scale-out -- each
@@ -95,7 +104,9 @@ each node's region only shrinks, and only bigger steps avoid that. That is the p
 data between old nodes, and it is accepted (a custom plan may move anything); whether the gap
 closes in larger clusters, as it must when the cluster size approaches the partition count, is to
 be measured. The initial placement stays contiguous ranges of partition IDs, which the spatial and
-GP generators (U2) number along their bisection: close to the best at power-of-two sizes.
+GP generators (U2) number along their bisection: close to the best at power-of-two sizes. A node
+removed by a scale-in is shut down, so the highest IDs leave (the latest joiners, whose partitions
+go home) and any idle node joins; a node coming back is not a case we handle.
 Koala's policy (`"even"`,
 kept as the baseline) is not reversible: after 4 -> 8 -> 4 none of the partitions that moved is
 home again. It has no reason to care, because its state changes with every input, so a copy left
@@ -115,10 +126,12 @@ are arriving, the controller flips every `"entry_flip_interval"` (1 s by default
 nodes that are ready, and adds the last ones at once when every pull has ended. These flips
 change only the entries, so they run alongside the grace period of the data flip. A node whose
 graph fails to load stays a data node and aggregator without holding up the others, and the
-rescale returns an error naming it. With `lazy` the graph is the only transfer in the background
-class. No node ever holds two copies of the graph: a major epoch patches it in place and a full
-rebuild moves the roles to spares (U14). How large the replica grows with the dataset is outside
-this work: an assumption, with smaller routing state as future work (U16).
+rescale returns an error naming it. The transfer stays eager: an entry without the whole graph
+serves no purpose, so no node takes the entry role before its graph has loaded. With `lazy` the
+graph is the only transfer in the background class. No node ever holds two copies of the graph:
+a major epoch patches it in place and a full rebuild moves the roles to spares (U14). How large
+the replica grows with the dataset is outside this work: an assumption, with smaller routing
+state as future work (U16).
 
 **Clients' entry lists (decided part of U17):** a client (`rtier-loadgen`) reads the entries
 from the controller's epoch table every 500 ms, and at once when an entry refuses a query under a
@@ -126,7 +139,10 @@ newer epoch than its list's. That entry has left the entry set (a scale-in, a fu
 the list is stale and the retry goes to the entries of that epoch; the queries that find it stale
 together share one read. A refusal carries the entry's epoch, so one under the list's own epoch
 -- paused admission under stop-and-copy, or an entry that has not installed the epoch yet --
-reads nothing and is retried after a pause. Where the list itself lives is the open part.
+reads nothing and is retried after a pause. The list stays in the epoch table, for now: a new
+node owns its partitions and aggregates from the data flip on, and only the entry role waits for
+its graph, so a list kept elsewhere would change when the rescale counts as done (once every new
+node is an entry), not when a node starts working.
 
 **Aggregator (decided part of U6):** the entry navigates first, then works out which nodes own
 the probed lists, and only then picks the aggregator among them (`"selector": "owner"`, the
@@ -137,6 +153,7 @@ sub-queries and pile aggregation onto the owners of hot partitions. `"local"` al
 the entry (the baseline). `"warmup"` hands the scatter/gather to a node that may aggregate but is
 not an entry yet -- during a scale-out, a new node whose navigation graph is still arriving.
 `rtier-overhead -owners` reports how often each case occurs for a dataset and partitioning.
+The aggregator is not outsourced beyond this (decided for now): `"owner"` stays the default.
 A query runs under one epoch, the one its entry pinned: a forwarded query carries that epoch and
 its lists grouped by owner, and the aggregator runs it as is -- it neither routes with nor checks
 an epoch of its own. It counts the work under the query's epoch (`Tracker.Pin`), so its own drain
@@ -145,6 +162,9 @@ back. Epochs are installed
 on the nodes in parallel, so this is what lets a joining node aggregate for an entry that
 installed the new epoch before it did, and a leaving node finish the queries it was handed just
 before the flip (`test/e2e/flip_race_test.go` holds an install or a query to reproduce both).
+A sub-query can meet a reclaimed partition only after a failure -- a forward still unread when
+the entry's client times out -- and then fails its query with an error: failures are out of
+scope (U7, U13).
 
 **Dataset updates (decided part of U14, first version):** updates come in batches, and each
 batch is a content epoch that reuses staging, flip, grace and reclaim. Vectors are immutable and
@@ -241,10 +261,10 @@ and a priority between the warm-up's fetches and the spares' (only the warm-up's
 
 Not there yet for updates: growing the ID and location spaces, a response to a batch over budget
 (it fails before anything is sent), reassigning the vectors of neighboring lists in a split
-(SPFresh's LIRE), a log to replay batches from, and freeing the pages of deleted vectors. `test/e2e/update_test.go`,
-`test/e2e/major_test.go` and `test/e2e/rebuild_test.go` check every answer against an oracle that
-applies the same decisions, across batches, a failed batch, a major epoch, a full rebuild and
-rescales.
+(SPFresh's LIRE), and a log to replay batches from. Deleted vectors' pages are kept (U1).
+`test/e2e/update_test.go`, `test/e2e/major_test.go` and `test/e2e/rebuild_test.go` check every
+answer against an oracle that applies the same decisions, across batches, a failed batch, a major
+epoch, a full rebuild and rescales.
 
 ## Layout
 
@@ -335,9 +355,10 @@ budget's `"reads"` in `stats-<node>.jsonl` counts reads). `scripts/run_one.sh` d
 run's own files from the page cache without root (`scripts/evict_cache.py`) and leaves
 `vm.swappiness` as it is.
 
-Queries run through the two-phase strategy (`cluster.strategy: two-phase`, the implemented half of
-U5): every owner filters for its own top-n, the aggregator merges the global top-n and re-ranks
-each candidate at the owner that reported it, which is exactly the single-node answer.
+Queries run through the two-phase strategy (`cluster.strategy: two-phase`, the decided answer to
+U5 for now, agreed with the PI): every owner filters for its own top-n, the aggregator merges the
+global top-n and re-ranks each candidate at the owner that reported it, which is exactly the
+single-node answer. A one-round-trip quota per owner, whose answer can differ, is not pursued.
 `test/e2e` checks that equality query by query while the cluster scales out and in, and that
 a vector new to a node arrives at most once: with `lazy` only when a query needs it, with the
 baselines all of them, streamed or fetched on demand.
@@ -375,9 +396,13 @@ hosts:
 This machine, the root, runs the stages, the controller and the load generator. It first checks
 every host over SSH: a login without a prompt, rsync, writable directories, and an engine build
 that its CPU and GPUs can run. A `-march=native` build from another CPU would die with SIGILL.
-Then it copies to each host, at this machine's paths, what its nodes read: `rtier_node`,
-`rtier-agent`, the index, the partitions and each rebuild's next generation. The index's page
-file goes only where a node of the initial deployment bootstraps from it. rsync sends only what
+Then it copies to each host, at this machine's paths, what its nodes open: `rtier_node` and
+`rtier-agent`; the index's meta, PQ codebook and PQ codes (`rtier_node` checks the codes at
+startup, though only the bootstrap reads them) and the partitions' manifest; where a node of the
+initial deployment runs, also the page file, the graph and the segments it stages from -- a node
+that joins later gets these from its peers; and of each rebuild's next generation, its meta,
+codebook, PQ codes, graph and manifest (its segments come from the controller). The rest of an
+index (postings, centroids, layout maps) is the build's own and stays here. rsync sends only what
 changed, and a directory a host already sees at its path (this machine, a shared file system) is
 not copied. The nodes start in order over SSH, each after the previous one registered, so `n1`,
 `n2`, ... get IDs 1, 2, .... A remote process stops when its SSH session closes, also when the
@@ -391,7 +416,10 @@ load generator -- and the hosts' clocks need no synchronization. `cluster.gpus` 
 node's own machine. `cluster.resources` and `cluster.emulation` emulate several machines on one
 and are refused, except `read_iops_per_node`; `run_local.py` refuses a configuration with
 `hosts`. To try the runner without an SSH server, `PATH=$PWD/scripts/testing/fake_ssh:$PATH`
-runs every "remote" command on this machine.
+runs every "remote" command on this machine. The hosts then share its files and nothing is
+copied; with `FAKE_SSH_PRIVATE` (directories, colon-separated) and `FAKE_SSH_ROOT`, each host
+sees a copy of its own at those paths (a mount namespace, root only), so the copies are made and
+the nodes run on them.
 
 ## The smallest experiment: one node, then two
 

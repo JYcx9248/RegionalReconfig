@@ -42,7 +42,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   merged, and every key is checked against its schema. `run_local.py` runs every node on one
   machine; `run_cluster.py` runs them on the hosts of a `hosts:` section, over SSH.
   `PATH=$PWD/scripts/testing/fake_ssh:$PATH` tries `run_cluster.py` on one machine without an
-  SSH server.
+  SSH server; with `FAKE_SSH_PRIVATE` (directories) and `FAKE_SSH_ROOT` each host sees its own
+  copy of them (a mount namespace, root only), so the copies are made and the nodes run on them.
 
 ## Layout
 
@@ -113,13 +114,16 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   through its PQ store. After a migration, RERANK fetches a missing vector when a query first
   needs it, and only then, from the holder that a posting of the query's lists on that node
   records: one hop, data node to data node (`RAW_GET`, `PeerPool`; nodes know each other by ID,
-  `SET_NODES`), and that posting then names the fetching node. Concurrent misses of one vector
-  wait for one fetch. Fetched vectors are re-ranked from memory (fetch cache) until a background
-  writer installs them with whole-page `O_DIRECT` writes (`WriterLoop`, `RawStore::PutPages`);
-  INFO never waits for it (`nodeclient.InfoSettled` does, for tests). A scale-in drains the
-  leaving nodes before it returns (`drainRaw`: each remaining node takes over the vectors only a
-  leaving node holds, `RAW_HELD_BY` then `RAW_PULL`), so they can go offline. No node drops a
-  raw vector it has held. Only bootstrap reads the index's page file.
+  `SET_NODES`), and that posting then names the fetching node. A fetch brings only what its
+  query needs, from every holder at once, no read-ahead: vectors move beyond that only in a
+  scale-in's drain (U9).
+  Concurrent misses of one vector wait for one fetch. Fetched vectors are re-ranked from memory
+  (fetch cache) until a background writer installs them with whole-page `O_DIRECT` writes
+  (`WriterLoop`, `RawStore::PutPages`); INFO never waits for it (`nodeclient.InfoSettled` does,
+  for tests). A scale-in drains the leaving nodes before it returns (`drainRaw`: each remaining
+  node takes over the vectors only a leaving node holds, `RAW_HELD_BY` then `RAW_PULL`), so they
+  can go offline. No node drops a raw vector it has held. Only bootstrap reads the index's page
+  file.
 - **Updates (U14)**: the update controller (`internal/update`, `rtier-updater`) takes the
   controller's lease and runs a batch as a content epoch: inserts routed by its own router
   (`ASSIGN`, the build's rule), PQ codes and raw vectors sent to the owners, the next version of
@@ -154,11 +158,13 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   the cgroup io controller is not delegated; `run_one.sh` evicts only the run's own files
   (`scripts/evict_cache.py`).
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
-  controller and the load generator; it checks every host, copies the binaries, the index (its
-  page file only where an initial node bootstraps), the partitions and any next generation with
-  rsync to the same paths, and starts the nodes in order over SSH, each after the previous one
-  registered. A remote process stops when its SSH session closes. `cluster.resources` (except
-  `read_iops_per_node`) and `cluster.emulation` are for one machine and are refused.
+  controller and the load generator; it checks every host, copies with rsync, to the same
+  paths, the binaries and what the host's nodes open (the index's meta, codebook and PQ codes and
+  the partitions' manifest; where an initial node runs, also the page file, the graph and the
+  segments; a next generation's meta, codebook, PQ codes, graph and manifest), and starts the
+  nodes in order over SSH, each after the previous one registered. A remote process stops when
+  its SSH session closes. `cluster.resources` (except `read_iops_per_node`) and
+  `cluster.emulation` are for one machine and are refused.
 
 ## Docs
 
@@ -190,11 +196,11 @@ Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current
    behavior, tests. Accepted (2026-10-16): the grace period waits for every old-epoch query, so
    a slow one holds it; a stale entry list costs one refusal, after which the client reads the
-   list (U17); lazy's fetches stay on the query path. Open edge (U7, a placeholder): an entry
-   whose client gave up releases its pin while its forward may still be on the way, and a
-   forward that reaches its aggregator after that node's drain returned meets a reclaimed
-   partition. Proposed, to be confirmed: reject it explicitly, or keep the entry's pin until the
-   forward has ended. Draft of the case analysis in `docs/handoff.md`, section 5.
+   list (U17); lazy's fetches stay on the query path. Closed (2026-10-20): a stale sub-query
+   (U7) needs a failure -- a client that gives up does not end the entry's pin (the agent serves
+   under its own lifetime), and an aggregator pins a forward as soon as it reads it -- so it is
+   out of scope with the failures (U13) and fails its query with a plain error. Draft of the
+   case analysis in `docs/handoff.md`, section 5.
 2. A real cluster: `run_cluster.py` has run only through `fake_ssh` on one machine. Then
    scaling curves on a multi-node GPU testbed.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
@@ -216,16 +222,21 @@ Next:
 7. Small code items: fill the whole connection pool during pre-connect and let entries
    pre-connect to aggregators; heap merge in `MergeTopK`; raw path (see `engine/README.md`,
    known limits): pulls (stream, drain) do not join the queries' fetches.
-8. Open design questions (the registry has them all):
-   - on the protocol: U7 (item 1); the entry list outside the epoch table (U17); rate adaptation
-     and whether to pace the drain (U8); placement by per-tier bytes, and which nodes leave or
-     join a rescale by node count (U3); the graph's transfer mode, eager or stream (U16);
-   - on updates (U14): the update interface (a log, LSNs, visibility; batch size and period are
-     set aside); a batch over budget (scale out first?); writes against queries during a
-     scale-out; freeing deleted vectors' pages; staged versions left by an expired lease;
-   - elsewhere: rerank policy (U5), aggregator outsourcing (U6), chunk storage (U12), a disk
-     budget for raw vectors (U1), the host copy of the PQ codes (U15), the number of partitions
-     (U2), the PQ compression level.
+8. Open design questions (the registry has them all). Decided on 2026-10-20: two-phase stays
+   (U5), no aggregator outsourcing (U6), raw vectors kept in full (U1), the graph transfer stays
+   eager (U16), nodes removed by a scale-in are shut down (U3), U7 closed with the failures, the
+   pacing stays as it is (U8), the entry list stays in the epoch table (U17). Still open:
+   - on the protocol: placement by per-tier bytes (U3);
+   - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
+     batch size and period are set aside); a batch over budget (scale out first?); writes
+     against queries during a scale-out; staged versions left by an expired lease;
+   - scale limits for billion-vector datasets, the target: single-frame replies (`PQ_MISSING`,
+     `RAW_MISSING`, graph patches; deferred until such a dataset is at hand), what
+     `run_cluster.py` still copies whole (the page file and every segment to each initial
+     node's host, the PQ codes to every host: `rtier_node` opens them at startup), per-node
+     structures sized by the dataset (`slot_of_`, the presence bitmap);
+   - elsewhere: chunk storage (U12, last), the host copy of the PQ codes (U15), the number of
+     partitions (U2), the PQ compression level.
 
 ## Working with the user
 

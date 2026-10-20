@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -1252,14 +1253,14 @@ bool SameRerank(const Fixture& f, uint32_t qi, NodeEngine* at, NodeEngine* ref,
 }
 
 // Raw vectors after a migration (U9): the new owner goes online without them, re-ranking fetches
-// the ones it needs from the old owner on demand -- through the source of the query's lists --
-// and only those; a stream (the lazy-stream baseline) can install the rest; the answers are the
-// old owner's throughout. The new nodes' index has no page file at all.
+// the ones it needs on demand -- from the holder a posting of the query's lists records, every
+// holder at once -- and only those; a stream (the lazy-stream baseline) can install the rest; the
+// answers are the old owner's throughout. The new nodes' index has no page file at all.
 void TestRawMigration() {
   Fixture& f = GetFixture();
   auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
   static const PartitionManifest man = PartitionManifest::Load(f.parts);
-  // Node IDs: src 1, dst 2, third 3, pulled 4, fourth 5, after 6, whole 7, slow 8.
+  // Node IDs: src 1, dst 2, third 3, pulled 4, fourth 5, after 6, whole 7, slow 8, src2 9, split 10.
   auto src = OpenNode(f, {0, 1, 2, 3}, true);
   src->SetNodes(1, {});
   const auto locs_all = Named(f, {0, 1, 2, 3}).second;
@@ -1453,6 +1454,50 @@ void TestRawMigration() {
   other.join();
   CHECK(ra == rb && da == db && slow->fetch_stats().coalesced > 0 &&
         src->raw_stats(true).served - served1 == slow->raw_stats(true).fetched);
+
+  // A query whose missing vectors lie at two holders fetches from both at once, one request
+  // each: `split` takes partition 2 from src and partition 3 from src2, as a new node takes
+  // partitions from several donors. Until one query has needed both, each fetch waits (up to
+  // 1 s) for one from the other holder to begin: they meet only if they run in parallel.
+  auto src2 = OpenNode(f, {2, 3}, false);
+  src2->SetNodes(9, {});
+  auto split = OpenNode(f, {}, false, f.index_nopages);
+  split->SetNodes(10, {{1, "node-1"}, {9, "node-9"}});
+  std::mutex mu;
+  std::condition_variable cv;
+  std::set<std::string> busy, asked;
+  bool probing = true, met = false;
+  split->SetRawFetcher([&](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+    {
+      std::unique_lock<std::mutex> l(mu);
+      asked.insert(peer);
+      busy.insert(peer);
+      cv.notify_all();
+      if (probing && cv.wait_for(l, std::chrono::seconds(1), [&] { return busy.size() > 1; })) met = true;
+    }
+    (peer == "node-1" ? src : src2)->RawGet(locs, n, out);
+    std::lock_guard<std::mutex> l(mu);
+    busy.erase(peer);
+  });
+  StageFrom(f, split.get(), src.get(), {2});
+  StageFrom(f, split.get(), src2.get(), {3});
+  same = true;
+  bool both = false;
+  for (uint32_t qi = 0; qi < f.nq; ++qi) {
+    {
+      std::lock_guard<std::mutex> l(mu);
+      asked.clear();
+    }
+    same = SameRerank(f, qi, split.get(), src.get(), {2, 3}) && same;
+    std::lock_guard<std::mutex> l(mu);
+    if (probing && asked.size() == 2) {
+      both = true;
+      probing = false;
+    }
+  }
+  // One request per holder: more requests than fetching calls.
+  const RawStats ss = split->raw_stats(true);
+  CHECK(same && both && met && ss.fetched > 0 && ss.fetches > split->fetch_stats().fetch_calls);
 }
 
 // Drops a file's pages from the page cache; false where that is not possible (tmpfs keeps a

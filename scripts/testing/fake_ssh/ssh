@@ -7,7 +7,14 @@
 #
 # ssh's options are skipped, the first other argument is the destination, and the rest, joined
 # with spaces as ssh joins them, is the command. Its input is this process's: closing it ends a
-# "session" as it ends a real one. Test-only.
+# "session" as it ends a real one.
+#
+# The hosts share this machine's files then, and run_cluster.py copies nothing. To give each host
+# a disk of its own, name the directories it must not share in FAKE_SSH_PRIVATE (absolute paths,
+# colon-separated) and a directory for the hosts' own in FAKE_SSH_ROOT: destination D then sees
+# FAKE_SSH_ROOT/D/<path> at each of those paths, bound there in a mount namespace of the
+# command's own (unshare; root only). The copies land there, and the nodes run on what was
+# copied. Test-only.
 while [ $# -gt 0 ]; do
   case "$1" in
     -[46AaCfGgKkMNnqsTtVvXxYy]*) shift ;;  # flags
@@ -17,5 +24,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ $# -gt 0 ] || { echo "fake ssh: no destination" >&2; exit 255; }
+dest=$1
 shift
-exec sh -c "$*"
+[ -n "$FAKE_SSH_PRIVATE" ] || exec sh -c "$*"
+[ -n "$FAKE_SSH_ROOT" ] || { echo "fake ssh: FAKE_SSH_PRIVATE without FAKE_SSH_ROOT" >&2; exit 255; }
+exec unshare --mount --propagation private sh -c '
+  own=$1/$2
+  shift 2
+  IFS=:
+  for p in $FAKE_SSH_PRIVATE; do
+    mkdir -p "$own$p" "$p" && mount --bind "$own$p" "$p" || exit 255
+  done
+  unset IFS
+  exec sh -c "$*"' fake-ssh "$FAKE_SSH_ROOT" "$dest" "$@"

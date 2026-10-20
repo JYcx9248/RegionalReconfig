@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -1952,17 +1953,49 @@ class NodeEngineImpl : public NodeEngine {
                                       "location %u, %s)", unknown, first,
                                       listed ? "its posting records no holder" : "no list of the query names it"));
     if (!arrived.empty()) settle(arrived, true);
-    size_t fetched = 0;
-    std::vector<uint8_t> buf;
-    for (const auto& kv : by) {
-      std::vector<uint32_t> ls;
-      for (size_t i : kv.second) ls.push_back(miss[i]);  // ascending, as miss
-      FetchFrom(kv.first, ls, &buf);
-      raw_->CountFetch();
-      fetched += Cache(ls.data(), ls.size(), buf.data());
-      for (size_t i : kv.second) via[i].seg->SetHolder(via[i].j, kSelfHolder);
-      settle(ls, true);
+    // The holders at once, one request each: a node that took partitions from several donors
+    // (the graph placement picks them by the partition graph, not as contiguous ranges) meets a
+    // query's misses at several holders, and the RERANK, which holds an engine worker, then
+    // waits for the slowest fetch instead of their sum. Every fetch ends before this call does
+    // -- they use its state -- and a failed one's claims are unclaimed as before.
+    const std::vector<std::pair<uint16_t, std::vector<size_t>>> jobs(by.begin(), by.end());
+    std::vector<size_t> got(jobs.size(), 0);
+    std::vector<std::exception_ptr> failed(jobs.size());
+    auto run = [&](size_t k) {
+      try {
+        std::vector<uint32_t> ls;
+        for (size_t i : jobs[k].second) ls.push_back(miss[i]);  // ascending, as miss
+        std::vector<uint8_t> buf;
+        FetchFrom(jobs[k].first, ls, &buf);
+        raw_->CountFetch();
+        got[k] = Cache(ls.data(), ls.size(), buf.data());
+        for (size_t i : jobs[k].second) via[i].seg->SetHolder(via[i].j, kSelfHolder);
+        settle(ls, true);
+      } catch (...) {
+        failed[k] = std::current_exception();
+      }
+    };
+    {
+      std::vector<std::thread> others;
+      struct Join {
+        std::vector<std::thread>& ts;
+        ~Join() {
+          for (auto& th : ts) th.join();
+        }
+      } join{others};
+      for (size_t k = 1; k < jobs.size(); ++k) {
+        try {
+          others.emplace_back(run, k);
+        } catch (...) {
+          run(k);  // no thread to be had: this one waits its turn
+        }
+      }
+      if (!jobs.empty()) run(0);
     }
+    for (const auto& e : failed)
+      if (e) std::rethrow_exception(e);
+    size_t fetched = 0;
+    for (size_t g : got) fetched += g;
     if (!waits.empty()) {
       std::unique_lock<std::mutex> l(cache_mu_);
       inflight_cv_.wait(l, [&] {
