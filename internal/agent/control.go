@@ -232,14 +232,15 @@ func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, 
 // maxPQRounds bounds how often stagePQAndLoad lists and pulls missing codes again.
 const maxPQRounds = 3
 
-// A raw-vector stream (StageRaw: copy-then-flip's copy, lazy-stream's stream) splits each
-// source's sorted locations into raw_streams contiguous ranges pulled concurrently, each with
-// one request of about raw_batch_bytes in flight. On the lab server (4 KB vectors, 2 sources,
+// A raw-vector stream (StageRaw: copy-then-flip's copy, lazy-stream's stream; DrainRaw's pulls
+// too) splits each source's sorted locations into raw_streams contiguous ranges pulled
+// concurrently, each with one request of about raw_batch_bytes in flight. On the lab server (4 KB vectors, 2 sources,
 // light load) the agent path moved 148 MB/s with one 64 KB request per source -- the stream as it
 // was, ~3.3 ms a request whatever reads the sources had to spare -- 162 with one 1 MiB request,
 // 272 with two and 406 with four. On BIGANN's 128-byte vectors locally more than one did not
 // help: there the installs here bound the stream (RawStore::Put holds one lock, and buffered
-// writes to one file take its inode lock).
+// writes to one file take its inode lock). raw_streams stays 2 by default (config.DefaultAgent;
+// decided 2026-10-20), and so does the fallback below for a setting of 0.
 //
 // By default the stream runs data node to data node (raw_path "node"): this node's data node
 // pulls each batch from the holders its postings record, with RAW_GET as RERANK fetches. Through the
@@ -249,7 +250,7 @@ const maxPQRounds = 3
 // is paced by the token bucket, so a paced agent (transfer_rate_bytes_per_sec) keeps its streams
 // there unless raw_path says otherwise.
 const (
-	defaultRawStreams    = 4
+	defaultRawStreams    = 2
 	defaultRawBatchBytes = 1 << 20
 )
 
