@@ -185,13 +185,22 @@ Known limits of the raw-vector path:
   same vector. With the lazy protocol this lasts for as
   long as queries meet vectors that have not moved. Pulls (stream, drain) do not join the
   queries' fetches: a vector both need at once comes twice.
-- A peer's `RAW_GET` reads its vectors one buffered `pread` per run, one after another. Reading
-  the pages with `O_DIRECT` all at once instead (tried 2026-09-30; patch kept outside the repo)
-  made things worse on BIGANN-10M, 2 -> 3: the old owners are at their read-IOPS cap during a
-  scale-out, so their reads queue in the cgroup throttle whatever the queue depth, and `O_DIRECT`
-  loses the page-cache hits and the readahead the buffered reads got -- copy-then-flip's stream
-  took 45 s instead of 31 s, lazy's backlog peaked at 3.8K instead of 2.9K. Concurrent buffered
-  reads (keeping the cache) are untried.
+- A peer's `RAW_GET` puts its device reads in flight together (2026-10-20): a read-ahead hint
+  (`POSIX_FADV_WILLNEED`) for each page the cache lacks, then the buffered reads, at most 256 per
+  request at a time. 200 vectors on random uncached pages take about 3 ms, against 29-38 ms read
+  one after another (this laptop's disk, with and without a read budget). What this changes end
+  to end is not measured yet. The reads stay buffered on purpose: reading the pages with
+  `O_DIRECT` all at once instead (tried 2026-09-30; patch kept outside the repo) made things worse
+  on BIGANN-10M, 2 -> 3. The old owners were at their read-IOPS cap during the scale-out, so their
+  reads queued in the cgroup throttle whatever the queue depth, and `O_DIRECT` lost the page-cache
+  hits and the readahead the buffered reads got: copy-then-flip's stream took 45 s instead of
+  31 s, and lazy's backlog peaked at 3.8K instead of 2.9K. A holder at its read cap gains less
+  from reads in flight together, since they add no reads per second.
+- The read budget charges only the reads a probe finds missing from the page cache, so the
+  kernel's read-ahead reads past it uncharged. Scattered vectors get none, since the kernel reads
+  random accesses as asked, but sorted, dense batches do -- a stream's -- so a stream can read
+  somewhat more than its budget. How much depends on the device's `read_ahead_kb` (8 MB on this
+  laptop's virtual disk).
 - Installing a vector on a page that already holds vectors reads that page back first (list
   tails share pages, and the slots of other vectors must be written back unchanged): one read per
   such page, from the node's own read IOPS. The writer's rounds let the vectors of one page that

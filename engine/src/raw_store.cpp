@@ -50,6 +50,10 @@ bool PreadCached(int fd, uint8_t* p, size_t n, uint64_t off) {
   return ::preadv2(fd, &iov, 1, static_cast<off_t>(off), RWF_NOWAIT) == static_cast<ssize_t>(n);
 }
 
+// Device reads one Get keeps in flight: enough for a query's misses at one holder (at most its N
+// candidates) to go out together, and a bound on what one stream batch puts on the device.
+constexpr size_t kReadsInFlight = 256;
+
 // Visits the entries of order (indices into locs, sorted by location) in runs of consecutive
 // locations on one page -- contiguous bytes in the file: fn(first, count) with positions into
 // order.
@@ -348,22 +352,44 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
   std::vector<size_t> order(n);
   std::iota(order.begin(), order.end(), size_t{0});
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return locs[a] < locs[b]; });
-  std::vector<uint8_t> run;
   // Repeated locations share a run position: read each distinct location once.
   std::vector<size_t> uniq;
   uniq.reserve(n);
   for (size_t i : order)
     if (uniq.empty() || locs[uniq.back()] != locs[i]) uniq.push_back(i);
+  struct Run {
+    size_t first, count;  // positions into uniq
+    uint64_t off;
+    bool here;  // the page cache had it
+  };
+  std::vector<Run> runs;
   ForEachRun(uniq, locs, layout_, [&](size_t first_pos, size_t count) {
-    run.resize(count * vb);
-    const uint64_t off = layout_.offset(locs[uniq[first_pos]]);
-    if (!budget_ || !PreadCached(fd_, run.data(), run.size(), off)) {
-      if (budget_) budget_->Charge(1);  // a run lies on one page: one device read
-      PreadAll(fd_, run.data(), run.size(), off, path_);
-    }
-    for (size_t k = 0; k < count; ++k)
-      std::memcpy(out + uniq[first_pos + k] * vb, run.data() + k * vb, vb);
+    runs.push_back({first_pos, count, layout_.offset(locs[uniq[first_pos]]), false});
   });
+  std::vector<uint8_t> got(uniq.size() * vb);  // uniq position u at u * vb
+  // A request's device reads are in flight together: a read-ahead hint for every run the page
+  // cache lacks, then the reads, which find their pages arrived or arriving. Read one after
+  // another, each waited out the device's latency -- a peer's RAW_GET of 200 scattered vectors
+  // took 18-21 ms on BIGANN-20M -- while the device serves many reads at once. Buffered on
+  // purpose: reading with O_DIRECT lost the page-cache hits and the read-ahead (engine/README.md).
+  for (size_t w = 0; w < runs.size(); w += kReadsInFlight) {
+    const size_t end = std::min(runs.size(), w + kReadsInFlight);
+    for (size_t k = w; k < end; ++k) {
+      Run& r = runs[k];
+      if (budget_) {
+        if (PreadCached(fd_, got.data() + r.first * vb, r.count * vb, r.off)) {
+          r.here = true;
+          continue;
+        }
+        budget_->Charge(1);  // a run lies on one page: one device read
+      }
+      // Only a hint: if it fails, the read below waits out the device alone.
+      ::posix_fadvise(fd_, static_cast<off_t>(r.off), static_cast<off_t>(r.count * vb), POSIX_FADV_WILLNEED);
+    }
+    for (size_t k = w; k < end; ++k)
+      if (!runs[k].here) PreadAll(fd_, got.data() + runs[k].first * vb, runs[k].count * vb, runs[k].off, path_);
+  }
+  for (size_t u = 0; u < uniq.size(); ++u) std::memcpy(out + uniq[u] * vb, got.data() + u * vb, vb);
   for (size_t p = 0, u = 0; p < order.size(); ++p) {  // copies for the repeated ones
     if (locs[order[p]] != locs[uniq[u]]) ++u;
     if (order[p] != uniq[u]) std::memcpy(out + order[p] * vb, out + uniq[u] * vb, vb);

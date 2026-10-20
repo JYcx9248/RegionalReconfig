@@ -1573,6 +1573,46 @@ void TestReadBudget() {
     }
   }
   {
+    // A Get puts its reads in flight together, a window at a time: the vectors come back in the
+    // order asked for, repeats included, over more pages than one window holds, and a budget
+    // charges one read per page the cache lacks. The odd pages: the kernel reads ahead at the
+    // start of a file and after sequential reads, so no page asked for arrives before its read.
+    RawLayout L;
+    L.vec_bytes = 1000;
+    L.vectors_per_page = 4;
+    L.num_pages = 1000;
+    const std::string path = TempDir() + "/raw-many.pages";
+    RawStore s(path, L, true);
+    std::vector<uint32_t> all(L.locations());
+    std::vector<uint8_t> vecs(all.size() * L.vec_bytes);
+    for (uint32_t loc = 0; loc < all.size(); ++loc) {
+      all[loc] = loc;
+      for (uint32_t k = 0; k < L.vec_bytes; ++k) vecs[loc * L.vec_bytes + k] = static_cast<uint8_t>(loc * 31 + k * 7);
+    }
+    CHECK(s.Put(all.data(), all.size(), vecs.data(), RawOrigin::kStreamed) == all.size());
+    std::vector<uint32_t> ask;  // a vector on each of 500 pages, every tenth asked twice
+    for (uint32_t p = 0; p < 500; ++p) ask.push_back((2 * p + 1) * L.vectors_per_page + p % L.vectors_per_page);
+    for (size_t i = 0; i < 500; i += 10) ask.push_back(ask[i]);
+    std::shuffle(ask.begin(), ask.end(), std::mt19937(7));
+    auto right = [&](const std::vector<uint8_t>& out) {
+      for (size_t i = 0; i < ask.size(); ++i)
+        if (std::memcmp(&out[i * L.vec_bytes], &vecs[ask[i] * L.vec_bytes], L.vec_bytes) != 0) return false;
+      return true;
+    };
+    std::vector<uint8_t> out(ask.size() * L.vec_bytes);
+    s.Get(ask.data(), ask.size(), out.data());
+    CHECK(right(out));
+    ReadBudget b(1000000);
+    s.SetReadBudget(&b);
+    if (EvictFromCache(path)) {
+      std::fill(out.begin(), out.end(), 0);
+      s.Get(ask.data(), ask.size(), out.data());
+      CHECK(right(out) && b.Stats().charged == 500);
+    } else {
+      std::printf("    TMPDIR cannot drop cached pages: cache misses not checked\n");
+    }
+  }
+  {
     Fixture& f = GetFixture();
     auto ref = OpenNode(f, {0, 1, 2, 3}, true);
     auto node = OpenNode(f, {0, 1, 2, 3}, true, "", 2000);  // a burst of 200 reads
