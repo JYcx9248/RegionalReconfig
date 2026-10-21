@@ -18,7 +18,7 @@ Sections, in the order of the pipeline:
     hosts:      {nodes: [HOST, {ssh, addr}, ...], root, user, ssh_options}   # run_cluster.py only
     load:      {k, nprobe, n, arrivals, rate, rate_steps, users, user_steps, duration_seconds, ...}
     calibrate:  {rates, seconds_per_rate}
-    updates:    {headroom, pq_capacity, list_headroom, max_list_len}
+    updates:    {headroom, list_headroom, max_list_len}
     reconfigurations: [{at: 90, data_nodes: 4}, {at: 90, plan: P}, {at: 90, rebuild: {...}}]
 
 Paths are relative to the repository root, as run_local.py runs from there, except a plan file
@@ -69,6 +69,7 @@ SCHEMA = {
         "transfer_rate_bytes_per_sec": ("TransferRateBytesPerSec", None),
         "metrics_interval": ("MetricsInterval", None), "ready_timeout_seconds": ("ReadyTimeoutSeconds", None),
         "stage_timeout": ("StageTimeout", None), "node_conns": ("NodeConns", None),
+        "pq_capacity": ("PQCapacity", None), "pq_headroom": ("PQHeadroom", None),
         "controller_addr": ("ControllerAddr", None), "api_addr": ("APIAddr", None), "backend": ("Backend", None),
         "gpus": ("GPUs", None), "node_args": ("NodeArgs", None), "query_sample": ("QuerySample", None),
         "raw": (None, {"streams": ("RawStreams", None), "batch_bytes": ("RawBatchBytes", None),
@@ -89,7 +90,7 @@ SCHEMA = {
         "drain_seconds": ("DrainSeconds", None)}),
     "calibrate": ("Calibrate", {"rates": ("Rates", None), "seconds_per_rate": ("SecondsPerRate", None)}),
     "updates": ("Updates", {
-        "headroom": ("Headroom", None), "pq_capacity": ("PQCapacity", None),
+        "headroom": ("Headroom", None),
         "list_headroom": ("ListHeadroom", None), "max_list_len": ("MaxListLen", None)}),
     "reconfigurations": ("Reconfigurations", {
         "at": ("TriggerTimeSeconds", None), "data_nodes": ("DataNodes", None), "plan": ("Plan", "opaque"),

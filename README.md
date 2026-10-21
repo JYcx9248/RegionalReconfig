@@ -21,10 +21,13 @@ destination's data node lists the codes it lacks, split by source so each is fet
 (`PULL_PQ`); they are installed (`PQ_PUT`) before the partitions load, so a new node goes online
 only once it holds every posting list and PQ code of its partitions and can filter at once.
 Vectors are immutable (an update deletes and inserts under a new ID, U14), so the old owner keeps
-the codes of partitions that moved away as a cache;
-they are dropped only when a later staging needs the room, and a staging protects the codes it
-needs. `rtier_node --pq-capacity N` sets a node's budget (its HBM, in codes). In fact nothing is
-ever dropped: a scale-out only takes partitions away and a reversible scale-in only gives back
+the codes of partitions that moved away as a cache; they are dropped only when a later staging
+needs the room, and a staging protects the codes it needs. `rtier_node --pq-capacity N` sets a
+node's budget (its HBM, in codes); the runners size it from the partitions
+(`cluster.pq_capacity: auto`, the default: the most distinct vectors one node's partitions name
+at the smallest cluster size, plus `cluster.pq_headroom`, 10%; `bin/rtier-client pq-share`
+counts them). In fact nothing is ever dropped: a scale-out only takes partitions away and a
+reversible scale-in only gives back
 what it took, so a node's resident set stays what it held at the initial cluster size -- which
 is why the budget is dimensioned by the *smallest* cluster size, not the current one. The
 end-to-end tests assert it (no eviction); it stops holding if the cluster shrinks below its
@@ -465,12 +468,13 @@ MB move in milliseconds and nothing is visible around the flip. The small config
 
 What this measures is the protocol: answers stay exact, the flip is short, and throughput
 follows the load once the second node is online. It does not show why ownership is partitioned
-at all -- with one node, its PQ codes fit by construction. That needs a budget that binds:
-`configs/experiment.small-2to3.yaml` starts at two nodes with `--pq-capacity` below what one
-node would need for the whole dataset. Pick the number from a first run: each node reports
-`pq.codes_resident` in `metrics.jsonl`, and with the range-assignment placeholder a node holds
-far more than its share of the codes (boundary vectors are replicated into up to 8 lists), so a
-budget much below ~90% of all codes will fail the staging on purpose.
+at all -- with one node, its PQ codes fit by construction. That needs a budget that binds, which
+the runners give every node of a cluster that starts at two nodes or more (`cluster.pq_capacity:
+auto`, written to `pq-budget.json`): the fullest initial node's codes plus 10%, below what one
+node would need for the whole dataset. `configs/experiment.small-2to3.yaml` pins a number of its
+own instead. With the range-assignment placeholder a node holds far more than its share of the
+codes (boundary vectors are replicated into up to 8 lists): each of two nodes names 88% of the
+vectors of the 200K synthetic set, and a budget below that fails the staging on purpose.
 
 ## Mean latency over time, per protocol
 

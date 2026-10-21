@@ -56,7 +56,11 @@ var Open = map[string]Question{
 			"started -- which makes --pq-capacity a function of the SMALLEST cluster size, not " +
 			"the current one. That holds while the cluster never shrinks below its initial size, " +
 			"the nodes that leave are the ones that joined, and placement never hands a " +
-			"partition to a node that never held it. Inserts (U14) add to the resident set, so " +
+			"partition to a node that never held it. The runners size the budget so (2026-10-21, " +
+			"cluster.pq_capacity: auto): the most distinct vectors one node's partitions name at " +
+			"the smallest size a run takes the cluster to, or in a plan it goes to, plus 10%; a run " +
+			"with a rebuild, whose placement is made at run time, gets the whole ID space. " +
+			"Inserts (U14) add to the resident set, so " +
 			"with updates the budget needs their headroom too, and a full rebuild's placement or " +
 			"a custom plan may hand a node partitions it never held. Spilling evicted codes to " +
 			"local SSD (one sequential file per partition, read back instead of pulling from a " +

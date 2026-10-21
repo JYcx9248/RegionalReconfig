@@ -23,6 +23,12 @@
 //
 //	rtier-client query -entry ADDR -queries Q.u8bin [-gt GT.ibin] [-k 10 -nprobe 64 -n 200]
 //	rtier-client search-local -node ADDR -queries Q.u8bin [...]   # single-node baseline
+//	rtier-client pq-share -partitions DIR -nodes K [-placement P] | -plan FILE
+//
+// pq-share needs no controller: it reads the partitions and prints, for each data node of the
+// first epoch the placement policy gives K nodes (as the controller deploys them: IDs 1..K), or
+// of a plan, how many distinct vectors its partitions name -- the PQ codes the node keeps
+// resident (U1). The experiment runners size --pq-capacity from it.
 package main
 
 import (
@@ -37,9 +43,12 @@ import (
 	"strings"
 	"time"
 
+	"rtier/internal/config"
 	"rtier/internal/ctrl"
 	"rtier/internal/design"
 	"rtier/internal/nodeclient"
+	"rtier/internal/partitioning"
+	"rtier/internal/placement"
 	"rtier/internal/protocol"
 	"rtier/internal/query"
 	"rtier/internal/vecio"
@@ -48,7 +57,7 @@ import (
 func main() {
 	api := flag.String("api", "127.0.0.1:7101", "controller API address")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ...")
+		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ...")
 	}
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -127,6 +136,21 @@ func main() {
 		}
 	case "query", "search-local":
 		runQueries(ctx, cmd, args)
+	case "pq-share":
+		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		parts := fs.String("partitions", "", "rtier_segment's output")
+		nodes := fs.Int("nodes", 0, "data nodes of the first epoch")
+		policy := fs.String("placement", config.DefaultController().Placement, "the controller's placement policy")
+		planPath := fs.String("plan", "", "a plan file instead: the partitions it gives each node")
+		fs.Parse(args)
+		if *parts == "" || (*nodes > 0) == (*planPath != "") {
+			log.Fatal("usage: pq-share -partitions DIR -nodes K [-placement P] | -plan FILE")
+		}
+		share, err := pqShare(*parts, *nodes, *policy, *planPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		printJSON(share)
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -145,6 +169,51 @@ func call(ctx context.Context, addr, method string, req, resp any, timeout time.
 	if err := c.Call(ctx, method, req, resp); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// pqShare is what pq-share prints: per node, the distinct vectors its partitions name.
+func pqShare(parts string, nodes int, policy, planPath string) (map[string]any, error) {
+	m, err := partitioning.LoadManifest(parts)
+	if err != nil {
+		return nil, err
+	}
+	owned := map[string][]int{}
+	if planPath != "" {
+		p, err := readPlan(planPath)
+		if err != nil {
+			return nil, err
+		}
+		for node, ps := range p.Owners {
+			owned[node] = ps
+		}
+	} else {
+		pol, err := placement.NewPolicy(policy, func() (placement.Adjacency, error) {
+			return nil, fmt.Errorf("the initial placement needs no partition graph")
+		})
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]placement.NodeID, nodes)
+		for i := range ids {
+			ids[i] = placement.NodeID(i + 1)
+		}
+		t, err := pol.Initial(m.NumPartitions, ids)
+		if err != nil {
+			return nil, err
+		}
+		for p, n := range t.Owners {
+			owned[strconv.Itoa(int(n))] = append(owned[strconv.Itoa(int(n))], p)
+		}
+	}
+	vectors, most := map[string]int{}, 0
+	for node, ps := range owned {
+		n, err := partitioning.DistinctIDs(parts, ps)
+		if err != nil {
+			return nil, err
+		}
+		vectors[node], most = n, max(most, n)
+	}
+	return map[string]any{"partitions": m.NumPartitions, "vectors": vectors, "max": most}, nil
 }
 
 func printJSON(v any) {

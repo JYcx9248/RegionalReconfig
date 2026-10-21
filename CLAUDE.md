@@ -51,7 +51,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | Path | What |
 |---|---|
 | `cmd/rtier-controller`, `cmd/rtier-agent` | control plane; per-node agent next to `rtier_node` |
-| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list; open-loop or closed-loop load |
+| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline); open-loop or closed-loop load |
 | `cmd/rtier-updater` | the update controller's command: one batch of inserts and deletes, or a major epoch (U14) |
 | `cmd/rtier-overhead` | fan-out cost analysis: one data node emulates N owners (`-owners`, `-compare`) |
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
@@ -109,7 +109,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   `raw_path: agent` (then at `raw_priority`, U8).
 - **PQ codes** are stored per node, once per vector, with a cache of codes of partitions that
   moved away (`engine/include/fusion/pq_store.h`); placement `even-reversible-graph` (the
-  default) returns partitions to former owners so a scale-in moves no PQ code.
+  default) returns partitions to former owners so a scale-in moves no PQ code. The runners give
+  every node a budget (`--pq-capacity`) of the fullest node's codes at the smallest cluster size,
+  plus 10% (`cluster.pq_capacity: auto`, `rtier-client pq-share`; a run with a rebuild gets the
+  whole ID space).
 - **Raw vectors**: every posting carries its vector's canonical location in the index's page
   file and the node that holds it (segment v3); a node keeps a sparse local copy of that file
   with a presence bit per location (`engine/include/fusion/raw_store.h`) and looks locations up
@@ -199,7 +202,8 @@ Done since late September:
   connection threads and read-budget charges; pre-connect in parallel; every long step under
   `stage_timeout`; a run cut short keeps its latency.csv and reconfigurations.json; plot_run
   counts answers when they came; ground truth for a stride of the queries; the graph's strict
-  yield to data (U16, for now); RERANK's own connection slots.
+  yield to data (U16, for now); RERANK's own connection slots; each node's PQ budget sized from
+  the partitions (`cluster.pq_capacity: auto`).
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current
@@ -214,7 +218,7 @@ Next:
    scaling curves on a multi-node GPU testbed.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
-   baseline, or `--pq-capacity` for a smaller HBM, to argue for partitioning.
+   baseline to argue for partitioning (each node's PQ budget is now its share by default).
 4. Full rebuild and updates, measured: affinity against random placement, warm-up on and off,
    stop-the-world; updates from the difference of two Wikipedia snapshots. The rebuild's
    figures still need an in-place baseline that holds both generations' graph and lists on

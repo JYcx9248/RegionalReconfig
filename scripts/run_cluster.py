@@ -522,7 +522,7 @@ def main(cfg_path: str, out_dir: str) -> None:
 
     # 2. index, ground truth, partitions; 3. copies
     index, gt, parts = rl.stages(ecfg, cfg)
-    node_args = rl.node_args_of(cfg, index, parts)
+    node_args = rl.node_args_of(cfg, index, parts, reconfigs, out_dir)
     graph = any(a == "--graph" and b == "index" for a, b in zip(node_args, node_args[1:]))
     sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")],
          index, parts, gens, graph, out_dir)

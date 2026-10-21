@@ -112,14 +112,23 @@ the entries kept, cluster.query_sample per entry, default 1024; -1: none), warmu
 and stop_the_world: true for the baseline without spares. The data nodes need room for the next
 generation's lists (--max-list-len in cluster.node_args, or updates.max_list_len).
 
-updates: {headroom: 1.5, pq_capacity: 200000} lets update batches (U14) run against the cluster
-(bin/rtier-updater; the controller gets "allow_updates"). Every data node leaves room for 1.5
-times the index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and
-for lists twice as long as the longest (list_headroom: 2.0, or max_list_len: N; --max-list-len).
-The PQ budget has to be given (pq_capacity, or --pq-capacity in cluster.node_args): by default
-it is the whole ID space, so the headroom would grow every node's PQ buffer -- its GPU memory --
-by the same factor and change what the run measures. Without updates the dataset is static: no
-room, and the controller refuses update batches.
+updates: {headroom: 1.5} lets update batches (U14) run against the cluster (bin/rtier-updater;
+the controller gets "allow_updates"). Every data node leaves room for 1.5 times the index's
+vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and for lists twice as
+long as the longest (list_headroom: 2.0, or max_list_len: N; --max-list-len), and its PQ budget
+grows by the same factor (cluster.pq_capacity). Without updates the dataset is static: no room,
+and the controller refuses update batches.
+
+cluster: {pq_capacity: auto} (the default) gives every data node a PQ budget (rtier_node
+--pq-capacity: its GPU memory, in codes) of the most distinct vectors one node's partitions
+name at the smallest size the cluster takes -- its initial size, or a smaller one a rescale
+goes to -- or in a plan the run goes to, plus cluster.pq_headroom (0.1): a node never holds
+more codes than that (U1), and no node could hold them all, which is what partitioning is for
+(bin/rtier-client pq-share counts them; pq-budget.json in the results has what it found). A
+number sets the budget; all leaves every node room for the whole ID space (rtier_node's
+default), as does auto for a run with a rebuild, whose placement is made at run time, or for
+one whose fullest node names nearly every vector anyway. --pq-capacity in cluster.node_args
+wins over all of them.
 
 Placeholders of decided design questions (see `bin/rtier-client design`) fail with "undecided":
   U5  cluster.strategy: two-phase, the default, is the decided one (exactly the single-node
@@ -204,9 +213,9 @@ def read_kv(path: str) -> dict:
     return kv
 
 
-def update_args(cfg: dict, index: str, parts: str, node_args: list) -> list:
+def update_args(cfg: dict, index: str, parts: str) -> list:
     """rtier_node flags for updates (U14): room for inserted vectors, their locations and
-    longer lists, and the PQ budget, which must be explicit (see the module doc)."""
+    longer lists."""
     upd = cfg.get("Updates")
     if upd is None:
         return []
@@ -215,15 +224,64 @@ def update_args(cfg: dict, index: str, parts: str, node_args: list) -> list:
     if head < 1:
         raise RuntimeError("updates.headroom must be at least 1")
     max_len = upd.get("MaxListLen") or math.ceil(int(man["max_list_len"]) * float(upd.get("ListHeadroom", 2.0)))
-    args = ["--max-vectors", str(math.ceil(int(meta["num_vectors"]) * head)),
+    return ["--max-vectors", str(math.ceil(int(meta["num_vectors"]) * head)),
             "--max-pages", str(math.ceil(int(man["num_pages"]) * head)),
             "--max-list-len", str(int(max_len))]
-    if "--pq-capacity" not in node_args:
-        if "PQCapacity" not in upd:
-            raise RuntimeError("updates needs the PQ budget (updates.pq_capacity, or --pq-capacity in "
-                               "cluster.node_args): by default it is the whole ID space, headroom included")
-        args += ["--pq-capacity", str(int(upd["PQCapacity"]))]
-    return args
+
+
+def pq_args(cfg: dict, index: str, parts: str, node_args: list, reconfigs: list, out_dir: str) -> list:
+    """--pq-capacity, unless cluster.node_args has it: cluster.pq_capacity N, all (the whole ID
+    space, rtier_node's default) or auto (the default). Auto sizes it by U1: a node never holds
+    more PQ codes than at the smallest size the cluster takes, so the budget is the most
+    distinct vectors one node's partitions name at that size -- the placement policy's split,
+    exact at the initial size, an estimate below it -- and in every plan the run goes to
+    (exact), plus cluster.pq_headroom (0.1), times updates.headroom with updates, whose inserts
+    add codes. A full rebuild's placement is made at run time: such a run gets the whole ID
+    space. What it found goes to pq-budget.json."""
+    if "--pq-capacity" in node_args:
+        return []
+    want = cfg.get("PQCapacity", "auto")
+    if want == "all":
+        return []
+    if want != "auto":
+        if not str(want).isdigit():
+            sys.exit(f"cluster.pq_capacity is {want!r}: auto, all or a number of PQ codes")
+        return ["--pq-capacity", str(int(want))]
+    if any(rc.get("rebuild") for rc in reconfigs):
+        log("PQ budget: the whole ID space (cluster.pq_capacity auto, and a rebuild's placement is made at run time)")
+        return []
+    gbin = paths_of(cfg)[2]
+
+    def share(extra):
+        cmd = [f"{gbin}/rtier-client", "pq-share", "-partitions", parts] + extra
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"PQ budget: {' '.join(cmd)}: {r.stderr.strip()}")
+        return json.loads(r.stdout)
+
+    smallest = min([int(cfg.get("InitialNodes", 1))] +
+                   [rc["data_nodes"] for rc in reconfigs if "plan" not in rc and rc.get("data_nodes")])
+    shares = {f"{smallest} node{'s' if smallest > 1 else ''}": share(
+        ["-nodes", str(smallest)] + (["-placement", cfg["Placement"]] if cfg.get("Placement") else []))}
+    for i, rc in enumerate(reconfigs):
+        if "plan" in rc:
+            path = os.path.join(paths_of(cfg)[0], f"pq-share-plan-{i}.json")
+            json.dump(rc["request"]["plan"], open(path, "w"))
+            shares[f"plan {rc['plan']}"] = share(["-plan", path])
+    most = max(s["max"] for s in shares.values())
+    upd = cfg.get("Updates")
+    grow = float(upd.get("Headroom", 1.5)) if upd is not None else 1.0
+    budget = math.ceil(most * (1 + float(cfg.get("PQHeadroom", 0.1))) * grow)
+    ids = math.ceil(int(read_kv(os.path.join(index, "meta.txt"))["num_vectors"]) * grow)
+    json.dump({"budget": budget if budget < ids else None, "id_space": ids, "shares": shares},
+              open(os.path.join(out_dir, "pq-budget.json"), "w"), indent=2)
+    seen = ", ".join(f"{k}: {v['max']}" for k, v in shares.items())
+    if budget >= ids:
+        log(f"PQ budget: the whole ID space ({ids}): the fullest node names {most} vectors ({seen})")
+        return []
+    log(f"PQ budget: {budget} codes per node, {100 * budget / ids:.0f}% of the ID space: the fullest node names "
+        f"{most} vectors ({seen})")
+    return ["--pq-capacity", str(budget)]
 
 
 def check_load(cfg: dict) -> None:
@@ -793,13 +851,14 @@ def revision(out_dir: str) -> None:
         open(os.path.join(out_dir, "revision.diff"), "w").write(diff)
 
 
-def node_args_of(cfg: dict, index: str, parts: str) -> list:
+def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: str) -> list:
     """rtier_node's flags beyond the ones every node has: cluster.node_args, the read budget,
-    room for updates."""
+    room for updates, the PQ budget."""
     res = cfg.get("NodeResources") or {}
     args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
                                       if res.get("ReadIOPSPerNode") else [])
-    return args + update_args(cfg, index, parts, args)
+    args += update_args(cfg, index, parts)
+    return args + pq_args(cfg, index, parts, args, reconfigs, out_dir)
 
 
 def node_gpus(cfg: dict, nodes: int, table_of) -> dict:
@@ -1051,7 +1110,7 @@ def main(cfg_path: str, out_dir: str) -> None:
                                                       else "no user scopes (sampled from /proc)") +
             (f", {res['ReadIOPSPerNode']} reads/s per data node" if res.get("ReadIOPSPerNode") else
              ", no read-IOPS limit"))
-    node_args = node_args_of(cfg, index, parts)
+    node_args = node_args_of(cfg, index, parts, reconfigs, out_dir)
     gpus = [str(g) for g in cfg.get("GPUs", [])] if cfg.get("Backend") == "gpu" else []
     table = gpu_table() if gpus else []
     visible = node_gpus(cfg, nodes, lambda i: table)

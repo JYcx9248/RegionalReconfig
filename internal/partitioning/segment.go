@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"path/filepath"
 )
 
 // Segment is one partition's posting lists, as engine/include/fusion/partition.h writes them
@@ -86,6 +87,30 @@ func ReadSegment(path string) (*Segment, error) {
 		}
 	}
 	return s, nil
+}
+
+// DistinctIDs counts the vector IDs the segments of partitions parts in dir name, each once: the
+// PQ codes a node that holds those partitions keeps resident (one per vector, U1).
+func DistinctIDs(dir string, parts []int) (int, error) {
+	var seen []uint64
+	n := 0
+	for _, p := range parts {
+		s, err := ReadSegment(filepath.Join(dir, SegmentName(p)))
+		if err != nil {
+			return 0, err
+		}
+		for _, id := range s.IDs {
+			w := int(id >> 6)
+			if w >= len(seen) {
+				seen = append(seen, make([]uint64, w+1-len(seen))...)
+			}
+			if bit := uint64(1) << (id & 63); seen[w]&bit == 0 {
+				seen[w] |= bit
+				n++
+			}
+		}
+	}
+	return n, nil
 }
 
 // Write saves the segment (version 3) under a temporary name and renames it, so that a reader
