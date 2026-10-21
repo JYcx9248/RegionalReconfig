@@ -396,6 +396,55 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) ([
 	return resp.Body, nil
 }
 
+// stream sends one request whose reply comes as several frames (PQ_MISSING, RAW_MISSING and
+// RAW_HELD_BY: engine/node/wire.h) and hands each frame's body to fn as it arrives. An error
+// frame ends the stream, and so does an error from fn: the connection, whose frames may still
+// be on their way, is closed then. fn holds the connection meanwhile, and the node's next frame
+// waits for it: a slow consumer paces the listing.
+func (c *Client) stream(ctx context.Context, op uint8, body []byte, fn func(b []byte) error) error {
+	cn, err := c.get(ctx, c.sem)
+	if err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(c.Timeout)
+	}
+	cn.nc.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { cn.nc.SetDeadline(time.Now()) })
+	id := c.nextID.Add(1)
+	err = frame.Write(cn.nc, &frame.Frame{Type: op, ReqID: id, Body: body})
+	for err == nil {
+		var resp frame.Frame
+		if err = frame.Read(cn.br, &resp); err != nil {
+			break
+		}
+		if resp.ReqID != id || resp.Type != op || !resp.IsResponse() {
+			err = fmt.Errorf("nodeclient: mismatched response from %s", c.addr)
+			break
+		}
+		last := resp.Flags&frame.FlagMore == 0
+		if resp.Status != StatusOK || last {
+			c.put(cn, stop() && last, c.sem)
+			if resp.Status != StatusOK {
+				return &StatusError{Addr: c.addr, Op: op, Status: resp.Status, Msg: string(resp.Body)}
+			}
+			return fn(resp.Body)
+		}
+		if ferr := fn(resp.Body); ferr != nil {
+			stop()
+			c.put(cn, false, c.sem)
+			return ferr
+		}
+	}
+	stop()
+	c.put(cn, false, c.sem)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("nodeclient %s: %w", c.addr, err)
+}
+
 // Ping checks that the node answers.
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.do(ctx, opPing, 0, nil)
@@ -523,13 +572,39 @@ func (c *Client) RawTraffic(ctx context.Context) (sent, received uint64, err err
 	return sent, received, r.Err
 }
 
-// PQMissing returns, for each group of segment files (paths on the node's host), the vector
-// IDs they name whose PQ code the node lacks and that no earlier group lists: every missing
-// code appears exactly once, under the first group (source) that needs it. The codes the node
+// PQMissing lists, for each group of segment files (paths on the node's host), the vector IDs
+// they name whose PQ code the node lacks: every missing code once, under the first group
+// (source) that needs it. The node streams them as it finds them, and fn gets each batch as it
+// arrives, so that the codes can be pulled while the rest are listed. The codes the node
 // already has are protected until the partitions load (or PQRelease), so making room for the
 // missing ones never drops them.
-func (c *Client) PQMissing(ctx context.Context, groups [][]string) ([][]uint32, error) {
-	return c.missing(ctx, opPQMissing, groups)
+func (c *Client) PQMissing(ctx context.Context, groups [][]string, fn func(group int, ids []uint32) error) error {
+	var w frame.Writer
+	w.U32(uint32(len(groups)))
+	for _, g := range groups {
+		w.U32(uint32(len(g)))
+		for _, p := range g {
+			w.U32(uint32(len(p)))
+			w.Str(p)
+		}
+	}
+	return c.stream(ctx, opPQMissing, w.B, func(b []byte) error {
+		r := frame.NewReader(b)
+		for runs := int(r.U32()); runs > 0 && r.Err == nil; runs-- {
+			g, n := int(r.U32()), int(r.U32())
+			ids := r.U32s(n)
+			if r.Err != nil || g >= len(groups) {
+				return fmt.Errorf("nodeclient: bad PQ_MISSING frame from %s", c.addr)
+			}
+			if err := fn(g, ids); err != nil {
+				return err
+			}
+		}
+		if r.Err != nil || r.Remaining() != 0 {
+			return fmt.Errorf("nodeclient: bad PQ_MISSING frame from %s", c.addr)
+		}
+		return nil
+	})
 }
 
 // RawRefs are raw-vector locations held by one node (its cluster ID) and, for each, a posting
@@ -539,51 +614,53 @@ type RawRefs struct {
 	Locs, Lists []uint32
 }
 
-// RawMissing returns the raw vectors that the newest resident versions of partitions name and
-// the node lacks, grouped by the node holding them, each once with a list that names it.
-func (c *Client) RawMissing(ctx context.Context, partitions []int) ([]RawRefs, error) {
+// RawMissing lists the raw vectors that the newest resident versions of partitions name and the
+// node lacks, each once with a list that names it. The node streams them as it finds them, and
+// fn gets each batch, grouped by the node holding them, as it arrives.
+func (c *Client) RawMissing(ctx context.Context, partitions []int, fn func([]RawRefs) error) error {
 	var w frame.Writer
 	w.U32(uint32(len(partitions)))
 	for _, p := range partitions {
 		w.U32(uint32(p))
 	}
-	b, err := c.do(ctx, opRawMissing, 0, w.B)
-	if err != nil {
-		return nil, err
-	}
-	r := frame.NewReader(b)
-	out := make([]RawRefs, r.U32())
-	for i := range out {
-		out[i].Holder = r.U16()
-		r.U16()
-		n := int(r.U32())
-		out[i].Locs, out[i].Lists = r.U32s(n), r.U32s(n)
-	}
-	if r.Err == nil && r.Remaining() != 0 {
-		return nil, fmt.Errorf("nodeclient: trailing bytes in the RAW_MISSING reply from %s", c.addr)
-	}
-	return out, r.Err
+	return c.stream(ctx, opRawMissing, w.B, func(b []byte) error {
+		r := frame.NewReader(b)
+		groups := make([]RawRefs, r.U32())
+		for i := range groups {
+			groups[i].Holder = r.U16()
+			r.U16()
+			n := int(r.U32())
+			groups[i].Locs, groups[i].Lists = r.U32s(n), r.U32s(n)
+		}
+		if r.Err != nil || r.Remaining() != 0 {
+			return fmt.Errorf("nodeclient: bad RAW_MISSING frame from %s", c.addr)
+		}
+		return fn(groups)
+	})
 }
 
 // RawHeldBy is the drain of node `holder` before it leaves: the node makes every posting that
-// names it, and whose vector it has now, name itself (repointed), and returns the vectors still
-// to pull from it (RawPull), each with a list that names it.
-func (c *Client) RawHeldBy(ctx context.Context, holder uint16) (repointed uint64, missing RawRefs, err error) {
+// names it, and whose vector it has now, name itself (repointed), and lists the vectors still
+// to pull from it (RawPull), each once with a list that names it. They stream to fn in batches
+// as the node finds them.
+func (c *Client) RawHeldBy(ctx context.Context, holder uint16, fn func(RawRefs) error) (repointed uint64, err error) {
 	var w frame.Writer
 	w.U16(holder)
 	w.U16(0)
-	b, err := c.do(ctx, opRawHeldBy, 0, w.B)
-	if err != nil {
-		return 0, RawRefs{}, err
-	}
-	r := frame.NewReader(b)
-	repointed = r.U64()
-	n := int(r.U32())
-	missing = RawRefs{Holder: holder, Locs: r.U32s(n), Lists: r.U32s(n)}
-	if r.Err == nil && r.Remaining() != 0 {
-		return 0, RawRefs{}, fmt.Errorf("nodeclient: trailing bytes in the RAW_HELD_BY reply from %s", c.addr)
-	}
-	return repointed, missing, r.Err
+	err = c.stream(ctx, opRawHeldBy, w.B, func(b []byte) error {
+		r := frame.NewReader(b)
+		repointed += r.U64() // the last frame's count; 0 in the others
+		n := int(r.U32())
+		missing := RawRefs{Holder: holder, Locs: r.U32s(n), Lists: r.U32s(n)}
+		if r.Err != nil || r.Remaining() != 0 {
+			return fmt.Errorf("nodeclient: bad RAW_HELD_BY frame from %s", c.addr)
+		}
+		if n == 0 {
+			return nil
+		}
+		return fn(missing)
+	})
+	return repointed, err
 }
 
 // SetNodes tells the node its cluster ID (0: unchanged) and where other data nodes are: the
@@ -606,43 +683,6 @@ func (c *Client) SetNodes(ctx context.Context, self uint16, peers map[uint16]str
 	}
 	_, err := c.do(ctx, opSetNodes, 0, w.B)
 	return err
-}
-
-func (c *Client) missing(ctx context.Context, op uint8, groups [][]string) ([][]uint32, error) {
-	r, err := c.missingReply(ctx, op, groups)
-	if err != nil {
-		return nil, err
-	}
-	out := make([][]uint32, len(groups))
-	for i := range out {
-		out[i] = r.U32s(int(r.U32()))
-	}
-	if r.Err == nil && r.Remaining() != 0 {
-		return nil, fmt.Errorf("nodeclient: trailing bytes in the reply to op 0x%02x from %s", op, c.addr)
-	}
-	return out, r.Err
-}
-
-// missingReply sends a *_MISSING request and returns the reply positioned after its group count.
-func (c *Client) missingReply(ctx context.Context, op uint8, groups [][]string) (*frame.Reader, error) {
-	var w frame.Writer
-	w.U32(uint32(len(groups)))
-	for _, g := range groups {
-		w.U32(uint32(len(g)))
-		for _, p := range g {
-			w.U32(uint32(len(p)))
-			w.Str(p)
-		}
-	}
-	b, err := c.do(ctx, op, 0, w.B)
-	if err != nil {
-		return nil, err
-	}
-	r := frame.NewReader(b)
-	if n := int(r.U32()); r.Err != nil || n != len(groups) {
-		return nil, fmt.Errorf("nodeclient: bad reply to op 0x%02x from %s", op, c.addr)
-	}
-	return r, nil
 }
 
 // RawGet returns the raw vectors at locs (vecBytes each, in order) from the node's own store

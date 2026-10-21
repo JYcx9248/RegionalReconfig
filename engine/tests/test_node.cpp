@@ -22,6 +22,7 @@
 #include <thread>
 
 #include "../node/server.h"
+#include "../node/stream.h"
 #include "fusion/builder.h"
 #include "fusion/dataset.h"
 #include "fusion/index_meta.h"
@@ -1655,6 +1656,18 @@ rtier::Frame Call(int fd, rtier::Op op, const rtier::BodyWriter& w, uint64_t id)
   return resp;
 }
 
+// A streamed reply (wire.h): its frames, up to the first that is not flagged more.
+std::vector<rtier::Frame> CallStream(int fd, rtier::Op op, const rtier::BodyWriter& w, uint64_t id) {
+  std::vector<rtier::Frame> frames{Call(fd, op, w, id)};
+  while (frames.back().status == rtier::kOk && (frames.back().flags & rtier::kFlagMore)) {
+    rtier::Frame f;
+    if (!rtier::ReadFrame(fd, &f)) throw std::runtime_error("server closed the connection");
+    CHECK(f.req_id == id && f.type == op && (f.flags & rtier::kFlagResponse));
+    frames.push_back(std::move(f));
+  }
+  return frames;
+}
+
 int Connect(int port) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in addr{};
@@ -1664,6 +1677,69 @@ int Connect(int port) {
   if (fd < 0 || ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
     throw std::runtime_error("cannot connect to the test server");
   return fd;
+}
+
+// A streamed reply's frames (wire.h): one goes when it is full, one whose first entry has waited
+// kStreamLingerMs goes on its own, and the last is the reply; every one but the last is flagged
+// more. A write that fails ends the listing; without a writer everything is in the last one.
+void TestStreamer() {
+  struct Count {  // a batch that counts its entries
+    uint32_t n = 0;
+    size_t size() const { return n; }
+    void Encode(rtier::BodyWriter* w, bool last) const {
+      w->Put<uint32_t>(n);
+      w->Put<uint8_t>(last ? 1 : 0);
+    }
+    void Clear() { n = 0; }
+  };
+  auto one = [](Count& c) { ++c.n; };
+  auto entries = [](const std::vector<uint8_t>& body) {
+    rtier::BodyReader r(body.data(), body.size());
+    return r.Get<uint32_t>();
+  };
+  rtier::Frame req;
+  req.type = rtier::kRawMissing;
+  req.req_id = 9;
+  req.epoch = 4;
+  std::mutex mu;
+  std::vector<rtier::Frame> sent;
+  auto count = [&] {
+    std::lock_guard<std::mutex> l(mu);
+    return sent.size();
+  };
+  {
+    rtier::Streamer<Count> s(req, [&](const rtier::Frame& f) {
+      std::lock_guard<std::mutex> l(mu);
+      sent.push_back(f);
+    }, 10);
+    for (int i = 0; i < 25; ++i) s.Add(one);  // two full frames; five entries wait
+    CHECK(count() == 2);
+    for (int i = 0; i < 100 && count() < 3; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(count() == 3);  // they went after kStreamLingerMs
+    s.Add(one);
+    const std::vector<uint8_t> last = s.Last();
+    rtier::BodyReader r(last.data(), last.size());
+    CHECK(r.Get<uint32_t>() == 1 && r.Get<uint8_t>() == 1);
+  }
+  CHECK(entries(sent[0].body) == 10 && entries(sent[1].body) == 10 && entries(sent[2].body) == 5);
+  for (const rtier::Frame& f : sent)
+    CHECK(f.type == rtier::kRawMissing && f.req_id == 9 && f.epoch == 4 &&
+          f.flags == (rtier::kFlagResponse | rtier::kFlagMore));
+  {
+    rtier::Streamer<Count> s(req, [](const rtier::Frame&) { throw std::runtime_error("gone"); }, 2);
+    bool stopped = false;
+    try {
+      for (int i = 0; i < 4; ++i) s.Add(one);
+    } catch (const std::runtime_error&) {
+      stopped = true;
+    }
+    CHECK(stopped);
+  }
+  {
+    rtier::Streamer<Count> s(req, {}, 2);
+    for (int i = 0; i < 5; ++i) s.Add(one);
+    CHECK(entries(s.Last()) == 5);
+  }
 }
 
 void TestWire() {
@@ -1777,15 +1853,27 @@ void TestWire() {
   miss.Put<uint32_t>(1);
   miss.Put<uint32_t>(static_cast<uint32_t>(saved0.size()));
   miss.PutBytes(saved0.data(), saved0.size());
-  r = Call(fd2, rtier::kPQMissing, miss, 61);
-  CHECK(r.status == rtier::kOk);
-  rtier::BodyReader mr(r.body.data(), r.body.size());
-  CHECK(mr.Get<uint32_t>() == 1);
-  const uint32_t nmiss = mr.Get<uint32_t>();
-  CHECK(nmiss == ids0.size() && mr.remaining() == nmiss * 4u);
-  std::vector<uint32_t> missing(nmiss);
-  std::memcpy(missing.data(), mr.Bytes(nmiss * 4u), nmiss * 4u);
-  CHECK(missing == ids0);
+  // The listings stream (wire.h): here in frames of about 100 entries, each entry once.
+  server2.SetStreamBatch(100);
+  const auto mframes = CallStream(fd2, rtier::kPQMissing, miss, 61);
+  std::vector<uint32_t> missing;
+  for (const rtier::Frame& mf : mframes) {
+    CHECK(mf.status == rtier::kOk);
+    rtier::BodyReader mr(mf.body.data(), mf.body.size());
+    size_t in_frame = 0;
+    for (uint32_t runs = mr.Get<uint32_t>(); runs > 0; --runs) {
+      CHECK(mr.Get<uint32_t>() == 0);  // the only group
+      const uint32_t n = mr.Get<uint32_t>();
+      const size_t at = missing.size();
+      missing.resize(at + n);
+      std::memcpy(missing.data() + at, mr.Bytes(n * 4u), n * 4u);
+      in_frame += n;
+    }
+    CHECK(mr.remaining() == 0 && in_frame < 125);
+  }
+  const uint32_t nmiss = static_cast<uint32_t>(missing.size());
+  std::sort(missing.begin(), missing.end());
+  CHECK(mframes.size() > 1 && missing == ids0);
   const uint32_t m = e->pq_stats().m;
   std::vector<uint8_t> codes(nmiss * m);
   e->PQGet(missing.data(), nmiss, codes.data());
@@ -1843,16 +1931,28 @@ void TestWire() {
   rtier::BodyWriter rmiss;
   rmiss.Put<uint32_t>(1);
   rmiss.Put<uint32_t>(0);  // partition 0
-  r = Call(fd2, rtier::kRawMissing, rmiss, 73);
-  CHECK(r.status == rtier::kOk);
-  rtier::BodyReader rr(r.body.data(), r.body.size());
-  CHECK(rr.Get<uint32_t>() == 1 && rr.Get<uint16_t>() == 1);
-  rr.Get<uint16_t>();
-  const uint32_t nraw = rr.Get<uint32_t>();
-  CHECK(nraw == locs0.size() - fetched2 && rr.remaining() == nraw * 8u);
-  std::vector<uint32_t> rlocs(nraw), rlists(nraw);
-  std::memcpy(rlocs.data(), rr.Bytes(nraw * 4u), nraw * 4u);
-  std::memcpy(rlists.data(), rr.Bytes(nraw * 4u), nraw * 4u);
+  const auto rframes = CallStream(fd2, rtier::kRawMissing, rmiss, 73);
+  std::vector<uint32_t> rlocs, rlists;
+  for (const rtier::Frame& rf : rframes) {
+    CHECK(rf.status == rtier::kOk);
+    rtier::BodyReader rr(rf.body.data(), rf.body.size());
+    for (uint32_t groups = rr.Get<uint32_t>(); groups > 0; --groups) {
+      CHECK(rr.Get<uint16_t>() == 1);  // node 1 holds them all
+      rr.Get<uint16_t>();
+      const uint32_t n = rr.Get<uint32_t>();
+      const size_t at = rlocs.size();
+      rlocs.resize(at + n);
+      rlists.resize(at + n);
+      std::memcpy(rlocs.data() + at, rr.Bytes(n * 4u), n * 4u);
+      std::memcpy(rlists.data() + at, rr.Bytes(n * 4u), n * 4u);
+    }
+    CHECK(rr.remaining() == 0);
+  }
+  const uint32_t nraw = static_cast<uint32_t>(rlocs.size());
+  std::vector<uint32_t> once(rlocs);
+  std::sort(once.begin(), once.end());
+  CHECK(rframes.size() > 1 && nraw == locs0.size() - fetched2 &&
+        std::adjacent_find(once.begin(), once.end()) == once.end());
   for (uint32_t i = 0; i < nraw; i += 97) CHECK(ListNamingLoc(f, 0, rlocs[i]) != kInvalidId);
   // Both ways of streaming: RAW_PULL has this node fetch the first half itself (from the first
   // node, through its peer pool); RAW_GET from the first node and RAW_PUT bring the rest.
@@ -1907,9 +2007,9 @@ void TestWire() {
   rtier::BodyWriter held;
   held.Put<uint16_t>(1);
   held.Put<uint16_t>(0);
-  r = Call(fd2, rtier::kRawHeldBy, held, 81);
-  CHECK(r.status == rtier::kOk && r.body.size() == 12);
-  rtier::BodyReader hr(r.body.data(), r.body.size());
+  const auto hframes = CallStream(fd2, rtier::kRawHeldBy, held, 81);
+  CHECK(hframes.size() == 1 && hframes[0].status == rtier::kOk && hframes[0].body.size() == 12);
+  rtier::BodyReader hr(hframes[0].body.data(), hframes[0].body.size());
   CHECK(hr.Get<uint64_t>() > 0 && hr.Get<uint32_t>() == 0);
   // RAW_CHECK: of these, the ones not here.
   rtier::BodyWriter check;
@@ -2548,6 +2648,7 @@ int main() {
       {"graph_patches", TestGraphPatches},
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
+      {"streamer", TestStreamer},
       {"wire", TestWire},
       {"fetch_holds_no_worker", TestFetchHoldsNoWorker},
   };

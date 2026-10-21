@@ -107,6 +107,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   what goes through the agents -- segments and PQ codes (data class) and the graph (background);
   raw vectors move data node to data node (`RAW_GET`, `RAW_PULL`), unpaced, unless
   `raw_path: agent` (then at `raw_priority`, U8).
+- **Listings stream** (`PQ_MISSING`, `RAW_MISSING`, `RAW_HELD_BY`; `engine/node/stream.h`): the
+  node lists what it lacks, each entry once, in frames of about 1M entries, each sent when full,
+  when its first entry has waited 100 ms, or as the last; the agent pulls what a frame names as
+  it arrives, several requests in flight per source (`pullMissingPQ`, `rawPuller`).
 - **PQ codes** are stored per node, once per vector, with a cache of codes of partitions that
   moved away (`engine/include/fusion/pq_store.h`); placement `even-reversible-graph` (the
   default) returns partitions to former owners so a scale-in moves no PQ code. The runners give
@@ -244,8 +248,8 @@ Next:
    - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
      batch size and period are set aside); a batch over budget (scale out first?); writes
      against queries during a scale-out; staged versions left by an expired lease;
-   - scale limits for billion-vector datasets, the target: single-frame replies (`PQ_MISSING`,
-     `RAW_MISSING`, graph patches; deferred until such a dataset is at hand), what
+   - scale limits for billion-vector datasets, the target: single-frame graph patches (the
+     listings `PQ_MISSING`, `RAW_MISSING`, `RAW_HELD_BY` stream since 2026-10-21), what
      `run_cluster.py` still copies whole (the page file and every segment to each initial
      node's host, the PQ codes to every host: `rtier_node` opens them at startup), per-node
      structures sized by the dataset (`slot_of_`, the presence bitmap);

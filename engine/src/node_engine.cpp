@@ -38,6 +38,32 @@ namespace {
 
 constexpr uint64_t kPQFileHeader = 16;  // pq_codes.bin: u64 n, u32 m, u32 reserved (fusion/pq.h)
 
+// A streamed listing hands its entries over in chunks of at most this many (RawMissingStream,
+// RawHeldByStream): the server sends them on while the rest are listed.
+constexpr size_t kListChunk = size_t{1} << 16;
+
+// One bit per vector ID or raw-vector location, growing as needed: what a streamed listing has
+// given out (or found here), so that it gives out each once without sorting everything first.
+class Seen {
+ public:
+  bool Has(uint32_t i) const {
+    const size_t w = i >> 6;
+    return w < bits_.size() && (bits_[w] >> (i & 63) & 1) != 0;
+  }
+  // Marks i; false if it was marked already.
+  bool Add(uint32_t i) {
+    const size_t w = i >> 6;
+    if (w >= bits_.size()) bits_.resize(std::max(w + 1, 2 * bits_.size()));
+    const uint64_t bit = uint64_t{1} << (i & 63);
+    if (bits_[w] & bit) return false;
+    bits_[w] |= bit;
+    return true;
+  }
+
+ private:
+  std::vector<uint64_t> bits_;
+};
+
 // A partition's posting lists as held by a node, with the PQ slot of every posting (resolved
 // once at load time: slots do not move while referenced).
 // A posting's holder in memory: this node holds the vector. A segment written for a hand-off
@@ -979,27 +1005,17 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // ---------------------------------------------------------------- PQ codes
-  std::vector<std::vector<uint32_t>> PQMissing(
-      const std::vector<std::vector<std::string>>& groups) override {
-    std::vector<std::vector<uint32_t>> out(groups.size());
-    std::vector<uint32_t> taken;  // sorted: listed for an earlier group
-    for (size_t g = 0; g < groups.size(); ++g) {
-      std::vector<uint32_t> ids;
+  void PQMissingStream(const std::vector<std::vector<std::string>>& groups,
+                       const std::function<void(size_t, const uint32_t*, size_t)>& sink) override {
+    Seen listed;  // for this group or an earlier one
+    for (size_t g = 0; g < groups.size(); ++g)
       for (const std::string& path : groups[g]) {
         const ListSegment s = LoadSegment(path);
-        ids.insert(ids.end(), s.ids.begin(), s.ids.end());
+        std::vector<uint32_t> fresh = store_->Reserve(s.ids.data(), s.ids.size());
+        fresh.erase(std::remove_if(fresh.begin(), fresh.end(), [&](uint32_t id) { return !listed.Add(id); }),
+                    fresh.end());
+        if (!fresh.empty()) sink(g, fresh.data(), fresh.size());
       }
-      const std::vector<uint32_t> miss = store_->Reserve(ids.data(), ids.size());
-      std::vector<uint32_t> fresh;
-      std::set_difference(miss.begin(), miss.end(), taken.begin(), taken.end(),
-                          std::back_inserter(fresh));
-      std::vector<uint32_t> merged;
-      merged.reserve(taken.size() + fresh.size());
-      std::merge(taken.begin(), taken.end(), fresh.begin(), fresh.end(), std::back_inserter(merged));
-      taken.swap(merged);
-      out[g] = std::move(fresh);
-    }
-    return out;
   }
 
   void PQGet(const uint32_t* ids, size_t n, uint8_t* out) override { store_->Get(ids, n, out); }
@@ -1018,7 +1034,7 @@ class NodeEngineImpl : public NodeEngine {
   PQStats pq_stats() const override { return store_->Stats(); }
 
   // ------------------------------------------------------------- raw vectors
-  std::vector<RawRefs> RawMissing(const std::vector<uint32_t>& partitions) override {
+  void RawMissingStream(const std::vector<uint32_t>& partitions, const RawSink& sink) override {
     std::vector<std::shared_ptr<const ResidentSegment>> segs;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
@@ -1029,64 +1045,52 @@ class NodeEngineImpl : public NodeEngine {
         segs.push_back(std::move(s));
       }
     }
-    struct Ref {
-      uint32_t loc, list;
-      uint16_t holder;
-    };
-    std::vector<Ref> refs;  // every posting whose vector is not here (fetched ones are)
+    // Each vector once, from the first posting, in the partitions' order, that records a holder.
+    // A posting that says the vector is here: a query fetched it since RawAbsent looked.
+    Seen done;                     // given out, or here
+    std::vector<uint32_t> unheld;  // postings that record no holder
+    std::vector<RawRef> chunk;
     for (const auto& s : segs) {
       const std::vector<uint32_t> absent = RawAbsent(s->seg.locs.data(), s->seg.locs.size());
       if (absent.empty()) continue;
       for (size_t i = 0; i < s->seg.list_ids.size(); ++i)
-        for (uint64_t j = s->seg.offsets[i]; j < s->seg.offsets[i + 1]; ++j)
-          if (std::binary_search(absent.begin(), absent.end(), s->seg.locs[j]))
-            refs.push_back({s->seg.locs[j], s->seg.list_ids[i], s->Holder(j)});
+        for (uint64_t j = s->seg.offsets[i]; j < s->seg.offsets[i + 1]; ++j) {
+          const uint32_t loc = s->seg.locs[j];
+          if (done.Has(loc) || !std::binary_search(absent.begin(), absent.end(), loc)) continue;
+          const uint16_t h = s->Holder(j);
+          if (h != kSelfHolder && !Fetchable(h)) {
+            unheld.push_back(loc);
+            continue;
+          }
+          done.Add(loc);
+          if (h == kSelfHolder) continue;
+          chunk.push_back({h, loc, s->seg.list_ids[i]});
+          if (chunk.size() == kListChunk) {
+            sink(chunk);
+            chunk.clear();
+          }
+        }
     }
-    std::stable_sort(refs.begin(), refs.end(), [](const Ref& a, const Ref& b) { return a.loc < b.loc; });
-    // Each vector once, from the first posting that records a holder. A posting that says the
-    // vector is here: a query fetched it since RawAbsent looked.
-    std::map<uint16_t, RawRefs> by;
+    if (!chunk.empty()) sink(chunk);
     size_t unknown = 0;
     uint32_t first = 0;
-    for (size_t i = 0; i < refs.size();) {
-      size_t e = i;  // [i, e): the postings of one location
-      while (e < refs.size() && refs[e].loc == refs[i].loc) ++e;
-      size_t k = e;
-      bool here = false;
-      for (size_t r = i; r < e; ++r) {
-        here = here || refs[r].holder == kSelfHolder;
-        if (k == e && Fetchable(refs[r].holder)) k = r;
-      }
-      if (!here && k < e) {
-        RawRefs& g = by[refs[k].holder];
-        g.locs.push_back(refs[k].loc);
-        g.lists.push_back(refs[k].list);
-      } else if (!here && unknown++ == 0) {
-        first = refs[i].loc;
-      }
-      i = e;
-    }
+    for (uint32_t loc : unheld)
+      if (done.Add(loc) && unknown++ == 0) first = loc;
     if (unknown)
       throw RawMissingError(StrFormat("%zu raw vectors are not on this node and no posting naming "
                                       "them records a holder (first: location %u)", unknown, first));
-    std::vector<RawRefs> out;
-    for (auto& kv : by) {
-      kv.second.holder = kv.first;
-      out.push_back(std::move(kv.second));
-    }
-    return out;
   }
 
-  HeldBy RawHeldBy(uint16_t holder) override {
+  uint64_t RawHeldByStream(uint16_t holder, const RawSink& sink) override {
     FUSION_CHECK(Fetchable(holder), "node ID %u is reserved", holder);
     std::vector<std::shared_ptr<const ResidentSegment>> segs;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
       for (const auto& vs : segs_) segs.insert(segs.end(), vs.begin(), vs.end());
     }
-    HeldBy out;
-    out.missing.holder = holder;
-    std::vector<std::pair<uint32_t, uint32_t>> missing;  // (location, list)
+    uint64_t repointed = 0;
+    Seen listed;
+    std::vector<RawRef> chunk;
     for (const auto& s : segs) {
       std::vector<size_t> named;
       for (size_t j = 0; j < s->seg.ids.size(); ++j)
@@ -1096,23 +1100,24 @@ class NodeEngineImpl : public NodeEngine {
       for (size_t k = 0; k < named.size(); ++k) locs[k] = s->seg.locs[named[k]];
       const std::vector<uint32_t> absent = RawAbsent(locs.data(), locs.size());
       for (size_t j : named) {
-        if (!std::binary_search(absent.begin(), absent.end(), s->seg.locs[j])) {
+        const uint32_t loc = s->seg.locs[j];
+        if (!std::binary_search(absent.begin(), absent.end(), loc)) {
           s->SetHolder(j, kSelfHolder);  // the vector is here: the key's holder is this node
-          ++out.repointed;
+          ++repointed;
           continue;
         }
+        if (!listed.Add(loc)) continue;
         const size_t li = static_cast<size_t>(
             std::upper_bound(s->seg.offsets.begin(), s->seg.offsets.end(), j) - s->seg.offsets.begin() - 1);
-        missing.emplace_back(s->seg.locs[j], s->seg.list_ids[li]);
+        chunk.push_back({holder, loc, s->seg.list_ids[li]});
+        if (chunk.size() == kListChunk) {
+          sink(chunk);
+          chunk.clear();
+        }
       }
     }
-    std::sort(missing.begin(), missing.end());
-    for (size_t i = 0; i < missing.size(); ++i) {
-      if (i > 0 && missing[i].first == missing[i - 1].first) continue;
-      out.missing.locs.push_back(missing[i].first);
-      out.missing.lists.push_back(missing[i].second);
-    }
-    return out;
+    if (!chunk.empty()) sink(chunk);
+    return repointed;
   }
 
   std::vector<uint32_t> RawAbsent(const uint32_t* locs, size_t n) const override {
@@ -2356,7 +2361,48 @@ class NodeEngineImpl : public NodeEngine {
   std::vector<std::unique_ptr<Worker>> workers_;
 };
 
+// A holder's refs as RawRefs, sorted by location (each location comes once).
+RawRefs Sorted(uint16_t holder, std::vector<std::pair<uint32_t, uint32_t>> refs) {
+  std::sort(refs.begin(), refs.end());
+  RawRefs g;
+  g.holder = holder;
+  g.locs.reserve(refs.size());
+  g.lists.reserve(refs.size());
+  for (const auto& [loc, list] : refs) {
+    g.locs.push_back(loc);
+    g.lists.push_back(list);
+  }
+  return g;
+}
+
 }  // namespace
+
+std::vector<std::vector<uint32_t>> NodeEngine::PQMissing(const std::vector<std::vector<std::string>>& groups) {
+  std::vector<std::vector<uint32_t>> out(groups.size());
+  PQMissingStream(groups, [&](size_t g, const uint32_t* ids, size_t n) { out[g].insert(out[g].end(), ids, ids + n); });
+  for (auto& ids : out) std::sort(ids.begin(), ids.end());
+  return out;
+}
+
+std::vector<RawRefs> NodeEngine::RawMissing(const std::vector<uint32_t>& partitions) {
+  std::map<uint16_t, std::vector<std::pair<uint32_t, uint32_t>>> by;
+  RawMissingStream(partitions, [&](const std::vector<RawRef>& refs) {
+    for (const RawRef& r : refs) by[r.holder].emplace_back(r.loc, r.list);
+  });
+  std::vector<RawRefs> out;
+  for (auto& [holder, refs] : by) out.push_back(Sorted(holder, std::move(refs)));
+  return out;
+}
+
+HeldBy NodeEngine::RawHeldBy(uint16_t holder) {
+  std::vector<std::pair<uint32_t, uint32_t>> refs;
+  HeldBy out;
+  out.repointed = RawHeldByStream(holder, [&](const std::vector<RawRef>& chunk) {
+    for (const RawRef& r : chunk) refs.emplace_back(r.loc, r.list);
+  });
+  out.missing = Sorted(holder, std::move(refs));
+  return out;
+}
 
 std::unique_ptr<NodeEngine> NodeEngine::Open(const NodeOptions& opts) {
   IndexMeta meta = IndexMeta::Load(JoinPath(opts.index_dir, files::kMeta));

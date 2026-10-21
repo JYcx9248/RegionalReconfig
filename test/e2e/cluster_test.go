@@ -232,8 +232,11 @@ func startNodeOn(f *fixture, index string, extra ...string) (string, func() erro
 
 // startNodeWith is startNode on another index and partition directory (a later generation).
 func startNodeWith(f *fixture, index, parts string, extra ...string) (string, func() error, error) {
+	// Listings stream in frames of 100 entries, so that every staging and drain here takes many
+	// (a frame holds 1M by default, more than this whole index).
 	args := append([]string{"--index", index, "--partitions", parts, "--listen", "127.0.0.1:0",
-		"--workers", "2", "--max-nprobe", "64", "--max-rerank", fmt.Sprint(maxRerank), "--no-direct"}, extra...)
+		"--workers", "2", "--max-nprobe", "64", "--max-rerank", fmt.Sprint(maxRerank), "--no-direct",
+		"--stream-batch", "100"}, extra...)
 	cmd := exec.Command(filepath.Join(f.bin, "rtier_node"), args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -14,8 +14,10 @@
 // other cannot deadlock on workers.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -68,8 +70,12 @@ class NodeServer {
   void Serve();
   void Stop();
 
-  // Handles one request frame (exposed for tests).
-  Frame Handle(const Frame& req);
+  // Handles one request frame (exposed for tests). The frames of a streamed reply but the last
+  // go to write as they fill (wire.h); without it, all of the reply is in the returned frame.
+  Frame Handle(const Frame& req, const std::function<void(const Frame&)>& write = {});
+
+  // Entries per frame of a streamed reply (kStreamBatch; tests stream a small index in several).
+  void SetStreamBatch(size_t entries) { stream_batch_ = std::max<size_t>(1, entries); }
 
   // One line of the node's stats log (rtier_node --stats-file): per-operation counters, the
   // fetch path's (fusion::FetchStats), the read budget's and the raw-vector bytes sent and
@@ -101,6 +107,7 @@ class NodeServer {
   std::vector<int> free_workers_;
   std::atomic<uint64_t> max_epoch_seen_{0};
   std::atomic<uint64_t> raw_sent_{0}, raw_received_{0};  // RAW_TRAFFIC
+  std::atomic<size_t> stream_batch_{kStreamBatch};
   std::mutex conn_mu_;
   std::set<int> conn_fds_;                          // open connections (shut down by Stop)
   std::map<uint64_t, std::thread> conn_threads_;   // by connection; joined by Serve

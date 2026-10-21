@@ -58,6 +58,8 @@ static void Usage() {
                          on-demand fetch path's and the read budget's, stamped with
                          CLOCK_MONOTONIC seconds ("t")
   --stats-ms MS          (default 1000)
+  --stream-batch N       entries per frame of a streamed listing (PQ_MISSING, RAW_MISSING,
+                         RAW_HELD_BY; default 1048576): tests stream a small index in many
 )");
 }
 
@@ -106,6 +108,7 @@ int main(int argc, char** argv) {
     const std::string load = a.Str("load", "");
     const std::string stats_file = a.Str("stats-file", "");
     const uint64_t stats_ms = std::max<uint64_t>(a.U64("stats-ms", 1000), 10);
+    const uint64_t stream_batch = a.U64("stream-batch", rtier::kStreamBatch);
     a.WarnUnused(flags);
 
     // Block the stop signals in every thread; one thread waits for them.
@@ -134,6 +137,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s", engine->Describe().c_str());
 
     rtier::NodeServer server(engine.get());
+    server.SetStreamBatch(stream_batch);
     const size_t colon = listen.rfind(':');
     FUSION_CHECK(colon != std::string::npos, "--listen wants HOST:PORT");
     const int port = server.ListenTcp(listen.substr(0, colon), std::stoi(listen.substr(colon + 1)));

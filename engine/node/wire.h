@@ -9,7 +9,8 @@
 //   0    4     magic_start   0x31465452 ("RTF1")
 //   4    4     length        bytes after this field: 20 + body + 4
 //   8    1     type          operation (Op)
-//   9    1     flags         bit 0: response
+//   9    1     flags         bit 0: response; bit 1: more frames of this response follow (a
+//                             streamed reply, below)
 //   10   2     status        0 = OK (responses only; see Status)
 //   12   8     req_id        echoed in the response
 //   20   8     epoch         placement epoch of the sender (0 = none)
@@ -41,21 +42,25 @@
 //                   (the raw vectors the node holds, one bit per location)
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
 //                                                                version is evicted)
-//   PQ_MISSING      u32 groups, per group: u32 paths,         -> u32 groups, per group:
-//                   str path[paths] (segment files)              u32 n, u32 ids[n]
-//                   (the codes already here are protected for the staging)
+//   PQ_MISSING      u32 groups, per group: u32 paths,         -> streamed, each frame: u32 runs,
+//                   str path[paths] (segment files)              (u32 group, u32 n, u32 ids[n])[runs]
+//                   (every missing code once, under the first group that needs it; the codes
+//                   already here are protected for the staging)
 //   PQ_GET          u32 n, u32 ids[n]                         -> u32 m, u8 codes[n * m]
 //   PQ_PUT          u32 n, u32 m, u32 ids[n], u8 codes[n * m] -> u32 installed, u32 skipped
 //   PQ_RELEASE      -                                         -> u64 freed (a staging that did
 //                                                                not load: its new codes)
-//   RAW_MISSING     u32 n, u32 partitions[n] (resident)       -> u32 groups, per group: u16 holder,
-//                                                                u16 pad, u32 n, u32 locs[n],
-//                                                                u32 lists[n] (a list naming each)
-//                   (the vectors their newest versions name that are not here, by holder)
-//   RAW_HELD_BY     u16 holder, u16 pad                       -> u64 repointed, u32 n, u32 locs[n],
-//                                                                u32 lists[n]
+//   RAW_MISSING     u32 n, u32 partitions[n] (resident)       -> streamed, each frame: u32 groups,
+//                                                                per group: u16 holder, u16 pad,
+//                                                                u32 n, u32 locs[n], u32 lists[n]
+//                                                                (a list naming each)
+//                   (the vectors their newest versions name that are not here, each once, by
+//                   holder)
+//   RAW_HELD_BY     u16 holder, u16 pad                       -> streamed, each frame: u64 repointed,
+//                                                                u32 n, u32 locs[n], u32 lists[n]
 //                   (before that node leaves: postings naming it whose vector is here now name
-//                   this node; the others are returned, to be pulled with RAW_PULL)
+//                   this node -- the last frame counts them, the others say 0; the vectors of
+//                   the other postings come once each, to be pulled with RAW_PULL)
 //   RAW_GET         u32 n, u32 locs[n]                        -> u32 vec_bytes, u8 vecs[n * vb]
 //                   (from this node's own store: a peer asks the holder, there is no chain)
 //   RAW_PUT         u32 n, u32 vec_bytes, u32 locs[n],        -> u32 installed, u32 skipped
@@ -70,6 +75,13 @@
 //                   (raw-vector bytes since startup: served by RAW_GET, and brought here --
 //                   fetched from peers, on demand or by RAW_PULL, or put with RAW_PUT; an
 //                   agent holds the navigation graph back while they move, U16)
+//
+// A streamed reply comes as frames of the same request ID, every one but the last flagged more,
+// each with at most about kStreamBatch entries: the node sends a frame when it is full, when its
+// first entry has waited kStreamLingerMs (a slow listing -- a large segment read from disk --
+// still feeds the requester, which pulls what a frame names as it arrives), and the last one
+// when the listing is done. An error frame ends the stream.
+//
 //   SET_NODES       u16 self, u16 pad, u32 n,                 -> -
 //                   (u16 id, u16 pad, str addr)[n]
 //                   (this node's cluster ID, 0 = unchanged, and other data nodes' addresses:
@@ -150,6 +162,9 @@ constexpr uint32_t kMagicEnd = 0x444E4546;    // "FEND"
 constexpr uint32_t kHeaderBytes = 28;         // through epoch
 constexpr uint32_t kMaxFrameBytes = 256u << 20;
 constexpr uint8_t kFlagResponse = 1;
+constexpr uint8_t kFlagMore = 2;            // a streamed reply: more frames follow
+constexpr size_t kStreamBatch = 1u << 20;   // entries per frame of a streamed reply
+constexpr int kStreamLingerMs = 100;        // the longest an entry waits for its frame to fill
 constexpr uint8_t kInfoSettle = 1;  // INFO flags
 constexpr uint32_t kMaxPQBatch = 1u << 22;  // IDs per PQ_GET / PQ_PUT
 constexpr uint32_t kMaxRawBatch = 1u << 20;  // locations per RAW_GET / RAW_PUT / RAW_PULL (also bytes / 2)

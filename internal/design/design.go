@@ -270,7 +270,8 @@ var Open = map[string]Question{
 			"vector it has held (vectors are immutable, and even a deleted vector's page is not " +
 			"freed); a disk budget would need the same hand-off first. Baselines: \"lazy-stream\" " +
 			"also streams the rest in after the flip (StageRaw at raw_priority; RAW_MISSING " +
-			"groups each missing vector by its holder; the rescale waits for it); " +
+			"lists each missing vector once with its holder, as a stream pulled as it arrives; " +
+			"the rescale waits for it); " +
 			"\"copy-then-flip\" streams before the flip, \"stop-and-copy\" while paused. Decided " +
 			"(2026-10-16): the fetch stays on the query path -- taking it off (re-ranking a " +
 			"missing candidate at its holder, fetching in the background) is not a goal -- and " +

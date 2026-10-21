@@ -316,28 +316,6 @@ func (a *Agent) pullRawViaNode(ctx context.Context, locs, lists []uint32, batch,
 	return st, nil
 }
 
-// rawStripes splits n locations into at most streams contiguous ranges [lo, hi) of whole
-// batches (only the last one ends with a partial batch), as even as whole batches allow.
-func rawStripes(n, batch, streams int) [][2]int {
-	if n <= 0 {
-		return nil
-	}
-	batch, streams = max(batch, 1), max(streams, 1)
-	batches := (n + batch - 1) / batch
-	k := min(streams, batches)
-	out := make([][2]int, 0, k)
-	for i, lo := 0, 0; i < k; i++ {
-		nb := batches / k
-		if i < batches%k {
-			nb++
-		}
-		hi := min(lo+nb*batch, n)
-		out = append(out, [2]int{lo, hi})
-		lo = hi
-	}
-	return out
-}
-
 // stagePQAndLoad brings the PQ codes the fetched partitions need, then loads the partitions.
 func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, reply *protocol.StageReply) error {
 	var pending []protocol.Source
@@ -392,8 +370,13 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 	return nil
 }
 
-// pullMissingPQ asks the data node which PQ codes the sources' partitions need that it lacks
-// (each listed under one source only) and pulls them from those sources in parallel.
+// pqStreams is how many PULL_PQ requests are in flight to one source at once.
+const pqStreams = 2
+
+// pullMissingPQ has the data node list the PQ codes the sources' partitions need that it lacks
+// (each under one source only) and pulls them from those sources as the listing streams in, in
+// requests of up to DefaultPQBatch codes, pqStreams at once per source: the first codes come
+// while the rest are listed.
 func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, reply *protocol.StageReply) error {
 	groups := make([][]string, len(sources))
 	for i, src := range sources {
@@ -401,29 +384,65 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 			groups[i] = append(groups[i], a.segmentPath(p, src.VersionOf(j)))
 		}
 	}
-	missing, err := a.localBulk.PQMissing(ctx, groups)
-	if err != nil {
-		return fmt.Errorf("listing the PQ codes to fetch: %w", err)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		mu    sync.Mutex
+		first error
+		wg    sync.WaitGroup
+	)
+	queues := make([]chan []uint32, len(sources))
+	for i := range sources {
+		queues[i] = make(chan []uint32, pqStreams)
+		for range pqStreams {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for ids := range queues[i] {
+					if ctx.Err() != nil {
+						continue // after a failure: only empties the queue
+					}
+					st, err := transfer.PullPQ(ctx, sources[i].Addr, ids, 0, func(ids []uint32, m int, codes []byte) error {
+						// Not cancelled with ctx: once every pull has returned, every PQ_PUT has been
+						// answered, so a cleanup that follows a failure sees all installed codes.
+						pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+						defer cancel()
+						_, _, err := a.localBulk.PQPut(pctx, ids, m, codes)
+						return err
+					})
+					mu.Lock()
+					reply.PQCodes += st.Codes
+					reply.PQBytes += st.Bytes
+					if err != nil && first == nil {
+						first = fmt.Errorf("PQ codes from %s: %w", sources[i].Addr, err)
+						cancel()
+					}
+					mu.Unlock()
+				}
+			}()
+		}
 	}
-	var mu sync.Mutex
-	return parallel(ctx, len(sources), func(ctx context.Context, i int) error {
-		st, err := transfer.PullPQ(ctx, sources[i].Addr, missing[i], 0, func(ids []uint32, m int, codes []byte) error {
-			// Not cancelled with ctx: once parallel returns, every PQ_PUT has been answered, so
-			// a cleanup that follows a failure sees all installed codes.
-			pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-			defer cancel()
-			_, _, err := a.localBulk.PQPut(pctx, ids, m, codes)
-			return err
-		})
-		mu.Lock()
-		reply.PQCodes += st.Codes
-		reply.PQBytes += st.Bytes
-		mu.Unlock()
-		if err != nil {
-			return fmt.Errorf("PQ codes from %s: %w", sources[i].Addr, err)
+	lerr := a.localBulk.PQMissing(ctx, groups, func(g int, ids []uint32) error {
+		for lo := 0; lo < len(ids); lo += transfer.DefaultPQBatch {
+			select {
+			case queues[g] <- ids[lo:min(lo+transfer.DefaultPQBatch, len(ids))]:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		return nil
 	})
+	for _, q := range queues {
+		close(q)
+	}
+	wg.Wait()
+	if first != nil {
+		return first
+	}
+	if lerr != nil {
+		return fmt.Errorf("listing the PQ codes to fetch: %w", lerr)
+	}
+	return nil
 }
 
 // loadPartition loads the segment file of version v of partition p as that version.
@@ -473,12 +492,13 @@ func parallel(ctx context.Context, n int, fn func(ctx context.Context, i int) er
 
 // StageRaw: stream in the raw vectors that the listed partitions (loaded already) name and the
 // data node lacks -- the lazy half of a migration (U9). Until a vector arrives, a query that
-// needs it has the data node fetch it from its holder on demand. RawMissing lists every missing
-// vector once, grouped by the node its postings say holds it, and before each batch the node
-// checks again what it still lacks, so that a vector a query fetched meanwhile is not sent again
-// (only the batches in flight can still bring one twice). On the agent path the pulls run at the
-// requested class on the holders' buckets (background by default: after the flip, the stream
-// takes only the bandwidth nothing else needs); the node path has no bucket and no class.
+// needs it has the data node fetch it from its holder on demand. The data node lists every
+// missing vector once, with the node its postings say holds it, as a stream (RAW_MISSING), and
+// each holder's vectors are pulled as their batches arrive (rawPuller); before each request the
+// node checks again what it still lacks, so that a vector a query fetched meanwhile is not sent
+// again (only the requests in flight can still bring one twice). On the agent path the pulls run
+// at the requested class on the holders' buckets (background by default: after the flip, the
+// stream takes only the bandwidth nothing else needs); the node path has no bucket and no class.
 func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageRawReq](body)
 	if err != nil {
@@ -506,14 +526,25 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 		}
 		parts = append(parts, src.Partitions...)
 	}
-	missing, err := a.localBulk.RawMissing(ctx, parts)
+	p, err := a.newRawPuller(ctx, class)
 	if err != nil {
-		return nil, fmt.Errorf("listing the raw vectors to fetch: %w", err)
+		return nil, err
 	}
-	reply, err := a.pullRaw(ctx, missing, class)
+	lerr := a.localBulk.RawMissing(p.ctx, parts, func(groups []nodeclient.RawRefs) error {
+		for _, g := range groups {
+			if err := p.add(g); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	reply, err := p.wait()
 	reply.Seconds = time.Since(start).Seconds()
 	if err != nil {
 		return nil, err
+	}
+	if lerr != nil {
+		return nil, fmt.Errorf("listing the raw vectors to fetch: %w", lerr)
 	}
 	return reply, nil
 }
@@ -539,41 +570,62 @@ func (a *Agent) handleDrainRaw(ctx context.Context, body json.RawMessage) (any, 
 	start := time.Now()
 	var reply protocol.StageReply
 	for _, from := range req.From {
-		repointed, missing, err := a.localBulk.RawHeldBy(ctx, uint16(from))
+		p, err := a.newRawPuller(ctx, class)
+		if err != nil {
+			return nil, err
+		}
+		repointed, lerr := a.localBulk.RawHeldBy(p.ctx, uint16(from), p.add)
+		st, err := p.wait()
+		reply.Repointed += int64(repointed)
+		reply.RawVectors += st.RawVectors
+		reply.RawBytes += st.RawBytes
+		if err == nil {
+			err = lerr
+		}
 		if err != nil {
 			return nil, fmt.Errorf("draining node %d: %w", from, err)
 		}
-		reply.Repointed += int64(repointed)
-		if len(missing.Locs) > 0 {
-			st, err := a.pullRaw(ctx, []nodeclient.RawRefs{missing}, class)
-			reply.RawVectors += st.RawVectors
-			reply.RawBytes += st.RawBytes
-			if err != nil {
-				return nil, fmt.Errorf("draining node %d: %w", from, err)
-			}
-		}
-		again, rest, err := a.localBulk.RawHeldBy(ctx, uint16(from))
+		left := 0
+		again, err := a.localBulk.RawHeldBy(ctx, uint16(from), func(m nodeclient.RawRefs) error {
+			left += len(m.Locs)
+			return nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("draining node %d: %w", from, err)
 		}
 		reply.Repointed += int64(again)
-		if len(rest.Locs) > 0 {
-			return nil, fmt.Errorf("draining node %d: %d raw vectors are still only there", from, len(rest.Locs))
+		if left > 0 {
+			return nil, fmt.Errorf("draining node %d: %d raw vectors are still only there", from, left)
 		}
 	}
 	reply.Seconds = time.Since(start).Seconds()
 	return reply, nil
 }
 
-// pullRaw brings the vectors of groups (each held by one node) into the data node, in requests
-// of about raw_batch_bytes, raw_streams at once per group: data node to data node (RAW_PULL: the
-// data node asks the holders its postings record), or through the agents (PULL_RAW from the
-// holder's bulk port, at class on its bucket).
-func (a *Agent) pullRaw(ctx context.Context, groups []nodeclient.RawRefs, class transfer.Class) (protocol.StageReply, error) {
-	var reply protocol.StageReply
-	// Requests of about raw_batch_bytes: a vector that a query fetches while its batch is in
-	// flight comes twice, so a batch is kept to a fraction of a second at the paced rates, and
-	// still large enough to amortize the round trip and the check before it.
+// rawPuller brings raw vectors into the data node as their listing streams in (RAW_MISSING,
+// RAW_HELD_BY), in requests of about raw_batch_bytes, raw_streams at once per holder: data node to
+// data node (RAW_PULL: the data node asks the holders its postings record), or through the agents
+// (PULL_RAW from the holder's bulk port, at class on its bucket). The listing names every vector
+// once, so none comes twice -- but for one a query fetches while its request is in flight, which
+// is why a request is kept to a fraction of a second at the paced rates, and still large enough
+// to amortize the round trip and the check before it.
+type rawPuller struct {
+	a                 *Agent
+	ctx               context.Context
+	cancel            context.CancelFunc
+	class             transfer.Class
+	viaNode           bool
+	batch             int // locations per request
+	vecBytes, streams int
+
+	mu     sync.Mutex
+	queues map[uint16]chan nodeclient.RawRefs
+	wg     sync.WaitGroup
+	reply  protocol.StageReply
+	first  error
+}
+
+func (a *Agent) newRawPuller(ctx context.Context, class transfer.Class) (*rawPuller, error) {
 	streams, batchBytes := a.cfg.RawStreams, a.cfg.RawBatchBytes
 	if streams <= 0 {
 		streams = defaultRawStreams
@@ -591,50 +643,104 @@ func (a *Agent) pullRaw(ctx context.Context, groups []nodeclient.RawRefs, class 
 	}
 	viaNode := a.rawViaNode()
 	if viaNode && vecBytes <= 0 {
-		return reply, errors.New("the data node does not report its raw-vector size")
+		return nil, errors.New("the data node does not report its raw-vector size")
 	}
-	type stripe struct{ g, lo, hi int }
-	var stripes []stripe
-	for i, g := range groups {
-		for _, r := range rawStripes(len(g.Locs), batch, streams) {
-			stripes = append(stripes, stripe{i, r[0], r[1]})
+	ctx, cancel := context.WithCancel(ctx)
+	return &rawPuller{a: a, ctx: ctx, cancel: cancel, class: class, viaNode: viaNode, batch: batch,
+		vecBytes: vecBytes, streams: streams, queues: map[uint16]chan nodeclient.RawRefs{}}, nil
+}
+
+// add queues the vectors of g for their holder's pulls, a request at a time; it waits while
+// they are behind, so the slowest holder paces the listing, and fails once a pull has failed.
+func (p *rawPuller) add(g nodeclient.RawRefs) error {
+	q := p.queue(g.Holder)
+	for lo := 0; lo < len(g.Locs); lo += p.batch {
+		hi := min(lo+p.batch, len(g.Locs))
+		select {
+		case q <- nodeclient.RawRefs{Holder: g.Holder, Locs: g.Locs[lo:hi], Lists: g.Lists[lo:hi]}:
+		case <-p.ctx.Done():
+			return p.failure()
 		}
 	}
-	var mu sync.Mutex
-	err := parallel(ctx, len(stripes), func(ctx context.Context, j int) error {
-		s := stripes[j]
-		g := groups[s.g]
-		locs, lists := g.Locs[s.lo:s.hi], g.Lists[s.lo:s.hi]
-		var st transfer.Stats
-		var err error
-		if viaNode {
-			st, err = a.pullRawViaNode(ctx, locs, lists, batch, vecBytes)
-		} else {
-			holder, ok := a.nodeInfo(placement.NodeID(g.Holder))
-			if !ok {
-				return fmt.Errorf("raw vectors held by node %d, whose address this agent does not know", g.Holder)
-			}
-			still := func(locs []uint32) ([]uint32, error) { return a.localBulk.RawAbsent(ctx, locs) }
-			st, err = transfer.PullRaw(ctx, holder.BulkAddr, locs, batch, class, still, func(locs []uint32, vb int, vecs []byte) error {
-				pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				defer cancel()
-				_, _, err := a.localBulk.RawPut(pctx, locs, vb, vecs)
-				return err
-			})
+	return nil
+}
+
+// queue is holder's queue, with its pulls started on first use.
+func (p *rawPuller) queue(holder uint16) chan nodeclient.RawRefs {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	q, ok := p.queues[holder]
+	if !ok {
+		q = make(chan nodeclient.RawRefs, p.streams)
+		p.queues[holder] = q
+		for range p.streams {
+			p.wg.Add(1)
+			go p.run(q)
 		}
-		mu.Lock()
-		reply.RawVectors += st.Vectors
-		reply.RawBytes += st.Bytes
-		mu.Unlock()
-		if err != nil {
-			return fmt.Errorf("raw vectors from node %d: %w", g.Holder, err)
+	}
+	return q
+}
+
+func (p *rawPuller) run(q chan nodeclient.RawRefs) {
+	defer p.wg.Done()
+	for r := range q {
+		if p.ctx.Err() != nil {
+			continue // after a failure: only empties the queue
 		}
-		return nil
+		st, err := p.pull(r)
+		p.mu.Lock()
+		p.reply.RawVectors += st.Vectors
+		p.reply.RawBytes += st.Bytes
+		if err != nil && p.first == nil {
+			p.first = fmt.Errorf("raw vectors from node %d: %w", r.Holder, err)
+			p.cancel()
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (p *rawPuller) pull(r nodeclient.RawRefs) (transfer.Stats, error) {
+	if p.viaNode {
+		return p.a.pullRawViaNode(p.ctx, r.Locs, r.Lists, p.batch, p.vecBytes)
+	}
+	holder, ok := p.a.nodeInfo(placement.NodeID(r.Holder))
+	if !ok {
+		return transfer.Stats{}, errors.New("this agent does not know the node's address")
+	}
+	ctx := p.ctx
+	still := func(locs []uint32) ([]uint32, error) { return p.a.localBulk.RawAbsent(ctx, locs) }
+	return transfer.PullRaw(ctx, holder.BulkAddr, r.Locs, p.batch, p.class, still, func(locs []uint32, vb int, vecs []byte) error {
+		pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		_, _, err := p.a.localBulk.RawPut(pctx, locs, vb, vecs)
+		return err
 	})
+}
+
+// failure is the first pull's error, else the context's.
+func (p *rawPuller) failure() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.first != nil {
+		return p.first
+	}
+	return p.ctx.Err()
+}
+
+// wait waits for the pulls queued so far and returns what they brought.
+func (p *rawPuller) wait() (protocol.StageReply, error) {
+	p.mu.Lock()
+	for _, q := range p.queues {
+		close(q)
+	}
+	p.mu.Unlock()
+	p.wg.Wait()
+	p.cancel()
+	reply := p.reply
 	reply.Bytes = reply.RawBytes
-	a.reg.Counter("bulk.bytes_received").Add(reply.RawBytes)
-	a.reg.Counter("bulk.raw_vectors_received").Add(reply.RawVectors)
-	return reply, err
+	p.a.reg.Counter("bulk.bytes_received").Add(reply.RawBytes)
+	p.a.reg.Counter("bulk.raw_vectors_received").Add(reply.RawVectors)
+	return reply, p.first
 }
 
 // StageGraph: fetch the navigation graph and load it (the entry role's prerequisite). The pull

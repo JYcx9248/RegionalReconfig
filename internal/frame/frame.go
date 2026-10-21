@@ -33,6 +33,7 @@ const (
 	HeaderBytes          = 28
 	MaxFrameBytes        = 256 << 20
 	FlagResponse  uint8  = 1
+	FlagMore      uint8  = 2 // a streamed reply: more frames of this response follow
 )
 
 // Frame is one message.

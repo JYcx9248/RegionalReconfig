@@ -1,5 +1,7 @@
 #include "server.h"
 
+#include "stream.h"
+
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -13,6 +15,8 @@
 #include <cerrno>
 #include <cstring>
 #include <chrono>
+#include <exception>
+#include <functional>
 #include <thread>
 
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the rtier wire format is little endian");
@@ -183,6 +187,76 @@ std::vector<std::vector<std::string>> TakeGroups(BodyReader* r) {
   Require(r->remaining() == 0, "trailing bytes after the groups");
   return groups;
 }
+
+// PQ_MISSING's frames: u32 runs, (u32 group, u32 n, u32 ids[n])[runs] -- the IDs in the order
+// they were found, a run per group.
+struct IdBatch {
+  std::vector<std::pair<uint32_t, std::vector<uint32_t>>> runs;
+  size_t n = 0;
+
+  size_t size() const { return n; }
+  void Add(uint32_t group, const uint32_t* ids, size_t k) {
+    if (runs.empty() || runs.back().first != group) runs.emplace_back(group, std::vector<uint32_t>());
+    runs.back().second.insert(runs.back().second.end(), ids, ids + k);
+    n += k;
+  }
+  void Encode(BodyWriter* w, bool) const {
+    w->Put<uint32_t>(static_cast<uint32_t>(runs.size()));
+    for (const auto& [group, ids] : runs) {
+      w->Put<uint32_t>(group);
+      w->Put<uint32_t>(static_cast<uint32_t>(ids.size()));
+      w->PutBytes(ids.data(), ids.size() * 4);
+    }
+  }
+  void Clear() {
+    runs.clear();
+    n = 0;
+  }
+};
+
+// RAW_MISSING's frames: u32 groups, (u16 holder, u16 pad, u32 n, u32 locs[n], u32 lists[n])
+// [groups]. RAW_HELD_BY's (held_by): u64 repointed (the last frame's; 0 before), u32 n,
+// u32 locs[n], u32 lists[n], all of the one holder.
+struct RawBatch {
+  bool held_by = false;
+  uint64_t repointed = 0;
+  std::map<uint16_t, fusion::RawRefs> by;
+  size_t n = 0;
+
+  size_t size() const { return n; }
+  void Add(const fusion::RawRef* refs, size_t k) {
+    for (size_t i = 0; i < k; ++i) {
+      fusion::RawRefs& g = by[refs[i].holder];
+      g.locs.push_back(refs[i].loc);
+      g.lists.push_back(refs[i].list);
+    }
+    n += k;
+  }
+  void Encode(BodyWriter* w, bool last) const {
+    if (held_by) {
+      Require(by.size() <= 1, "RAW_HELD_BY lists one holder");
+      w->Put<uint64_t>(last ? repointed : 0);
+      w->Put<uint32_t>(static_cast<uint32_t>(n));
+      for (const auto& [holder, g] : by) {
+        w->PutBytes(g.locs.data(), g.locs.size() * 4);
+        w->PutBytes(g.lists.data(), g.lists.size() * 4);
+      }
+      return;
+    }
+    w->Put<uint32_t>(static_cast<uint32_t>(by.size()));
+    for (const auto& [holder, g] : by) {
+      w->Put<uint16_t>(holder);
+      w->Put<uint16_t>(0);
+      w->Put<uint32_t>(static_cast<uint32_t>(g.locs.size()));
+      w->PutBytes(g.locs.data(), g.locs.size() * 4);
+      w->PutBytes(g.lists.data(), g.lists.size() * 4);
+    }
+  }
+  void Clear() {
+    by.clear();
+    n = 0;
+  }
+};
 
 }  // namespace
 
@@ -401,7 +475,8 @@ void NodeServer::AcceptLoop(int listen_fd) {
 void NodeServer::ServeConnection(int fd, uint64_t id) {
   try {
     Frame req;
-    while (!stop_ && ReadFrame(fd, &req)) WriteFrame(fd, Handle(req));
+    const std::function<void(const Frame&)> write = [fd](const Frame& f) { WriteFrame(fd, f); };
+    while (!stop_ && ReadFrame(fd, &req)) WriteFrame(fd, Handle(req, write));
   } catch (const std::exception& e) {
     if (!stop_) fusion::Log("connection closed: %s", e.what());
   }
@@ -429,7 +504,7 @@ void NodeServer::ReleaseWorker(int w) {
   pool_cv_.notify_one();
 }
 
-Frame NodeServer::Handle(const Frame& req) {
+Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&)>& write) {
   Frame resp;
   resp.type = req.type;
   resp.flags = kFlagResponse;
@@ -498,17 +573,15 @@ Frame NodeServer::Handle(const Frame& req) {
         break;
       case kPQMissing: {
         const auto groups = TakeGroups(&r);
-        const uint32_t ngroups = static_cast<uint32_t>(groups.size());
-        const auto miss = e.PQMissing(groups);
-        uint64_t bytes = 4;
-        for (const auto& m : miss) bytes += 4 + 4 * static_cast<uint64_t>(m.size());
-        Require(bytes + 64 <= kMaxFrameBytes,
-                "the missing IDs do not fit in one frame; stage fewer partitions per call");
-        w.Put<uint32_t>(ngroups);
-        for (const auto& m : miss) {
-          w.Put<uint32_t>(static_cast<uint32_t>(m.size()));
-          w.PutBytes(m.data(), m.size() * 4);
-        }
+        Streamer<IdBatch> stream(req, write, stream_batch_);
+        e.PQMissingStream(groups, [&](size_t g, const uint32_t* ids, size_t n) {
+          for (size_t i = 0; i < n; i += stream.piece()) {
+            const size_t k = std::min(stream.piece(), n - i);
+            stream.Add([&](IdBatch& b) { b.Add(static_cast<uint32_t>(g), ids + i, k); });
+          }
+        });
+        const std::vector<uint8_t> last = stream.Last();
+        w.PutBytes(last.data(), last.size());
         break;
       }
       case kPQGet: {
@@ -544,32 +617,32 @@ Frame NodeServer::Handle(const Frame& req) {
         const uint32_t np = r.Get<uint32_t>();
         Require(static_cast<uint64_t>(np) * 4 == r.remaining(), "RAW_MISSING: partitions do not match");
         const auto parts = TakeArray<uint32_t>(&r, np);
-        const auto miss = e.RawMissing(parts);
-        uint64_t bytes = 4;
-        for (const auto& m : miss) bytes += 8 + 8 * static_cast<uint64_t>(m.locs.size());
-        Require(bytes + 64 <= kMaxFrameBytes,
-                "the missing locations do not fit in one frame; ask for fewer partitions per call");
-        w.Put<uint32_t>(static_cast<uint32_t>(miss.size()));
-        for (const auto& m : miss) {
-          w.Put<uint16_t>(m.holder);
-          w.Put<uint16_t>(0);
-          w.Put<uint32_t>(static_cast<uint32_t>(m.locs.size()));
-          w.PutBytes(m.locs.data(), m.locs.size() * 4);
-          w.PutBytes(m.lists.data(), m.lists.size() * 4);
-        }
+        Streamer<RawBatch> stream(req, write, stream_batch_);
+        e.RawMissingStream(parts, [&](const std::vector<fusion::RawRef>& refs) {
+          for (size_t i = 0; i < refs.size(); i += stream.piece()) {
+            const size_t k = std::min(stream.piece(), refs.size() - i);
+            stream.Add([&](RawBatch& b) { b.Add(refs.data() + i, k); });
+          }
+        });
+        const std::vector<uint8_t> last = stream.Last();
+        w.PutBytes(last.data(), last.size());
         break;
       }
       case kRawHeldBy: {
         const uint16_t holder = r.Get<uint16_t>();
         r.Get<uint16_t>();
         Require(r.remaining() == 0, "trailing bytes in RAW_HELD_BY");
-        const fusion::HeldBy hb = e.RawHeldBy(holder);
-        Require(8 + 4 + 8 * static_cast<uint64_t>(hb.missing.locs.size()) + 64 <= kMaxFrameBytes,
-                "the vectors held by that node do not fit in one frame");
-        w.Put<uint64_t>(hb.repointed);
-        w.Put<uint32_t>(static_cast<uint32_t>(hb.missing.locs.size()));
-        w.PutBytes(hb.missing.locs.data(), hb.missing.locs.size() * 4);
-        w.PutBytes(hb.missing.lists.data(), hb.missing.lists.size() * 4);
+        RawBatch held;
+        held.held_by = true;
+        Streamer<RawBatch> stream(req, write, stream_batch_, std::move(held));
+        const uint64_t repointed = e.RawHeldByStream(holder, [&](const std::vector<fusion::RawRef>& refs) {
+          for (size_t i = 0; i < refs.size(); i += stream.piece()) {
+            const size_t k = std::min(stream.piece(), refs.size() - i);
+            stream.Add([&](RawBatch& b) { b.Add(refs.data() + i, k); });
+          }
+        });
+        const std::vector<uint8_t> last = stream.Last([&](RawBatch& b) { b.repointed = repointed; });
+        w.PutBytes(last.data(), last.size());
         break;
       }
       case kSetNodes: {

@@ -200,6 +200,15 @@ struct RawRefs {
   std::vector<uint32_t> lists;
 };
 
+// One raw vector to bring: its location, the node holding it and a posting list here that names
+// it -- an entry of a streamed listing (RawMissingStream, RawHeldByStream).
+struct RawRef {
+  uint16_t holder = kNoHolder;
+  uint32_t loc = 0;
+  uint32_t list = 0;
+};
+using RawSink = std::function<void(const std::vector<RawRef>& refs)>;
+
 // What RawHeldBy found: postings that named the node and whose vector is here now (they name
 // this node from now on), and the ones whose vector must be pulled from it.
 struct HeldBy {
@@ -359,12 +368,16 @@ class NodeEngine {
 
   // PQ codes (node-level store). For each group of segment files (one group per source a
   // staging pulls from): the vector IDs they name that have no code on this node and are not
-  // listed for an earlier group, sorted. Asking once for all sources makes every missing code
-  // come exactly once, even when several sources could send it. The codes the node already
-  // has (live or cached) are protected until the partitions load or PQReleaseStaged, so that
-  // making room for the missing ones never drops them.
-  virtual std::vector<std::vector<uint32_t>> PQMissing(
-      const std::vector<std::vector<std::string>>& groups) = 0;
+  // listed for an earlier group. Asking once for all sources makes every missing code come
+  // exactly once, even when several sources could send it. The codes the node already has
+  // (live or cached) are protected until the partitions load or PQReleaseStaged, so that making
+  // room for the missing ones never drops them. PQMissingStream hands the IDs to sink a segment
+  // at a time, as it finds them (sorted within a call, each ID in one call only): the server
+  // streams them, and the requester pulls the first while the rest are listed. PQMissing
+  // collects them, sorted per group.
+  virtual void PQMissingStream(const std::vector<std::vector<std::string>>& groups,
+                               const std::function<void(size_t group, const uint32_t* ids, size_t n)>& sink) = 0;
+  std::vector<std::vector<uint32_t>> PQMissing(const std::vector<std::vector<std::string>>& groups);
   // Codes of ids (m bytes each) for a peer; PQMissingError if one is not held.
   virtual void PQGet(const uint32_t* ids, size_t n, uint8_t* out) = 0;
   // Installs codes received from a peer (staged until LoadPartition names them).
@@ -375,14 +388,18 @@ class NodeEngine {
   virtual PQStats pq_stats() const = 0;
 
   // Raw vectors (node-level, fusion/raw_store.h). The vectors the newest resident versions of
-  // these partitions name that are not on this node, grouped by holder, each once with a list
+  // these partitions name that are not on this node, each once with its holder and a list
   // naming it -- what a stream brings (the eager baselines and lazy-stream; the lazy protocol
-  // fetches on demand only).
-  virtual std::vector<RawRefs> RawMissing(const std::vector<uint32_t>& partitions) = 0;
+  // fetches on demand only). RawMissingStream hands them to sink as it finds them, a partition
+  // (or a chunk of one) at a time; RawMissing collects them by holder, sorted by location.
+  virtual void RawMissingStream(const std::vector<uint32_t>& partitions, const RawSink& sink) = 0;
+  std::vector<RawRefs> RawMissing(const std::vector<uint32_t>& partitions);
   // Before a node leaves (U9): of every resident posting whose holder is `holder`, the ones
-  // whose vector is here now are made to name this node, and the others are returned, to be
-  // pulled from it (RawPull). Once they are, no posting here names the node.
-  virtual HeldBy RawHeldBy(uint16_t holder) = 0;
+  // whose vector is here now are made to name this node, and the vectors of the others go to
+  // sink, each once, to be pulled from it (RawPull); returns how many postings it repointed.
+  // Once they are pulled, no posting here names the node. RawHeldBy collects them, sorted.
+  virtual uint64_t RawHeldByStream(uint16_t holder, const RawSink& sink) = 0;
+  HeldBy RawHeldBy(uint16_t holder);
   // Which of locs[0..n) are not on this node (sorted, without duplicates): the stream asks
   // again before each batch, so that what queries fetched meanwhile is not sent twice.
   virtual std::vector<uint32_t> RawAbsent(const uint32_t* locs, size_t n) const = 0;

@@ -17,8 +17,9 @@ disk-bound hot spot: its data is on its owner's SSD. List them with `bin/rtier-c
 **PQ codes (decided part of U1):** node-level. A data node keeps one PQ code per vector named by
 its resident posting lists, however many lists or partitions name it. When partitions move, the
 destination's data node lists the codes it lacks, split by source so each is fetched once
-(`PQ_MISSING`); the old owners send exactly those over the rate-limited bulk channel
-(`PULL_PQ`); they are installed (`PQ_PUT`) before the partitions load, so a new node goes online
+(`PQ_MISSING`), as a stream that its agent pulls from while the rest is listed; the old owners
+send exactly those over the rate-limited bulk channel (`PULL_PQ`); they are installed
+(`PQ_PUT`) before the partitions load, so a new node goes online
 only once it holds every posting list and PQ code of its partitions and can filter at once.
 Vectors are immutable (an update deletes and inserts under a new ID, U14), so the old owner keeps
 the codes of partitions that moved away as a cache; they are dropped only when a later staging
