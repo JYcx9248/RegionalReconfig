@@ -361,3 +361,83 @@ func TestPullBackground(t *testing.T) {
 		t.Fatalf("graph differs (%v)", err)
 	}
 }
+
+// A background file waits for the sender's Yield before each chunk and for the receiver's gate
+// before each read; a data pull asks neither, and an error from either ends the pull.
+func TestPullYields(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("graph"), 60000) // 300 KB: five 64 KiB chunks
+	os.MkdirAll(filepath.Join(src, "graph"), 0o755)
+	if err := os.WriteFile(filepath.Join(src, "graph", "graph.hnsw"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	var hold, fail atomic.Bool
+	var yields atomic.Int64
+	held := errors.New("held")
+	hold.Store(true)
+	srv := &Server{Root: src, Limiter: NewTokenBucket(0, 0), ChunkBytes: 64 << 10, Yield: func() error {
+		yields.Add(1)
+		if fail.Load() {
+			return held
+		}
+		for hold.Load() {
+			time.Sleep(time.Millisecond)
+		}
+		return nil
+	}}
+	go srv.Serve(ln)
+	ctx, addr, files := context.Background(), ln.Addr().String(), []string{"graph/graph.hnsw"}
+	type result struct {
+		st  Stats
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		st, err := Pull(ctx, addr, files, dst, 0, Background)
+		done <- result{st, err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if n := srv.BytesSent.Load(); n != 0 {
+		t.Fatalf("%d bytes sent while the sender yielded", n)
+	}
+	hold.Store(false)
+	if r := <-done; r.err != nil || r.st.Bytes != int64(len(data)) {
+		t.Fatalf("background pull: %+v, %v", r.st, r.err)
+	}
+	if n := yields.Load(); n < 5 {
+		t.Fatalf("Yield asked %d times for 5 chunks", n)
+	}
+	yields.Store(0)
+	if _, err := Pull(ctx, addr, files, t.TempDir(), 0, Data); err != nil || yields.Load() != 0 {
+		t.Fatalf("data pull: %v, %d yields", err, yields.Load())
+	}
+
+	var gateOpen atomic.Bool
+	go func() {
+		st, err := PullGated(ctx, addr, files, dst, 0, Background, func(ctx context.Context) error {
+			for !gateOpen.Load() {
+				time.Sleep(time.Millisecond)
+			}
+			return nil
+		})
+		done <- result{st, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("pull ended (%+v, %v) while the receiver held it", r.st, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	gateOpen.Store(true)
+	if r := <-done; r.err != nil || r.st.Bytes != int64(len(data)) {
+		t.Fatalf("gated pull: %+v, %v", r.st, r.err)
+	}
+	if _, err := PullGated(ctx, addr, files, t.TempDir(), 0, Background, func(context.Context) error { return held }); !errors.Is(err, held) {
+		t.Fatalf("gate error: %v", err)
+	}
+	fail.Store(true)
+	if _, err := Pull(ctx, addr, files, t.TempDir(), 0, Background); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("Yield error: %v", err)
+	}
+}

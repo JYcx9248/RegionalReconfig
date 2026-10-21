@@ -53,9 +53,9 @@ type Controller struct {
 	MetricsPath    string   `json:"metrics_path"`    // JSON-lines sink
 	CallTimeout    Duration `json:"call_timeout"`    // short control calls
 	StageTimeout   Duration `json:"stage_timeout"`   // data/graph staging, drains
-	// GraphPriority is the class of graph transfers on their source's bucket: "background"
-	// (default: only bandwidth the segment and PQ transfers leave unused) or "data" (share it
-	// equally -- the baseline to compare against).
+	// GraphPriority is the class of graph transfers: "background" (default: the graph moves only
+	// while neither end moves segments, PQ codes or raw vectors, U16) or "data" (it shares the
+	// source's bucket with them equally -- the baseline to compare against).
 	GraphPriority string `json:"graph_priority"`
 	// RawPriority is the class of the raw-vector stream that follows the flip in the
 	// lazy-stream baseline: "background" (default: queries fetch the vectors they need on

@@ -66,6 +66,10 @@
 //                   (the node fetches what it lacks from the holders its postings in those
 //                   lists record, with RAW_GET, and installs it: a stream that does not pass
 //                   through the agents; those postings then name this node)
+//   RAW_TRAFFIC     -                                         -> u64 sent, u64 received
+//                   (raw-vector bytes since startup: served by RAW_GET, and brought here --
+//                   fetched from peers, on demand or by RAW_PULL, or put with RAW_PUT; an
+//                   agent holds the navigation graph back while they move, U16)
 //   SET_NODES       u16 self, u16 pad, u32 n,                 -> -
 //                   (u16 id, u16 pad, str addr)[n]
 //                   (this node's cluster ID, 0 = unchanged, and other data nodes' addresses:
@@ -189,6 +193,7 @@ enum Op : uint8_t {
   kPatchSave = 0x3B,
   kSwitchGeneration = 0x3C,
   kRawBitmap = 0x3D,
+  kRawTraffic = 0x3E,
 };
 
 enum Status : uint16_t {

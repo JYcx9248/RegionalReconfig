@@ -1921,6 +1921,20 @@ void TestWire() {
   CHECK(r.status == rtier::kOk && r.body.size() == 8);
   rtier::BodyReader cr(r.body.data(), r.body.size());
   CHECK(cr.Get<uint32_t>() == 1 && cr.Get<uint32_t>() == other);
+  // RAW_TRAFFIC: what node 1 served (the RERANK's fetch, the pull, the RAW_GET) all went to
+  // node 2 (fetched, pulled, put), and the refused RAW_GET moved nothing.
+  auto traffic = [](int conn, uint64_t id) {
+    rtier::BodyWriter none;
+    rtier::Frame t = Call(conn, rtier::kRawTraffic, none, id);
+    CHECK(t.status == rtier::kOk && t.body.size() == 16);
+    rtier::BodyReader tr(t.body.data(), t.body.size());
+    const uint64_t sent = tr.Get<uint64_t>();
+    return std::make_pair(sent, tr.Get<uint64_t>());
+  };
+  const uint64_t moved = e->raw_stats(false).served * vb;
+  CHECK(moved >= static_cast<uint64_t>(fetched2 + nraw) * vb);
+  CHECK(traffic(fd, 82) == std::make_pair(moved, uint64_t{0}));
+  CHECK(traffic(fd2, 83) == std::make_pair(uint64_t{0}, moved));
   r = Call(fd2, rtier::kPQRelease, empty, 65);
   CHECK(r.status == rtier::kOk && r.body.size() == 8);
   r = Call(fd2, rtier::kInfo, empty, 66);

@@ -135,6 +135,7 @@ const char* OpName(uint8_t op) {
     case kPatchSave: return "patch_save";
     case kSwitchGeneration: return "switch_generation";
     case kRawBitmap: return "raw_bitmap";
+    case kRawTraffic: return "raw_traffic";
     default: return nullptr;
   }
 }
@@ -291,6 +292,7 @@ NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
   const uint32_t vb = engine->vec_bytes();
   engine->SetRawFetcher([this, vb](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
     peers_.RawGet(peer, locs, n, vb, out);
+    raw_received_.fetch_add(static_cast<uint64_t>(n) * vb, std::memory_order_relaxed);
   });
 }
 
@@ -593,6 +595,7 @@ Frame NodeServer::Handle(const Frame& req) {
         Require(r.remaining() == 0, "trailing bytes in RAW_GET");
         std::vector<uint8_t> vecs(static_cast<size_t>(n) * vb);
         e.RawGet(locs.data(), n, vecs.data());
+        raw_sent_.fetch_add(vecs.size(), std::memory_order_relaxed);
         w.Put<uint32_t>(vb);
         w.PutBytes(vecs.data(), vecs.size());
         break;
@@ -616,6 +619,7 @@ Frame NodeServer::Handle(const Frame& req) {
         const auto locs = TakeArray<uint32_t>(&r, n);
         Require(r.remaining() == static_cast<size_t>(n) * vb, "RAW_PUT: vectors do not match the locations");
         const fusion::RawPutResult res = e.RawPut(locs.data(), n, r.Bytes(static_cast<size_t>(n) * vb));
+        raw_received_.fetch_add(static_cast<uint64_t>(n) * vb, std::memory_order_relaxed);
         w.Put<uint32_t>(static_cast<uint32_t>(res.installed));
         w.Put<uint32_t>(static_cast<uint32_t>(res.skipped));
         break;
@@ -635,6 +639,11 @@ Frame NodeServer::Handle(const Frame& req) {
       }
       case kPauseUpdates:
         e.PauseUpdateWrites(r.Get<uint8_t>() != 0);
+        break;
+      case kRawTraffic:
+        Require(r.remaining() == 0, "trailing bytes in RAW_TRAFFIC");
+        w.Put<uint64_t>(raw_sent_.load(std::memory_order_relaxed));
+        w.Put<uint64_t>(raw_received_.load(std::memory_order_relaxed));
         break;
       case kRawPull: {
         const uint32_t n = r.Get<uint32_t>();
@@ -1017,10 +1026,13 @@ std::string NodeServer::FetchJson() const {
 std::string NodeServer::StatsJson() const {
   const fusion::ReadBudgetStats r = engine_->read_budget_stats();
   return "{\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() +
-         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"charged\":%llu,\"wait_us\":%llu}}",
+         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"charged\":%llu,\"wait_us\":%llu}"
+                           ",\"raw_bytes\":{\"sent\":%llu,\"received\":%llu}}",
                            static_cast<unsigned long long>(r.reads_per_sec),
                            static_cast<unsigned long long>(r.charged),
-                           static_cast<unsigned long long>(r.wait_us));
+                           static_cast<unsigned long long>(r.wait_us),
+                           static_cast<unsigned long long>(raw_sent_.load(std::memory_order_relaxed)),
+                           static_cast<unsigned long long>(raw_received_.load(std::memory_order_relaxed)));
 }
 
 }  // namespace rtier

@@ -59,6 +59,7 @@ const (
 	opPatchSave      uint8 = 0x3B
 	opSwitchGen      uint8 = 0x3C
 	opRawBitmap      uint8 = 0x3D
+	opRawTraffic     uint8 = 0x3E
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -445,6 +446,21 @@ func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
 		out.Words[i] = r.U64()
 	}
 	return out, r.Err
+}
+
+// RawTraffic returns the raw-vector bytes the node has sent (RAW_GET) and received (fetched from
+// peers, on demand or by RAW_PULL, or put with RAW_PUT) since it started.
+func (c *Client) RawTraffic(ctx context.Context) (sent, received uint64, err error) {
+	b, err := c.do(ctx, opRawTraffic, 0, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	r := frame.NewReader(b)
+	sent, received = r.U64(), r.U64()
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, 0, fmt.Errorf("RAW_TRAFFIC: %d trailing bytes", r.Remaining())
+	}
+	return sent, received, r.Err
 }
 
 // PQMissing returns, for each group of segment files (paths on the node's host), the vector

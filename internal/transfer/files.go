@@ -48,7 +48,11 @@ type Server struct {
 	Raw        RawSource    // nil = PULL_RAW is refused
 	Limiter    *TokenBucket // nil = unlimited
 	ChunkBytes int          // default chunk size (Koala: StateMigrationChunkSize, 1 MiB)
-	BytesSent  atomic.Int64
+	// Yield, if set, is called before each chunk of a background file -- the navigation graph and
+	// its patches -- is read, and holds the transfer back until it returns (the agent's strict
+	// yield to data, U16); an error ends the transfer.
+	Yield     func() error
+	BytesSent atomic.Int64
 }
 
 // Serve accepts pull connections until ln is closed.
@@ -130,6 +134,12 @@ func (s *Server) sendFiles(bw *bufio.Writer, req *pullRequest) error {
 		crc := crc32.NewIEEE()
 		var off int64
 		for {
+			if class == Background && s.Yield != nil {
+				if err := s.Yield(); err != nil {
+					fh.Close()
+					return err
+				}
+			}
 			n, rerr := io.ReadFull(fh, buf)
 			if n > 0 {
 				if s.Limiter != nil {
@@ -191,6 +201,14 @@ type Stats struct {
 // class on the sender's bucket. Each file is written to "<name>.part", checked against the
 // sender's size and CRC-32, then renamed.
 func Pull(ctx context.Context, addr string, files []string, destDir string, chunk int, class Class) (Stats, error) {
+	return PullGated(ctx, addr, files, destDir, chunk, class, nil)
+}
+
+// PullGated is Pull with gate (if not nil) called before each chunk is read: while it blocks,
+// nothing is read, and the sender, once the connection's buffers are full, sends nothing either
+// (the agent's strict yield for the graph, U16). An error from gate ends the pull.
+func PullGated(ctx context.Context, addr string, files []string, destDir string, chunk int, class Class,
+	gate func(context.Context) error) (Stats, error) {
 	start := time.Now()
 	var d net.Dialer
 	c, err := d.DialContext(ctx, "tcp", addr)
@@ -233,6 +251,12 @@ func Pull(ctx context.Context, addr string, files []string, destDir string, chun
 	}
 	br := bufio.NewReaderSize(c, 256<<10)
 	for {
+		if gate != nil {
+			if err := gate(ctx); err != nil {
+				cleanup()
+				return Stats{}, err
+			}
+		}
 		var f frame.Frame
 		if err := frame.Read(br, &f); err != nil {
 			cleanup()

@@ -20,12 +20,14 @@ import (
 // PQ codes it can own them and answer FILTER and RERANK, which is what takes load off the old
 // owners; only with the navigation graph can it also take client queries, and navigation is
 // the smallest share of a query's work, which any existing entry can do meanwhile. So what the
-// first step needs goes first: the graph never slows a data transfer down, and gets whatever
-// bandwidth the data transfers leave unused. Raw vectors are not needed for the first step
-// either: RERANK fetches the ones it lacks from their holders on demand (U9), data node to data
-// node and outside this bucket. Only a raw-vector pull that runs through the agents (raw_path
-// "agent") takes a class here: a baseline's stream after the flip and a scale-in's drain at
-// "raw_priority", background by default, and an eager baseline's copy before the flip as data.
+// first step needs goes first: here, background takes only the tokens data transfers leave
+// unused. The graph yields further, outside the bucket: it moves no byte while either end of
+// its transfer moves data, raw vectors included (the agent's graphYield, U16). Raw vectors are
+// not needed for the first step either: RERANK fetches the ones it lacks from their holders on
+// demand (U9), data node to data node and outside this bucket. Only a raw-vector pull that runs
+// through the agents (raw_path "agent") takes a class here: a baseline's stream after the flip
+// and a scale-in's drain at "raw_priority", background by default, and an eager baseline's copy
+// before the flip as data.
 type Class int
 
 const (
@@ -107,6 +109,13 @@ func (b *TokenBucket) Begin(c Class) func() {
 			b.mu.Unlock()
 		})
 	}
+}
+
+// Active returns how many transfers of class c are in progress (Begin).
+func (b *TokenBucket) Active(c Class) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.active[c]
 }
 
 func (b *TokenBucket) refillLocked(now time.Time) {

@@ -639,8 +639,8 @@ func (a *Agent) pullRaw(ctx context.Context, groups []nodeclient.RawRefs, class 
 }
 
 // StageGraph: fetch the navigation graph and load it (the entry role's prerequisite). The pull
-// runs at the priority the controller asks for -- background by default, so on its source it
-// only uses the bandwidth that data transfers (segments, PQ codes) leave unused.
+// runs at the priority the controller asks for -- background by default: then it moves nothing
+// while its source or this node moves data, raw vectors included (graphYield).
 func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageGraphReq](body)
 	if err != nil {
@@ -657,13 +657,18 @@ func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any
 	}
 	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
+	var gate func(context.Context) error // this end's half of the yield; the source holds its own
+	if class == transfer.Background {
+		gate = a.yield.Wait
+	}
 	const name = "graph.hnsw"
 	var st transfer.Stats
 	switch req.Source.Kind {
 	case "local":
 		st, err = transfer.CopyLocal(req.Source.Dir, []string{name}, a.graphDir())
 	case "peer":
-		st, err = transfer.Pull(ctx, req.Source.Addr, []string{filepath.Join("graph", name)}, a.cfg.WorkDir, a.cfg.ChunkBytes, class)
+		st, err = transfer.PullGated(ctx, req.Source.Addr, []string{filepath.Join("graph", name)}, a.cfg.WorkDir,
+			a.cfg.ChunkBytes, class, gate)
 	default:
 		err = fmt.Errorf("unknown source kind %q", req.Source.Kind)
 	}
@@ -681,7 +686,8 @@ func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any
 		if req.Source.Kind != "peer" {
 			return nil, fmt.Errorf("graph version %d: a %s graph source has no patches", req.Graph, req.Source.Kind)
 		}
-		pst, err := transfer.Pull(ctx, req.Source.Addr, []string{filepath.Join("graph", file)}, a.cfg.WorkDir, a.cfg.ChunkBytes, class)
+		pst, err := transfer.PullGated(ctx, req.Source.Addr, []string{filepath.Join("graph", file)}, a.cfg.WorkDir,
+			a.cfg.ChunkBytes, class, gate)
 		if err != nil {
 			return nil, err
 		}
@@ -826,6 +832,8 @@ func (a *Agent) handleSavePartitions(ctx context.Context, body json.RawMessage) 
 	}
 	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
+	a.saving.Add(1) // the moved lists on their way out: the graph waits (graphYield)
+	defer a.saving.Add(-1)
 	for _, pv := range req.Versions {
 		if err := a.localBulk.SavePartition(ctx, pv.Partition, pv.Version, a.segmentPath(pv.Partition, pv.Version)); err != nil {
 			return nil, fmt.Errorf("save partition %d at version %d: %w", pv.Partition, pv.Version, err)

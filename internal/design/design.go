@@ -430,16 +430,22 @@ var Open = map[string]Question{
 			"transfer itself: each new entry's source is assigned when the reconfiguration " +
 			"starts, round-robin over the live entries with a cursor that carries over between " +
 			"reconfigurations (instead of every new node pulling from the first entry), and the " +
-			"pull runs at background priority on its source (graph_priority): FILTER and RERANK " +
-			"need posting lists and PQ codes, not the graph, and navigation is the smallest " +
-			"share of a query that any existing entry can do meanwhile -- so the graph only gets " +
-			"the bandwidth the segment and PQ transfers leave unused and never delays the flip. " +
+			"pull runs at background priority (graph_priority): FILTER and RERANK need posting " +
+			"lists and PQ codes, not the graph, and navigation is the smallest share of a query " +
+			"that any existing entry can do meanwhile. Decided (2026-10-21): the graph yields " +
+			"strictly to posting lists, PQ codes and raw vectors, paced or not, at both ends of " +
+			"its transfer -- it moves no byte while its source or its destination moves segments " +
+			"or PQ codes through its agent, or raw vectors through its data node (RAW_TRAFFIC, " +
+			"polled every 100 ms) -- so it delays neither the flip nor a query's fetch. In the " +
+			"worst case, queries fetching without pause, a new node becomes an entry only once " +
+			"the fetching subsides (accepted: only navigation waits, which existing entries do). " +
 			"Pairs with U6's warmup selector, which moves aggregation to the new node before its " +
 			"graph arrives. After major epochs (U14), the transfer brings the build's graph and " +
 			"then, from the same source, the patch of every later graph version, merged in order " +
 			"before the node takes the role",
 		"internal/controller/reconfig.go (graphSources, StageGraph, promoteEntries), " +
-			"internal/transfer/tokenbucket.go (classes), engine/src/node_engine.cpp (LoadGraph)"},
+			"internal/agent/yield.go (graphYield), internal/transfer/tokenbucket.go (classes), " +
+			"engine/src/node_engine.cpp (LoadGraph)"},
 	"U17": {"U17", "Where the client-facing availability list lives",
 		"today the entry set is a field of the epoch table, so \"this node finished loading its " +
 			"graph\" -- a local event that has nothing to do with who owns what -- costs an epoch " +

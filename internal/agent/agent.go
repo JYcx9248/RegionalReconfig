@@ -73,6 +73,8 @@ type Agent struct {
 	selector   query.Selector
 	limiter    *transfer.TokenBucket
 	bulk       *transfer.Server
+	yield      *graphYield  // the graph's transfers wait while data moves here (U16)
+	saving     atomic.Int32 // SavePartitions calls in flight
 	reg        *metrics.Registry
 	// The local data node, twice. Queries (NAVIGATE, and FILTER/RERANK through peer) use local;
 	// everything else -- serving peers' pulls, installing what arrives, loads, evictions, INFO --
@@ -173,6 +175,19 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 	a.manifest.Store(m)
 	a.agg = &query.Aggregator{Nodes: a, Strategy: strategy}
 	a.bulk = &transfer.Server{Root: cfg.WorkDir, Limiter: a.limiter, ChunkBytes: cfg.ChunkBytes}
+	a.yield = &graphYield{dataMoving: a.dataMoving, poll: graphPoll,
+		rawBytes: func(ctx context.Context) (uint64, error) {
+			sent, received, err := a.localBulk.RawTraffic(ctx)
+			return sent + received, err
+		},
+		// Every wait, at either end: how much later the graph arrived for the data.
+		waited: func(d time.Duration) { a.reg.Counter("graph.yield_ms").Add(d.Milliseconds()) }}
+	a.bulk.Yield = func() error {
+		// A pull being served has no context of its own: a wait ends at the step timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), a.stepTimeout())
+		defer cancel()
+		return a.yield.Wait(ctx)
+	}
 	return a, nil
 }
 

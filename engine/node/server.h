@@ -72,8 +72,9 @@ class NodeServer {
   Frame Handle(const Frame& req);
 
   // One line of the node's stats log (rtier_node --stats-file): per-operation counters, the
-  // fetch path's (fusion::FetchStats) and the read budget's, without INFO's raw-vector totals,
-  // which wait for the writer and rescan the resident postings.
+  // fetch path's (fusion::FetchStats), the read budget's and the raw-vector bytes sent and
+  // received (RAW_TRAFFIC), without INFO's raw-vector totals, which wait for the writer and
+  // rescan the resident postings.
   std::string StatsJson() const;
 
  private:
@@ -99,6 +100,7 @@ class NodeServer {
   std::condition_variable pool_cv_;
   std::vector<int> free_workers_;
   std::atomic<uint64_t> max_epoch_seen_{0};
+  std::atomic<uint64_t> raw_sent_{0}, raw_received_{0};  // RAW_TRAFFIC
   std::mutex conn_mu_;
   std::set<int> conn_fds_;                          // open connections (shut down by Stop)
   std::map<uint64_t, std::thread> conn_threads_;   // by connection; joined by Serve

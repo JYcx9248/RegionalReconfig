@@ -466,10 +466,11 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	// Entry readiness runs in the background: the graph is large, and new nodes serve as data
 	// nodes and aggregators without it. Every return waits for it, so it never overlaps the
 	// next reconfiguration. Graph sources were assigned when the reconfiguration started
-	// (round-robin over the entries), and the pulls run at background priority by default: on
-	// a source that is also sending segments or PQ codes, the graph only gets the bandwidth
-	// those leave unused, so it never delays the flip (U16). Each pull reports on its own, so a
-	// node whose graph loads early does not wait for the others (promoteEntries).
+	// (round-robin over the entries), and the pulls run at background priority by default: a
+	// graph moves only while neither its source nor its destination moves data -- segments, PQ
+	// codes, raw vectors -- so it never delays the flip or a query's fetch (U16). Each pull
+	// reports on its own, so a node whose graph loads early does not wait for the others
+	// (promoteEntries).
 	graphs := make(chan graphDone, len(entryAdds))
 	var graphWG sync.WaitGroup
 	var graphBytes atomic.Int64

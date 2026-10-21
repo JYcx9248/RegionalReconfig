@@ -118,9 +118,13 @@ partitions and answer FILTER and RERANK -- the steps that take load off the old 
 the navigation graph only for the entry role, whose navigation any existing entry can do
 meanwhile. So each new entry's graph source is assigned when the reconfiguration starts,
 round-robin over the live entries (`graph_sources` in the rescale reply), and the pull runs at
-background priority on its source (`"graph_priority": "background"`, the default): on a node
-that is also sending segments or PQ codes, the graph only takes bandwidth those leave unused,
-so it never delays the flip. `"data"` shares the bucket equally, as a baseline. A new node
+background priority (`"graph_priority": "background"`, the default): the graph moves only while
+neither its source nor its destination moves data -- segments or PQ codes through the agent,
+raw vectors through the data node (`RAW_TRAFFIC`, polled every 100 ms) -- paced or not, so it
+delays neither the flip nor a query's fetch. In the worst case, queries fetching without pause,
+a new node becomes an entry only once the fetching subsides; only navigation waits for it,
+which the existing entries do meanwhile. `"data"` shares the source's bucket equally, as a
+baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
 are arriving, the controller flips every `"entry_flip_interval"` (1 s by default) to add all the
 nodes that are ready, and adds the last ones at once when every pull has ended. These flips

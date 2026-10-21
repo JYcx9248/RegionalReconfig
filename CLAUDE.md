@@ -56,7 +56,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `cmd/rtier-overhead` | fan-out cost analysis: one data node emulates N owners (`-owners`, `-compare`) |
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
 | `internal/controller` | registration, placement, reconfiguration (`reconfig.go`), update leases (`update.go`), full rebuild (`rebuild.go`); collects metrics and the nodes' diagnostics |
-| `internal/agent` | staging, epoch install, entry and aggregator roles (`serve.go`), generations and the rebuild's warm-up (`generation.go`), diagnostics forwarding (`diag.go`) |
+| `internal/agent` | staging, epoch install, entry and aggregator roles (`serve.go`), generations and the rebuild's warm-up (`generation.go`), diagnostics forwarding (`diag.go`), the graph's yield to data (`yield.go`) |
 | `internal/update` | update batches (`batch.go`) and major epochs (`major.go`), with their router |
 | `internal/query` | selectors (aggregator choice), strategies (`TwoPhase`), wire format |
 | `internal/placement`, `internal/transfer` | placement policies, plans, the rebuild's placement (`affinity.go`); bulk transfer + token bucket |
@@ -94,8 +94,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   aggregator → `TwoPhase`: FILTER (local top-n by PQ) at each owner, global top-n merge, RERANK
   of each candidate at one owner that reported it, top-k merge. Equal to the single-node answer.
 - **Reconfiguration** (`copyThenFlip`, protocol `lazy` by default): pre-connect aggregators →
-  new nodes pull segments and the PQ codes they lack (graph in the background, lower priority,
-  sources round-robin over entries) → flip (CAS + install) → grace (drain the old epoch) →
+  new nodes pull segments and the PQ codes they lack (the graph last: it moves only while
+  neither end moves segments, PQ codes or raw vectors, `graphYield`; sources round-robin over
+  entries) → flip (CAS + install) → grace (drain the old epoch) →
   reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
   Alongside grace and reclaim, `promoteEntries` flips every `entry_flip_interval` to make
   entries of the new nodes whose graph has loaded; the rescale waits for it. Raw vectors do
