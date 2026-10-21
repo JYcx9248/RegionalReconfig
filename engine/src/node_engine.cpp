@@ -1127,6 +1127,10 @@ class NodeEngineImpl : public NodeEngine {
 
   void RawGet(const uint32_t* locs, size_t n, uint8_t* out) override {
     const uint32_t vb = raw_->layout().vec_bytes;
+    const uint64_t total = raw_->layout().locations();
+    for (size_t i = 0; i < n; ++i)  // a peer's request: checked before the presence bits are read
+      FUSION_CHECK(locs[i] < total, "raw-vector location %u out of range (%llu locations)", locs[i],
+                   static_cast<unsigned long long>(total));
     std::vector<uint32_t> disk;
     std::vector<size_t> at;
     size_t from_cache = 0;
@@ -1965,9 +1969,9 @@ class NodeEngineImpl : public NodeEngine {
     if (!arrived.empty()) settle(arrived, true);
     // The holders at once, one request each: a node that took partitions from several donors
     // (the graph placement picks them by the partition graph, not as contiguous ranges) meets a
-    // query's misses at several holders, and the RERANK, which holds an engine worker, then
-    // waits for the slowest fetch instead of their sum. Every fetch ends before this call does
-    // -- they use its state -- and a failed one's claims are unclaimed as before.
+    // query's misses at several holders, and the query then waits for the slowest fetch instead
+    // of their sum. Every fetch ends before this call does -- they use its state -- and a failed
+    // one's claims are unclaimed as before.
     const std::vector<std::pair<uint16_t, std::vector<size_t>>> jobs(by.begin(), by.end());
     std::vector<size_t> got(jobs.size(), 0);
     std::vector<std::exception_ptr> failed(jobs.size());

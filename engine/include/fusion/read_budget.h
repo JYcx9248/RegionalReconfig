@@ -7,8 +7,9 @@
 // what reaches the device, as io.max does: every page re-ranking reads (O_DIRECT, unless the node
 // runs with --no-direct), the pages the background writer reads back before rewriting them, and
 // the RAW_GET reads the page cache does not serve. Not charged: bootstrap (before the load),
-// segment and graph files (the agent's reads), and the reads a buffered install may cause --
-// streams fill pages that are holes, which cost no read.
+// segment and graph files (the agent's reads), the reads a buffered install may cause -- streams
+// fill pages that are holes, which cost no read -- and the kernel's read-ahead, which a stream's
+// sorted batches get (engine/README.md, known limits).
 //
 // A caller blocks until its reads fit the budget, in arrival order (generic cell rate algorithm:
 // reads are spaced 1/rate apart, and an idle spell earns at most kBurstSeconds of budget, so a

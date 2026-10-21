@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -360,11 +361,13 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
   struct Run {
     size_t first, count;  // positions into uniq
     uint64_t off;
+    uint32_t page;
     bool here;  // the page cache had it
   };
   std::vector<Run> runs;
   ForEachRun(uniq, locs, layout_, [&](size_t first_pos, size_t count) {
-    runs.push_back({first_pos, count, layout_.offset(locs[uniq[first_pos]]), false});
+    const uint32_t loc = locs[uniq[first_pos]];
+    runs.push_back({first_pos, count, layout_.offset(loc), layout_.page(loc), false});
   });
   std::vector<uint8_t> got(uniq.size() * vb);  // uniq position u at u * vb
   // A request's device reads are in flight together: a read-ahead hint for every run the page
@@ -374,17 +377,23 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
   // purpose: reading with O_DIRECT lost the page-cache hits and the read-ahead (engine/README.md).
   for (size_t w = 0; w < runs.size(); w += kReadsInFlight) {
     const size_t end = std::min(runs.size(), w + kReadsInFlight);
+    // A page holds several runs where the asked vectors on it are not adjacent, and they come
+    // in a row (runs are sorted): once one has started the page's read, the others wait for it
+    // in their own read, neither probed (the page is not in the cache yet) nor charged again.
+    uint32_t started = UINT32_MAX;
     for (size_t k = w; k < end; ++k) {
       Run& r = runs[k];
+      if (r.page == started) continue;
       if (budget_) {
         if (PreadCached(fd_, got.data() + r.first * vb, r.count * vb, r.off)) {
           r.here = true;
           continue;
         }
-        budget_->Charge(1);  // a run lies on one page: one device read
+        budget_->Charge(1);  // one device read per page
       }
       // Only a hint: if it fails, the read below waits out the device alone.
       ::posix_fadvise(fd_, static_cast<off_t>(r.off), static_cast<off_t>(r.count * vb), POSIX_FADV_WILLNEED);
+      started = r.page;
     }
     for (size_t k = w; k < end; ++k)
       if (!runs[k].here) PreadAll(fd_, got.data() + runs[k].first * vb, runs[k].count * vb, runs[k].off, path_);

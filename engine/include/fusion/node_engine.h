@@ -16,9 +16,9 @@
 //   * raw vectors (the SSD tier) are node-level too: the node holds a sparse copy of the index's
 //     page file, the vectors named by the partitions it has held, at their canonical locations
 //     (fusion/raw_store.h, the decided part of U1). A partition that arrives by migration goes
-//     online without them (U9): RERANK fetches the ones a query needs from the partition's old
-//     owner on demand, and only those -- the rest stay with the old owner, which keeps every
-//     vector it has held (the lazy-stream baseline streams them in too: RawMissing, RawPut).
+//     online without them (U9): RERANK fetches the ones a query needs on demand, and only those,
+//     from the holder each posting records -- the rest stay where they are, since no node drops a
+//     vector it has held (the lazy-stream baseline streams them in too: RawMissing, RawPull).
 //     There is no vector -> page map: the posting lists carry each vector's location and the
 //     node that holds it (its holder: this node, or a peer), so a missing vector is one hop away;
 //   * the query pipeline is exposed as primitives, so that the Go aggregator can spread one
@@ -222,7 +222,8 @@ struct FetchStats {
   uint64_t queued = 0;           // now: of those, waiting for the writer
   uint64_t queued_peak = 0;
   uint64_t fetched = 0;          // new vectors fetched from peers
-  uint64_t fetch_calls = 0;      // fetches that asked a peer (RERANK, SEARCH_LOCAL)
+  uint64_t fetch_calls = 0;      // calls that missed a vector, fetching it or waiting for another
+                                 // query's fetch (RERANK, SEARCH_LOCAL)
   uint64_t coalesced = 0;        // missing vectors a fetch waited for instead of fetching: another
                                  // query was fetching them
   uint64_t fetch_us = 0;         // time those callers waited for them, backpressure included

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <chrono>
 #include <thread>
 
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the rtier wire format is little endian");
@@ -234,8 +235,15 @@ int PeerPool::Take(const std::string& addr) {
 }
 
 void PeerPool::Give(const std::string& addr, int fd) {
-  std::lock_guard<std::mutex> l(mu_);
-  idle_[addr].push_back(fd);
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    auto& idle = idle_[addr];
+    if (idle.size() < kMaxIdlePerPeer) {
+      idle.push_back(fd);
+      return;
+    }
+  }
+  ::close(fd);
 }
 
 void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, uint32_t vec_bytes,
@@ -335,12 +343,12 @@ void NodeServer::Serve() {
   for (auto& t : threads) t.join();
   // Listeners are closed and Stop() shut every open connection down: wait for the connection
   // threads, which may still be finishing a request on the engine.
-  std::vector<std::thread> conns;
+  std::map<uint64_t, std::thread> conns;
   {
     std::lock_guard<std::mutex> l(conn_mu_);
     conns.swap(conn_threads_);
   }
-  for (auto& t : conns) t.join();
+  for (auto& kv : conns) kv.second.join();
 }
 
 void NodeServer::Stop() {
@@ -355,8 +363,11 @@ void NodeServer::AcceptLoop(int listen_fd) {
   while (!stop_) {
     const int fd = ::accept(listen_fd, nullptr, nullptr);
     if (fd < 0) {
-      if (errno == EINTR) continue;
-      break;  // listener shut down
+      if (stop_ || errno == EBADF || errno == EINVAL) break;  // listener shut down
+      // Anything else is not the listener's end: a connection's own network error, which accept
+      // passes on (ECONNABORTED, EPROTO, ...), or descriptors or memory running out for a while.
+      if (errno != EINTR) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
     }
     const int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));  // fails harmlessly on AF_UNIX
@@ -365,13 +376,27 @@ void NodeServer::AcceptLoop(int listen_fd) {
       ::close(fd);
       break;
     }
-    conn_fds_.insert(fd);
-    conn_threads_.emplace_back([this, fd] { ServeConnection(fd); });
+    // The threads of connections that ended: their last step is to say so, under this lock.
+    for (uint64_t id : conn_ended_) {
+      const auto it = conn_threads_.find(id);
+      if (it == conn_threads_.end()) continue;
+      it->second.join();
+      conn_threads_.erase(it);
+    }
+    conn_ended_.clear();
+    const uint64_t id = next_conn_++;
+    try {
+      conn_threads_.emplace(id, std::thread([this, fd, id] { ServeConnection(fd, id); }));
+      conn_fds_.insert(fd);
+    } catch (const std::exception& e) {  // no thread to be had: this connection is refused
+      fusion::Log("connection refused: %s", e.what());
+      ::close(fd);
+    }
   }
   ::close(listen_fd);
 }
 
-void NodeServer::ServeConnection(int fd) {
+void NodeServer::ServeConnection(int fd, uint64_t id) {
   try {
     Frame req;
     while (!stop_ && ReadFrame(fd, &req)) WriteFrame(fd, Handle(req));
@@ -381,6 +406,7 @@ void NodeServer::ServeConnection(int fd) {
   std::lock_guard<std::mutex> l(conn_mu_);
   conn_fds_.erase(fd);
   ::close(fd);
+  conn_ended_.push_back(id);
 }
 
 int NodeServer::AcquireWorker(OpStats* st) {

@@ -1576,8 +1576,9 @@ void TestReadBudget() {
   {
     // A Get puts its reads in flight together, a window at a time: the vectors come back in the
     // order asked for, repeats included, over more pages than one window holds, and a budget
-    // charges one read per page the cache lacks. The odd pages: the kernel reads ahead at the
-    // start of a file and after sequential reads, so no page asked for arrives before its read.
+    // charges one read per page the cache lacks, however many runs the page holds (two vectors
+    // apart on each page: two runs, one read). The odd pages: the kernel reads ahead at the start
+    // of a file and after sequential reads, so no page asked for arrives before its read.
     RawLayout L;
     L.vec_bytes = 1000;
     L.vectors_per_page = 4;
@@ -1591,8 +1592,11 @@ void TestReadBudget() {
       for (uint32_t k = 0; k < L.vec_bytes; ++k) vecs[loc * L.vec_bytes + k] = static_cast<uint8_t>(loc * 31 + k * 7);
     }
     CHECK(s.Put(all.data(), all.size(), vecs.data(), RawOrigin::kStreamed) == all.size());
-    std::vector<uint32_t> ask;  // a vector on each of 500 pages, every tenth asked twice
-    for (uint32_t p = 0; p < 500; ++p) ask.push_back((2 * p + 1) * L.vectors_per_page + p % L.vectors_per_page);
+    std::vector<uint32_t> ask;  // two vectors on each of 500 pages, every tenth asked twice
+    for (uint32_t p = 0; p < 500; ++p) {
+      ask.push_back((2 * p + 1) * L.vectors_per_page + p % 2);
+      ask.push_back((2 * p + 1) * L.vectors_per_page + p % 2 + 2);
+    }
     for (size_t i = 0; i < 500; i += 10) ask.push_back(ask[i]);
     std::shuffle(ask.begin(), ask.end(), std::mt19937(7));
     auto right = [&](const std::vector<uint8_t>& out) {

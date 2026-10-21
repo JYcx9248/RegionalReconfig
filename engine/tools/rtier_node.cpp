@@ -3,6 +3,7 @@
 // Prints "READY tcp=<port>" on stdout once it accepts connections (the Go agent and the tests
 // wait for that line). SIGINT/SIGTERM stop it.
 #include <signal.h>
+#include <sys/resource.h>
 #include <time.h>
 
 #include <algorithm>
@@ -62,6 +63,14 @@ static void Usage() {
 
 int main(int argc, char** argv) {
   const std::set<std::string> flags = {"no-direct", "help"};
+  // Descriptors grow with the cluster: a connection from each aggregator's client, one to each
+  // holder per concurrent fetch. A login shell's soft limit, often 1024, runs out at a few dozen
+  // nodes; the hard limit is the node's to use.
+  rlimit files{};
+  if (::getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max) {
+    files.rlim_cur = files.rlim_max;
+    ::setrlimit(RLIMIT_NOFILE, &files);
+  }
   try {
     Args a(argc, argv, flags);
     if (a.Flag("help") || !a.Has("index") || !a.Has("partitions")) {
