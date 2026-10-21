@@ -256,7 +256,9 @@ var Open = map[string]Question{
 			"re-ranked from memory and a background writer installs them with whole-page direct " +
 			"writes. It waits holding no engine worker (2026-10-20): the data node fetches on " +
 			"the request's connection thread and takes a worker only once the vectors are there, " +
-			"so the node's FILTERs and other RERANKs keep the workers meanwhile. A scale-out " +
+			"so the node's FILTERs and other RERANKs keep the workers meanwhile; nor a slot a " +
+			"FILTER needs at the aggregator (2026-10-21): the clients there give RERANKs slots of " +
+			"their own, node_conns of each kind. A scale-out " +
 			"does not wait for raw vectors. A scale-in drains the nodes that leave first " +
 			"(DrainRaw: each remaining node takes over the vectors its postings say only a " +
 			"leaving node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so they " +

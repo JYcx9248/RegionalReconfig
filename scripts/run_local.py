@@ -72,10 +72,11 @@ by default). A step grows with the dataset and the transfer rate: a billion vect
 32-71 GB graph on every new entry. cluster.ready_timeout_seconds (600) bounds the initial
 deployment, which copies every partition's vectors from the index.
 
-cluster: {node_conns: 8} (the agent's default) is how many requests an aggregator keeps in
-flight to one data node, each on its own connection, and so how many queries' FILTERs and
-RERANKs a data node serves for it at once: set it for the hardware, the data nodes' engine
-workers and the aggregators' number.
+cluster: {node_conns: 8} (the agent's default) is how many requests of each kind an aggregator
+keeps in flight to one data node, each on its own connection: RERANKs, and FILTERs (with the
+rest) -- a RERANK waits at the holders for the raw vectors it lacks, and the FILTERs of other
+queries must not wait behind it. Set it for the hardware, the data nodes' engine workers and
+the aggregators' number.
 
 cluster: {backend: gpu} runs the data nodes on the GPU filter backend (a CUDA build of the
 engine); cluster.gpus: [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi

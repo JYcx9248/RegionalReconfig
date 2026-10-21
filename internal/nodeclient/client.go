@@ -215,24 +215,31 @@ type conn struct {
 	br *bufio.Reader
 }
 
-// Client is a connection pool to one data node.
+// Client is a connection pool to one data node. A request holds one of the client's slots and
+// a connection of its own for its duration. RERANKs have slots of their own: a RERANK first waits
+// at the holders for the raw vectors it lacks, holding no engine worker on the node
+// (FetchForRerank), and the FILTERs of other queries must not wait behind it for a slot here
+// either. Everything else (FILTER, NAVIGATE, ...) shares the other slots, and every request
+// takes whichever idle connection there is.
 type Client struct {
 	addr    string
-	sem     chan struct{}
+	sem     chan struct{} // slots of everything but RERANK
+	rerank  chan struct{} // RERANK's slots
 	idle    chan *conn
 	open    atomic.Int64 // connections open, idle or in use
 	nextID  atomic.Uint64
 	Timeout time.Duration // per request when ctx has no deadline (default 30 s)
 }
 
-// New creates a client for addr with up to maxConns concurrent requests. Connections are
-// opened lazily.
+// New creates a client for addr with up to maxConns concurrent RERANKs and as many concurrent
+// other requests. Connections are opened when a request needs one, or by Preconnect.
 func New(addr string, maxConns int) *Client {
 	maxConns = max(maxConns, 1)
 	return &Client{
 		addr:    addr,
 		sem:     make(chan struct{}, maxConns),
-		idle:    make(chan *conn, maxConns),
+		rerank:  make(chan struct{}, maxConns),
+		idle:    make(chan *conn, 2*maxConns),
 		Timeout: 30 * time.Second,
 	}
 }
@@ -242,9 +249,6 @@ func (c *Client) Addr() string { return c.addr }
 
 // Open is the number of connections open, idle or in use.
 func (c *Client) Open() int { return int(c.open.Load()) }
-
-// Conns is the most connections the client opens, one per concurrent request.
-func (c *Client) Conns() int { return cap(c.sem) }
 
 // Close closes idle connections.
 func (c *Client) Close() {
@@ -259,9 +263,43 @@ func (c *Client) Close() {
 	}
 }
 
-func (c *Client) get(ctx context.Context) (*conn, error) {
+// Preconnect opens a connection for every slot the client lacks one for, checks each with a
+// PING and leaves them idle, so that the burst of queries after a flip pays no handshake
+// (StageAggregator).
+func (c *Client) Preconnect(ctx context.Context) error {
+	n := cap(c.idle) - c.Open()
+	if n <= 0 {
+		return nil
+	}
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			cn, err := c.dial(ctx)
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp, reusable, err := c.exchange(ctx, cn, opPing, 0, nil)
+			if err == nil && resp.Status != StatusOK {
+				err = &StatusError{Addr: c.addr, Op: opPing, Status: resp.Status, Msg: string(resp.Body)}
+			}
+			c.release(cn, err == nil && reusable)
+			errs <- err
+		}()
+	}
+	var first error
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil && first == nil {
+			first = fmt.Errorf("nodeclient %s: %w", c.addr, err)
+		}
+	}
+	return first
+}
+
+// get takes a slot of sem, then an idle connection or a new one.
+func (c *Client) get(ctx context.Context, sem chan struct{}) (*conn, error) {
 	select {
-	case c.sem <- struct{}{}:
+	case sem <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -270,10 +308,18 @@ func (c *Client) get(ctx context.Context) (*conn, error) {
 		return cn, nil
 	default:
 	}
+	cn, err := c.dial(ctx)
+	if err != nil {
+		<-sem
+		return nil, err
+	}
+	return cn, nil
+}
+
+func (c *Client) dial(ctx context.Context) (*conn, error) {
 	var d net.Dialer
 	nc, err := d.DialContext(ctx, "tcp", c.addr)
 	if err != nil {
-		<-c.sem
 		return nil, err
 	}
 	if tc, ok := nc.(*net.TCPConn); ok {
@@ -283,27 +329,29 @@ func (c *Client) get(ctx context.Context) (*conn, error) {
 	return &conn{nc: nc, br: bufio.NewReaderSize(nc, 64<<10)}, nil
 }
 
-func (c *Client) put(cn *conn, healthy bool) {
+// put returns cn (release) and the slot of sem it held.
+func (c *Client) put(cn *conn, healthy bool, sem chan struct{}) {
+	c.release(cn, healthy)
+	<-sem
+}
+
+// release keeps a healthy connection idle, room permitting, and closes the others.
+func (c *Client) release(cn *conn, healthy bool) {
 	if healthy {
 		select {
 		case c.idle <- cn:
+			return
 		default:
-			healthy = false
 		}
 	}
-	if !healthy {
-		cn.nc.Close()
-		c.open.Add(-1)
-	}
-	<-c.sem
+	cn.nc.Close()
+	c.open.Add(-1)
 }
 
-// do sends one request and returns the response body.
-func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) ([]byte, error) {
-	cn, err := c.get(ctx)
-	if err != nil {
-		return nil, err
-	}
+// exchange sends one request on cn and reads its response. reusable is false when a
+// cancellation crossed the reply: its deadline is on the way, and back in the pool the
+// connection would fail the next request, whoever made it.
+func (c *Client) exchange(ctx context.Context, cn *conn, op uint8, epoch uint64, body []byte) (frame.Frame, bool, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(c.Timeout)
@@ -311,25 +359,37 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) ([
 	cn.nc.SetDeadline(deadline)
 	stop := context.AfterFunc(ctx, func() { cn.nc.SetDeadline(time.Now()) })
 	id := c.nextID.Add(1)
-	err = frame.Write(cn.nc, &frame.Frame{Type: op, ReqID: id, Epoch: epoch, Body: body})
+	err := frame.Write(cn.nc, &frame.Frame{Type: op, ReqID: id, Epoch: epoch, Body: body})
 	var resp frame.Frame
 	if err == nil {
 		err = frame.Read(cn.br, &resp)
 	}
-	// A cancellation that crossed the reply has its deadline on the way: back in the pool, the
-	// connection would fail the next request, whoever made it.
 	reusable := stop()
 	if err == nil && (resp.ReqID != id || resp.Type != op || !resp.IsResponse()) {
 		err = fmt.Errorf("nodeclient: mismatched response from %s", c.addr)
 	}
+	return resp, reusable, err
+}
+
+// do sends one request and returns the response body.
+func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) ([]byte, error) {
+	sem := c.sem
+	if op == opRerank {
+		sem = c.rerank
+	}
+	cn, err := c.get(ctx, sem)
 	if err != nil {
-		c.put(cn, false)
+		return nil, err
+	}
+	resp, reusable, err := c.exchange(ctx, cn, op, epoch, body)
+	if err != nil {
+		c.put(cn, false, sem)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		return nil, fmt.Errorf("nodeclient %s: %w", c.addr, err)
 	}
-	c.put(cn, reusable)
+	c.put(cn, reusable, sem)
 	if resp.Status != StatusOK {
 		return nil, &StatusError{Addr: c.addr, Op: op, Status: resp.Status, Msg: string(resp.Body)}
 	}

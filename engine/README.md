@@ -185,7 +185,9 @@ Known limits of the raw-vector path:
   the first) -- and so does one that waits for another query's fetch of the same vector. A
   RERANK waits on its connection's thread and takes an engine worker only once it has the
   vectors (`FetchForRerank`, 2026-10-20), so the node's FILTERs and other RERANKs keep the
-  workers meanwhile; `SEARCH_LOCAL` (tests, a single node) still fetches holding its worker,
+  workers meanwhile, and the aggregators' clients give RERANKs connection slots of their own, so
+  FILTERs do not wait behind them for a connection either (`internal/nodeclient`);
+  `SEARCH_LOCAL` (tests, a single node) still fetches holding its worker,
   since its candidates come from its own FILTER. With the lazy protocol this lasts for as long
   as queries meet vectors that have not moved. Pulls (stream, drain) do not join the queries'
   fetches: a vector both need at once comes twice.

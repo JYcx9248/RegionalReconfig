@@ -118,7 +118,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   records: one hop, data node to data node (`RAW_GET`, `PeerPool`; nodes know each other by ID,
   `SET_NODES`), and that posting then names the fetching node. A fetch brings only what its
   query needs, from every holder at once, no read-ahead: vectors move beyond that only in a
-  scale-in's drain (U9). A RERANK fetches before it takes an engine worker.
+  scale-in's drain (U9). A RERANK fetches before it takes an engine worker, and holds a
+  connection slot of its own at the aggregator (`nodeclient`): FILTERs wait behind it in
+  neither place.
   Concurrent misses of one vector wait for one fetch. Fetched vectors are re-ranked from memory
   (fetch cache) until a background writer installs them with whole-page `O_DIRECT` writes
   (`WriterLoop`, `RawStore::PutPages`); INFO never waits for it (`nodeclient.InfoSettled` does,
@@ -196,7 +198,8 @@ Done since late September:
 - Fixes from a review of the whole implementation (2026-10-21): the data node's accept loop,
   connection threads and read-budget charges; pre-connect in parallel; every long step under
   `stage_timeout`; a run cut short keeps its latency.csv and reconfigurations.json; plot_run
-  counts answers when they came; ground truth for a stride of the queries.
+  counts answers when they came; ground truth for a stride of the queries; the graph's strict
+  yield to data (U16, for now); RERANK's own connection slots.
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current

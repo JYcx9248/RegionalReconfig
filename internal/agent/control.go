@@ -57,8 +57,9 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 // StageAggregator: connect to every data node of the given table, so the first queries after
 // the flip do not pay connection setup (Koala: waitAllInboundPeersToConnect). A node already
 // connected is left alone: its queries keep the connections open, and a scale-out comes under
-// load, when a ping would queue behind them in the pool. A new one gets the whole pool at once,
-// every node in parallel, so the burst after the flip finds its connections open.
+// load, when a ping would queue behind them in the pool. A new one gets the whole pool at once
+// -- a connection for every slot of both kinds, FILTER's and RERANK's (Preconnect) -- every
+// node in parallel, so the burst after the flip finds its connections open.
 func (a *Agent) handleStageAggregator(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageAggregatorReq](body)
 	if err != nil || req.Table == nil {
@@ -79,21 +80,19 @@ func (a *Agent) handleStageAggregator(ctx context.Context, body json.RawMessage)
 		if c.Open() > 0 {
 			continue
 		}
-		for range c.Conns() {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-				if err := c.Ping(cctx); err != nil {
-					mu.Lock()
-					if first == nil {
-						first = fmt.Errorf("data node %d (%s): %w", id, n.NodeAddr, err)
-					}
-					mu.Unlock()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := c.Preconnect(cctx); err != nil {
+				mu.Lock()
+				if first == nil {
+					first = fmt.Errorf("data node %d (%s): %w", id, n.NodeAddr, err)
 				}
-			}()
-		}
+				mu.Unlock()
+			}
+		}()
 	}
 	wg.Wait()
 	if first != nil {

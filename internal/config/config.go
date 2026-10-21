@@ -116,7 +116,7 @@ type Agent struct {
 	BulkListen      string   `json:"bulk_listen"`  // bulk transfer server (separate connection)
 	AdvertiseHost   string   `json:"advertise_host"`
 	NodeAddr        string   `json:"node_addr"`  // this node's C++ rtier_node (TCP)
-	NodeConns       int      `json:"node_conns"` // connections per data-node client
+	NodeConns       int      `json:"node_conns"` // requests in flight per data-node client, of each kind: RERANK, and the rest
 	WorkDir         string   `json:"work_dir"`   // staged segments and graph live here
 	PartitionsDir   string   `json:"partitions_dir"`
 	Strategy        string   `json:"strategy"` // "two-phase" (also "") | "proportional-quota" (U5's placeholder)
