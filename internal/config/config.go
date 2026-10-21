@@ -119,7 +119,7 @@ type Agent struct {
 	NodeConns       int      `json:"node_conns"` // connections per data-node client
 	WorkDir         string   `json:"work_dir"`   // staged segments and graph live here
 	PartitionsDir   string   `json:"partitions_dir"`
-	Strategy        string   `json:"strategy"` // "two-phase" | "proportional-quota" (U5)
+	Strategy        string   `json:"strategy"` // "two-phase" (also "") | "proportional-quota" (U5's placeholder)
 	Selector        string   `json:"selector"` // "owner" | "local" | "warmup" | "outsource" (U6)
 	TransferRate    float64  `json:"transfer_rate_bytes_per_sec"`
 	TransferAdapter string   `json:"transfer_adapter"` // "fixed" | "adaptive" (U8)
@@ -128,6 +128,11 @@ type Agent struct {
 	RawBatchBytes   int      `json:"raw_batch_bytes"` // raw vectors per request of such a stream, in bytes
 	RawPath         string   `json:"raw_path"`        // "node" | "agent" | "" (node unless TransferRate paces the agents)
 	MetricsInterval Duration `json:"metrics_interval"`
+	// StepTimeout: the longest a long step may take inside the agent -- staging, the graph, a raw
+	// stream or drain, a grace period, a reclaim, the warm-up. It grows with the dataset and the
+	// transfer rate (a billion vectors: a 32-71 GB graph per new entry), so the experiment sets it
+	// with the controller's stage_timeout (cluster.stage_timeout).
+	StepTimeout Duration `json:"step_timeout"`
 	// QuerySample: how many recent client queries an entry keeps, for a full rebuild's warm-up to
 	// replay under the next generation (U14; 0: none).
 	QuerySample int `json:"query_sample"`
@@ -155,6 +160,7 @@ func DefaultAgent() Agent {
 		RawStreams:      2,
 		RawBatchBytes:   1 << 20,
 		MetricsInterval: Duration{5 * time.Second},
+		StepTimeout:     Duration{30 * time.Minute},
 		QuerySample:     1024,
 	}
 }

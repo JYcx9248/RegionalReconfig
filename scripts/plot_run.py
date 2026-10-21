@@ -7,8 +7,9 @@
 
 Reads what run_local.py (or run_cluster.py) leaves in the results directory:
 
-  latency.csv            one row per query: sched_ms, latency_us, status, epoch, recall,
-                         attempts (older runs have no attempts column)
+  latency.csv            one row per query: sched_ms, latency_us, status, epoch, recall
+                         (empty when the query has no ground truth), attempts (older runs have
+                         no attempts column)
   reconfigurations.json  one entry per reconfiguration (a rescale, a plan or a full rebuild):
                          when it was triggered, how long it took, what it moved (older runs hold
                          the bare replies)
@@ -16,20 +17,28 @@ Reads what run_local.py (or run_cluster.py) leaves in the results directory:
 and writes, over the same time axis:
 
   timeline.svg   two panels -- queries per second (offered and answered) and latency (the mean
-                 of the answered queries, or p50 and p99) -- with the epochs marked, so a flip is visible as a line and a reconfiguration
-                 as a band. The dashed "offered" line hides under "answered" exactly while the
-                 cluster keeps up: where it appears, the load is past what the nodes serve
+                 of the answered queries, or p50 and p99) -- with the epochs marked, so a flip
+                 is visible as a line and a reconfiguration as a band. The dashed "offered"
+                 line hides under "answered" exactly while the cluster keeps up: where it
+                 appears, the load is past what the nodes serve
   timeline.csv   the same windows as numbers, for your own plotting
 
 No dependencies: the SVG is written here, in light and dark.
+
+A query counts as offered in the window of its scheduled time, as answered (or failed) in the
+window of its answer, and its latency in the window of its scheduled time -- what a query sent
+then waited, as compare_runs.py counts them. By the scheduled time alone, every query of a
+backlog would count as answered in the window it was sent, and the answered line would follow
+the offered one through the dip it is meant to show. A flip is marked where the first query of
+its epoch was answered: no query of an epoch is answered before its flip.
 
 What to read off it: time-to-online (trigger to the epoch line), the latency cost of the
 transition (how far the latency rises above its level before the trigger, and for how long),
 and whether throughput actually follows the load after the new node joins.
 
 The mean covers answered queries only. A query that failed (e.g. refused while a
-stop-and-copy paused admission) is missing from it and shows up as "failed" in the top
-panel instead; run the load generator with -retry-for ("RetryForSeconds" in the experiment)
+stop-and-copy paused admission, or abandoned when the runner stopped waiting for the backlog)
+is missing from it and from "answered", and counts as failed in timeline.csv; run the load generator with -retry-for ("RetryForSeconds" in the experiment)
 so such a query waits for its answer and its wait counts in the mean.
 """
 
@@ -54,7 +63,7 @@ def read_latency(path):
                 "us": float(r["latency_us"]),
                 "status": r["status"],
                 "epoch": int(r["epoch"]),
-                "recall": float(r.get("recall") or 0.0),
+                "recall": float(r["recall"]) if r.get("recall") else None,
                 "attempts": int(r.get("attempts") or 1),
                 "users": int(r.get("users") or 0),
             })
@@ -69,25 +78,38 @@ def pctl(sorted_values, q):
     return sorted_values[i]
 
 
+def answered_at(r):
+    """When the query was answered (or failed, or was abandoned), in seconds into the run."""
+    return r["t"] + r["us"] / 1e6
+
+
 def windows(rows, width):
-    """Per window of `width` seconds (by scheduled time): offered and answered rate, the mean
-    and percentiles of the answered queries' latency."""
+    """Per window of `width` seconds, up to the last query's scheduled time: the offered rate
+    (by scheduled time), the answered and failed rates (by the time of the answer; answers after
+    the last window are left out, not piled into it), the mean and percentiles of the latency of
+    the answered queries sent in the window."""
     if not rows:
         return []
     out = []
     end = rows[-1]["t"]
     n = max(1, int(math.ceil((end + 1e-9) / width)))
-    buckets = [[] for _ in range(n)]
+    sent = [[] for _ in range(n)]
+    answered, failed = [0] * n, [0] * n
     for r in rows:
-        buckets[min(n - 1, int(r["t"] / width))].append(r)
-    for i, b in enumerate(buckets):
+        sent[min(n - 1, int(r["t"] / width))].append(r)
+        k = int(answered_at(r) / width)
+        if k < n:
+            if r["status"] == "ok":
+                answered[k] += 1
+            else:
+                failed[k] += 1
+    for i, b in enumerate(sent):
         lat = sorted(r["us"] for r in b if r["status"] == "ok")
-        bad = sum(1 for r in b if r["status"] != "ok")
         out.append({
             "t": i * width,
             "offered": len(b) / width,
-            "answered": len(lat) / width,
-            "failed": bad / width,
+            "answered": answered[i] / width,
+            "failed": failed[i] / width,
             "mean_us": sum(lat) / len(lat) if lat else None,
             "p50_us": pctl(lat, 0.5),
             "p99_us": pctl(lat, 0.99),
@@ -97,23 +119,18 @@ def windows(rows, width):
 
 def epoch_marks(rows):
     """(time, epoch) of the first query answered in each epoch after the first: the flips."""
-    marks, seen, first = [], set(), None
+    first = {}
     for r in rows:
         e = r["epoch"]
-        if e == 0 or e in seen:
-            continue
-        seen.add(e)
-        if first is None:
-            first = e
-            continue
-        marks.append((r["t"], e))
-    return marks
+        if e and (e not in first or answered_at(r) < first[e]):
+            first[e] = answered_at(r)
+    return sorted((t, e) for e, t in first.items() if e != min(first))
 
 
 def summarize(rows):
     lat = sorted(r["us"] for r in rows if r["status"] == "ok")
     status, epochs = {}, {}
-    recalls = [r["recall"] for r in rows if r["status"] == "ok" and r["recall"] > 0]
+    recalls = [r["recall"] for r in rows if r["status"] == "ok" and r["recall"] is not None]
     for r in rows:
         status[r["status"]] = status.get(r["status"], 0) + 1
         epochs[r["epoch"]] = epochs.get(r["epoch"], 0) + 1
@@ -129,6 +146,7 @@ def summarize(rows):
         "p50_us": pctl(lat, 0.5), "p99_us": pctl(lat, 0.99),
         "p999_us": pctl(lat, 0.999), "max_us": pctl(lat, 1.0),
         "recall": round(sum(recalls) / len(recalls), 4) if recalls else None,
+        "recall_queries": len(recalls),
     }
 
 
@@ -310,6 +328,7 @@ def main():
     rcs = reconfigurations(os.path.join(args.results, "reconfigurations.json"))
     bands = [(t0, dur, label) for t0, dur, label, _ in rcs]
     span = rows[-1]["t"]
+    marks = [(t, label) for t, label in marks if t <= span]  # a flip only the backlog saw, after the load
 
     svg = svg_document(win, marks, bands, span, os.path.basename(os.path.abspath(args.results)),
                        args.latency)

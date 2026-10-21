@@ -94,15 +94,13 @@ type Strategy interface {
 	Execute(ctx context.Context, env *Env, req *Request, groups []Group) ([]nodeclient.Candidate, error)
 }
 
-// NewStrategy returns the strategy named name.
+// NewStrategy returns the strategy named name; two-phase when none is named (U5 is decided).
 func NewStrategy(name string) (Strategy, error) {
 	switch name {
-	case "two-phase":
+	case "", "two-phase":
 		return TwoPhase{}, nil
 	case "proportional-quota":
 		return ProportionalQuota{}, nil
-	case "", "undecided":
-		return nil, design.Undecided("U5", "no query strategy selected")
 	}
 	return nil, fmt.Errorf("query: unknown strategy %q", name)
 }

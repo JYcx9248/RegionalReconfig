@@ -24,14 +24,20 @@ section; see its doc).
 The configuration is YAML: a base and overrides (scripts/experiment_config.py has the format and
 every key; `python3 scripts/experiment_config.py CONFIG.yaml` prints one merged). The stages
 record what they were made with: an index (build.index_dir, default WORK_DIR/index) built with
-other build flags stops the run instead of being rebuilt (that can take hours), and the
-partitions are made again when the index or the assignment changes.
+other build flags stops the run instead of being rebuilt (that can take hours), the partitions
+are made again when the index or the assignment changes, and a ground truth made of other
+vectors, queries or stride stops the run too.
 
 partition: {generator: gp, partitions: 64, gp: {kaminpar: PATH}} makes the assignment: GP on the
 list heads over the navigation graph, with unit weights, so that the initial split balances the
 number of lists per node (the decided part of U2; the gp_kaminpar binary is built from
 scripts/testing/gp). generator: spatial or range are placeholders; generator: file takes the
 assignment in partition.file (a file of u64 n, u32 partition[n]).
+
+dataset: {ground_truth_stride: 10} gives every 10th query its ground truth, and only those
+(fusion_gt --stride; the ground truth's row r is query 10r, the load generator's -gt-stride): a
+query file longer than the run, which repeats no query, has recall measured all through the run
+for a tenth of the brute-force cost. The recall averages the queries that have it.
 
 Two things a capacity-driven scale-out run needs:
 
@@ -59,6 +65,17 @@ then fails, so it is missing from the mean latency; comparing protocols by their
 needs it (scripts/compare_runs.py). A query refused by an entry that left (a scale-in, a full
 rebuild) is retried on the entries of the newer epoch at once, with or without it: the
 refusal carries that epoch, and the client reads its list again (U17).
+
+cluster: {stage_timeout: 2h} bounds each long step of a reconfiguration -- staging, the graph,
+a raw stream or drain, a grace period, a reclaim -- in the controller and in every agent (30m
+by default). A step grows with the dataset and the transfer rate: a billion vectors put a
+32-71 GB graph on every new entry. cluster.ready_timeout_seconds (600) bounds the initial
+deployment, which copies every partition's vectors from the index.
+
+cluster: {node_conns: 8} (the agent's default) is how many requests an aggregator keeps in
+flight to one data node, each on its own connection, and so how many queries' FILTERs and
+RERANKs a data node serves for it at once: set it for the hardware, the data nodes' engine
+workers and the aggregators' number.
 
 cluster: {backend: gpu} runs the data nodes on the GPU filter backend (a CUDA build of the
 engine); cluster.gpus: [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi
@@ -103,10 +120,10 @@ it is the whole ID space, so the headroom would grow every node's PQ buffer -- i
 by the same factor and change what the run measures. Without updates the dataset is static: no
 room, and the controller refuses update batches.
 
-Open design questions this script depends on (see `bin/rtier-client design`):
-  U5  queries need a strategy (cluster.strategy): two-phase is the implemented one, exactly the
-      single-node answer; proportional-quota is a placeholder and fails with "undecided".
-  U11 load.arrivals: semdn is a placeholder; poisson works.
+Placeholders of decided design questions (see `bin/rtier-client design`) fail with "undecided":
+  U5  cluster.strategy: two-phase, the default, is the decided one (exactly the single-node
+      answer); proportional-quota is the placeholder.
+  U11 load.arrivals: poisson, the default, over the query file; semdn is the placeholder.
 
 With cluster.emulation: {netns: true, delay: 100us, rate: 10gbit} (run as root), every node
 runs in its own network namespace (scripts/emulation/netns.sh) and the controller listens on the
@@ -680,6 +697,28 @@ def make_assignment(ecfg: dict, cfg: dict, index: str, work: str) -> str:
     return out
 
 
+def ground_truth(cfg: dict, ecfg: dict, gt: str, ebin: str) -> None:
+    """Stage 1b: the ground truth (fusion_gt), of every stride-th query ("GroundTruthStride"):
+    a query file longer than a run, which repeats no query, has some all through it, for a
+    fraction of the cost. Made if missing; one that exists is used unless its record (next to
+    it) says it was made of other vectors, queries or stride -- then the run stops rather than
+    compute it again, which takes hours at scale. Ground truth from elsewhere has no record."""
+    want = {"vectors": os.path.abspath(cfg["Base"]), "queries": os.path.abspath(cfg["Queries"]),
+            "max_n": (ecfg.get("build") or {}).get("max_n"), "stride": int(cfg.get("GroundTruthStride", 1))}
+    rec_path = gt + ".rtier.json"
+    if os.path.exists(gt):
+        have = stage_record(rec_path)
+        if have is not None and have != want:
+            diff = [k for k in want if have.get(k) != want[k]]
+            sys.exit(f"ground truth {gt} was made with " + ", ".join(f"{k} {have.get(k)}" for k in diff) +
+                     ", this run needs " + ", ".join(f"{k} {want[k]}" for k in diff) +
+                     ": name another file (dataset.ground_truth) or remove it")
+        return
+    run([f"{ebin}/fusion_gt", "--base", cfg["Base"], "--queries", cfg["Queries"], "--out", gt, "--k", "100",
+         "--stride", str(want["stride"])] + (["--max-n", str(want["max_n"])] if want["max_n"] else []))
+    json.dump(want, open(rec_path, "w"), indent=2)
+
+
 def segment(index: str, assignment: str, parts: str, ebin: str) -> None:
     """Stage 2b: the partitions (rtier_segment), made again whenever the index or the
     assignment differs from the ones they were made of (rtier-partition.json records them)."""
@@ -695,17 +734,62 @@ def segment(index: str, assignment: str, parts: str, ebin: str) -> None:
     json.dump(want, open(rec_path, "w"), indent=2)
 
 
-def check_fresh(gbin: str) -> None:
-    """Refuses to run Go binaries older than the Go sources: `go test` (and so `make test`
-    before it built bin/ too) compiles the code under test without touching bin/, and an
-    experiment on a stale agent measures code that is no longer there."""
-    built = min((os.path.getmtime(os.path.join(gbin, f)) for f in os.listdir(gbin)), default=0) \
+# The engine's binaries a run uses (its build directory holds CMake's files and the tests too).
+ENGINE_BINS = ("rtier_node", "rtier_segment", "fusion_build", "fusion_gt")
+
+
+def engine_sources(ebin: str):
+    """The sources ENGINE_BINS are built from: every engine source but the other tools', and the
+    CUDA backend only in a build that compiles it."""
+    cuda = os.path.exists(os.path.join(ebin, "CMakeFiles", "fusion.dir", "src", "gpu_filter.cu.o"))
+    engine = os.path.join(ROOT, "engine")
+    for top in ("include", "src", "node"):
+        for d, _, files in os.walk(os.path.join(engine, top)):
+            for f in files:
+                if f.endswith((".h", ".cpp")) or (cuda and f.endswith((".cuh", ".cu"))):
+                    yield os.path.join(d, f)
+    for f in ("cli.h",) + tuple(b + ".cpp" for b in ENGINE_BINS):
+        yield os.path.join(engine, "tools", f)
+
+
+def check_fresh(ebin: str, gbin: str) -> None:
+    """Refuses to run binaries older than their sources: `go test` (and so `make test` before it
+    built bin/ too) compiles the code under test without touching bin/, an engine edit is not in
+    rtier_node until the engine is built again, and an experiment on a stale binary measures code
+    that is no longer there. The engine's build relinks only the binaries an edit concerns, so an
+    engine source is compared with the newest of them: newer than all of them, it is not built."""
+    mtime = lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0
+    built = min((mtime(os.path.join(gbin, f)) for f in os.listdir(gbin)), default=0) \
         if os.path.isdir(gbin) else 0
     for top in ("cmd", "internal"):
         for d, _, files in os.walk(os.path.join(ROOT, top)):
             for f in files:
-                if f.endswith(".go") and not f.endswith("_test.go") and os.path.getmtime(os.path.join(d, f)) > built:
+                if f.endswith(".go") and not f.endswith("_test.go") and mtime(os.path.join(d, f)) > built:
                     sys.exit(f"{os.path.join(d, f)} is newer than the binaries in {gbin}: run `make` first")
+    built = max(mtime(os.path.join(ebin, b)) for b in ENGINE_BINS)
+    if not built:
+        sys.exit(f"no engine binaries in {ebin}: run `make` first")
+    for path in engine_sources(ebin):
+        if mtime(path) > built:
+            sys.exit(f"{path} is newer than the engine's binaries in {ebin}: run `make` first")
+
+
+def revision(out_dir: str) -> None:
+    """The code a run measured: the commit, and the changes on top of it (revision.diff, without
+    docs/), so that a result can be traced back to its code."""
+    def git(*args):
+        r = subprocess.run(["git", "-C", ROOT, *args], capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else None
+    head = git("rev-parse", "HEAD")
+    if head is None:
+        open(os.path.join(out_dir, "revision.txt"), "w").write(f"{ROOT}: not a git checkout\n")
+        return
+    diff = git("diff", "HEAD", "--", ".", ":(exclude)docs") or ""
+    open(os.path.join(out_dir, "revision.txt"), "w").write(
+        f"commit {head.strip()}\n" + (git("status", "--short", "--", ".", ":(exclude)docs") or "") +
+        ("" if diff else "no changes to the commit outside docs/\n"))
+    if diff:
+        open(os.path.join(out_dir, "revision.diff"), "w").write(diff)
 
 
 def node_args_of(cfg: dict, index: str, parts: str) -> list:
@@ -761,6 +845,7 @@ def controller_config(cfg: dict, ctl_addr: str, api_addr: str, index: str, parts
         # The nodes' stats logs arrive here through their agents, stamped on arrival.
         "stats_dir": out_dir,
         "work_dir": os.path.join(work, "controller"),
+        **({"stage_timeout": cfg["StageTimeout"]} if "StageTimeout" in cfg else {}),
     }
 
 
@@ -785,7 +870,8 @@ def agent_config(cfg: dict, name: str, ctl_addr: str, listen_host: str, node_add
         # Forwarded to the controller (stats-<node>.jsonl there), as on a cluster.
         "node_stats_file": os.path.join(node_dir, "stats.jsonl"),
         **{k: cfg[e] for k, e in (("raw_streams", "RawStreams"), ("raw_batch_bytes", "RawBatchBytes"),
-                                  ("raw_path", "RawPath"), ("query_sample", "QuerySample")) if e in cfg},
+                                  ("raw_path", "RawPath"), ("query_sample", "QuerySample"),
+                                  ("step_timeout", "StageTimeout"), ("node_conns", "NodeConns")) if e in cfg},
     }
 
 
@@ -794,8 +880,10 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
     """Steps 4 and 5, wherever the nodes run: wait for the initial deployment, then either measure
     capacity (calibrate) or run the load and trigger the reconfigurations on time. The load
     generator runs on this machine, with prefix (the CPUs left by the nodes on one machine)."""
-    # 4. initial deployment, then load
-    api = Controller(api_addr)
+    # 4. initial deployment, then load. A rescale blocks for as long as its steps take, and the
+    # controller bounds every step (stage_timeout): no deadline of its own here, which an hour-long
+    # copy at scale would hit; a controller that dies closes the connection.
+    api = Controller(api_addr, timeout=None)
     # Bootstrapping copies every partition's PQ codes and raw vectors from the index: minutes
     # on a 10M-vector index ("ReadyTimeoutSeconds").
     deploy_start = time.monotonic()
@@ -819,7 +907,7 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
         if load.get("RetryForSeconds"):
             cmd += ["-retry-for", f"{load['RetryForSeconds']}s"]
         if gt:
-            cmd += ["-gt", gt]
+            cmd += ["-gt", gt, "-gt-stride", str(cfg.get("GroundTruthStride", 1))]
         return cmd
 
     # 4b. capacity first: how much this cluster serves before it falls behind. Scale-out is
@@ -842,14 +930,15 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
             f"set the reconfiguration run's rate from this")
         return  # a calibration run measures capacity only: no reconfiguration in it
 
-    procs.start("loadgen", loadgen(load.get("Rate", 100), dur,
-                                   os.path.join(out_dir, "latency.csv"),
-                                   rate_steps(load.get("RateSteps"))), prefix=prefix)
-
     # 5. timed reconfigurations (Koala: "Reconfigurations" with TriggerTimeSeconds; here reconfigurations: at)
     # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
-    # seconds), and the load generator's times are monotonic too.
-    t0 = time.monotonic()
+    # seconds). The zero is the one of latency.csv, which the load generator prints once it has
+    # read its queries and ground truth: from its own start, a large query file would put every
+    # trigger that much early on the timeline.
+    line = procs.start("loadgen", loadgen(load.get("Rate", 100), dur,
+                                          os.path.join(out_dir, "latency.csv"),
+                                          rate_steps(load.get("RateSteps"))), prefix=prefix, wait_line="START ")
+    t0 = float(line.split()[1])
     json.dump({"load_start": round(t0, 3)}, open(os.path.join(out_dir, "clock.json"), "w"))
     for rc in reconfigs:
         while time.monotonic() - t0 < rc["at"]:
@@ -863,17 +952,18 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
                         "trigger_seconds": round(started - t0, 3),
                         "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
         log(json.dumps(results[-1]))
-    json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
+        # After each one: a later one that fails ends the run, and the timeline still has these.
+        json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
 
     # The load generator stops sending at the duration and exits once every query it sent is
-    # answered, writing latency.csv only then: an open-loop run that ends with a backlog
-    # needs the time to drain it, or its queries are lost ("DrainSeconds").
+    # answered: an open-loop run that ends with a backlog needs the time to drain it
+    # ("DrainSeconds"). Stopped before, it records the queries still unanswered as abandoned.
     drain = load.get("DrainSeconds", 300)
     while time.monotonic() - t0 < dur + drain and procs.procs[-1][1].poll() is None:
         time.sleep(0.5)
     if procs.procs[-1][1].poll() is None:
-        log(f"load generator still waiting for answers {drain} s after the load ended: stopped, "
-            "no latency.csv")
+        log(f"load generator still waiting for answers {drain} s after the load ended: stopped, its "
+            "unanswered queries recorded as abandoned")
 
 
 def finish(out_dir: str) -> None:
@@ -897,7 +987,7 @@ def load_config(cfg_path: str) -> tuple:
     cfg = experiment_config.flatten(ecfg)
     check_load(cfg)
     reconfigs = reconfig_requests(cfg, cfg_path)
-    check_fresh(paths_of(cfg)[2])
+    check_fresh(*paths_of(cfg)[1:])
     return ecfg, cfg, reconfigs
 
 
@@ -914,6 +1004,7 @@ def record(ecfg: dict, cfg: dict, cfg_path: str, out_dir: str) -> None:
     open(os.path.join(out_dir, "experiment.yaml"), "w").write(
         f"# {os.path.abspath(cfg_path)}, merged with its bases\n" + experiment_config.dump(ecfg))
     json.dump(cfg, open(os.path.join(out_dir, "experiment.json"), "w"), indent=2)
+    revision(out_dir)
 
 
 def stages(ecfg: dict, cfg: dict) -> tuple:
@@ -925,8 +1016,8 @@ def stages(ecfg: dict, cfg: dict) -> tuple:
     index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
     build_index(cfg, ecfg, index, ebin)
     gt = cfg.get("GroundTruth", "")
-    if gt and not os.path.exists(gt):
-        run([f"{ebin}/fusion_gt", "--base", cfg["Base"], "--queries", cfg["Queries"], "--out", gt, "--k", "100"])
+    if gt:
+        ground_truth(cfg, ecfg, gt, ebin)
 
     # 2. partitions: the assignment (U2), then the segments
     parts = os.path.join(work, "partitions")

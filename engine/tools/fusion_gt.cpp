@@ -1,9 +1,15 @@
 // Exact k-NN ground truth by brute force (for dataset prefixes, whose official ground
 // truth is not available). Output is in big-ann-benchmarks format.
+//
+// --stride S computes it for every S-th query only (row r is query r*S): a query file longer
+// than a run, which repeats no query, still has ground truth all through the run, at a fraction
+// of the cost of all of it.
 #include <omp.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "cli.h"
@@ -15,7 +21,7 @@ using namespace fusion;
 static void Usage() {
   std::fprintf(stderr,
                "usage: fusion_gt --base FILE --queries FILE --out FILE [--max-n N] [--nq N]\n"
-               "                 [--k 100] [--dtype T] [--threads T]\n");
+               "                 [--stride S] [--k 100] [--dtype T] [--threads T]\n");
 }
 
 int main(int argc, char** argv) {
@@ -29,7 +35,17 @@ int main(int argc, char** argv) {
     std::optional<DType> dt;
     if (a.Has("dtype")) dt = ParseDType(a.Str("dtype"));
     auto base = VectorFile::Open(a.Required("base"), dt, a.U64("max-n", 0));
-    VectorSet q = LoadVectors(a.Required("queries"), base->dtype(), a.U64("nq", 0));
+    const uint64_t stride = a.U64("stride", 1);
+    FUSION_CHECK(stride >= 1, "--stride must be at least 1");
+    VectorSet q;  // queries 0, stride, 2*stride, ... of the first --nq
+    {
+      auto qf = VectorFile::Open(a.Required("queries"), base->dtype(), a.U64("nq", 0));
+      q.dtype = qf->dtype();
+      q.dim = qf->dim();
+      q.n = (qf->size() + stride - 1) / stride;
+      q.data.resize(q.n * q.vec_bytes());
+      for (uint64_t r = 0; r < q.n; ++r) std::memcpy(q.data.data() + r * q.vec_bytes(), qf->Get(r * stride), q.vec_bytes());
+    }
     const uint32_t k = static_cast<uint32_t>(a.U64("k", 100));
     if (a.Has("threads")) omp_set_num_threads(static_cast<int>(a.U64("threads", 1)));
     const std::string out = a.Required("out");
@@ -38,7 +54,8 @@ int main(int argc, char** argv) {
     const uint64_t n = base->size();
     const uint64_t nq = q.n;
     FUSION_CHECK(k <= n, "k larger than the dataset");
-    Log("ground truth: %llu queries x %llu base vectors, k=%u", (unsigned long long)nq,
+    const std::string every = stride > 1 ? " (one in " + std::to_string(stride) + ")" : "";
+    Log("ground truth: %llu queries%s x %llu base vectors, k=%u", (unsigned long long)nq, every.c_str(),
         (unsigned long long)n, k);
 
     using Entry = std::pair<float, uint32_t>;

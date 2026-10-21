@@ -398,7 +398,7 @@ func (c *Controller) stageGeneration(ctx context.Context, t *epoch.Table, gen *g
 	// 5. STAGE: connections, partitions and graph, every node in parallel.
 	var mu sync.Mutex
 	if err := forEach(nodes, func(n *ManagedNode) error {
-		if err := n.call(ctx, c.callTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil); err != nil {
+		if err := n.call(ctx, c.stageTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil); err != nil {
 			return err
 		}
 		var st, gst protocol.StageReply

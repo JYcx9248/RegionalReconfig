@@ -690,16 +690,17 @@ func TestStagingFailsCleanly(t *testing.T) {
 func TestPlaceholdersFailLoudly(t *testing.T) {
 	f := getFixture(t)
 
-	// No query strategy configured (U5): the node deploys, queries fail with ErrUndecided.
+	// The quota strategy (U5's placeholder, not pursued): the node deploys, queries fail with
+	// ErrUndecided.
 	cl := newCluster(t, f, "lazy", 1)
-	cl.addNode("solo", nil)
+	cl.addNode("solo", query.ProportionalQuota{})
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
 		t.Fatalf("deployment: %v (%s)", err, cl.ctl.LastError())
 	}
 	c := cl.entryClients()[0]
 	_, err := c.Query(cl.ctx, &query.Request{Vec: f.queries.Row(0), Params: query.Params{K: 10, NProbe: 16, N: 200}})
 	if !errors.Is(err, design.ErrUndecided) {
-		t.Fatalf("query without a strategy: got %v, want ErrUndecided", err)
+		t.Fatalf("query with proportional quotas: got %v, want ErrUndecided", err)
 	}
 
 	// Adapting the transfer rate to foreground latency (U8) is a placeholder: an agent asked

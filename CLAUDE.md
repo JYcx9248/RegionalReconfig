@@ -22,8 +22,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 
 - The Makefile exports `GOTOOLCHAIN=local`: never download a Go toolchain.
 - Experiments run `bin/`, which `go test` does not rebuild: `make test` builds it too, and
-  `run_local.py` and `run_cluster.py` refuse to start when `bin/` is older than the Go sources
-  (run `make`).
+  `run_local.py` and `run_cluster.py` refuse to start when `bin/` or the engine's binaries are
+  older than their sources (run `make`). Each results directory records the commit and the diff
+  it ran (`revision.txt`, `revision.diff`).
 - `-march=native` is on by default (`FUSION_NATIVE`). Rebuild the engine on each machine: a build
   copied from another CPU can die with SIGILL. Use `-DFUSION_NATIVE=OFF` for a portable build.
   `run_cluster.py` checks every host's CPU and GPUs against the build before it starts anything.
@@ -178,7 +179,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   correctness evidence, placement). `docs/server-runbook.md`: runs on the lab server.
 - `engine/README.md`: engine additions and known limits.
 
-## Current state and next steps (2026-10-20)
+## Current state and next steps (2026-10-21)
 
 Done since late September:
 - Raw vectors: a holder per posting instead of a source per list, one-hop fetches, a scale-in
@@ -191,6 +192,10 @@ Done since late September:
   with a stale entry list at once (U17).
 - Reference runs: `results/bigann10m-spatial-scaleout-v2` (BIGANN-10M, laptop); Wikipedia
   c1024 runs on the lab server (`docs/design.md`, "实验结果").
+- Fixes from a review of the whole implementation (2026-10-21): the data node's accept loop,
+  connection threads and read-budget charges; pre-connect in parallel; every long step under
+  `stage_timeout`; a run cut short keeps its latency.csv and reconfigurations.json; plot_run
+  counts answers when they came; ground truth for a stride of the queries.
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current
@@ -219,13 +224,13 @@ Next:
    known from it, and a custom plan built from it runs at a fixed node count (`rtier-client
    rescale -plan`). We show that any plan runs without disruption and with exact answers; the
    skew policy is not part of our design.
-7. Small code items: fill the whole connection pool during pre-connect and let entries
-   pre-connect to aggregators; heap merge in `MergeTopK`; raw path (see `engine/README.md`,
+7. Small code items: let entries pre-connect to aggregators; heap merge in `MergeTopK`; raw path (see `engine/README.md`,
    known limits): pulls (stream, drain) do not join the queries' fetches.
 8. Open design questions (the registry has them all). Decided on 2026-10-20: two-phase stays
    (U5), no aggregator outsourcing (U6), raw vectors kept in full (U1), the graph transfer stays
    eager (U16), nodes removed by a scale-in are shut down (U3), U7 closed with the failures, the
-   pacing stays as it is (U8), the entry list stays in the epoch table (U17). Still open:
+   pacing stays as it is (U8), the entry list stays in the epoch table (U17), no workload
+   generator of our own (U11: real queries that do not repeat, and the worst case). Still open:
    - on the protocol: placement by per-tier bytes (U3);
    - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
      batch size and period are set aside); a batch over budget (scale out first?); writes

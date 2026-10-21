@@ -316,7 +316,12 @@ configuration. `run_local.py` makes what is missing and records what each stage 
 the index (`build`: fusion_build's flags), the ground truth, the assignment (`partition`: a
 `file`, or `generator: gp` with `partitions: N`; `spatial` and `range` are placeholders) and
 the partitions, which it makes again when the index or the assignment changes. An index built
-with other flags stops the run instead of being rebuilt. `scripts/run_one.sh CONFIG PROTOCOL
+with other flags, or a ground truth made of other vectors, queries or stride, stops the run
+instead of being made again. `dataset.ground_truth_stride: S` computes the ground truth of every
+S-th query only (`fusion_gt --stride`), so that a query file longer than a run, which repeats no
+query, has recall measured all through it. Each results directory records the code it ran:
+`revision.txt` (the commit and the files changed on top of it) and `revision.diff`; the runners
+refuse Go or engine binaries older than their sources. `scripts/run_one.sh CONFIG PROTOCOL
 OUT ['{...}']` runs one configuration with the protocol and any other key overridden.
 
 `configs/experiment.example.yaml` is the same run on BigANN (edit the paths). With
@@ -437,10 +442,14 @@ python3 scripts/run_local.py configs/experiment.small.yaml results/scaleout
 
 The first run offers a ladder of rates to one node and reports where it stops keeping up; set
 `load.rate` below that and `load.rate_steps` above it in `configs/experiment.small.yaml`, so the
-load outgrows one node before the rescale. The second run writes `timeline.svg` (throughput and
-p50/p99 over time, with the flips marked), `timeline.csv`, `reconfigurations.json` (when each
-rescale was triggered, how long it took, what it moved) and the metrics; `scripts/plot_run.py
-results/scaleout` redraws them with another window size.
+load outgrows one node before the rescale. The second run writes `timeline.svg` (queries offered
+and answered per second, answers counted when they came so that a stall shows, and the mean
+latency by send time, with the flips marked; `--latency tail` for p50 and p99), `timeline.csv`,
+`reconfigurations.json` (when each rescale was triggered, how long it took, what it moved) and
+the metrics; `scripts/plot_run.py results/scaleout` redraws them with another window size. A run
+cut short keeps what it measured: `reconfigurations.json` is written after each
+reconfiguration, and a load generator stopped before its backlog drained (`load.drain_seconds`
+after the load, 300 s by default) records the queries still unanswered as `abandoned`.
 
 `cluster.transfer_rate_bytes_per_sec` matters more than it looks on a small dataset: at full speed the few
 MB move in milliseconds and nothing is visible around the flip. The small configs pace it at

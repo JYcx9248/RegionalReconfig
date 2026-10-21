@@ -272,7 +272,9 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) (R
 	if err == nil {
 		err = frame.Read(q.br, &resp)
 	}
-	stop()
+	// A cancellation that crossed the reply has its deadline on the way: back in the pool, the
+	// connection would fail the next request, whoever made it.
+	reusable := stop()
 	if err == nil && resp.ReqID != id {
 		err = fmt.Errorf("query: mismatched response from %s", c.addr)
 	}
@@ -283,10 +285,14 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) (R
 		}
 		return Result{}, err
 	}
-	select {
-	case c.idle <- q:
-	default:
+	if !reusable {
 		q.nc.Close()
+	} else {
+		select {
+		case c.idle <- q:
+		default:
+			q.nc.Close()
+		}
 	}
 	if resp.Status != StatusOK {
 		return Result{Epoch: resp.Epoch}, &StatusError{Addr: c.addr, Status: resp.Status, Msg: string(resp.Body)}

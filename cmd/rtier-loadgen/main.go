@@ -30,11 +30,13 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"rtier/internal/ctrl"
@@ -46,12 +48,13 @@ import (
 
 type record struct {
 	sched    time.Duration // scheduled send time since start
-	latency  time.Duration // completion - scheduled
+	latency  time.Duration // completion - scheduled; for an abandoned query, its wait until the stop
 	status   string
 	epoch    uint64
 	recall   float64
-	attempts int // queries sent, retries included
-	users    int // concurrent users when it was sent (closed loop; 0 in open loop)
+	hasGT    bool // recall is measured: the query has a ground-truth row
+	attempts int  // queries sent, retries included
+	users    int  // concurrent users when it was sent (closed loop; 0 in open loop)
 }
 
 // entries is the client's list of entry nodes, read from the controller's epoch table.
@@ -145,6 +148,8 @@ func main() {
 	fixed := flag.String("entries", "", "comma-separated entry query addresses (disables discovery)")
 	qpath := flag.String("queries", "", "query vectors (.u8bin/.i8bin/.fbin)")
 	gtpath := flag.String("gt", "", "ground truth (.ibin), optional")
+	gtStride := flag.Int("gt-stride", 1, "the ground truth's row r is query r*stride: a query file larger than "+
+		"a run, with ground truth for some of it all through the run")
 	rate := flag.Float64("rate", 100, "queries per second (the rate at the start of the run)")
 	steps := flag.String("rate-steps", "", "rate schedule after -rate, e.g. \"30:400,90:800\": "+
 		"at 30 s the rate becomes 400 q/s, at 90 s 800 q/s (0 pauses the load)")
@@ -218,10 +223,56 @@ func main() {
 	lat := metrics.NewHistogram()
 	var sent, ok, failed atomic.Int64
 	start := time.Now()
+	// The runner times its reconfigurations from this line: the file reads before it take a while
+	// with a large query file, and its own clock would run ahead of latency.csv's by that much.
+	fmt.Printf("START %.6f\n", metrics.Monotonic())
+	// The queries sent and not answered yet: a stop (the runner gives up on a backlog that
+	// outlasts its drain time) records them as abandoned, with how long they waited, rather than
+	// losing every record of the run -- the slowest protocol's.
+	pending := map[uint64]record{}
+	var nextSeq uint64
+	var finish sync.Once
+	stopped := false
+	done := func() {
+		finish.Do(func() {
+			mu.Lock()
+			all := append([]record(nil), recs...)
+			if stopped {
+				now := time.Since(start)
+				for _, r := range pending {
+					r.latency = now - r.sched
+					all = append(all, r)
+				}
+				log.Printf("stopped: %d queries unanswered, recorded as abandoned", len(pending))
+			}
+			mu.Unlock()
+			summarize(all, gt != nil, ents.stale.Load())
+			if *out != "" {
+				if err := writeCSV(*out, all); err != nil {
+					log.Fatal(err)
+				}
+			}
+		})
+	}
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		mu.Lock()
+		stopped = true
+		mu.Unlock()
+		done()
+		os.Exit(0)
+	}()
 	go report(ctx, start, &sent, &ok, &failed, lat)
 	// one sends query qi, scheduled (open loop) or sent (closed loop) at sched, and records it.
 	one := func(sched time.Duration, qi, active int) {
 		rec := record{sched: sched, status: "ok", users: active}
+		mu.Lock()
+		seq := nextSeq
+		nextSeq++
+		pending[seq] = record{sched: sched, status: "abandoned", users: active}
+		mu.Unlock()
 		var until time.Time
 		if *retryFor > 0 {
 			until = start.Add(sched + *retryFor)
@@ -236,16 +287,18 @@ func main() {
 		} else {
 			ok.Add(1)
 			lat.Record(rec.latency)
-			if gt != nil && qi < gt.NQ {
+			if row := qi / *gtStride; gt != nil && qi%*gtStride == 0 && row < gt.NQ {
 				ids := make([]uint32, len(res.Candidates))
 				ds := make([]float32, len(res.Candidates))
 				for j, c := range res.Candidates {
 					ids[j], ds[j] = c.ID, c.Dist
 				}
-				rec.recall = gt.Recall(qi, ids, ds, *k)
+				rec.recall = gt.Recall(row, ids, ds, *k)
+				rec.hasGT = true
 			}
 		}
 		mu.Lock()
+		delete(pending, seq)
 		recs = append(recs, rec)
 		mu.Unlock()
 	}
@@ -293,12 +346,7 @@ func main() {
 	}
 	wg.Wait()
 	cancel()
-	summarize(recs, gt != nil, ents.stale.Load())
-	if *out != "" {
-		if err := writeCSV(*out, recs); err != nil {
-			log.Fatal(err)
-		}
-	}
+	done()
 }
 
 // maxBackoff caps the pause between retries of a waiting client. It bounds how late a
@@ -394,7 +442,7 @@ func report(ctx context.Context, start time.Time, sent, ok, failed *atomic.Int64
 func summarize(recs []record, withRecall bool, staleReads int64) {
 	var lats []float64
 	var recall, sum float64
-	retried := 0
+	retried, measured := 0, 0
 	counts := map[string]int{}
 	for _, r := range recs {
 		counts[r.status]++
@@ -404,7 +452,10 @@ func summarize(recs []record, withRecall bool, staleReads int64) {
 		if r.status == "ok" {
 			lats = append(lats, float64(r.latency.Microseconds()))
 			sum += lats[len(lats)-1]
-			recall += r.recall
+			if r.hasGT {
+				recall += r.recall
+				measured++
+			}
 		}
 	}
 	sort.Float64s(lats)
@@ -421,8 +472,8 @@ func summarize(recs []record, withRecall bool, staleReads int64) {
 	fmt.Printf("queries %d: %v, %d retried, the entry list read %d times after a refusal under a newer epoch\n"+
 		"latency us: mean %.0f  p50 %.0f  p99 %.0f  p99.9 %.0f  max %.0f\n",
 		len(recs), counts, retried, staleReads, mean, q(0.5), q(0.99), q(0.999), q(1))
-	if withRecall && len(lats) > 0 {
-		fmt.Printf("recall %.4f\n", recall/float64(len(lats)))
+	if withRecall && measured > 0 {
+		fmt.Printf("recall %.4f (%d queries with ground truth)\n", recall/float64(measured), measured)
 	}
 }
 
@@ -435,10 +486,14 @@ func writeCSV(path string, recs []record) error {
 	w := csv.NewWriter(f)
 	w.Write([]string{"sched_ms", "latency_us", "status", "epoch", "recall", "attempts", "users"})
 	for _, r := range recs {
+		recall := "" // no ground truth for it: not a recall of 0
+		if r.hasGT {
+			recall = strconv.FormatFloat(r.recall, 'f', 4, 64)
+		}
 		w.Write([]string{
 			strconv.FormatFloat(float64(r.sched.Microseconds())/1000, 'f', 3, 64),
 			strconv.FormatInt(r.latency.Microseconds(), 10), r.status,
-			strconv.FormatUint(r.epoch, 10), strconv.FormatFloat(r.recall, 'f', 4, 64),
+			strconv.FormatUint(r.epoch, 10), recall,
 			strconv.Itoa(r.attempts), strconv.Itoa(r.users),
 		})
 	}

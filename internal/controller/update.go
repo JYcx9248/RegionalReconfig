@@ -103,7 +103,7 @@ func (c *Controller) releaseStaged(ctx context.Context, ids []placement.NodeID) 
 		return err
 	}
 	return forEach(nodes, func(n *ManagedNode) error {
-		return n.call(ctx, c.callTimeout(), protocol.EvictM, protocol.EvictReq{ReleaseStagedPQ: true}, nil)
+		return n.call(ctx, c.stageTimeout(), protocol.EvictM, protocol.EvictReq{ReleaseStagedPQ: true}, nil)
 	})
 }
 
@@ -321,7 +321,7 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 	// vectors too; for them the step only frees memory (no list can name those copies), so a
 	// node that does not answer is logged, not an error.
 	if err := forEach(owners, func(n *ManagedNode) error {
-		return n.call(ctx, c.callTimeout(), protocol.DropVersionsM,
+		return n.call(ctx, c.stageTimeout(), protocol.DropVersionsM,
 			protocol.DropVersionsReq{Versions: replaced[n.ID], Deleted: req.Deleted}, nil)
 	}); err != nil {
 		return reply, afterFlip(err)
@@ -334,7 +334,7 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 			}
 		}
 		if err := forEach(others, func(n *ManagedNode) error {
-			return n.call(ctx, c.callTimeout(), protocol.DropVersionsM, protocol.DropVersionsReq{Deleted: req.Deleted}, nil)
+			return n.call(ctx, c.stageTimeout(), protocol.DropVersionsM, protocol.DropVersionsReq{Deleted: req.Deleted}, nil)
 		}); err != nil {
 			log.Printf("controller: freeing the PQ codes of deleted vectors on former owners: %v", err)
 		}
@@ -355,7 +355,7 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 // next major epoch's patch replaces it).
 func (c *Controller) graphPatch(nodes []*ManagedNode, req protocol.GraphPatchReq) {
 	if err := forEach(nodes, func(n *ManagedNode) error {
-		return n.call(context.Background(), c.callTimeout(), protocol.GraphPatchM, req, nil)
+		return n.call(context.Background(), c.stageTimeout(), protocol.GraphPatchM, req, nil)
 	}); err != nil {
 		log.Printf("controller: graph patch %d on the entries: %v", req.Version, err)
 	}
@@ -367,7 +367,7 @@ func (c *Controller) dropVersions(byOwner map[placement.NodeID][]protocol.Partit
 	owners, err := c.managed(sortedKeys(byOwner))
 	if err == nil {
 		err = forEach(owners, func(n *ManagedNode) error {
-			return n.call(context.Background(), c.callTimeout(), protocol.DropVersionsM, protocol.DropVersionsReq{Versions: byOwner[n.ID]}, nil)
+			return n.call(context.Background(), c.stageTimeout(), protocol.DropVersionsM, protocol.DropVersionsReq{Versions: byOwner[n.ID]}, nil)
 		})
 	}
 	if err != nil {

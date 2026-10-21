@@ -58,7 +58,7 @@ func (c *Controller) deployInitial(ctx context.Context, nodes []*ManagedNode) er
 	start := time.Now()
 
 	if err := forEach(nodes, func(n *ManagedNode) error {
-		return n.call(ctx, c.callTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil)
+		return n.call(ctx, c.stageTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil)
 	}); err != nil {
 		return err
 	}
@@ -447,7 +447,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 			}
 			// The agent stops a staging still running there, drops what it loaded and frees
 			// PQ codes installed for it.
-			return n.call(bg, c.callTimeout(), protocol.EvictM,
+			return n.call(bg, c.stageTimeout(), protocol.EvictM,
 				protocol.EvictReq{Partitions: parts, ReleaseStagedPQ: true}, nil)
 		}); err != nil {
 			log.Printf("controller: cleanup of staged partitions failed: %v", err)
@@ -457,7 +457,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	// 1. PREPARE -- aggregator readiness: pre-connect to every data node of e+1.
 	aggNodes, _ := c.managed(draft.Aggregators)
 	if err := forEach(aggNodes, func(n *ManagedNode) error {
-		return n.call(ctx, c.callTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil)
+		return n.call(ctx, c.stageTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil)
 	}); err != nil {
 		return reply, err
 	}
@@ -668,7 +668,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 			parts = append(parts, l...)
 		}
 		sort.Ints(parts)
-		return n.call(ctx, c.callTimeout(), protocol.EvictM, protocol.EvictReq{Partitions: parts}, nil)
+		return n.call(ctx, c.stageTimeout(), protocol.EvictM, protocol.EvictReq{Partitions: parts}, nil)
 	}); err != nil {
 		return reply, afterFlip(err)
 	}

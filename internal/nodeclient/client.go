@@ -219,6 +219,7 @@ type Client struct {
 	addr    string
 	sem     chan struct{}
 	idle    chan *conn
+	open    atomic.Int64 // connections open, idle or in use
 	nextID  atomic.Uint64
 	Timeout time.Duration // per request when ctx has no deadline (default 30 s)
 }
@@ -238,12 +239,19 @@ func New(addr string, maxConns int) *Client {
 // Addr is the node's address.
 func (c *Client) Addr() string { return c.addr }
 
+// Open is the number of connections open, idle or in use.
+func (c *Client) Open() int { return int(c.open.Load()) }
+
+// Conns is the most connections the client opens, one per concurrent request.
+func (c *Client) Conns() int { return cap(c.sem) }
+
 // Close closes idle connections.
 func (c *Client) Close() {
 	for {
 		select {
 		case cn := <-c.idle:
 			cn.nc.Close()
+			c.open.Add(-1)
 		default:
 			return
 		}
@@ -270,6 +278,7 @@ func (c *Client) get(ctx context.Context) (*conn, error) {
 	if tc, ok := nc.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
+	c.open.Add(1)
 	return &conn{nc: nc, br: bufio.NewReaderSize(nc, 64<<10)}, nil
 }
 
@@ -278,10 +287,12 @@ func (c *Client) put(cn *conn, healthy bool) {
 		select {
 		case c.idle <- cn:
 		default:
-			cn.nc.Close()
+			healthy = false
 		}
-	} else {
+	}
+	if !healthy {
 		cn.nc.Close()
+		c.open.Add(-1)
 	}
 	<-c.sem
 }
@@ -304,7 +315,9 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) ([
 	if err == nil {
 		err = frame.Read(cn.br, &resp)
 	}
-	stop()
+	// A cancellation that crossed the reply has its deadline on the way: back in the pool, the
+	// connection would fail the next request, whoever made it.
+	reusable := stop()
 	if err == nil && (resp.ReqID != id || resp.Type != op || !resp.IsResponse()) {
 		err = fmt.Errorf("nodeclient: mismatched response from %s", c.addr)
 	}
@@ -315,7 +328,7 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) ([
 		}
 		return nil, fmt.Errorf("nodeclient %s: %w", c.addr, err)
 	}
-	c.put(cn, true)
+	c.put(cn, reusable)
 	if resp.Status != StatusOK {
 		return nil, &StatusError{Addr: c.addr, Op: op, Status: resp.Status, Msg: string(resp.Body)}
 	}

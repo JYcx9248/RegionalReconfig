@@ -10,7 +10,7 @@ Sections, in the order of the pipeline:
 
     base: base/wiki-c1024.yaml
     paths:      {work_dir, engine_bin, go_bin}
-    dataset:    {vectors, queries, ground_truth}       # ground truth: fusion_gt makes it if missing
+    dataset:    {vectors, queries, ground_truth, ground_truth_stride}   # fusion_gt makes it if missing
     build:      {index_dir, pq_m, threads, ...}         # fusion_build's flags, BUILD_FLAGS; extra_args
     partition:  {generator: file | gp | spatial | range, partitions, file, gp: {...}}
     cluster:    {nodes, initial_nodes, protocol, placement, strategy, backend, gpus, node_args,
@@ -55,7 +55,8 @@ SCHEMA = {
     "paths": (None, {
         "work_dir": ("WorkDir", None), "engine_bin": ("EngineBin", None), "go_bin": ("GoBin", None)}),
     "dataset": (None, {
-        "vectors": ("Base", None), "queries": ("Queries", None), "ground_truth": ("GroundTruth", None)}),
+        "vectors": ("Base", None), "queries": ("Queries", None), "ground_truth": ("GroundTruth", None),
+        "ground_truth_stride": ("GroundTruthStride", None)}),
     "build": (None, dict({"index_dir": ("IndexDir", None), "extra_args": (None, None)},
                          **{k: (None, None) for k in BUILD_FLAGS})),
     "partition": (None, {
@@ -67,6 +68,7 @@ SCHEMA = {
         "placement": ("Placement", None), "strategy": ("Strategy", None), "raw_priority": ("RawPriority", None),
         "transfer_rate_bytes_per_sec": ("TransferRateBytesPerSec", None),
         "metrics_interval": ("MetricsInterval", None), "ready_timeout_seconds": ("ReadyTimeoutSeconds", None),
+        "stage_timeout": ("StageTimeout", None), "node_conns": ("NodeConns", None),
         "controller_addr": ("ControllerAddr", None), "api_addr": ("APIAddr", None), "backend": ("Backend", None),
         "gpus": ("GPUs", None), "node_args": ("NodeArgs", None), "query_sample": ("QuerySample", None),
         "raw": (None, {"streams": ("RawStreams", None), "batch_bytes": ("RawBatchBytes", None),

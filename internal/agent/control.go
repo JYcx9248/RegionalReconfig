@@ -21,8 +21,13 @@ import (
 	"rtier/internal/transfer"
 )
 
-// Longest a drain or staging step may take inside the agent.
-const maxStepTime = 30 * time.Minute
+// stepTimeout is the longest a long step may take inside the agent (config StepTimeout).
+func (a *Agent) stepTimeout() time.Duration {
+	if d := a.cfg.StepTimeout.Duration; d > 0 {
+		return d
+	}
+	return 30 * time.Minute
+}
 
 func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	c.Handle(protocol.StageAggregatorM, a.handleStageAggregator)
@@ -49,25 +54,50 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	})
 }
 
-// StageAggregator: connect to (and ping) every data node of the given table, so the first
-// queries after the flip do not pay connection setup (Koala: waitAllInboundPeersToConnect).
+// StageAggregator: connect to every data node of the given table, so the first queries after
+// the flip do not pay connection setup (Koala: waitAllInboundPeersToConnect). A node already
+// connected is left alone: its queries keep the connections open, and a scale-out comes under
+// load, when a ping would queue behind them in the pool. A new one gets the whole pool at once,
+// every node in parallel, so the burst after the flip finds its connections open.
 func (a *Agent) handleStageAggregator(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageAggregatorReq](body)
 	if err != nil || req.Table == nil {
 		return nil, fmt.Errorf("bad StageAggregator request: %v", err)
 	}
 	a.learn(req.Table)
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		first error
+	)
 	for _, id := range req.Table.Placement.Nodes() {
 		n, ok := req.Table.Node(id)
 		if !ok {
 			return nil, fmt.Errorf("table has no address for node %d", id)
 		}
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := a.peer(n.NodeAddr).Ping(cctx)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("data node %d (%s): %w", id, n.NodeAddr, err)
+		c := a.peer(n.NodeAddr)
+		if c.Open() > 0 {
+			continue
 		}
+		for range c.Conns() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				if err := c.Ping(cctx); err != nil {
+					mu.Lock()
+					if first == nil {
+						first = fmt.Errorf("data node %d (%s): %w", id, n.NodeAddr, err)
+					}
+					mu.Unlock()
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	if first != nil {
+		return nil, first
 	}
 	a.setReady(config.RoleAggregator)
 	return struct{}{}, nil
@@ -97,7 +127,7 @@ func (a *Agent) handleStagePartitions(ctx context.Context, body json.RawMessage)
 		return nil, err
 	}
 	a.learnNodes(req.Nodes)
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	ctx, finish := a.beginStaging(ctx)
 	defer finish()
@@ -467,7 +497,7 @@ func (a *Agent) handleStageRaw(ctx context.Context, body json.RawMessage) (any, 
 			return nil, err
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	start := time.Now()
 	var parts []int
@@ -504,7 +534,7 @@ func (a *Agent) handleDrainRaw(ctx context.Context, body json.RawMessage) (any, 
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	a.learnNodes(req.Nodes)
 	start := time.Now()
@@ -625,7 +655,7 @@ func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any
 			return nil, err
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	const name = "graph.hnsw"
 	var st transfer.Stats
@@ -682,6 +712,8 @@ func (a *Agent) handleGraphPatch(ctx context.Context, body json.RawMessage) (any
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout()) // a merge in place grows with the graph
+	defer cancel()
 	if req.Drop {
 		_, err := a.localBulk.PatchDrop(ctx, req.Version)
 		return struct{}{}, err
@@ -724,7 +756,7 @@ func (a *Agent) handleWaitDrained(ctx context.Context, body json.RawMessage) (an
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	return struct{}{}, a.tracker.WaitDrained(ctx, req.Epoch)
 }
@@ -739,6 +771,10 @@ func (a *Agent) handleEvict(ctx context.Context, body json.RawMessage) (any, err
 	if err != nil {
 		return nil, err
 	}
+	// An eviction drops a reference per posting (the PQ store's reclaimer): a whole partition
+	// takes seconds at a billion vectors, past a request's default timeout.
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
+	defer cancel()
 	if req.ReleaseStagedPQ {
 		// Rollback of an aborted staging: stop a staging still running here first, so that it
 		// neither loads a partition after this eviction nor installs codes after the release.
@@ -788,7 +824,7 @@ func (a *Agent) handleSavePartitions(ctx context.Context, body json.RawMessage) 
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	for _, pv := range req.Versions {
 		if err := a.localBulk.SavePartition(ctx, pv.Partition, pv.Version, a.segmentPath(pv.Partition, pv.Version)); err != nil {
@@ -812,6 +848,8 @@ func (a *Agent) handleDropVersions(ctx context.Context, body json.RawMessage) (a
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout()) // as an eviction: a reference per posting
+	defer cancel()
 	for lo := 0; lo < len(req.Deleted); lo += forgetBatch {
 		if _, err := a.localBulk.ForgetVectors(ctx, req.Deleted[lo:min(lo+forgetBatch, len(req.Deleted))], true); err != nil {
 			return nil, fmt.Errorf("freeing the PQ codes of deleted vectors: %w", err)
@@ -838,7 +876,7 @@ func (a *Agent) handleSetAdmission(ctx context.Context, body json.RawMessage) (a
 }
 
 func (a *Agent) handleWaitIdle(ctx context.Context, _ json.RawMessage) (any, error) {
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	return struct{}{}, a.tracker.WaitIdle(ctx)
 }

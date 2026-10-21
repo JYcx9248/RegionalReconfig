@@ -291,8 +291,11 @@ var Open = map[string]Question{
 			"makes the lazy protocol worth it; without any, lazy still moves at most what " +
 			"copy-then-flip copies, since a node fetches each vector at most once and concurrent " +
 			"misses of one vector wait for one fetch (Wikipedia 2 -> 4: 3.0 GB fetched against 51.2 " +
-			"GB copied). Open: a generator or a real query log with locality for the experiments (the " +
-			"SemDN-style generator is a placeholder)",
+			"GB copied). Decided (2026-10-20): no generator of our own -- Koala swept its locality " +
+			"because its workload came from its own Nexmark generator. The experiments take the two " +
+			"ends: real queries that do not repeat (their own locality) and the worst case, queries " +
+			"sampled from the base vectors without repetition (none); the SemDN-style generator " +
+			"(\"semdn\") stays a placeholder and is not pursued",
 		"cmd/rtier-loadgen/arrivals.go"},
 	"U12": {"U12", "Vector ID -> RAG chunk ID mapping returned to the caller",
 		"the tier returns vector IDs (no code path maps them yet); the chunk store and the " +

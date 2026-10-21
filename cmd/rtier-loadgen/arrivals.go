@@ -102,9 +102,9 @@ func (p *poisson) Next() (time.Duration, int) {
 // newArrivals returns the arrival process named kind. steps is the rate schedule after the
 // initial rate (parseSteps), empty for a constant rate.
 //
-// TODO(design) U11: the workload the proposal targets is SemDN-style bursty, task-coherent
-// query streams from agents (bursts of related queries that hit a small set of lists). Its
-// generator (or a trace to replay) is not designed yet; "semdn" is the placeholder.
+// U11: the experiments replay query files, real queries that do not repeat or the worst case
+// sampled from the base vectors, with Poisson arrivals. "semdn" (SemDN-style bursty,
+// task-coherent streams from agents) stays a placeholder: decided not pursued.
 func newArrivals(kind string, steps []step, nq int, seed int64) (Arrivals, error) {
 	switch kind {
 	case "", "poisson":

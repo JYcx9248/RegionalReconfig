@@ -43,6 +43,8 @@ func (a *Agent) handleSwitchGeneration(ctx context.Context, body json.RawMessage
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout()) // reads the generation's manifest and PQ file
+	defer cancel()
 	in, err := a.localBulk.Info(ctx)
 	if err != nil {
 		return nil, err
@@ -91,6 +93,8 @@ func (a *Agent) handleSwitchGeneration(ctx context.Context, body json.RawMessage
 // RawBitmap: the raw vectors the data node holds, which a full rebuild places the next
 // generation's partitions by.
 func (a *Agent) handleRawBitmap(ctx context.Context, _ json.RawMessage) (any, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout()) // a bit per location: 125 MB at a billion
+	defer cancel()
 	bm, err := a.localBulk.RawBitmap(ctx)
 	if err != nil {
 		return nil, err
@@ -146,7 +150,7 @@ func (a *Agent) handleWarmup(ctx context.Context, body json.RawMessage) (any, er
 		return nil, fmt.Errorf("bad Warmup request: %v", err)
 	}
 	a.learn(req.Table)
-	ctx, cancel := context.WithTimeout(ctx, maxStepTime)
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	conc := req.Concurrency
 	if conc <= 0 {

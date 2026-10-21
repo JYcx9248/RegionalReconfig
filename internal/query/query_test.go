@@ -77,8 +77,8 @@ func TestPlaceholders(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
-	if _, err := NewStrategy(""); !errors.Is(err, design.ErrUndecided) {
-		t.Fatal("empty strategy must be undecided")
+	if s, err := NewStrategy(""); err != nil || s.Name() != "two-phase" {
+		t.Fatalf("no strategy named: %v, %v; want two-phase, the decided answer to U5", s, err)
 	}
 	s, _ := NewSelector("outsource")
 	if _, err := s.Pick(nil, 1, nil, nil); !errors.Is(err, design.ErrUndecided) {
