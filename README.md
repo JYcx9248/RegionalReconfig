@@ -123,8 +123,10 @@ neither its source nor its destination moves data -- segments or PQ codes throug
 raw vectors through the data node (`RAW_TRAFFIC`, polled every 100 ms) -- paced or not, so it
 delays neither the flip nor a query's fetch. In the worst case, queries fetching without pause,
 a new node becomes an entry only once the fetching subsides; only navigation waits for it,
-which the existing entries do meanwhile. `"data"` shares the source's bucket equally, as a
-baseline. A new node
+which the existing entries do meanwhile. This strict yield is decided for now: whether the
+graph moves nothing at all while data moves, or takes the bandwidth the data leaves unused, is
+settled once the experiments show what it costs. `"data"` shares the source's bucket equally,
+as a baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
 are arriving, the controller flips every `"entry_flip_interval"` (1 s by default) to add all the
 nodes that are ready, and adds the last ones at once when every pull has ended. These flips

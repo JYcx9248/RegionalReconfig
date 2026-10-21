@@ -432,13 +432,16 @@ var Open = map[string]Question{
 			"reconfigurations (instead of every new node pulling from the first entry), and the " +
 			"pull runs at background priority (graph_priority): FILTER and RERANK need posting " +
 			"lists and PQ codes, not the graph, and navigation is the smallest share of a query " +
-			"that any existing entry can do meanwhile. Decided (2026-10-21): the graph yields " +
-			"strictly to posting lists, PQ codes and raw vectors, paced or not, at both ends of " +
-			"its transfer -- it moves no byte while its source or its destination moves segments " +
-			"or PQ codes through its agent, or raw vectors through its data node (RAW_TRAFFIC, " +
-			"polled every 100 ms) -- so it delays neither the flip nor a query's fetch. In the " +
-			"worst case, queries fetching without pause, a new node becomes an entry only once " +
-			"the fetching subsides (accepted: only navigation waits, which existing entries do). " +
+			"that any existing entry can do meanwhile. Decided for now (2026-10-21; final once " +
+			"the experiments show what it costs): the graph yields strictly to posting lists, PQ " +
+			"codes and raw vectors, paced or not, at both ends of its transfer -- it moves no byte " +
+			"while its source or its destination moves segments or PQ codes through its agent, or " +
+			"raw vectors through its data node (RAW_TRAFFIC, polled every 100 ms) -- so it delays " +
+			"neither the flip nor a query's fetch. In the worst case, queries fetching without " +
+			"pause, a new node becomes an entry only once the fetching subsides (accepted for now: " +
+			"only navigation waits, which existing entries do). Open until the experiments: " +
+			"whether the graph moves nothing at all while data moves, or takes the bandwidth the " +
+			"data leaves unused, as the bucket's background class does. " +
 			"Pairs with U6's warmup selector, which moves aggregation to the new node before its " +
 			"graph arrives. After major epochs (U14), the transfer brings the build's graph and " +
 			"then, from the same source, the patch of every later graph version, merged in order " +

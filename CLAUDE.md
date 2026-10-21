@@ -94,9 +94,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   aggregator → `TwoPhase`: FILTER (local top-n by PQ) at each owner, global top-n merge, RERANK
   of each candidate at one owner that reported it, top-k merge. Equal to the single-node answer.
 - **Reconfiguration** (`copyThenFlip`, protocol `lazy` by default): pre-connect aggregators →
-  new nodes pull segments and the PQ codes they lack (the graph last: it moves only while
-  neither end moves segments, PQ codes or raw vectors, `graphYield`; sources round-robin over
-  entries) → flip (CAS + install) → grace (drain the old epoch) →
+  new nodes pull segments and the PQ codes they lack (the graph last, for now strictly: it
+  moves only while neither end moves segments, PQ codes or raw vectors, `graphYield`; sources
+  round-robin over entries) → flip (CAS + install) → grace (drain the old epoch) →
   reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
   Alongside grace and reclaim, `promoteEntries` flips every `entry_flip_interval` to make
   entries of the new nodes whose graph has loaded; the rescale waits for it. Raw vectors do
@@ -232,7 +232,8 @@ Next:
    eager (U16), nodes removed by a scale-in are shut down (U3), U7 closed with the failures, the
    pacing stays as it is (U8), the entry list stays in the epoch table (U17), no workload
    generator of our own (U11: real queries that do not repeat, and the worst case). Still open:
-   - on the protocol: placement by per-tier bytes (U3);
+   - on the protocol: placement by per-tier bytes (U3); whether the graph moves nothing at all
+     while data moves (U16: strictly for now, settled once the experiments show the cost);
    - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
      batch size and period are set aside); a batch over budget (scale out first?); writes
      against queries during a scale-out; staged versions left by an expired lease;
