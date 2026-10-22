@@ -298,7 +298,8 @@ epoch, a full rebuild and rescales.
 
 Needs Linux, CMake ≥ 3.18, a C++17 compiler with OpenMP, Go ≥ 1.24 (the standard library and
 `gopkg.in/yaml.v3`, vendored),
-Python 3 with numpy and PyYAML for the scripts. CUDA ≥ 11 and liburing are optional.
+Python 3 for the scripts (PyYAML, which the runners need, is vendored in `scripts/vendor/`; numpy
+for the data and testing scripts). CUDA ≥ 11 and liburing are optional.
 
 ```sh
 make                 # engine + bin/rtier-*; CUDA=AUTO builds the GPU backend when nvcc is found

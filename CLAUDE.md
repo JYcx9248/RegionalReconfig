@@ -9,8 +9,8 @@ a short flip, and throughput that follows the load.
 ## Build and test
 
 Linux only (the end-to-end tests and the network emulation need it). CMake ≥ 3.18, a C++17
-compiler with OpenMP, Go ≥ 1.24, Python 3 with numpy and PyYAML. CUDA ≥ 11 and liburing are
-optional.
+compiler with OpenMP, Go ≥ 1.24, Python 3 (numpy for the data and testing scripts). CUDA ≥ 11 and
+liburing are optional.
 
 ```sh
 make CUDA=OFF            # engine in engine/build + bin/rtier-*
@@ -80,6 +80,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 
 - Go uses the standard library and `gopkg.in/yaml.v3` (config.yaml, as Koala), vendored
   (`vendor/`) so that a build needs no network. The module path `rtier` is a placeholder.
+- The runners (`run_local.py`, `run_cluster.py`, `run_one.sh` and what they call) use the standard
+  library and PyYAML, vendored (`scripts/vendor/yaml`, pure Python): a run needs nothing but
+  `python3`, never a venv (a shared server's system Python takes no packages, PEP 668). numpy
+  only in the data and testing scripts.
 - Open design questions live in `internal/design/design.go` (U1–U17; U4 is out of scope).
   Code that reaches an undecided question returns `design.Undecided("Un", "...")` — never
   silently pick an answer. When something gets decided, update that entry (decided part, open

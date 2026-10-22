@@ -36,10 +36,12 @@ try:
 except (OSError, ValueError) as e:
     sys.exit(f"run_one.sh: {e}")
 PY
+# Before anything is removed or evicted: an OUT_DIR that cannot be written (an unset variable
+# in the path makes it /...) stops here.
+rm -rf "$OUT"; mkdir -p "$(dirname "$OUT")" || exit 1
+MEM=$(dirname "$OUT")/mem-$P.log; : > "$MEM" || exit 1
 W=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('WorkDir', '/tmp/rtier-run'))" "$TMP")
 for d in "$W"/n[0-9]*; do [ -d "$d" ] && rm -rf "$d"; done
-rm -rf "$OUT"; mkdir -p "$(dirname "$OUT")"
-MEM=$(dirname "$OUT")/mem-$P.log; : > "$MEM"
 if [ "$(id -u)" = 0 ]; then
   if [ -n "$(swapon --noheadings 2>/dev/null)" ] && [ "$(cat /proc/sys/vm/swappiness)" != 1 ]; then
     sysctl -q -w vm.swappiness=1 && echo "vm.swappiness set to 1"

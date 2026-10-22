@@ -23,6 +23,10 @@ hnswlib v0.8.0 (nmslib/hnswlib), Apache License 2.0
 go-yaml v3.0.1 (gopkg.in/yaml.v3), MIT and Apache License 2.0
   vendor/gopkg.in/yaml.v3, unmodified (its LICENSE and NOTICE are there); reads config.yaml.
 
+PyYAML v6.0.3 (yaml/pyyaml), MIT License
+  scripts/vendor/yaml, its pure-Python package (lib/yaml), unmodified (its LICENSE is there);
+  the runners read and write config.yaml with it.
+
 FusionANNS
   engine/ is a reimplementation written from the paper (Tian et al., FAST '25); the authors
   have not released code.

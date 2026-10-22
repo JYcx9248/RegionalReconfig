@@ -38,10 +38,10 @@ import json
 import os
 import sys
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover
-    sys.exit("config.yaml is YAML: install PyYAML (pip install --user pyyaml)")
+# PyYAML is vendored (scripts/vendor/yaml, its pure-Python part), as yaml.v3 is for Go: a run then
+# needs nothing but python3, whose packages a shared server may not let anyone add (PEP 668).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+import yaml  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SYSTEM_CONFIG = os.path.join(ROOT, "config.yaml")
