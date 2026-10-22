@@ -56,7 +56,9 @@ done
 wait $RL; rc=$?
 mv "$OUT.log" "$OUT/run_local.log" 2>/dev/null
 rm -f "$TMP" "$FLAT"
-# A calibration run writes calibration.json (and calib-<rate>.csv), not latency.csv.
+# A calibration run writes calibration.json (and calib-<rate>.csv), a warmup snapshot.json, not
+# latency.csv.
 RES=latency.csv; grep -q '"Calibrate"' "$OUT/experiment.json" 2>/dev/null && RES=calibration.json
+grep -q '"Type": "warmup"' "$OUT/experiment.json" 2>/dev/null && RES=snapshot.json
 echo "exit $rc $(date +%T), $RES: $(test -f "$OUT/$RES" && echo yes || echo NO), min available $(sort -k2 -n "$MEM" | head -1 | awk '{print $2}') MB, swap-ins $(( $(tail -1 "$MEM" | awk '{print $4}') - $(head -1 "$MEM" | awk '{print $4}') )) pages"
 exit $rc

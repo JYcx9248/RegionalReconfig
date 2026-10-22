@@ -60,6 +60,8 @@ const (
 	opSwitchGen      uint8 = 0x3C
 	opRawBitmap      uint8 = 0x3D
 	opRawTraffic     uint8 = 0x3E
+	opPQFromIndex    uint8 = 0x3F
+	opRawSave        uint8 = 0x40
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -168,6 +170,7 @@ type RawStats struct {
 	Fetches   uint64 `json:"fetches"`
 	Skipped   uint64 `json:"skipped"`
 	Served    uint64 `json:"served"`
+	Restored  uint64 `json:"restored"` // present when the node started on a snapshot (--raw-reuse)
 }
 
 // Info is the node's INFO reply.
@@ -557,6 +560,22 @@ func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
 	return out, r.Err
 }
 
+// RawSave has the node sync its raw vectors and save their presence bits next to its raw file
+// (<raw-file>.present), for a node started later on a copy of both (rtier_node --raw-reuse):
+// an experiment's warmup snapshot. It returns how many vectors they mark.
+func (c *Client) RawSave(ctx context.Context) (uint64, error) {
+	b, err := c.do(ctx, opRawSave, 0, nil)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	n := r.U64()
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, fmt.Errorf("RAW_SAVE: %d trailing bytes", r.Remaining())
+	}
+	return n, r.Err
+}
+
 // RawTraffic returns the raw-vector bytes the node has sent (RAW_GET) and received (fetched from
 // peers, on demand or by RAW_PULL, or put with RAW_PUT) since it started.
 func (c *Client) RawTraffic(ctx context.Context) (sent, received uint64, err error) {
@@ -570,6 +589,28 @@ func (c *Client) RawTraffic(ctx context.Context) (sent, received uint64, err err
 		return 0, 0, fmt.Errorf("RAW_TRAFFIC: %d trailing bytes", r.Remaining())
 	}
 	return sent, received, r.Err
+}
+
+// PQFromIndex has the node install, for its bootstrap, the PQ codes the segment files at paths
+// (on the node's host) name that it lacks, from the index's pq_codes.bin in one pass, staged
+// until the partitions load (or PQRelease); it returns how many it installed.
+func (c *Client) PQFromIndex(ctx context.Context, paths []string) (uint64, error) {
+	var w frame.Writer
+	w.U32(uint32(len(paths)))
+	for _, p := range paths {
+		w.U32(uint32(len(p)))
+		w.Str(p)
+	}
+	b, err := c.do(ctx, opPQFromIndex, 0, w.B)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	n := r.U64()
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, fmt.Errorf("PQ_FROM_INDEX: %d trailing bytes", r.Remaining())
+	}
+	return n, r.Err
 }
 
 // PQMissing lists, for each group of segment files (paths on the node's host), the vector IDs

@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <linux/aio_abi.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -13,10 +14,18 @@
 #include <cstring>
 #include <numeric>
 
+#include "fusion/partition.h"  // Crc32
 #include "fusion/read_budget.h"
 
 namespace fusion {
 namespace {
+
+// The presence bits as SaveBitmap writes them (little endian): the magic, u32 version, the page
+// geometry (u32 vec_bytes, u32 vectors_per_page, u32 page_size, u64 num_pages), u64 words, the
+// words, then a CRC-32 of every byte before it.
+constexpr char kBitsMagic[8] = {'R', 'T', 'R', 'A', 'W', 'B', 'I', 'T'};
+constexpr uint32_t kBitsVersion = 1;
+constexpr size_t kBitsHeader = 8 + 4 * 4 + 8 + 8;
 
 constexpr uint32_t kChunkPages = 256;  // pages per round of direct I/O (1 MB at 4 KB pages)
 constexpr uint32_t kIoDepth = 16;      // installs are background work: a modest queue depth
@@ -54,6 +63,78 @@ bool PreadCached(int fd, uint8_t* p, size_t n, uint64_t off) {
 // Device reads one Get keeps in flight: enough for a query's misses at one holder (at most its N
 // candidates) to go out together, and a bound on what one stream batch puts on the device.
 constexpr size_t kReadsInFlight = 256;
+
+// The presence bits saved at path, as many words as a store of layout L has: refused if they
+// are of another page geometry, or mark a location L has no room for (saved with more pages).
+std::vector<uint64_t> LoadBits(const std::string& path, const RawLayout& L) {
+  const std::vector<uint8_t> b = ReadFile(path);
+  FUSION_CHECK(b.size() >= kBitsHeader + 4 && std::memcmp(b.data(), kBitsMagic, 8) == 0,
+               "%s holds no presence bits", path.c_str());
+  uint32_t crc = 0;
+  std::memcpy(&crc, b.data() + b.size() - 4, 4);
+  FUSION_CHECK(Crc32(b.data(), b.size() - 4) == crc, "%s: checksum mismatch", path.c_str());
+  uint32_t hdr[4];
+  uint64_t pages = 0, words = 0;
+  std::memcpy(hdr, b.data() + 8, sizeof(hdr));
+  std::memcpy(&pages, b.data() + 24, 8);
+  std::memcpy(&words, b.data() + 32, 8);
+  FUSION_CHECK(hdr[0] == kBitsVersion, "%s: presence bits of version %u, expected %u", path.c_str(), hdr[0],
+               kBitsVersion);
+  FUSION_CHECK(hdr[1] == L.vec_bytes && hdr[2] == L.vectors_per_page && hdr[3] == L.page_size,
+               "%s: presence bits of %u-byte vectors, %u to a %u-byte page; this node's are %u-byte, %u to a "
+               "%u-byte page",
+               path.c_str(), hdr[1], hdr[2], hdr[3], L.vec_bytes, L.vectors_per_page, L.page_size);
+  FUSION_CHECK(words == CeilDiv(pages * hdr[2], 64) && b.size() == kBitsHeader + words * 8 + 4,
+               "%s is truncated", path.c_str());
+  std::vector<uint64_t> out(CeilDiv(L.locations(), 64), 0);
+  const uint64_t keep = std::min<uint64_t>(words, out.size());
+  std::memcpy(out.data(), b.data() + kBitsHeader, keep * 8);
+  bool beyond = false;
+  for (uint64_t w = keep; w < words; ++w) {
+    uint64_t v = 0;
+    std::memcpy(&v, b.data() + kBitsHeader + w * 8, 8);
+    beyond |= v != 0;
+  }
+  if (const uint64_t tail = L.locations() % 64; tail && keep == out.size()) {
+    beyond |= (out.back() >> tail) != 0;
+  }
+  FUSION_CHECK(!beyond, "%s marks vectors past this node's %llu locations", path.c_str(),
+               static_cast<unsigned long long>(L.locations()));
+  return out;
+}
+
+// Where the last vector the bits mark ends in the file (0: they mark none).
+uint64_t EndOfLast(const std::vector<uint64_t>& bits, const RawLayout& L) {
+  for (size_t w = bits.size(); w-- > 0;)
+    if (bits[w]) return L.offset(static_cast<uint32_t>(w * 64 + 63 - __builtin_clzll(bits[w]))) + L.vec_bytes;
+  return 0;
+}
+
+// Writes path at once: a temporary file of its own (two writers at once each rename a whole
+// file), synced, renamed over it.
+void WriteDurably(const std::string& path, const std::vector<uint8_t>& data) {
+  std::string tmp = path + ".tmp.XXXXXX";
+  const int fd = ::mkstemp(&tmp[0]);
+  FUSION_CHECK(fd >= 0, "cannot create %s: %s", tmp.c_str(), std::strerror(errno));
+  ::fchmod(fd, 0644);
+  try {
+    PwriteAll(fd, data.data(), data.size(), 0, tmp);
+    FUSION_CHECK(::fsync(fd) == 0, "fsync %s: %s", tmp.c_str(), std::strerror(errno));
+  } catch (...) {
+    ::close(fd);
+    ::unlink(tmp.c_str());
+    throw;
+  }
+  ::close(fd);
+  FUSION_CHECK(std::rename(tmp.c_str(), path.c_str()) == 0, "rename %s: %s", tmp.c_str(), std::strerror(errno));
+  const size_t slash = path.rfind('/');
+  const std::string dir = slash == std::string::npos ? "." : slash == 0 ? "/" : path.substr(0, slash);
+  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {  // the rename itself, where the file system takes a directory sync
+    ::fsync(dfd);
+    ::close(dfd);
+  }
+}
 
 // Visits the entries of order (indices into locs, sorted by location) in runs of consecutive
 // locations on one page -- contiguous bytes in the file: fn(first, count) with positions into
@@ -150,29 +231,50 @@ class RawStore::DirectIo {
   std::vector<io_event> events_;
 };
 
-RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct)
-    : layout_(layout), path_(path) {
+RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct, bool reuse)
+    : layout_(layout), path_(path), anonymous_(path.empty()) {
   FUSION_CHECK(layout.vec_bytes > 0 && layout.vectors_per_page >= 1 &&
                    static_cast<uint64_t>(layout.vec_bytes) * layout.vectors_per_page <= layout.page_size,
                "bad raw-vector page geometry");
   FUSION_CHECK(layout.locations() < kInvalidId, "too many raw-vector locations");
-  const bool anonymous = path_.empty();
-  if (anonymous) {
+  FUSION_CHECK(!(reuse && anonymous_), "raw vectors to reuse need their file");
+  std::vector<uint64_t> words;  // reuse: the saved presence bits
+  if (anonymous_) {
     const char* tmp = std::getenv("TMPDIR");
     std::string tmpl = std::string(tmp && *tmp ? tmp : "/tmp") + "/rtier-raw-XXXXXX";
     fd_ = ::mkstemp(&tmpl[0]);
     FUSION_CHECK(fd_ >= 0, "cannot create a temporary raw-vector file: %s", std::strerror(errno));
     path_ = tmpl;
+  } else if (reuse) {
+    words = LoadBits(BitmapPath(path_), layout);
+    fd_ = ::open(path_.c_str(), O_RDWR | O_CLOEXEC);
+    FUSION_CHECK(fd_ >= 0, "cannot open %s: %s", path_.c_str(), std::strerror(errno));
+    // A copy cut short would read as zeros where its bits say vectors are.
+    struct stat sb;
+    const uint64_t need = EndOfLast(words, layout);
+    if (::fstat(fd_, &sb) != 0 || static_cast<uint64_t>(sb.st_size) < need) {
+      ::close(fd_);
+      FUSION_CHECK(false, "%s ends before the last vector its presence bits mark (at byte %llu)", path_.c_str(),
+                   static_cast<unsigned long long>(need));
+    }
   } else {
     fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     FUSION_CHECK(fd_ >= 0, "cannot create %s: %s", path_.c_str(), std::strerror(errno));
+    const std::string bits = BitmapPath(path_);
+    if (::unlink(bits.c_str()) != 0 && errno != ENOENT) {
+      const std::string err = std::strerror(errno);
+      ::close(fd_);
+      FUSION_CHECK(false, "cannot remove %s, the presence bits of the vectors %s held: %s", bits.c_str(),
+                   path_.c_str(), err.c_str());
+    }
   }
-  // Sparse: only the vectors written take space.
+  // Sparse: only the vectors written take space. A reused file may have been saved with room
+  // for more pages, or fewer: its bits mark none of those beyond this store's.
   const uint64_t bytes = layout.num_pages * layout.page_size;
   if (::ftruncate(fd_, static_cast<off_t>(bytes)) != 0) {
     const std::string err = std::strerror(errno);
     ::close(fd_);
-    if (anonymous) ::unlink(path_.c_str());
+    if (anonymous_) ::unlink(path_.c_str());
     FUSION_CHECK(false, "cannot size %s to %llu bytes: %s", path_.c_str(),
                  static_cast<unsigned long long>(bytes), err.c_str());
   }
@@ -180,7 +282,7 @@ RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct
     pages_ = std::make_unique<PageFile>(path_, layout.page_size, direct);
   } catch (...) {
     ::close(fd_);
-    if (anonymous) ::unlink(path_.c_str());
+    if (anonymous_) ::unlink(path_.c_str());
     throw;
   }
   if (pages_->direct() && layout.page_size % 4096 == 0) {
@@ -196,10 +298,39 @@ RawStore::RawStore(const std::string& path, const RawLayout& layout, bool direct
       }
     }
   }
-  if (anonymous) ::unlink(path_.c_str());  // both descriptors keep it alive until we exit
-  const uint64_t words = CeilDiv(layout.locations(), 64);
-  bits_.reset(new std::atomic<uint64_t>[words]);
-  for (uint64_t i = 0; i < words; ++i) bits_[i].store(0, std::memory_order_relaxed);
+  if (anonymous_) ::unlink(path_.c_str());  // both descriptors keep it alive until we exit
+  const uint64_t nwords = CeilDiv(layout.locations(), 64);
+  bits_.reset(new std::atomic<uint64_t>[nwords]);
+  uint64_t present = 0;
+  for (uint64_t i = 0; i < nwords; ++i) {
+    const uint64_t w = i < words.size() ? words[i] : 0;
+    bits_[i].store(w, std::memory_order_relaxed);
+    present += static_cast<uint64_t>(__builtin_popcountll(w));
+  }
+  present_.store(present, std::memory_order_relaxed);
+  restored_ = present;
+}
+
+uint64_t RawStore::SaveBitmap() {
+  FUSION_CHECK(!anonymous_, "the raw vectors are in an anonymous file (no --raw-file): nothing to save them with");
+  // The bits first, then the sync: a bit is set only once its vector's write returned, so the
+  // sync puts every vector they mark on the device.
+  const std::vector<uint64_t> words = Bitmap();
+  FUSION_CHECK(::fsync(fd_) == 0, "fsync %s: %s", path_.c_str(), std::strerror(errno));
+  std::vector<uint8_t> b(kBitsHeader + words.size() * 8 + 4);
+  const uint32_t hdr[4] = {kBitsVersion, layout_.vec_bytes, layout_.vectors_per_page, layout_.page_size};
+  const uint64_t pages = layout_.num_pages, nwords = words.size();
+  std::memcpy(b.data(), kBitsMagic, 8);
+  std::memcpy(b.data() + 8, hdr, sizeof(hdr));
+  std::memcpy(b.data() + 24, &pages, 8);
+  std::memcpy(b.data() + 32, &nwords, 8);
+  std::memcpy(b.data() + kBitsHeader, words.data(), words.size() * 8);
+  const uint32_t crc = Crc32(b.data(), b.size() - 4);
+  std::memcpy(b.data() + b.size() - 4, &crc, 4);
+  WriteDurably(BitmapPath(path_), b);
+  uint64_t n = 0;
+  for (uint64_t w : words) n += static_cast<uint64_t>(__builtin_popcountll(w));
+  return n;
 }
 
 RawStore::~RawStore() {
@@ -418,6 +549,7 @@ RawStats RawStore::Stats() const {
   s.fetches = fetches_.load(std::memory_order_relaxed);
   s.skipped = skipped_.load(std::memory_order_relaxed);
   s.served = served_.load(std::memory_order_relaxed);
+  s.restored = restored_;
   return s;
 }
 

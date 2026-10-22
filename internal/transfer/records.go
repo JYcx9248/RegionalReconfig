@@ -150,31 +150,73 @@ func (s *Server) sendRecords(bw *bufio.Writer, k recordKind, src RecordSource, c
 	return bw.Flush()
 }
 
-// PullPQ fetches the PQ codes of ids from the server at addr, batch IDs per request (0 =
-// DefaultPQBatch), and hands every verified batch to sink (the agent: its data node's PQ_PUT)
-// before requesting the next one. Stats.Codes counts the codes.
-func PullPQ(ctx context.Context, addr string, ids []uint32, batch int,
+// Puller is a client's connection to one record server, kept from one pull to the next: a
+// stream's worker pulls what each frame of a listing names, a batch at a time, from the same
+// source, and a connection per batch would pay its setup and a slow start every time. The
+// connection is dialed by the first pull and dropped by a failed one, so the next pull dials
+// again. One goroutine at a time; Close ends it.
+type Puller struct {
+	addr string
+	c    net.Conn
+	br   *bufio.Reader
+}
+
+// NewPuller makes a Puller for the server at addr; nothing is dialed yet.
+func NewPuller(addr string) *Puller { return &Puller{addr: addr} }
+
+// Close drops the connection, if one is open.
+func (p *Puller) Close() error {
+	if p.c == nil {
+		return nil
+	}
+	err := p.c.Close()
+	p.c, p.br = nil, nil
+	return err
+}
+
+// PullPQ fetches the PQ codes of ids, batch IDs per request (0 = DefaultPQBatch), and hands
+// every verified batch to sink (the agent: its data node's PQ_PUT) before requesting the next
+// one. Stats.Codes counts the codes.
+func (p *Puller) PullPQ(ctx context.Context, ids []uint32, batch int,
 	sink func(ids []uint32, m int, codes []byte) error) (Stats, error) {
-	st, err := pullRecords(ctx, addr, pqRecords, Data, ids, batch, nil, sink)
+	st, err := p.pull(ctx, pqRecords, Data, ids, batch, nil, sink)
 	st.Codes, st.Vectors = st.Vectors, 0
 	return st, err
 }
 
-// PullRaw fetches the raw vectors at locs (unique) from the server at addr, which holds them,
-// at priority class on the server's bucket, batch locations per request
-// (0 = DefaultRawBatch), and hands every verified batch to sink (the agent: its data node's
-// RAW_PUT). Before each request, still (if not nil) keeps only the locations the destination
-// still lacks: queries fetch vectors on demand while the stream runs, and those need not come
-// twice. Stats.Vectors counts the vectors received.
+// PullRaw fetches the raw vectors at locs (unique) from the server, which holds them, at
+// priority class on its bucket, batch locations per request (0 = DefaultRawBatch), and hands
+// every verified batch to sink (the agent: its data node's RAW_PUT). Before each request, still
+// (if not nil) keeps only the locations the destination still lacks: queries fetch vectors on
+// demand while the stream runs, and those need not come twice. Stats.Vectors counts the vectors
+// received.
+func (p *Puller) PullRaw(ctx context.Context, locs []uint32, batch int, class Class,
+	still func(locs []uint32) ([]uint32, error),
+	sink func(locs []uint32, vecBytes int, vecs []byte) error) (Stats, error) {
+	return p.pull(ctx, rawRecords, class, locs, batch, still, sink)
+}
+
+// PullPQ is Puller.PullPQ on a connection of its own.
+func PullPQ(ctx context.Context, addr string, ids []uint32, batch int,
+	sink func(ids []uint32, m int, codes []byte) error) (Stats, error) {
+	p := NewPuller(addr)
+	defer p.Close()
+	return p.PullPQ(ctx, ids, batch, sink)
+}
+
+// PullRaw is Puller.PullRaw on a connection of its own.
 func PullRaw(ctx context.Context, addr string, locs []uint32, batch int, class Class,
 	still func(locs []uint32) ([]uint32, error),
 	sink func(locs []uint32, vecBytes int, vecs []byte) error) (Stats, error) {
-	return pullRecords(ctx, addr, rawRecords, class, locs, batch, still, sink)
+	p := NewPuller(addr)
+	defer p.Close()
+	return p.PullRaw(ctx, locs, batch, class, still, sink)
 }
 
-// pullRecords pulls keys in batches.
-func pullRecords(ctx context.Context, addr string, k recordKind, class Class, keys []uint32, batch int,
-	still func(keys []uint32) ([]uint32, error), sink func(keys []uint32, size int, data []byte) error) (Stats, error) {
+// pull pulls keys in batches on the connection, dialed if there is none; any failure, the
+// sink's included, drops the connection, so that a request never finds another's reply.
+func (p *Puller) pull(ctx context.Context, k recordKind, class Class, keys []uint32, batch int,
+	still func(keys []uint32) ([]uint32, error), sink func(keys []uint32, size int, data []byte) error) (st Stats, err error) {
 	start := time.Now()
 	if len(keys) == 0 {
 		return Stats{}, nil
@@ -182,16 +224,21 @@ func pullRecords(ctx context.Context, addr string, k recordKind, class Class, ke
 	if batch <= 0 {
 		batch = k.defaultPullBatch
 	}
-	var d net.Dialer
-	c, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return Stats{}, err
+	if p.c == nil {
+		var d net.Dialer
+		c, err := d.DialContext(ctx, "tcp", p.addr)
+		if err != nil {
+			return Stats{}, err
+		}
+		p.c, p.br = c, bufio.NewReaderSize(c, 256<<10)
 	}
-	defer c.Close()
-	stop := context.AfterFunc(ctx, func() { c.SetDeadline(time.Now()) })
+	defer func() {
+		if err != nil {
+			p.Close()
+		}
+	}()
+	stop := context.AfterFunc(ctx, func() { p.c.SetDeadline(time.Now()) })
 	defer stop()
-	br := bufio.NewReaderSize(c, 256<<10)
-	var st Stats
 	for first := 0; first < len(keys); first += batch {
 		end := min(first+batch, len(keys))
 		part := keys[first:end]
@@ -211,11 +258,11 @@ func pullRecords(ctx context.Context, addr string, k recordKind, class Class, ke
 		}
 		w.U32(uint32(len(part)))
 		w.U32s(part)
-		err := frame.Write(c, &frame.Frame{Type: k.pull, Body: w.B})
+		err := frame.Write(p.c, &frame.Frame{Type: k.pull, Body: w.B})
 		var size int
 		var data []byte
 		if err == nil {
-			size, data, err = readRecords(br, addr, k, len(part))
+			size, data, err = readRecords(p.br, p.addr, k, len(part))
 		}
 		if err != nil {
 			if ctx.Err() != nil {

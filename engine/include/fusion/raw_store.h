@@ -30,6 +30,13 @@
 // writes back the dirty range it covers first), so a reader that saw the bit reads the vector;
 // a reader of a page being rewritten gets its present slots either way. Readers ignore the slots
 // whose bit is clear. Without O_DIRECT (e.g. tmpfs) every install is buffered.
+//
+// The presence bits live in memory. SaveBitmap writes them next to the file (BitmapPath), once
+// the vectors they mark are synced, and a store opened with reuse starts from the file and those
+// bits: an experiment's warmup snapshot of a node (scripts/run_local.py, type: warmup), restored
+// before the node starts, so that its bootstrap copies nothing from the index. A store opened
+// without reuse starts empty and removes bits left next to its file: they would describe
+// vectors that are no longer there.
 #pragma once
 
 #include <atomic>
@@ -72,13 +79,16 @@ struct RawStats {
   uint64_t fetches = 0;     // cumulative: on-demand fetch round trips
   uint64_t skipped = 0;     // cumulative: offered but already here
   uint64_t served = 0;      // cumulative: copied out for peers (RAW_GET)
+  uint64_t restored = 0;    // present when the store opened (reuse: a snapshot)
 };
 
 class RawStore {
  public:
-  // path: the local file, created or truncated (presence is not persisted: a node starts
-  // empty); "" = an anonymous temporary file. direct: O_DIRECT page reads when possible.
-  RawStore(const std::string& path, const RawLayout& layout, bool direct);
+  // path: the local file, created or truncated (a node starts empty); "" = an anonymous
+  // temporary file. reuse: open the file as it is, with the presence bits SaveBitmap wrote next
+  // to it, instead -- refused without them, or with another page geometry. direct: O_DIRECT page
+  // reads when possible.
+  RawStore(const std::string& path, const RawLayout& layout, bool direct, bool reuse = false);
   ~RawStore();
   RawStore(const RawStore&) = delete;
   RawStore& operator=(const RawStore&) = delete;
@@ -101,6 +111,12 @@ class RawStore {
   uint64_t CountAbsent(const std::vector<uint64_t>& mask) const;
   // The presence bits, in that form.
   std::vector<uint64_t> Bitmap() const;
+  // Where SaveBitmap puts the presence bits of the store whose file is at path.
+  static std::string BitmapPath(const std::string& path) { return path + ".present"; }
+  // Syncs the file and writes the presence bits of the vectors in it to BitmapPath(path()),
+  // replacing the file there at once; returns how many vectors they mark. One installed
+  // meanwhile may or may not be among them. Refused for an anonymous file.
+  uint64_t SaveBitmap();
   // Copies n vectors out (vec_bytes each, in the order of locs). Throws RawMissingError, having
   // copied nothing, if one is not here.
   void Get(const uint32_t* locs, size_t n, uint8_t* out);
@@ -121,6 +137,8 @@ class RawStore {
 
   const RawLayout layout_;
   std::string path_;
+  bool anonymous_ = false;
+  uint64_t restored_ = 0;
   int fd_ = -1;   // buffered, read-write (Get; installs without O_DIRECT)
   int dfd_ = -1;  // O_DIRECT, read-write (installs), -1 if unsupported
   std::unique_ptr<PageFile> pages_;

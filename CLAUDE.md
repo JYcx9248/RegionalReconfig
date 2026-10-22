@@ -37,7 +37,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   `RTIER_E2E_BACKEND=gpu` (with a CUDA build in `RTIER_ENGINE_BIN`) runs the cluster's nodes on
   the GPU backend against the CPU oracle. Nodes that join after the initial
   deployment run on a copy of the index without its page file (`indexNoPages`): they can only
-  get raw vectors from peers.
+  get raw vectors from peers (so do the initial nodes of `TestBootstrapFromSnapshot`, which
+  start on their saved raw vectors). Every node runs with `--stream-batch 100`, so each staging
+  and drain streams in many frames.
 - Experiment configurations are YAML, a base and overrides (`configs/base/*.yaml`,
   `configs/experiment.*.yaml`); `python3 scripts/experiment_config.py CONFIG.yaml` prints one
   merged, and every key is checked against its schema. `run_local.py` runs every node on one
@@ -51,7 +53,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | Path | What |
 |---|---|
 | `cmd/rtier-controller`, `cmd/rtier-agent` | control plane; per-node agent next to `rtier_node` |
-| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline); open-loop or closed-loop load |
+| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline) / a node's raw-vector snapshot (`save-raw`); open-loop or closed-loop load |
 | `cmd/rtier-updater` | the update controller's command: one batch of inserts and deletes, or a major epoch (U14) |
 | `cmd/rtier-overhead` | fan-out cost analysis: one data node emulates N owners (`-owners`, `-compare`) |
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
@@ -64,7 +66,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `engine/` | FusionANNS engine, `NodeEngine`, `rtier_node`, `rtier_segment` (see `engine/README.md`) |
 | `test/e2e` | end-to-end tests |
 | `configs/` | experiment configurations (YAML: bases and experiments) |
-| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the YAML format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `emulation/netns.sh`, `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
+| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the YAML format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `run_one.sh` (one run on a clean node state; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
 
 ## Conventions
 
@@ -134,7 +136,16 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   for tests). A scale-in drains the leaving nodes before it returns (`drainRaw`: each remaining
   node takes over the vectors only a leaving node holds, `RAW_HELD_BY` then `RAW_PULL`), so they
   can go offline. No node drops a raw vector it has held. Only bootstrap reads the index's page
-  file.
+  file, and not on a warmup snapshot (below).
+- **Warmup snapshots** (`type: warmup`, `run_local.py`): a run that only deploys the initial
+  nodes and saves each one's raw vectors -- its raw file and presence bits (`RAW_SAVE`,
+  `rtier-client save-raw`) -- under `paths.snapshot_dir`, on the node's machine. A later run of
+  the same index, partitions, placement and initial node count restores them (`cp
+  --reflink=auto --sparse=always`) and starts those nodes with `rtier_node --raw-reuse`: their
+  bootstrap copies no raw vector, `run_cluster.py` copies no page file to their hosts, and the
+  run checks that each got its snapshot's partitions. PQ codes still come from `pq_codes.bin`,
+  all of a node's in one pass (`PQ_FROM_INDEX`). Nodes start one at a time, each after the
+  previous one registered, so IDs, and with them the initial placement, follow the order.
 - **Updates (U14)**: the update controller (`internal/update`, `rtier-updater`) takes the
   controller's lease and runs a batch as a content epoch: inserts routed by its own router
   (`ASSIGN`, the build's rule), PQ codes and raw vectors sent to the owners, the next version of
@@ -155,14 +166,15 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   controller every 500 ms, and at once when an entry refuses a query under a newer epoch than
   its list's (the queries that meet the stale list share one read); a refusal under the list's
   own epoch (paused admission) reads nothing.
-- **Diagnosing a run**: `metrics.jsonl`, `stats-<node>.jsonl` (per-node counters,
-  `rtier_node --stats-file`) and `cgroups.jsonl` (CPU, disk, dirty pages, pressure; a host
-  record with the whole disk's I/O and how busy each node's CPUs were). The agents forward the
-  stats logs (`node_stats_file`) and, on a cluster, their samples (`sample_interval`;
-  `run_local.py` samples itself with `cluster.resources`), and the controller stamps every
-  record and metrics report on arrival (`"t"`, on its monotonic clock; the node's own as
-  `"node_t"`): one clock with `clock.json` and the load generator, without synchronizing the
-  machines' clocks (Koala's metric collector).
+- **Diagnosing a run**: `metrics.jsonl` (the agents' counters too, e.g. `graph.yield_ms`, how
+  long the graph waited for data), `stats-<node>.jsonl` (per-node counters, `rtier_node
+  --stats-file`; `raw_bytes` sent and received) and `cgroups.jsonl` (CPU, disk, dirty pages,
+  pressure; a host record with the whole disk's I/O and how busy each node's CPUs were). The
+  agents forward the stats logs (`node_stats_file`) and, on a cluster, their samples
+  (`sample_interval`; `run_local.py` samples itself with `cluster.resources`), and the
+  controller stamps every record and metrics report on arrival (`"t"`, on its monotonic clock;
+  the node's own as `"node_t"`): one clock with `clock.json` and the load generator, without
+  synchronizing the machines' clocks (Koala's metric collector).
 - **Without root** (shared servers): `cluster.resources` pins CPUs with `taskset` and limits
   memory in user scopes (`systemd-run --user`); per-node read IOPS come from the data node's own
   read budget (`read_iops_per_node` → `rtier_node --read-iops`, `fusion/read_budget.h`), since
@@ -171,8 +183,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
   controller and the load generator; it checks every host, copies with rsync, to the same
   paths, the binaries and what the host's nodes open (the index's meta, codebook and PQ codes and
-  the partitions' manifest; where an initial node runs, also the page file, the graph and the
-  segments; a next generation's meta, codebook, PQ codes, graph and manifest), and starts the
+  the partitions' manifest; where an initial node runs, also the page file (unless the host's
+  initial nodes start on a warmup snapshot), the graph and the segments; a next generation's
+  meta, codebook, PQ codes, graph and manifest), and starts the
   nodes in order over SSH, each after the previous one registered. A remote process stops when
   its SSH session closes. `cluster.resources` (except `read_iops_per_node`) and
   `cluster.emulation` are for one machine and are refused.
@@ -207,7 +220,8 @@ Done since late September:
   `stage_timeout`; a run cut short keeps its latency.csv and reconfigurations.json; plot_run
   counts answers when they came; ground truth for a stride of the queries; the graph's strict
   yield to data (U16, for now); RERANK's own connection slots; each node's PQ budget sized from
-  the partitions (`cluster.pq_capacity: auto`).
+  the partitions (`cluster.pq_capacity: auto`); the listings streamed; warmup snapshots of the
+  initial nodes' raw vectors, and their PQ codes read in one pass (2026-10-22).
 
 Next:
 1. Issue: how queries of the old epoch are handled during a reconfiguration — cases, current
@@ -250,8 +264,9 @@ Next:
      against queries during a scale-out; staged versions left by an expired lease;
    - scale limits for billion-vector datasets, the target: single-frame graph patches (the
      listings `PQ_MISSING`, `RAW_MISSING`, `RAW_HELD_BY` stream since 2026-10-21), what
-     `run_cluster.py` still copies whole (the page file and every segment to each initial
-     node's host, the PQ codes to every host: `rtier_node` opens them at startup), per-node
+     `run_cluster.py` still copies whole (every segment, and the page file where there is no
+     warmup snapshot, to each initial node's host; the PQ codes to every host: `rtier_node`
+     opens them at startup), per-node
      structures sized by the dataset (`slot_of_`, the presence bitmap);
    - elsewhere: chunk storage (U12, last), the host copy of the PQ codes (U15), the number of
      partitions (U2), the PQ compression level.

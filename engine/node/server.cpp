@@ -140,6 +140,8 @@ const char* OpName(uint8_t op) {
     case kSwitchGeneration: return "switch_generation";
     case kRawBitmap: return "raw_bitmap";
     case kRawTraffic: return "raw_traffic";
+    case kPQFromIndex: return "pq_from_index";
+    case kRawSave: return "raw_save";
     default: return nullptr;
   }
 }
@@ -584,6 +586,14 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         w.PutBytes(last.data(), last.size());
         break;
       }
+      case kPQFromIndex: {
+        const uint32_t n = r.Get<uint32_t>();
+        std::vector<std::string> paths;
+        for (uint32_t i = 0; i < n; ++i) paths.push_back(TakeStr(&r));
+        Require(r.remaining() == 0, "trailing bytes in PQ_FROM_INDEX");
+        w.Put<uint64_t>(e.PQFromIndex(paths).installed);
+        break;
+      }
       case kPQGet: {
         const uint32_t n = r.Get<uint32_t>();
         const uint32_t m = e.pq_stats().m;
@@ -717,6 +727,10 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         Require(r.remaining() == 0, "trailing bytes in RAW_TRAFFIC");
         w.Put<uint64_t>(raw_sent_.load(std::memory_order_relaxed));
         w.Put<uint64_t>(raw_received_.load(std::memory_order_relaxed));
+        break;
+      case kRawSave:
+        Require(r.remaining() == 0, "trailing bytes in RAW_SAVE");
+        w.Put<uint64_t>(e.RawSave());
         break;
       case kRawPull: {
         const uint32_t n = r.Get<uint32_t>();
@@ -1048,9 +1062,10 @@ std::string NodeServer::InfoJson(bool settle) const {
   s += fusion::StrFormat(
       ",\"raw\":{\"vec_bytes\":%u,\"locations\":%llu,\"present\":%llu,\"cached\":%llu,"
       "\"pending\":%llu,\"from_index\":%llu,\"streamed\":%llu,\"fetched\":%llu,\"added\":%llu,"
-      "\"fetches\":%llu,\"skipped\":%llu,\"served\":%llu}",
+      "\"fetches\":%llu,\"skipped\":%llu,\"served\":%llu,\"restored\":%llu}",
       raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.cached), u(raw.pending), u(raw.from_index),
-      u(raw.streamed), u(raw.fetched), u(raw.added), u(raw.fetches), u(raw.skipped), u(raw.served));
+      u(raw.streamed), u(raw.fetched), u(raw.added), u(raw.fetches), u(raw.skipped), u(raw.served),
+      u(raw.restored));
   s += ",\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
   return s;
 }

@@ -78,6 +78,8 @@ struct NodeOptions {
   std::string partitions_dir;  // written by rtier_segment (manifest, list_part.bin, segments)
   std::string layout;          // "" = the manifest's (the page layout its locations refer to)
   std::string raw_file;        // this node's raw vectors; "" = an anonymous temporary file
+  bool raw_reuse = false;      // open raw_file as it is, with the presence bits RawSave wrote
+                               // next to it (a warmup snapshot's copy), instead of empty
   FilterDevice device = FilterDevice::kCpu;
   int num_workers = 2;
   uint32_t max_nprobe = 256;   // largest m per request
@@ -105,6 +107,8 @@ struct NodeOptions {
   // graph is loaded with capacity for that many more elements, and list IDs up to the same
   // number are accepted.
   double graph_headroom = 0.2;
+  // PQFromIndex reads pq_codes.bin in stretches of at most this many bytes (tests make them small).
+  uint64_t pq_read_bytes = 16ull << 20;
 };
 
 // Navigate's graph version: the newest the node has (a staged patch's, else the graph's).
@@ -172,7 +176,8 @@ enum class PQSource {
   // come later, from the raw peer (see LoadPartition).
   kPresent,
   // Bootstrap (the initial deployment, --load): PQ codes and raw vectors are copied from the
-  // index's pq_codes.bin and vectors_<layout>.bin.
+  // index's pq_codes.bin and vectors_<layout>.bin -- those the node lacks: none of the codes
+  // after PQFromIndex, none of the vectors a snapshot restored (raw_reuse).
   kIndex,
   // A generation's partitions after a full rebuild (U14): the codes the node lacks are copied
   // from the generation's pq_codes.bin (one codebook: the same codes), and raw vectors come from
@@ -382,6 +387,12 @@ class NodeEngine {
   virtual void PQGet(const uint32_t* ids, size_t n, uint8_t* out) = 0;
   // Installs codes received from a peer (staged until LoadPartition names them).
   virtual PQPutResult PQPut(const uint32_t* ids, size_t n, const uint8_t* codes) = 0;
+  // Bootstrap: installs the codes the segments at these paths name that this node lacks, from
+  // the index's pq_codes.bin, staged as PQPut's (the ones here already are protected), so that
+  // their LoadPartition with kIndex reads none. One pass over the file, in its order, a read per
+  // stretch that holds some of them: a node's codes are scattered over the whole file (IDs follow
+  // the dataset, not the partitions), which a load a partition at a time read code by code.
+  virtual PQPutResult PQFromIndex(const std::vector<std::string>& segments) = 0;
   // Ends a staging that did not load: frees the codes installed for it and returns the codes
   // it protected to the cache.
   virtual size_t PQReleaseStaged() = 0;
@@ -425,6 +436,10 @@ class NodeEngine {
   // Which raw vectors the node holds (on the SSD, or fetched and not written yet): one bit per
   // location, 64 per word -- what a full rebuild places the new partitions by (U14).
   virtual std::vector<uint64_t> RawBitmap() const = 0;
+  // Syncs the raw vectors on the SSD and saves their presence bits next to raw_file
+  // (RawStore::SaveBitmap; one fetched and still in memory is not among them), for a node
+  // started later with raw_reuse on a copy of both: a warmup snapshot. Returns how many there are.
+  virtual uint64_t RawSave() = 0;
   // A snapshot that waits for nothing, or (settle) one taken once the vectors fetched before
   // the call are on the SSD: with no query fetching, cached is then 0.
   virtual RawStats raw_stats(bool settle) const = 0;

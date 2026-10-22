@@ -326,6 +326,16 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 			mode := nodeclient.LoadIndex
 			if src.Kind == "gen" {
 				mode = nodeclient.LoadGeneration
+			} else {
+				// The PQ codes of them all first, in one pass over the index's file: a node's codes
+				// are scattered over the whole of it, and the loads read them code by code.
+				paths := make([]string, len(src.Partitions))
+				for i, p := range src.Partitions {
+					paths[i] = a.segmentPath(p, src.VersionOf(i))
+				}
+				if _, err := a.localBulk.PQFromIndex(ctx, paths); err != nil {
+					return fmt.Errorf("PQ codes from the index: %w", err)
+				}
 			}
 			for i, p := range src.Partitions {
 				if err := a.loadPartition(ctx, p, src.VersionOf(i), mode); err != nil {
@@ -398,11 +408,13 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				pl := transfer.NewPuller(sources[i].Addr) // one connection for this worker's requests
+				defer pl.Close()
 				for ids := range queues[i] {
 					if ctx.Err() != nil {
 						continue // after a failure: only empties the queue
 					}
-					st, err := transfer.PullPQ(ctx, sources[i].Addr, ids, 0, func(ids []uint32, m int, codes []byte) error {
+					st, err := pl.PullPQ(ctx, ids, 0, func(ids []uint32, m int, codes []byte) error {
 						// Not cancelled with ctx: once every pull has returned, every PQ_PUT has been
 						// answered, so a cleanup that follows a failure sees all installed codes.
 						pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
@@ -683,11 +695,29 @@ func (p *rawPuller) queue(holder uint16) chan nodeclient.RawRefs {
 
 func (p *rawPuller) run(q chan nodeclient.RawRefs) {
 	defer p.wg.Done()
+	var pl *transfer.Puller // the agent path: this worker's connection to the holder, kept across its requests
+	defer func() {
+		if pl != nil {
+			pl.Close()
+		}
+	}()
 	for r := range q {
 		if p.ctx.Err() != nil {
 			continue // after a failure: only empties the queue
 		}
-		st, err := p.pull(r)
+		var st transfer.Stats
+		var err error
+		switch {
+		case p.viaNode:
+			st, err = p.a.pullRawViaNode(p.ctx, r.Locs, r.Lists, p.batch, p.vecBytes)
+		default:
+			if pl == nil {
+				pl, err = p.puller(r.Holder)
+			}
+			if err == nil {
+				st, err = p.pull(pl, r)
+			}
+		}
 		p.mu.Lock()
 		p.reply.RawVectors += st.Vectors
 		p.reply.RawBytes += st.Bytes
@@ -699,17 +729,20 @@ func (p *rawPuller) run(q chan nodeclient.RawRefs) {
 	}
 }
 
-func (p *rawPuller) pull(r nodeclient.RawRefs) (transfer.Stats, error) {
-	if p.viaNode {
-		return p.a.pullRawViaNode(p.ctx, r.Locs, r.Lists, p.batch, p.vecBytes)
-	}
-	holder, ok := p.a.nodeInfo(placement.NodeID(r.Holder))
+// puller is a connection to holder's bulk port.
+func (p *rawPuller) puller(holder uint16) (*transfer.Puller, error) {
+	n, ok := p.a.nodeInfo(placement.NodeID(holder))
 	if !ok {
-		return transfer.Stats{}, errors.New("this agent does not know the node's address")
+		return nil, errors.New("this agent does not know the node's address")
 	}
+	return transfer.NewPuller(n.BulkAddr), nil
+}
+
+// pull brings r's vectors through the agents, on pl.
+func (p *rawPuller) pull(pl *transfer.Puller, r nodeclient.RawRefs) (transfer.Stats, error) {
 	ctx := p.ctx
 	still := func(locs []uint32) ([]uint32, error) { return p.a.localBulk.RawAbsent(ctx, locs) }
-	return transfer.PullRaw(ctx, holder.BulkAddr, r.Locs, p.batch, p.class, still, func(locs []uint32, vb int, vecs []byte) error {
+	return pl.PullRaw(ctx, r.Locs, p.batch, p.class, still, func(locs []uint32, vb int, vecs []byte) error {
 		pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		_, _, err := p.a.localBulk.RawPut(pctx, locs, vb, vecs)

@@ -222,7 +222,9 @@ var Open = map[string]Question{
 		"a token bucket on a separate connection (implemented, fixed rate) with two priority " +
 			"classes on the sender (implemented): data -- segments and PQ codes, what a node " +
 			"needs to own partitions -- and background -- the navigation graph (graph_priority), " +
-			"which only takes tokens no data sender is waiting for. With lazy (the default) the " +
+			"which only takes tokens no data sender is waiting for -- and, since 2026-10-21, moves " +
+			"nothing while either end of its transfer moves data, paced or not (U16, graphYield). " +
+			"With lazy (the default) the " +
 			"graph is the only background transfer, while new entries join a scale-out. Only " +
 			"what goes through the agents is paced: the raw-vector paths between data nodes are " +
 			"not -- a query's fetch (RAW_GET, on the query path by design), a scale-in's drain " +
@@ -239,7 +241,7 @@ var Open = map[string]Question{
 			"cluster.raw bounds (batch_bytes per request, streams in flight per source, shared " +
 			"with the baselines' streams) besides the source's read budget",
 		"internal/transfer/adapter.go, internal/transfer/tokenbucket.go (classes), " +
-			"internal/agent/control.go (rawViaNode, pullRaw), internal/controller/reconfig.go " +
+			"internal/agent/control.go (rawViaNode, rawPuller), internal/controller/reconfig.go " +
 			"(stageRaw, drainRaw)"},
 	"U9": {"U9", "Lazy fetch of raw vectors (and chunks) after a new node is online",
 		"Decided: a node goes online (the flip) only once it holds every posting list and PQ " +
@@ -331,9 +333,9 @@ var Open = map[string]Question{
 			"and writes them after fetched ones, never while paused (PAUSE_UPDATES), within " +
 			"--update-write-mbps -- writes are not charged to the read budget yet. Batches run " +
 			"only with the controller's allow_updates (off by default: a static experiment " +
-			"refuses them; an experiment configuration's updates section turns it on, leaves " +
-			"room on the data nodes and requires an explicit PQ budget, since the default budget " +
-			"is the whole ID space, headroom included). The update controller (internal/update, " +
+			"refuses them; an experiment configuration's updates section turns it on and leaves " +
+			"room on the data nodes, the PQ budget included: cluster.pq_capacity auto grows by " +
+			"updates.headroom). The update controller (internal/update, " +
 			"rtier-updater) takes the controller's lease (BeginUpdate: no reconfiguration and no " +
 			"other batch until the commit or the abort, or until update_lease expires; the " +
 			"agents first release PQ codes left staged by a staging that never ended), routes " +

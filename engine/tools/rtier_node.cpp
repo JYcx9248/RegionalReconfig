@@ -36,6 +36,9 @@ static void Usage() {
                          (default: every vector of the index)
   --raw-file PATH        this node's raw vectors: a sparse file laid out like the index's page
                          file, created empty (default: an anonymous temporary file)
+  --raw-reuse            open --raw-file as it is, with the presence bits RAW_SAVE wrote next to
+                         it (PATH.present), instead of empty: a copy of a warmup snapshot, whose
+                         vectors the bootstrap then does not copy from the index
   --layout L             bucket | id (default: the layout the partitions were written for)
   --io B                 auto | uring | aio | pread (default auto)
   --io-depth D           (default 64)
@@ -60,11 +63,12 @@ static void Usage() {
   --stats-ms MS          (default 1000)
   --stream-batch N       entries per frame of a streamed listing (PQ_MISSING, RAW_MISSING,
                          RAW_HELD_BY; default 1048576): tests stream a small index in many
+                         frames
 )");
 }
 
 int main(int argc, char** argv) {
-  const std::set<std::string> flags = {"no-direct", "help"};
+  const std::set<std::string> flags = {"no-direct", "raw-reuse", "help"};
   // Descriptors grow with the cluster: a connection from each aggregator's client, one to each
   // holder per concurrent fetch. A login shell's soft limit, often 1024, runs out at a few dozen
   // nodes; the hard limit is the node's to use.
@@ -84,6 +88,7 @@ int main(int argc, char** argv) {
     o.partitions_dir = a.Required("partitions");
     o.layout = a.Str("layout", "");
     o.raw_file = a.Str("raw-file", "");
+    o.raw_reuse = a.Flag("raw-reuse");
     const std::string backend = a.Str("backend", "cpu");
     FUSION_CHECK(backend == "cpu" || backend == "gpu", "unknown backend %s", backend.c_str());
     o.device = backend == "gpu" ? FilterDevice::kGpu : FilterDevice::kCpu;
@@ -128,11 +133,13 @@ int main(int argc, char** argv) {
       } else {
         parts = ParseUintList(load);
       }
-      for (uint64_t p : parts) {  // bootstrap: PQ codes and raw vectors come from the index
-        engine->LoadPartition(static_cast<uint32_t>(p),
-                              JoinPath(o.partitions_dir, partfiles::SegmentName(static_cast<uint32_t>(p))),
-                              PQSource::kIndex);
-      }
+      // Bootstrap: PQ codes and raw vectors come from the index, the codes in one pass.
+      std::vector<std::string> segs;
+      for (uint64_t p : parts)
+        segs.push_back(JoinPath(o.partitions_dir, partfiles::SegmentName(static_cast<uint32_t>(p))));
+      engine->PQFromIndex(segs);
+      for (size_t i = 0; i < parts.size(); ++i)
+        engine->LoadPartition(static_cast<uint32_t>(parts[i]), segs[i], PQSource::kIndex);
     }
     std::fprintf(stderr, "%s", engine->Describe().c_str());
 

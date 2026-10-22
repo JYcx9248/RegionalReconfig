@@ -59,6 +59,20 @@ class Seen {
     bits_[w] |= bit;
     return true;
   }
+  // fn(i) for every marked i in [lo, hi), ascending.
+  template <class F>
+  void ForEach(uint64_t lo, uint64_t hi, F fn) const {
+    hi = std::min<uint64_t>(hi, uint64_t{bits_.size()} * 64);
+    for (uint64_t w = lo >> 6; (w << 6) < hi; ++w) {
+      uint64_t b = bits_[w];
+      if (w == lo >> 6) b &= ~uint64_t{0} << (lo & 63);
+      for (; b; b &= b - 1) {
+        const uint64_t i = (w << 6) + static_cast<uint64_t>(__builtin_ctzll(b));
+        if (i >= hi) return;
+        fn(static_cast<uint32_t>(i));
+      }
+    }
+  }
 
  private:
   std::vector<uint64_t> bits_;
@@ -274,7 +288,8 @@ class NodeEngineImpl : public NodeEngine {
     // (fusion/raw_store.h). The index's page file is only read to bootstrap.
     RawLayout raw_layout = man.raw;  // with room for the locations of inserted vectors
     raw_layout.num_pages = std::max<uint64_t>(raw_layout.num_pages, o.max_pages);
-    raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io);
+    FUSION_CHECK(!o.raw_reuse || !o.raw_file.empty(), "raw vectors to reuse need their file (--raw-file)");
+    raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io, o.raw_reuse);
     if (o.read_iops) {
       budget_ = std::make_unique<ReadBudget>(o.read_iops);
       raw_->SetReadBudget(budget_.get());
@@ -396,6 +411,8 @@ class NodeEngineImpl : public NodeEngine {
     }
     resident_version_.fetch_add(1);
   }
+
+  uint64_t RawSave() override { return raw_->SaveBitmap(); }
 
   std::vector<uint64_t> RawBitmap() const override {
     std::lock_guard<std::mutex> l(cache_mu_);  // the writer moves a vector to the SSD under it
@@ -1024,6 +1041,42 @@ class NodeEngineImpl : public NodeEngine {
     PQPutResult r;
     r.installed = store_->Put(ids, n, codes, PQOrigin::kReceived);
     r.skipped = n - r.installed;
+    return r;
+  }
+
+  PQPutResult PQFromIndex(const std::vector<std::string>& segments) override {
+    std::shared_ptr<ReadOnlyFile> file;
+    uint64_t n = 0;  // the vectors the file holds: read with it (see FillFromIndex)
+    {
+      std::lock_guard<std::mutex> l(gen_mu_);
+      file = pq_file_;
+      n = n_.load();
+    }
+    // A bit per code to read, so that the pass goes in the file's order without sorting them.
+    // Inserted vectors (U14) are not in the file: their codes must be here already.
+    Seen want;
+    uint64_t wanted = 0;
+    PQMissingStream(std::vector<std::vector<std::string>>(1, segments), [&](size_t, const uint32_t* ids, size_t k) {
+      for (size_t i = 0; i < k; ++i)
+        if (ids[i] < n && want.Add(ids[i])) ++wanted;
+    });
+    PQPutResult r;
+    const uint32_t m = store_->m();
+    const uint64_t per_read = std::max<uint64_t>(opts_.pq_read_bytes / m, 1);
+    std::vector<uint32_t> ids;
+    std::vector<uint8_t> span, codes;
+    for (uint64_t lo = 0; lo < n && wanted > 0; lo += per_read) {
+      ids.clear();
+      want.ForEach(lo, std::min(n, lo + per_read), [&](uint32_t id) { ids.push_back(id); });
+      if (ids.empty()) continue;
+      span.resize(static_cast<size_t>(ids.back() - ids.front() + 1) * m);
+      file->ReadAt(span.data(), span.size(), kPQFileHeader + static_cast<uint64_t>(ids.front()) * m);
+      codes.resize(ids.size() * m);
+      for (size_t i = 0; i < ids.size(); ++i)
+        std::memcpy(codes.data() + i * m, span.data() + static_cast<size_t>(ids[i] - ids.front()) * m, m);
+      r.installed += store_->Put(ids.data(), ids.size(), codes.data(), PQOrigin::kIndex);
+    }
+    r.skipped = wanted - r.installed;
     return r;
   }
 

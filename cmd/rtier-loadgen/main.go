@@ -169,6 +169,9 @@ func main() {
 	userSteps := flag.String("users-steps", "", "user schedule after -users, e.g. \"30:16,60:4\": "+
 		"16 concurrent users from 30 s, 4 from 60 s")
 	flag.Parse()
+	if *gtStride < 1 {
+		log.Fatalf("-gt-stride is %d: at least 1", *gtStride)
+	}
 
 	qs, err := vecio.ReadBin(*qpath, 0)
 	if err != nil {

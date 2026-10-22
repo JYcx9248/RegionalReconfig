@@ -9,7 +9,8 @@ base's value. Every key is checked against SCHEMA, so a misspelled one stops the
 Sections, in the order of the pipeline:
 
     base: base/wiki-c1024.yaml
-    paths:      {work_dir, engine_bin, go_bin}
+    type: warmup                                        # optional: a warmup run (run_local.py)
+    paths:      {work_dir, engine_bin, go_bin, snapshot_dir}
     dataset:    {vectors, queries, ground_truth, ground_truth_stride}   # fusion_gt makes it if missing
     build:      {index_dir, pq_m, threads, ...}         # fusion_build's flags, BUILD_FLAGS; extra_args
     partition:  {generator: file | gp | spatial | range, partitions, file, gp: {...}}
@@ -52,8 +53,10 @@ BOOL_FLAGS = {"rng"}
 # YAML key -> (flat key, nested schema or None). A nested schema of a list applies to its items.
 SCHEMA = {
     "base": (None, None),
+    "type": ("Type", None),
     "paths": (None, {
-        "work_dir": ("WorkDir", None), "engine_bin": ("EngineBin", None), "go_bin": ("GoBin", None)}),
+        "work_dir": ("WorkDir", None), "engine_bin": ("EngineBin", None), "go_bin": ("GoBin", None),
+        "snapshot_dir": ("SnapshotDir", None)}),
     "dataset": (None, {
         "vectors": ("Base", None), "queries": ("Queries", None), "ground_truth": ("GroundTruth", None),
         "ground_truth_stride": ("GroundTruthStride", None)}),

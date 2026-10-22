@@ -323,6 +323,9 @@ type cluster struct {
 
 	// agentCfg, when set, adjusts each agent's configuration before it starts.
 	agentCfg func(name string, c *config.Agent)
+	// initialIndex, when set, is the index the initial nodes run on instead of f.index
+	// (f.indexNoPages: nodes started on a snapshot of their raw vectors).
+	initialIndex string
 }
 
 // contentVersion: the exact answers to the fixture's queries from epoch from on, until the
@@ -396,6 +399,9 @@ func (cl *cluster) addNode(name string, strategy query.Strategy, nodeArgs ...str
 // bootstrap from the index; the others join later and run without the index's page file.
 func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...string) *agent.Agent {
 	index := cl.f.index
+	if cl.initialIndex != "" {
+		index = cl.initialIndex
+	}
 	if len(cl.agents) >= cl.initial {
 		index = cl.f.indexNoPages
 	}

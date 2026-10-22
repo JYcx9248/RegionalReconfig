@@ -7,13 +7,17 @@ reconfigurations -> collect results -> clean up), without Kafka and SSH:
   1. build the index (fusion_build) and ground truth (fusion_gt) unless they are there
   2. assign the posting lists to partitions (partition: a file, or a generator) and write the
      partitions (rtier_segment)
-  3. start the controller, then one rtier_node + rtier-agent per node
+  3. start the controller, then one rtier_node + rtier-agent per node, each once the previous
+     one registered (n1, n2, ... get IDs 1, 2, ...); initial nodes with a warmup snapshot start
+     on it (below)
   4. wait for the initial deployment, start the open-loop load generator
   5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale, Rebuild)
-  6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg; each
-     node's stats log (stats-<node>.jsonl) and, with cluster.resources, cgroups.jsonl, both on
-     the monotonic clock of clock.json; the configuration as it ran, merged with its bases
-     (experiment.yaml) and flat (experiment.json, which the analysis scripts read)
+  6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg,
+     reconfigurations.json; each node's stats log (stats-<node>.jsonl) and, with
+     cluster.resources, cgroups.jsonl, both on the monotonic clock of clock.json; the
+     configuration as it ran, merged with its bases (experiment.yaml) and flat (experiment.json,
+     which the analysis scripts read), the code it ran (revision.txt, revision.diff) and the PQ
+     budget it found (pq-budget.json); a warmup run writes snapshot.json, what it saved
   7. stop everything
 
     python3 scripts/run_local.py configs/experiment.example.yaml results/run1
@@ -27,6 +31,19 @@ record what they were made with: an index (build.index_dir, default WORK_DIR/ind
 other build flags stops the run instead of being rebuilt (that can take hours), the partitions
 are made again when the index or the assignment changes, and a ground truth made of other
 vectors, queries or stride stops the run too.
+
+type: warmup makes a warmup run: the initial deployment (no spare node), then each initial node
+saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw),
+everything stops, and each node's raw file and bits are copied into a snapshot -- under
+paths.snapshot_dir (default WORK_DIR/snapshots), named by the number of initial nodes and a
+digest of what the vectors are made of (the index's page file, the partitions, the placement) --
+with its manifest, snapshot.json, written last; no load, no reconfiguration. A later run of the
+same index, partitions, placement and number of initial nodes copies the snapshot into each
+initial node's directory (cp --reflink=auto --sparse=always: at once on XFS or btrfs, a copy of
+the node's share elsewhere) and starts its rtier_node with --raw-reuse, so that its bootstrap
+copies no raw vector from the index; once deployed, it checks that every such node got the
+partitions its snapshot was made for. A run without one bootstraps from the index and says why.
+The PQ codes come from the index either way: all of a node's in one pass over pq_codes.bin.
 
 partition: {generator: gp, partitions: 64, gp: {kaminpar: PATH}} makes the assignment: GP on the
 list heads over the navigation graph, with unit weights, so that the initial split balances the
@@ -70,7 +87,8 @@ cluster: {stage_timeout: 2h} bounds each long step of a reconfiguration -- stagi
 a raw stream or drain, a grace period, a reclaim -- in the controller and in every agent (30m
 by default). A step grows with the dataset and the transfer rate: a billion vectors put a
 32-71 GB graph on every new entry. cluster.ready_timeout_seconds (600) bounds the initial
-deployment, which copies every partition's vectors from the index.
+deployment, which copies every partition's vectors from the index (unless they start on a
+warmup snapshot).
 
 cluster: {node_conns: 8} (the agent's default) is how many requests of each kind an aggregator
 keeps in flight to one data node, each on its own connection: RERANKs, and FILTERs (with the
@@ -140,9 +158,13 @@ runs in its own network namespace (scripts/emulation/netns.sh) and the controlle
 bridge address 10.10.0.1. Delay and rate values are per-experiment choices.
 """
 
+import concurrent.futures
+import glob
+import hashlib
 import json
 import math
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -267,7 +289,7 @@ def pq_args(cfg: dict, index: str, parts: str, node_args: list, reconfigs: list,
         if "plan" in rc:
             path = os.path.join(paths_of(cfg)[0], f"pq-share-plan-{i}.json")
             json.dump(rc["request"]["plan"], open(path, "w"))
-            shares[f"plan {rc['plan']}"] = share(["-plan", path])
+            shares[f"plan {i + 1} ({rc['plan']})"] = share(["-plan", path])
     most = max(s["max"] for s in shares.values())
     upd = cfg.get("Updates")
     grow = float(upd.get("Headroom", 1.5)) if upd is not None else 1.0
@@ -690,7 +712,6 @@ def stage_record(path: str):
 
 
 def file_digest(path: str) -> str:
-    import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -890,6 +911,222 @@ def gpu_env(visible: dict, i: int) -> list:
     return ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={visible[i]}"] if i in visible else []
 
 
+# ------------------------------------------------------------------- warmup snapshots
+
+SNAPSHOT_FILES = ("raw.pages", "raw.pages.present")  # a node's raw vectors and their presence bits
+
+
+class Local:
+    """This machine, as run_cluster.py's Host is another: where shell scripts run."""
+    dest = "this machine"
+
+    def run(self, script: str, what: str, input=None, timeout=60) -> str:
+        r = subprocess.run(["sh", "-c", script], input=input, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            raise RuntimeError(f"{what} failed ({r.returncode}): {r.stderr.strip()[-2000:]}")
+        return r.stdout
+
+
+def snapshot_key(cfg: dict, index: str, parts: str) -> dict:
+    """What an initial node's raw vectors after its bootstrap are made of: the index's page file,
+    the partitions (the locations each one names) and the ones the node gets -- the placement
+    policy's split over the initial nodes, node i being the i-th to register (the runners start
+    them one after another). The run checks after the deployment that every node started on the
+    snapshot got the partitions it was made for."""
+    man = read_kv(os.path.join(parts, "manifest.txt"))
+    pages = os.stat(os.path.join(index, f"vectors_{man['layout']}.bin"))
+    segs = hashlib.sha256()
+    for p in range(int(man["num_partitions"])):
+        st = os.stat(os.path.join(parts, f"part-{p:05d}.seg"))
+        segs.update(f"{p} {st.st_size} {st.st_mtime_ns}\n".encode())
+    return {"index": os.path.abspath(index), "meta": file_digest(os.path.join(index, "meta.txt")),
+            "pages": [pages.st_size, pages.st_mtime_ns], "partitions": os.path.abspath(parts),
+            "manifest": file_digest(os.path.join(parts, "manifest.txt")), "segments": segs.hexdigest(),
+            "placement": cfg.get("Placement") or "default", "initial_nodes": int(cfg.get("InitialNodes", 1))}
+
+
+def snapshot_path(cfg: dict, key: dict) -> str:
+    """The snapshot of key: under paths.snapshot_dir (WORK_DIR/snapshots), named by the initial
+    nodes and a digest of key, on every machine that runs one of its nodes."""
+    root = cfg.get("SnapshotDir") or os.path.join(paths_of(cfg)[0], "snapshots")
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
+    return os.path.join(os.path.abspath(root), f"{key['initial_nodes']}n-{digest}")
+
+
+def by_machine(host_of: dict) -> dict:
+    """Machine -> its node numbers, of node number -> machine."""
+    out = {}
+    for i, h in sorted(host_of.items()):
+        out.setdefault(h, []).append(i)
+    return out
+
+
+def find_snapshot(snap: str, key: dict, host_of: dict) -> tuple:
+    """The nodes (of host_of: node number -> machine) that can start on the snapshot at snap --
+    their machine has its manifest, made of key, and their files -- and the manifest."""
+    found, manifest = [], None
+    for h, nodes in by_machine(host_of).items():
+        q = shlex.quote
+        out = h.run(f"cat {q(os.path.join(snap, 'snapshot.json'))} 2>/dev/null; echo; " +
+                    "; ".join(f"[ -f {q(os.path.join(snap, f'n{i}', f))} ] || echo missing=n{i}"
+                              for i in nodes for f in SNAPSHOT_FILES) + "; true",
+                    f"{h.dest}: looking for the snapshot")
+        first, _, rest = out.partition("\n")
+        try:
+            m = json.loads(first)
+        except ValueError:
+            continue
+        missing = {line.split("=", 1)[1] for line in rest.splitlines() if line.startswith("missing=")}
+        if m.get("key") == key:
+            manifest = m
+            found += [i for i in nodes if f"n{i}" not in missing and f"n{i}" in m.get("nodes", {})]
+    return found, manifest
+
+
+def snapshot_mismatch(snap: str, key: dict) -> str:
+    """Why no snapshot of this machine's snapshot directory fits key: what differs in the closest."""
+    best = None
+    for path in glob.glob(os.path.join(os.path.dirname(snap), "*", "snapshot.json")):
+        try:
+            other = json.load(open(path)).get("key", {})
+        except (OSError, ValueError):
+            continue
+        diff = sorted(k for k in key if other.get(k) != key[k])
+        if best is None or len(diff) < len(best[1]):
+            best = (os.path.dirname(path), diff)
+    if best is None:
+        return f"there is none in {os.path.dirname(snap)}"
+    return f"the closest, {best[0]}, was made of another " + ", ".join(best[1])
+
+
+def restore_snapshot(snap: str, nodes: list, host_of: dict, work: str) -> None:
+    """Copies the files of the snapshot's nodes into their directories (WORK_DIR/n<i>), for
+    rtier_node --raw-reuse: copies, as a run changes them (fetches, drains, inserts). cp
+    --reflink=auto shares the blocks where the file system can (XFS, btrfs), and elsewhere copies
+    the sparse file whole -- through the page cache, so the copies are synced and dropped from
+    it: every restored node starts with its vectors on the disk alone, nothing to write back and
+    nothing cached, whatever the file system did."""
+    def one(i):
+        q, d = shlex.quote, os.path.join(work, f"n{i}")
+        dst = [q(os.path.join(d, f)) for f in SNAPSHOT_FILES]
+        host_of[i].run(f"set -e; mkdir -p {q(d)}; " + "; ".join(
+            f"cp --reflink=auto --sparse=always {q(os.path.join(snap, f'n{i}', f))} {t}"
+            for f, t in zip(SNAPSHOT_FILES, dst)) + "; sync " + " ".join(dst) + "; " +
+            "; ".join(f"dd if={t} iflag=nocache count=0 status=none" for t in dst),
+            f"n{i}: restoring the snapshot", timeout=24 * 3600)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as ex:
+        list(ex.map(one, nodes))
+
+
+def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, snap: str, key: dict,
+                  procs, out_dir: str) -> None:
+    """The warmup run, once the initial deployment is ready (st: its status): each node saves the
+    presence bits of its raw vectors (rtier-client save-raw), everything stops, and each node's
+    raw file and bits are copied into the snapshot on its machine, synced, with the manifest
+    written there last: it marks a complete snapshot. addrs: node number -> data node address."""
+    gbin = paths_of(cfg)[2]
+    ids = {n["name"]: n["id"] for n in st.get("nodes") or []}
+    owners = st["table"]["placement"]["owners"]
+    manifest = {"key": key, "made": time.strftime("%Y-%m-%d %H:%M:%S"), "results": os.path.abspath(out_dir),
+                "nodes": {}}
+    for i, addr in sorted(addrs.items()):
+        r = subprocess.run([f"{gbin}/rtier-client", "save-raw", "-node", addr], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"n{i}: save-raw failed: {r.stderr.strip()}")
+        manifest["nodes"][f"n{i}"] = {"partitions": [p for p, o in enumerate(owners) if o == ids.get(f"n{i}")],
+                                      "vectors": json.loads(r.stdout)["present"]}
+    procs.stop()  # nothing runs while the files are copied
+    started = time.monotonic()
+    q = shlex.quote
+    path = os.path.join(snap, "snapshot.json")
+
+    def copy(h, nodes):
+        # The old manifest goes first: until the new one is there, the directory is no snapshot.
+        script = [f"set -e; rm -f {q(path)}"]
+        for i in nodes:
+            d, src = os.path.join(snap, f"n{i}"), os.path.join(work, f"n{i}")
+            script.append(f"rm -rf {q(d)}; mkdir -p {q(d)}")
+            script += [f"cp --reflink=auto --sparse=always {q(os.path.join(src, f))} {q(os.path.join(d, f))}"
+                       for f in SNAPSHOT_FILES]
+            script.append("sync " + " ".join(q(os.path.join(d, f)) for f in SNAPSHOT_FILES))
+            script.append(f"echo n{i}=$(du -s -B1 {q(d)} | cut -f1)")
+        out = h.run("; ".join(script), f"{h.dest}: saving the snapshot", timeout=24 * 3600)
+        return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+    def write_manifest(h):
+        # Once every machine's copy is complete; a temporary file of the machine's own, renamed
+        # at once, so that machines sharing the directory do not trip over each other.
+        h.run(f"set -e; t=$(mktemp {q(path)}.XXXXXX); cat > \"$t\"; sync \"$t\"; mv \"$t\" {q(path)}",
+              f"{h.dest}: writing the snapshot's manifest", input=json.dumps(manifest) + "\n")
+
+    sizes = {}
+    machines = by_machine(host_of)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(machines))) as ex:
+        for got in ex.map(lambda hn: copy(*hn), machines.items()):
+            sizes.update(got)
+        for name, n in manifest["nodes"].items():
+            n["bytes"] = int(sizes.get(name, 0))  # on disk: the file is sparse
+        list(ex.map(write_manifest, machines))
+    json.dump(manifest, open(os.path.join(out_dir, "snapshot.json"), "w"), indent=2)
+    log(f"snapshot of {len(addrs)} nodes in {snap}, saved in {time.monotonic() - started:.0f} s: " +
+        ", ".join(f"{k} {v['vectors']} vectors ({v['bytes'] / 2**30:.2f} GiB)" for k, v in manifest["nodes"].items()))
+
+
+def check_restored(st: dict, manifest: dict, restored: list, snap: str) -> None:
+    """After the deployment: every node started on the snapshot got the partitions it was made for
+    -- else it holds vectors its bootstrap would not have, and the run measures another state."""
+    ids = {n["name"]: n["id"] for n in st.get("nodes") or []}
+    owners = st["table"]["placement"]["owners"]
+    for i in restored:
+        got = [p for p, o in enumerate(owners) if o == ids.get(f"n{i}")]
+        want = manifest["nodes"][f"n{i}"]["partitions"]
+        if got != want:
+            raise RuntimeError(f"n{i} owns partitions {got} in this deployment, and the snapshot {snap} was made "
+                               f"for {want}: remove it, or run the warmup again")
+
+
+def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, local: bool) -> tuple:
+    """Before the nodes start: those of host_of (node number -> machine) that can start on the
+    warmup snapshot get its files (restore_snapshot); returns them and the manifest. The others
+    bootstrap from the index. local: the snapshot directory is this machine's, which says why
+    none fits."""
+    found, manifest = find_snapshot(snap, key, host_of)
+    rest = sorted(set(host_of) - set(found))
+    if rest:
+        why = (snapshot_mismatch(snap, key) if local else "") if not found else "its files are missing there"
+        log(", ".join(f"n{i}" for i in rest) + f": no warmup snapshot of this index, partitions, placement and "
+            f"{key['initial_nodes']} initial nodes" + (f" ({why})" if why else "") +
+            ": bootstrapped from the index (a run with type: warmup makes one)")
+    if found:
+        started = time.monotonic()
+        restore_snapshot(snap, found, host_of, work)
+        log(", ".join(f"n{i}" for i in found) + f": start on the warmup snapshot {snap} (restored in "
+            f"{time.monotonic() - started:.0f} s)")
+    return found, manifest
+
+
+def connect(api_addr: str, procs, timeout: float = 30) -> Controller:
+    deadline = time.monotonic() + timeout
+    while True:
+        procs.check()
+        try:
+            return Controller(api_addr, timeout=30)
+        except OSError:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"the controller's API {api_addr} did not come up (see controller.log)")
+            time.sleep(0.2)
+
+
+def wait_registered(api: Controller, name: str, procs, timeout: float = 120) -> None:
+    """Until the controller lists the node: the next one starts only then, so IDs follow the order."""
+    deadline = time.monotonic() + timeout
+    while not any(n["name"] == name for n in api.call("Status").get("nodes") or []):
+        procs.check()
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"{name} did not register within {timeout:.0f} s (see agent-{name}.log)")
+        time.sleep(0.2)
+
+
 def controller_config(cfg: dict, ctl_addr: str, api_addr: str, index: str, parts: str, work: str,
                       out_dir: str) -> dict:
     return {
@@ -935,21 +1172,30 @@ def agent_config(cfg: dict, name: str, ctl_addr: str, listen_host: str, node_add
     }
 
 
-def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir: str, procs, results: list,
-          prefix: list) -> None:
-    """Steps 4 and 5, wherever the nodes run: wait for the initial deployment, then either measure
-    capacity (calibrate) or run the load and trigger the reconfigurations on time. The load
-    generator runs on this machine, with prefix (the CPUs left by the nodes on one machine)."""
-    # 4. initial deployment, then load. A rescale blocks for as long as its steps take, and the
-    # controller bounds every step (stage_timeout): no deadline of its own here, which an hour-long
-    # copy at scale would hit; a controller that dies closes the connection.
-    api = Controller(api_addr, timeout=None)
+def wait_deployment(cfg: dict, api: Controller) -> dict:
+    """The initial deployment's status, once it is ready."""
     # Bootstrapping copies every partition's PQ codes and raw vectors from the index: minutes
-    # on a 10M-vector index ("ReadyTimeoutSeconds").
+    # on a 10M-vector index ("ReadyTimeoutSeconds"), unless the nodes start on a snapshot.
     deploy_start = time.monotonic()
     st = api.call("WaitReady", {"timeout_seconds": cfg.get("ReadyTimeoutSeconds", 600)})
     log(f"epoch {st['table']['epoch']} ready on {len(st['table']['placement']['owners'])} partitions "
         f"after {time.monotonic() - deploy_start:.0f} s")
+    return st
+
+
+def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir: str, procs, results: list,
+          prefix: list, on_deploy=None) -> None:
+    """Steps 4 and 5, wherever the nodes run: wait for the initial deployment (on_deploy, if
+    given, checks its status), then either measure capacity (calibrate) or run the load and
+    trigger the reconfigurations on time. The load generator runs on this machine, with prefix
+    (the CPUs left by the nodes on one machine)."""
+    # 4. initial deployment, then load. A rescale blocks for as long as its steps take, and the
+    # controller bounds every step (stage_timeout): no deadline of its own here, which an hour-long
+    # copy at scale would hit; a controller that dies closes the connection.
+    api = Controller(api_addr, timeout=None)
+    st = wait_deployment(cfg, api)
+    if on_deploy:
+        on_deploy(st)
     load = cfg.get("Load", {})
     dur = load.get("DurationSeconds", 60)
 
@@ -1045,7 +1291,13 @@ def load_config(cfg_path: str) -> tuple:
                  "the old JSON ones)")
     ecfg = experiment_config.load(cfg_path)
     cfg = experiment_config.flatten(ecfg)
-    check_load(cfg)
+    if cfg.get("Type") not in (None, "warmup"):
+        sys.exit(f"{cfg_path}: type is {cfg['Type']!r}: warmup, or none (a run that measures)")
+    if cfg.get("Type") != "warmup":
+        check_load(cfg)
+        if int(cfg.get("Nodes", 1)) < int(cfg.get("InitialNodes", 1)):
+            sys.exit(f"{cfg_path}: cluster.nodes ({cfg.get('Nodes', 1)}) is below cluster.initial_nodes "
+                     f"({cfg.get('InitialNodes', 1)}): the deployment would wait for nodes that never come")
     reconfigs = reconfig_requests(cfg, cfg_path)
     check_fresh(*paths_of(cfg)[1:])
     return ecfg, cfg, reconfigs
@@ -1076,7 +1328,7 @@ def stages(ecfg: dict, cfg: dict) -> tuple:
     index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
     build_index(cfg, ecfg, index, ebin)
     gt = cfg.get("GroundTruth", "")
-    if gt:
+    if gt and cfg.get("Type") != "warmup":  # a warmup sends no query
         ground_truth(cfg, ecfg, gt, ebin)
 
     # 2. partitions: the assignment (U2), then the segments
@@ -1096,7 +1348,9 @@ def main(cfg_path: str, out_dir: str) -> None:
 
     emu = cfg.get("Emulation", {})
     netns = bool(emu.get("Netns"))
-    nodes = cfg.get("Nodes", 1)
+    warmup = cfg.get("Type") == "warmup"
+    initial = int(cfg.get("InitialNodes", 1))
+    nodes = initial if warmup else cfg.get("Nodes", 1)  # a warmup has no spare: no reconfiguration
     ctl_host = "10.10.0.1" if netns else "127.0.0.1"  # bridge address in netns mode
     ctl_addr = cfg.get("ControllerAddr", f"{ctl_host}:7100")
     api_addr = cfg.get("APIAddr", f"{ctl_host}:7101")
@@ -1115,6 +1369,12 @@ def main(cfg_path: str, out_dir: str) -> None:
     table = gpu_table() if gpus else []
     visible = node_gpus(cfg, nodes, lambda i: table)
 
+    key = snapshot_key(cfg, index, parts)
+    snap = snapshot_path(cfg, key)
+    machine = Local()
+    here = {i: machine for i in range(1, initial + 1)}  # one machine: one manifest
+    restored, manifest = ([], None) if warmup else start_on_snapshot(snap, key, here, work, local=True)
+
     procs = Procs(out_dir)
     results = []
     sampler = CgroupSampler(os.path.join(out_dir, "cgroups.jsonl"), data_disk(work),
@@ -1129,8 +1389,9 @@ def main(cfg_path: str, out_dir: str) -> None:
         ctl_cfg = os.path.join(work, "controller.json")
         json.dump(controller_config(cfg, ctl_addr, api_addr, index, parts, work, out_dir), open(ctl_cfg, "w"), indent=2)
         procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg], prefix=rest_cpus(cfg, nodes))
-        time.sleep(0.5)
+        api = connect(api_addr, procs)
 
+        addrs = {}
         for i in range(1, nodes + 1):
             name = f"n{i}"
             prefix = isolation(cfg, groups[i - 1], work, scopes) + \
@@ -1142,22 +1403,30 @@ def main(cfg_path: str, out_dir: str) -> None:
             # The agent forwards this run's stats log from its start: none of an earlier run's.
             if os.path.exists(os.path.join(node_dir, "stats.jsonl")):
                 os.remove(os.path.join(node_dir, "stats.jsonl"))
-            ready = procs.start(f"node-{name}", node_command(cfg, ebin, index, parts, f"{host}:0", node_dir, node_args),
+            reuse = ["--raw-reuse"] if i in restored else []
+            ready = procs.start(f"node-{name}", node_command(cfg, ebin, index, parts, f"{host}:0", node_dir,
+                                                             node_args + reuse),
                                 prefix=prefix + gpu_env(visible, i), wait_line="READY tcp=")
+            addrs[i] = f"{host}:{ready.split('=')[1]}"
             if sampler:
                 sampler.add(name, procs.procs[-1][1].pid, scoped)
             agent_cfg = os.path.join(work, f"agent-{name}.json")
-            json.dump(agent_config(cfg, name, ctl_addr, host, f"{host}:{ready.split('=')[1]}", node_dir, parts),
-                      open(agent_cfg, "w"), indent=2)
+            json.dump(agent_config(cfg, name, ctl_addr, host, addrs[i], node_dir, parts), open(agent_cfg, "w"), indent=2)
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
             if sampler:
                 sampler.add(f"{name}-agent", procs.procs[-1][1].pid, scoped)
+                if i == 1:  # from here on: the deployment starts once the initial nodes registered
+                    sampler.start()
+            wait_registered(api, name, procs)
+        api.close()
 
-        if sampler:
-            sampler.start()
-
+        if warmup:  # the initial deployment, its snapshot, and nothing else
+            st = wait_deployment(cfg, Controller(api_addr, timeout=None))
+            take_snapshot(cfg, st, {i: addrs[i] for i in here}, here, work, snap, key, procs, out_dir)
+            return
         # 4-5. initial deployment, load, timed reconfigurations
-        drive(cfg, reconfigs, api_addr, gbin, gt, out_dir, procs, results, rest_cpus(cfg, nodes))
+        drive(cfg, reconfigs, api_addr, gbin, gt, out_dir, procs, results, rest_cpus(cfg, nodes),
+              on_deploy=(lambda st: check_restored(st, manifest, restored, snap)) if restored else None)
     finally:
         # 7. clean up, then 6. results
         procs.stop()

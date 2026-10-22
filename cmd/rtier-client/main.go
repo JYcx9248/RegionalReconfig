@@ -1,7 +1,7 @@
 // rtier-client: talk to the controller API, an entry node, or a data node.
 //
 //	rtier-client [-api ADDR] status
-//	rtier-client [-api ADDR] wait-ready [-timeout 60s]
+//	rtier-client [-api ADDR] wait-ready [-timeout 5m]
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] N           # N data nodes, placed by the policy
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] -plan FILE  # the placement FILE names
 //	rtier-client [-api ADDR] design             # open design questions (placeholders)
@@ -24,11 +24,16 @@
 //	rtier-client query -entry ADDR -queries Q.u8bin [-gt GT.ibin] [-k 10 -nprobe 64 -n 200]
 //	rtier-client search-local -node ADDR -queries Q.u8bin [...]   # single-node baseline
 //	rtier-client pq-share -partitions DIR -nodes K [-placement P] | -plan FILE
+//	rtier-client save-raw -node ADDR
 //
 // pq-share needs no controller: it reads the partitions and prints, for each data node of the
 // first epoch the placement policy gives K nodes (as the controller deploys them: IDs 1..K), or
 // of a plan, how many distinct vectors its partitions name -- the PQ codes the node keeps
 // resident (U1). The experiment runners size --pq-capacity from it.
+//
+// save-raw talks to a data node, not the controller: it syncs the node's raw vectors and saves
+// their presence bits next to its raw file, for a warmup snapshot (scripts/run_local.py, type:
+// warmup) that later nodes start from (rtier_node --raw-reuse).
 package main
 
 import (
@@ -57,7 +62,7 @@ import (
 func main() {
 	api := flag.String("api", "127.0.0.1:7101", "controller API address")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ...")
+		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ... | save-raw -node ADDR")
 	}
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -136,6 +141,22 @@ func main() {
 		}
 	case "query", "search-local":
 		runQueries(ctx, cmd, args)
+	case "save-raw":
+		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		node := fs.String("node", "", "data node address")
+		fs.Parse(args)
+		if *node == "" {
+			log.Fatal("usage: save-raw -node ADDR")
+		}
+		c := nodeclient.New(*node, 1)
+		defer c.Close()
+		sctx, cancel := context.WithTimeout(ctx, time.Hour) // a sync of the node's whole share
+		defer cancel()
+		n, err := c.RawSave(sctx)
+		if err != nil {
+			log.Fatalf("save-raw %s: %v", *node, err)
+		}
+		printJSON(map[string]uint64{"present": n})
 	case "pq-share":
 		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 		parts := fs.String("partitions", "", "rtier_segment's output")

@@ -12,11 +12,12 @@ load (run_local.py is the single-machine case):
   3. copy what the nodes open to every host, at this machine's paths (Koala's syncRepo):
      rtier_node and rtier-agent; the index's meta, PQ codebook and PQ codes, and the
      partitions' manifest; where a node of the initial deployment runs, also the index's page
-     file, its graph and the segments, which only the initial deployment reads -- the nodes
-     that join later get them from their peers; of each rebuild's next generation, its meta,
-     codebook, PQ codes, graph and manifest. The rest of an index is the build's own
-     (postings, centroids, layout maps). A host that sees a directory at its path already
-     (this machine, a shared file system) gets no copy of it.
+     file (not where every such node starts on a warmup snapshot), its graph and the segments,
+     which only the initial deployment reads -- the nodes that join later get them from their
+     peers; of each rebuild's next generation, its meta, codebook, PQ codes, graph and
+     manifest. The rest of an index is the build's own (postings, centroids, layout maps). A
+     host that sees a directory at its path already (this machine, a shared file system) gets
+     no copy of it. Before that, each initial node's warmup snapshot is restored on its host.
   4. start the controller here, then each node in order over SSH -- its rtier_node, then its
      agent -- and wait for the agent's registration before the next: nodes n1, n2, ... get IDs
      1, 2, ..., and the first cluster.initial_nodes form the deployment (Koala starts its
@@ -54,6 +55,10 @@ opens them there. An engine built with -march=native (FUSION_NATIVE, the default
 CPUs with every instruction set extension of the one it was built on, and a CUDA build only on
 GPUs its architectures cover: step 1 stops the run rather than let a node die with SIGILL later.
 Build for every host's hardware then (cmake -DFUSION_NATIVE=OFF, -DCMAKE_CUDA_ARCHITECTURES=...).
+
+A warmup run (type: warmup, run_local.py's doc) saves each initial node's snapshot on that
+node's host, at the same path (paths.snapshot_dir): a later run restores it there, and a host
+whose initial nodes all start on one needs no page file.
 
 cluster.gpus applies on each node's own machine: node i gets the i-th entry (in turns, as in
 run_local.py), named by nvidia-smi index, UUID or PCI bus id there. cluster.resources and
@@ -342,11 +347,12 @@ NODE_INDEX = ("meta.txt", "pq_codebook.bin", "pq_codes.bin")
 NODE_PARTS = ("manifest.txt", "list_part.bin")
 
 
-def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool) -> list:
+def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool, pages: bool = True) -> list:
     """(directory, its files) for the nodes of one host. Every node opens the index's meta, PQ
     codebook and PQ codes and the partitions' manifest. A node of the initial deployment also
-    reads the page file (its bootstrap), its segments and the graph (staged from the build
-    output): all the segments go, since the initial placement is the controller's. A node that
+    reads the page file (its bootstrap; pages: unless every such node of the host starts on a
+    warmup snapshot), its segments and the graph (staged from the build output): all the
+    segments go, since the initial placement is the controller's. A node that
     joins later gets these from its peers. Of each rebuild's next generation (gens: index and
     partition directories), the meta, codebook, PQ codes, graph and manifest: every node in the
     cluster at the rebuild switches to it, and its segments, with their holders, come from the
@@ -356,8 +362,9 @@ def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool)
     idx, seg = list(NODE_INDEX), list(NODE_PARTS)
     if bootstrap or graph:
         idx.append("graph.hnsw")
-    if bootstrap:
+    if bootstrap and pages:
         idx.append(f"vectors_{man['layout']}.bin")
+    if bootstrap:
         seg += [f"part-{p:05d}.seg" for p in range(int(man["num_partitions"]))]
     out = [(index, idx), (parts, seg)]
     for gi, gp in gens:
@@ -366,16 +373,18 @@ def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool)
 
 
 def sync(hosts: list, initial: int, binaries: list, index: str, parts: str, gens: list, graph: bool,
-         out_dir: str) -> None:
+         out_dir: str, restored: list) -> None:
     """Step 3: the copies, at the same paths, to every host in parallel: the binaries and what its
-    nodes open (node_files). A directory a host already sees at that path -- this machine itself,
+    nodes open (node_files; restored: the initial nodes that start on a warmup snapshot, which
+    read no page file). A directory a host already sees at that path -- this machine itself,
     under any name, or a file system it shares -- is left alone: a marker file put in it here
     shows there (Koala's syncRepo skips the local machine by its addresses). rsync copies what
     changed only, so a host keeps the index from one run to the next."""
     bootstrap = set(hosts[:initial])
+    pages = {hosts[i - 1] for i in range(1, initial + 1) if i not in restored}
     distinct = list(dict.fromkeys(hosts))
     plans = {h: [(os.path.dirname(f), [os.path.basename(f)]) for f in binaries] +
-             node_files(index, parts, gens, h in bootstrap, graph) for h in distinct}
+             node_files(index, parts, gens, h in bootstrap, graph, h in pages) for h in distinct}
     srcs = list(dict.fromkeys(d for plan in plans.values() for d, _ in plan))
     marker = f".rtier-same-{os.urandom(8).hex()}"
     marked = []
@@ -469,28 +478,6 @@ class Procs(rl.Procs):
                 p.kill()
 
 
-def connect(api_addr: str, procs: Procs, timeout: float = 30) -> Controller:
-    deadline = time.monotonic() + timeout
-    while True:
-        procs.check()
-        try:
-            return Controller(api_addr, timeout=30)
-        except OSError:
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"the controller's API {api_addr} did not come up (see controller.log)")
-            time.sleep(0.2)
-
-
-def wait_registered(api: Controller, name: str, procs: Procs, timeout: float = 120) -> None:
-    """Until the controller lists the node: the next one starts only then, so IDs follow the order."""
-    deadline = time.monotonic() + timeout
-    while not any(n["name"] == name for n in api.call("Status").get("nodes") or []):
-        procs.check()
-        if time.monotonic() > deadline:
-            raise RuntimeError(f"{name} did not register within {timeout:.0f} s (see agent-{name}.log)")
-        time.sleep(0.2)
-
-
 def main(cfg_path: str, out_dir: str) -> None:
     ecfg, cfg, reconfigs = rl.load_config(cfg_path)
     check_cluster_config(cfg)
@@ -500,8 +487,13 @@ def main(cfg_path: str, out_dir: str) -> None:
         sys.exit(f"cluster.nodes is {nodes}, hosts.nodes names {len(hosts)} hosts: one per node")
     if nodes < len(hosts):
         log(f"hosts.nodes names {len(hosts)} hosts, cluster.nodes is {nodes}: the first {nodes}")
-    hosts = hosts[:nodes]
     initial = cfg.get("InitialNodes", 1)
+    if initial > len(hosts):
+        sys.exit(f"cluster.initial_nodes is {initial}, hosts.nodes names {len(hosts)} hosts: one per node")
+    warmup = cfg.get("Type") == "warmup"
+    if warmup:  # no spare: no reconfiguration
+        nodes = min(nodes, initial)
+    hosts = hosts[:nodes]
     work, ebin, gbin = rl.paths_of(cfg)
     root = root_addr(cfg, hosts)
     index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
@@ -520,12 +512,16 @@ def main(cfg_path: str, out_dir: str) -> None:
     visible = rl.node_gpus(cfg, nodes, lambda i: tables.get(hosts[i - 1], []))
     check_gpus(hosts, visible, tables, ebin)
 
-    # 2. index, ground truth, partitions; 3. copies
+    # 2. index, ground truth, partitions; the warmup snapshot on the hosts; 3. copies
     index, gt, parts = rl.stages(ecfg, cfg)
     node_args = rl.node_args_of(cfg, index, parts, reconfigs, out_dir)
     graph = any(a == "--graph" and b == "index" for a, b in zip(node_args, node_args[1:]))
+    key = rl.snapshot_key(cfg, index, parts)
+    snap = rl.snapshot_path(cfg, key)
+    host_of = {i: hosts[i - 1] for i in range(1, initial + 1)}
+    restored, manifest = ([], None) if warmup else rl.start_on_snapshot(snap, key, host_of, work, local=False)
     sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")],
-         index, parts, gens, graph, out_dir)
+         index, parts, gens, graph, out_dir, restored)
 
     ctl_addr = cfg.get("ControllerAddr", f"{root}:7100")
     api_addr = cfg.get("APIAddr", f"{root}:7101")
@@ -539,25 +535,34 @@ def main(cfg_path: str, out_dir: str) -> None:
         ctl_cfg = os.path.join(work, "controller.json")
         json.dump(ctl, open(ctl_cfg, "w"), indent=2)
         procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg])
-        api = connect(api_addr, procs)
+        api = rl.connect(api_addr, procs)
+        addrs = {}
         for i, h in enumerate(hosts, 1):
             name, node_dir = f"n{i}", os.path.join(work, f"n{i}")
             # Listening everywhere, known by the host's address: the one the others reach.
-            ready = procs.start(f"node-{name}", rl.node_command(cfg, ebin, index, parts, "0.0.0.0:0", node_dir, node_args),
+            reuse = ["--raw-reuse"] if i in restored else []
+            ready = procs.start(f"node-{name}", rl.node_command(cfg, ebin, index, parts, "0.0.0.0:0", node_dir,
+                                                                node_args + reuse),
                                 prefix=rl.gpu_env(visible, i), wait_line="READY tcp=", host=h)
-            agent = rl.agent_config(cfg, name, ctl_addr, "0.0.0.0", f"{h.addr}:{ready.split('=')[1]}", node_dir, parts)
+            addrs[i] = f"{h.addr}:{ready.split('=')[1]}"
+            agent = rl.agent_config(cfg, name, ctl_addr, "0.0.0.0", addrs[i], node_dir, parts)
             # The agent samples its node, itself and its machine for cgroups.jsonl here.
             agent.update(advertise_host=h.addr, sample_interval="1s")
             agent_cfg = os.path.join(work, f"agent-{name}.json")
             h.run(f"cat > {shlex.quote(agent_cfg)}", f"{h.dest}: writing {agent_cfg}", input=json.dumps(agent, indent=2))
             procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg],
                         prefix=rl.gpu_env(visible, i), host=h)
-            wait_registered(api, name, procs)
+            rl.wait_registered(api, name, procs)
             log(f"{name} on {h.dest} ({h.addr}) registered")
         api.close()
 
+        if warmup:  # the initial deployment, its snapshot on the hosts, and nothing else
+            st = rl.wait_deployment(cfg, Controller(api_addr, timeout=None))
+            rl.take_snapshot(cfg, st, addrs, host_of, work, snap, key, procs, out_dir)
+            return
         # 5. initial deployment, load, timed reconfigurations
-        rl.drive(cfg, reconfigs, api_addr, gbin, gt, out_dir, procs, results, [])
+        rl.drive(cfg, reconfigs, api_addr, gbin, gt, out_dir, procs, results, [],
+                 on_deploy=(lambda st: rl.check_restored(st, manifest, restored, snap)) if restored else None)
     finally:
         # 7. clean up, then 6. results
         procs.stop()

@@ -124,6 +124,12 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 			return nil, fmt.Errorf("agent: %s is required", name)
 		}
 	}
+	// A listing (PQ_MISSING, RAW_MISSING, RAW_HELD_BY) holds one connection to the data node for
+	// as long as it streams, and the pulls it feeds need another for their PQ_PUT or RAW_PULL:
+	// with a single slot the two would wait for each other until a timeout.
+	if cfg.NodeConns < 2 {
+		return nil, fmt.Errorf("agent: node_conns is %d: at least 2", cfg.NodeConns)
+	}
 	m, err := partitioning.LoadManifest(cfg.PartitionsDir)
 	if err != nil {
 		return nil, err

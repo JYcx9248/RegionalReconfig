@@ -202,7 +202,7 @@ func checkResidency(t *testing.T, cl *cluster) {
 		}
 		raw := info.Raw
 		switch {
-		case raw.Present != raw.FromIndex+raw.Streamed+raw.Fetched:
+		case raw.Present != raw.Restored+raw.FromIndex+raw.Streamed+raw.Fetched:
 			t.Errorf("node %d (%s) raw vectors %+v: want each installed once", ns.ID, ns.Name, raw)
 		case rawComplete(cl.protocol) && (raw.Present != all || raw.Pending != 0):
 			t.Errorf("node %d (%s) raw vectors %+v: want the %d vectors of every partition it has owned, "+

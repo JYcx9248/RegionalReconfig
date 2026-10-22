@@ -46,6 +46,10 @@
 //                   str path[paths] (segment files)              (u32 group, u32 n, u32 ids[n])[runs]
 //                   (every missing code once, under the first group that needs it; the codes
 //                   already here are protected for the staging)
+//   PQ_FROM_INDEX   u32 n, str path[n] (segment files)        -> u64 installed
+//                   (bootstrap: the codes they name that are not here, read from the index's
+//                   pq_codes.bin in one pass in its order and staged as PQ_PUT's; the ones
+//                   here already are protected for the staging)
 //   PQ_GET          u32 n, u32 ids[n]                         -> u32 m, u8 codes[n * m]
 //   PQ_PUT          u32 n, u32 m, u32 ids[n], u8 codes[n * m] -> u32 installed, u32 skipped
 //   PQ_RELEASE      -                                         -> u64 freed (a staging that did
@@ -75,6 +79,10 @@
 //                   (raw-vector bytes since startup: served by RAW_GET, and brought here --
 //                   fetched from peers, on demand or by RAW_PULL, or put with RAW_PUT; an
 //                   agent holds the navigation graph back while they move, U16)
+//   RAW_SAVE        -                                         -> u64 present
+//                   (the raw file is synced and the presence bits of the vectors on the SSD
+//                   are written next to it, <raw-file>.present: a warmup snapshot of this
+//                   node, which rtier_node --raw-reuse opens with a copy of the file)
 //
 // A streamed reply comes as frames of the same request ID, every one but the last flagged more,
 // each with at most about kStreamBatch entries: the node sends a frame when it is full, when its
@@ -209,6 +217,8 @@ enum Op : uint8_t {
   kSwitchGeneration = 0x3C,
   kRawBitmap = 0x3D,
   kRawTraffic = 0x3E,
+  kPQFromIndex = 0x3F,
+  kRawSave = 0x40,
 };
 
 enum Status : uint16_t {

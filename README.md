@@ -46,8 +46,9 @@ node needs a global vector -> page map. Each data node keeps the vectors it hold
 sparse file laid out like the whole page file (`rtier_node --raw-file`), with a presence bit per
 location, and finds a candidate's location through its PQ store. The same vector reached through
 two lists names the same offset, so dedup is free, and the transfer unit is a single vector (list
-tails share pages). Only the initial deployment reads the index's page file; the end-to-end tests
-run every node that joins later on a copy of the index without it. Old owners keep the vectors of
+tails share pages). Only the initial deployment reads the index's page file, and not even it on a
+warmup snapshot (below); the end-to-end tests run every node that joins later on a copy of the
+index without it. Old owners keep the vectors of
 partitions that moved away, like PQ codes. Raw vectors need no versions under updates: vectors are
 immutable, and IDs and locations are only appended. Decided for now: raw vectors are kept in full
 -- no disk budget, no eviction, and deleted vectors' pages stay -- since disk is cheap, and the
@@ -131,8 +132,8 @@ delays neither the flip nor a query's fetch. In the worst case, queries fetching
 a new node becomes an entry only once the fetching subsides; only navigation waits for it,
 which the existing entries do meanwhile. This strict yield is decided for now: whether the
 graph moves nothing at all while data moves, or takes the bandwidth the data leaves unused, is
-settled once the experiments show what it costs. `"data"` shares the source's bucket equally,
-as a baseline. A new node
+settled once the experiments show what it costs (each wait counts in the agent's
+`graph.yield_ms`). `"data"` shares the source's bucket equally, as a baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
 are arriving, the controller flips every `"entry_flip_interval"` (1 s by default) to add all the
 nodes that are ready, and adds the last ones at once when every pull has ended. These flips
@@ -284,14 +285,14 @@ epoch, a full rebuild and rescales.
 |---|---|
 | `cmd/rtier-controller` | control plane: registration, placement, epochs, reconfiguration, metrics sink |
 | `cmd/rtier-agent` | per-node agent next to `rtier_node`: staging, epochs, entry + aggregator roles |
-| `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline |
+| `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline / `pq-share` (each initial node's PQ codes, offline) / `save-raw` (a node's warmup snapshot) |
 | `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time) with a rate schedule, or closed-loop users; follows the entry list (U17) |
 | `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14), routing inserts with its own router (`-router`, or `-index` to start one), and runs major epochs (`-split-len`, `-merge-len`; `-split`, `-merge`) |
 | `cmd/rtier-overhead` | cost of fan-out: emulates N owners on one data node holding every partition and reports what the two-phase query adds over N = 1 (owners per query, duplicate PQ scoring, extra page reads, per-call and merge time); `-compare` sets two-phase against local re-ranking (recall with `-gt`), `-owners` shows how queries spread over owners |
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |
-| `test/e2e` | real `rtier_node` processes under query load: scale-out and scale-in, plans, update batches, major epochs, full rebuilds, diagnostics forwarding |
-| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; YAML configurations of a base and overrides, `experiment_config.py`; `convert_configs.py` turns the old JSON ones into them), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `emulation/netns.sh`, metrics → SQLite, Python API client |
+| `test/e2e` | real `rtier_node` processes under query load: scale-out and scale-in, plans, update batches, major epochs, full rebuilds, diagnostics forwarding, a deployment on a warmup snapshot |
+| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; YAML configurations of a base and overrides, `experiment_config.py`; `convert_configs.py` turns the old JSON ones into them), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `run_one.sh` one run on a clean node state (`evict_cache.py`), `node_reads.py` each node's device reads, `emulation/netns.sh`, metrics → SQLite, Python API client |
 
 ## Build and test
 
@@ -336,6 +337,21 @@ query, has recall measured all through it. Each results directory records the co
 refuse Go or engine binaries older than their sources. `scripts/run_one.sh CONFIG PROTOCOL
 OUT ['{...}']` runs one configuration with the protocol and any other key overridden.
 
+The initial deployment copies each initial node's share of the raw vectors from the index's page
+file: minutes at scale (371 s for Wikipedia's two nodes on the lab server). A warmup run does it
+once. `type: warmup` deploys the initial nodes, has each save the presence bits of its raw vectors
+next to its raw file (`rtier-client save-raw`), stops, and copies every node's raw file and bits
+into a snapshot under `paths.snapshot_dir` (default `WORK_DIR/snapshots`), with no load. A later
+run of the same index, partitions, placement and number of initial nodes copies the snapshot into
+its initial nodes' directories (`cp --reflink=auto --sparse=always`, at once on XFS or btrfs) and
+starts them with `rtier_node --raw-reuse`: their bootstrap copies no raw vector. Once deployed, it
+checks that each got the partitions its snapshot was made for. A run without a matching snapshot
+bootstraps from the index and says why. The nodes start one at a time, each after the previous one
+registered, so `n1`, `n2`, ... get IDs 1, 2, ... and the same partitions every time. The PQ codes
+come from `pq_codes.bin` either way, read once in file order for all of a node's partitions
+(`PQ_FROM_INDEX`). `configs/experiment.wiki-c1024-warmup-{1,2,4}.yaml` are the warmups of the
+Wikipedia runs.
+
 `configs/experiment.example.yaml` is the same run on BigANN (edit the paths). With
 `cluster.emulation: {netns: true}` (root), each node runs in its own network namespace with its
 link shaped by `tc` (`scripts/emulation/netns.sh`; delay needs the `netem` qdisc).
@@ -351,7 +367,8 @@ The controller and the load generator get the CPUs after the nodes'. `memory_max
 once a second into `cgroups.jsonl` (CPU time, reads and writes on the data disk, dirty and
 writeback page cache, pressure stall times). Every run also collects each data node's stats log,
 `stats-<node>.jsonl` (`rtier_node --stats-file`: operation counts and times, time spent waiting
-for an engine worker, the fetch cache and its writer), which its agent forwards to the controller
+for an engine worker, the fetch cache and its writer, the raw-vector bytes sent and received),
+which its agent forwards to the controller
 and the controller stamps on arrival (`"t"`; the node's own time stays as `"node_t"`). Both are on
 the monotonic clock of `clock.json`, whose `load_start` is the load's time 0.
 
@@ -417,7 +434,8 @@ that its CPU and GPUs can run. A `-march=native` build from another CPU would di
 Then it copies to each host, at this machine's paths, what its nodes open: `rtier_node` and
 `rtier-agent`; the index's meta, PQ codebook and PQ codes (`rtier_node` checks the codes at
 startup, though only the bootstrap reads them) and the partitions' manifest; where a node of the
-initial deployment runs, also the page file, the graph and the segments it stages from -- a node
+initial deployment runs, also the page file (unless every such node there starts on a warmup
+snapshot, which stays on its host), the graph and the segments it stages from -- a node
 that joins later gets these from its peers; and of each rebuild's next generation, its meta,
 codebook, PQ codes, graph and manifest (its segments come from the controller). The rest of an
 index (postings, centroids, layout maps) is the build's own and stays here. rsync sends only what
@@ -457,8 +475,10 @@ The first run offers a ladder of rates to one node and reports where it stops ke
 load outgrows one node before the rescale. The second run writes `timeline.svg` (queries offered
 and answered per second, answers counted when they came so that a stall shows, and the mean
 latency by send time, with the flips marked; `--latency tail` for p50 and p99), `timeline.csv`,
-`reconfigurations.json` (when each rescale was triggered, how long it took, what it moved) and
-the metrics; `scripts/plot_run.py results/scaleout` redraws them with another window size. A run
+`reconfigurations.json` (when each rescale was triggered, how long it took, what it moved), the
+metrics, `pq-budget.json`, `revision.txt` and `revision.diff` (a warmup run writes `snapshot.json`,
+what it saved, instead of a latency.csv); `scripts/plot_run.py results/scaleout` redraws them
+with another window size. A run
 cut short keeps what it measured: `reconfigurations.json` is written after each
 reconfiguration, and a load generator stopped before its backlog drained (`load.drain_seconds`
 after the load, 300 s by default) records the queries still unanswered as `abandoned`.

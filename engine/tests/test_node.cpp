@@ -51,6 +51,16 @@ std::string TempDir() {
   return d;
 }
 
+template <class F>
+bool Throws(F&& fn) {
+  try {
+    fn();
+  } catch (const std::exception&) {
+    return true;
+  }
+  return false;
+}
+
 void TestCrc32() {
   const char* s = "123456789";
   CHECK(Crc32(s, 9) == 0xCBF43926u);  // standard check value of CRC-32/IEEE
@@ -987,6 +997,47 @@ void TestPQMigration() {
 // LoadPartition) and releases on a node whose PQ budget forces cached codes out and slots to be
 // reused. Every Filter that succeeds must equal the answer of a node holding everything;
 // afterwards exactly the codes of the resident partitions are live.
+// Bootstrap's PQ codes in one pass (PQFromIndex): the codes the segments name that the node
+// lacks, read from the index's file -- here a few codes a read, so that the pass crosses many
+// reads and bit words -- and staged until their partitions load, which then read none: the
+// codes a load a partition at a time copies. The codes held already are protected, not read; a
+// staging that does not load frees what it installed.
+void TestPQFromIndex() {
+  Fixture& f = GetFixture();
+  auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
+  std::vector<uint32_t> all;
+  std::vector<std::string> segs;
+  for (uint32_t p = 0; p < f.num_parts; ++p) {
+    segs.push_back(seg(p));
+    const ListSegment s = ListSegment::Load(segs.back());
+    all.insert(all.end(), s.ids.begin(), s.ids.end());
+  }
+  std::sort(all.begin(), all.end());
+  all.erase(std::unique(all.begin(), all.end()), all.end());
+  auto ref = OpenNode(f, {0, 1, 2, 3}, false);  // a partition at a time
+  NodeOptions o = ref->options();
+  o.pq_read_bytes = 3 * ref->pq_stats().m;
+  auto e = NodeEngine::Open(o);
+  e->LoadPartition(3, seg(3), PQSource::kIndex);
+  const uint64_t had = e->pq_stats().from_index;
+  const PQPutResult r = e->PQFromIndex(segs);
+  PQStats st = e->pq_stats();
+  CHECK(had > 0 && r.installed == all.size() - had && r.skipped == 0 && st.from_index == all.size() &&
+        st.staged == r.installed && st.resident == all.size());
+  for (uint32_t p = 0; p < 3; ++p) e->LoadPartition(p, seg(p), PQSource::kIndex);
+  st = e->pq_stats();
+  CHECK(st.from_index == all.size() && st.live == all.size() && st.staged == 0);
+  std::vector<uint8_t> a(all.size() * st.m), b(all.size() * st.m);
+  e->PQGet(all.data(), all.size(), a.data());
+  ref->PQGet(all.data(), all.size(), b.data());
+  CHECK(a == b);
+  CHECK(e->PQFromIndex(segs).installed == 0);
+  auto g = NodeEngine::Open(o);
+  const PQPutResult r1 = g->PQFromIndex({seg(1)});
+  CHECK(r1.installed > 0 && g->pq_stats().staged == r1.installed);
+  CHECK(g->PQReleaseStaged() == r1.installed && g->pq_stats().resident == 0);
+}
+
 void TestPQEvictUnderLoad() {
   Fixture& f = GetFixture();
   auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
@@ -1205,11 +1256,101 @@ void RawStoreManyPages(bool direct) {
   CHECK(same);
 }
 
+// A store's snapshot (an experiment's warmup): SaveBitmap writes the presence bits next to the
+// file, and a store opened with reuse on the file, or on a copy of both, holds the same vectors
+// without writing them again, also with room for more pages. Refused, changing nothing: no bits,
+// another page geometry, bits a smaller store has no room for, a file cut short, damaged bits. A
+// store opened without reuse starts empty and removes the bits.
+void RawStoreSnapshot(bool direct) {
+  RawLayout L;
+  L.vec_bytes = 1000;  // 4 per 4 KB page
+  L.vectors_per_page = 4;
+  L.num_pages = 5;  // 20 locations
+  auto vecs = [](const std::vector<uint32_t>& locs) {
+    std::vector<uint8_t> out;
+    for (uint32_t l : locs)
+      for (size_t i = 0; i < 1000; ++i) out.push_back(static_cast<uint8_t>(l * 7 + i));
+    return out;
+  };
+  auto copy = [](const std::string& from, const std::string& to) {
+    const std::vector<uint8_t> b = ReadFile(from);
+    WriteFile(to, b.data(), b.size());
+  };
+  const std::string dir = TempDir(), path = dir + "/raw.pages", bits = RawStore::BitmapPath(path);
+  const std::vector<uint32_t> held = {0, 3, 4, 5, 13, 19};
+  {
+    RawStore s(path, L, direct);
+    // Bulk installs are buffered writes, fetched vectors whole pages (O_DIRECT): both are saved.
+    CHECK(s.Put(held.data(), 4, vecs({0, 3, 4, 5}).data(), RawOrigin::kIndex) == 4);
+    CHECK(s.Put(held.data() + 4, 2, vecs({13, 19}).data(), RawOrigin::kFetched) == 2);
+    CHECK(s.SaveBitmap() == 6 && FileExists(bits) && !FileExists(bits + ".tmp"));
+  }
+  auto holds = [&](RawStore& s) {
+    bool same = true;
+    for (uint32_t loc = 0; loc < 20; ++loc)
+      same &= s.Present(loc) == (std::find(held.begin(), held.end(), loc) != held.end());
+    std::vector<uint8_t> out(held.size() * 1000);
+    s.Get(held.data(), held.size(), out.data());
+    return same && out == vecs(held);
+  };
+  {
+    RawStore s(path, L, direct, true);
+    const RawStats st = s.Stats();
+    CHECK(holds(s) && st.present == 6 && st.restored == 6 && st.from_index == 0);
+    // It goes on as any store; the saved bits stay as they were until saved again.
+    const std::vector<uint32_t> more = {1, 6};
+    CHECK(s.Put(more.data(), 2, vecs(more).data(), RawOrigin::kStreamed) == 2 && s.Stats().present == 8);
+  }
+  // A copy of both, as an experiment restores a snapshot, opened with room for more pages
+  // (inserted vectors, U14): the vectors saved, not the two installed since.
+  const std::string dir2 = TempDir(), path2 = dir2 + "/raw.pages", bits2 = RawStore::BitmapPath(path2);
+  copy(path, path2);
+  copy(bits, bits2);
+  RawLayout big = L;
+  big.num_pages = 8;
+  {
+    RawStore s(path2, big, direct, true);
+    CHECK(holds(s) && !s.Present(1) && s.Stats().restored == 6 && s.Stats().locations == 32);
+  }
+  RawLayout other = L;  // another geometry
+  other.vec_bytes = 500;
+  other.vectors_per_page = 8;
+  RawLayout small = L;  // no room for location 19
+  small.num_pages = 4;
+  CHECK(Throws([&] { RawStore s(dir2 + "/none.pages", L, direct, true); }));
+  CHECK(Throws([&] { RawStore s(path2, other, direct, true); }));
+  CHECK(Throws([&] { RawStore s(path2, small, direct, true); }));
+  {
+    RawStore s(path2, L, direct, true);  // the refusals changed nothing
+    CHECK(holds(s));
+  }
+  CHECK(::truncate(path2.c_str(), 4 * 4096 + 3500) == 0);  // location 19 ends at 4 * 4096 + 4000
+  CHECK(Throws([&] { RawStore s(path2, L, direct, true); }));
+  copy(path, path2);
+  std::vector<uint8_t> b = ReadFile(bits);
+  b[b.size() - 5] ^= 1;  // a word of bits, under the checksum
+  WriteFile(bits2, b.data(), b.size());
+  CHECK(Throws([&] { RawStore s(path2, L, direct, true); }));
+  // Opened without reuse: empty, and the bits saved for the vectors it dropped are gone.
+  {
+    RawStore s(path, L, direct);
+    CHECK(s.Stats().present == 0 && s.Stats().restored == 0 && !FileExists(bits));
+  }
+  CHECK(Throws([&] { RawStore s(path, L, direct, true); }));
+  {
+    RawStore s("", L, direct);  // nothing to save an anonymous file's vectors with
+    CHECK(Throws([&] { s.SaveBitmap(); }));
+  }
+  CHECK(Throws([&] { RawStore s("", L, direct, true); }));
+}
+
 void TestRawStore() {
   RawStoreCase(false);
   RawStoreCase(true);
   RawStoreManyPages(false);
   RawStoreManyPages(true);
+  RawStoreSnapshot(false);
+  RawStoreSnapshot(true);
 }
 
 // Stages partitions on `to` the way an agent does after a migration: `from` writes each as a
@@ -2047,6 +2188,37 @@ void TestWire() {
   server2.Stop();
   serve2.join();
 
+  // Bootstrap over the wire: PQ_FROM_INDEX stages the codes partition 0's segment names, its
+  // load copies none, and RAW_SAVE saves the presence bits of its vectors next to the raw file
+  // -- of a node that has one: the first node's is anonymous.
+  NodeOptions bo = e->options();
+  bo.raw_file = JoinPath(TempDir(), "raw.pages");
+  auto boot = NodeEngine::Open(bo);
+  rtier::NodeServer server3(boot.get());
+  const int port3 = server3.ListenTcp("127.0.0.1", 0);
+  std::thread serve3([&] { server3.Serve(); });
+  const int fd3 = Connect(port3);
+  rtier::BodyWriter pfi;
+  pfi.Put<uint32_t>(1);
+  pfi.Put<uint32_t>(static_cast<uint32_t>(seg0.size()));
+  pfi.PutBytes(seg0.data(), seg0.size());
+  r = Call(fd3, rtier::kPQFromIndex, pfi, 90);
+  rtier::BodyReader fr(r.body.data(), r.body.size());
+  CHECK(r.status == rtier::kOk && r.body.size() == 8 && fr.Get<uint64_t>() == ids0.size());
+  r = Call(fd3, rtier::kLoadPartition, load0(1, seg0), 91);
+  CHECK(r.status == rtier::kOk && boot->pq_stats().from_index == ids0.size());
+  r = Call(fd3, rtier::kRawSave, empty, 92);
+  rtier::BodyReader sr(r.body.data(), r.body.size());
+  CHECK(r.status == rtier::kOk && r.body.size() == 8 && sr.Get<uint64_t>() == boot->raw_stats(false).present &&
+        FileExists(RawStore::BitmapPath(bo.raw_file)));
+  r = Call(fd, rtier::kRawSave, empty, 93);
+  CHECK(r.status == rtier::kInternal);
+  r = Call(fd3, rtier::kInfo, empty, 94);
+  CHECK(std::string(r.body.begin(), r.body.end()).find("\"restored\":0}") != std::string::npos);
+  ::close(fd3);
+  server3.Stop();
+  serve3.join();
+
   r = Call(fd, static_cast<rtier::Op>(0x7f), empty, 7);
   CHECK(r.status == rtier::kBadRequest);
 
@@ -2163,16 +2335,6 @@ std::vector<std::vector<uint32_t>> NavigateAll(const Fixture& f, NodeEngine& e, 
     out.push_back(lists);
   }
   return out;
-}
-
-template <class F>
-bool Throws(F&& fn) {
-  try {
-    fn();
-  } catch (const std::exception&) {
-    return true;
-  }
-  return false;
 }
 
 // Graph patches (U14 major epochs): the router edits its own graph and exports a patch; an entry
@@ -2642,6 +2804,7 @@ int main() {
       {"pq_store", TestPQStore},
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},
+      {"pq_from_index", TestPQFromIndex},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"read_budget", TestReadBudget},
