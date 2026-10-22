@@ -307,14 +307,14 @@ const (
 //  4. RECLAIM  old owners evict the moved partitions (their PQ codes and raw vectors stay, as
 //     a cache).
 //  5. ENTRY    alongside 3 and 4, new nodes become entries as their graphs load: every
-//     entry_flip_interval, one more flip adds those whose graph loaded since the previous
+//     EntryFlipInterval, one more flip adds those whose graph loaded since the previous
 //     one (promoteEntries). A node whose graph fails to load stays a data node and aggregator.
 //  6. RAW      from the flip on, a new owner's data node fetches the raw vectors a query needs
 //     on demand, each straight from its holder: every posting records the node holding its
 //     vector (the old owner writes the moved segments for that), and with rawOnDemand nothing
 //     else moves -- what no query needs stays where it is, and the rescale does not wait for
 //     any of it. With rawStreamAfterFlip, alongside 3-5, the destinations also stream in the
-//     rest from the holders (raw_priority, background by default), and the rescale waits for it.
+//     rest from the holders (RawPriority, background by default), and the rescale waits for it.
 //  7. DRAIN    alongside 3-5, when nodes leave: every data node of e+1 pulls the raw vectors its
 //     postings say only they hold, and its postings then name it (DrainRaw). That holders stay
 //     rests on one invariant (U9): no node drops a raw vector it has held -- and a node that
@@ -748,7 +748,7 @@ func (c *Controller) stageRaw(ctx context.Context, dests []*ManagedNode, sources
 }
 
 // drainRaw has every data node of t pull the raw vectors its postings say only the removed
-// nodes hold (at raw_priority), and adds up what moved.
+// nodes hold (at RawPriority), and adds up what moved.
 func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, removed []*ManagedNode,
 	book map[placement.NodeID]epoch.NodeInfo) (protocol.StageReply, error) {
 	nodes, err := c.managed(t.Placement.Nodes())
@@ -774,7 +774,7 @@ type graphDone struct {
 }
 
 // promoteEntries makes the n new nodes entries as their graphs load, starting from t, the
-// epoch the data flip installed. At every tick of entry_flip_interval, one flip adds all the
+// epoch the data flip installed. At every tick of EntryFlipInterval, one flip adds all the
 // nodes whose graph loaded since the previous flip; once every pull has ended, the last ones
 // are added at once. So a node does not wait for the slowest pull, and one whose pull failed
 // stays a data node and aggregator without holding up the others. It returns the last table

@@ -9,8 +9,9 @@ load (run_local.py is the single-machine case):
      (Koala's cleanUp before a run)
   2. build the index, the ground truth and the partitions on this machine, the root
      (run_local.py's stages)
-  3. copy what the nodes open to every host, at this machine's paths (Koala's syncRepo):
-     rtier_node and rtier-agent; the index's meta, PQ codebook and PQ codes, and the
+  3. rewrite config.yaml (run_local.py's), then copy it and what the nodes open to every host,
+     at this machine's paths (Koala's syncRepo): rtier_node and rtier-agent; the index's meta,
+     PQ codebook and PQ codes, and the
      partitions' manifest; where a node of the initial deployment runs, also the index's page
      file (not where every such node starts on a warmup snapshot), its graph and the segments,
      which only the initial deployment reads -- the nodes that join later get them from their
@@ -20,8 +21,8 @@ load (run_local.py is the single-machine case):
      no copy of it. Before that, each initial node's warmup snapshot is restored on its host.
   4. start the controller here, then each node in order over SSH -- its rtier_node, then its
      agent -- and wait for the agent's registration before the next: nodes n1, n2, ... get IDs
-     1, 2, ..., and the first cluster.initial_nodes form the deployment (Koala starts its
-     workers in order)
+     1, 2, ..., and the first InitialNodes form the deployment (Koala starts its workers in
+     order)
   5. run the load here and trigger the reconfigurations (run_local.py's)
   6. the results arrive here: metrics.jsonl from the controller and, through the agents, each
      node's stats log (stats-<node>.jsonl) and samples of each node, its agent and its machine
@@ -31,21 +32,22 @@ load (run_local.py is the single-machine case):
   7. stop everything. A remote process runs with its SSH session's input open and is stopped
      when that closes: when this script stops it, and when this script dies however it does.
 
-    python3 scripts/run_cluster.py configs/experiment.X.yaml results/run1
+    python3 scripts/run_cluster.py configs/experiment.X.json results/run1
 
-The configuration is run_local.py's (see its doc) with a hosts section, one host per node:
+The experiment is run_local.py's (see its doc) with Hosts, one host per node:
 
-    hosts:
-      nodes:                            # n1 runs on the first, n2 on the second, ...
-        - 10.0.0.2                      # the SSH destination and the address, the same
-        - {ssh: gpu3, addr: 10.0.0.3}   # an SSH destination (a ~/.ssh/config alias, say) and
-                                        # the address the other machines reach it at
-      root: 10.0.0.1                    # the address the nodes reach this machine at
-                                        # (default: the one it reaches the first host from)
-      user: chenxu                      # SSH login (default: SSH's)
-      ssh_options: [-p, 22222]          # more ssh options
+    "Hosts": {
+      "Nodes": [                            # n1 runs on the first, n2 on the second, ...
+        "10.0.0.2",                         # the SSH destination and the address, the same
+        {"SSH": "gpu3", "Addr": "10.0.0.3"} # an SSH destination (a ~/.ssh/config alias, say) and
+      ],                                    # the address the other machines reach it at
+      "Root": "10.0.0.1",                   # the address the nodes reach this machine at
+                                            # (default: the one it reaches the first host from)
+      "User": "chenxu",                     # SSH login (default: SSH's)
+      "SSHOptions": ["-p", "22222"]         # more ssh options
+    }
 
-cluster.nodes defaults to the number of hosts. A host may run several nodes, each with its own
+Nodes defaults to the number of hosts. A host may run several nodes, each with its own
 directory (WORK_DIR/n1, ...), sharing the machine. This machine may be one of the hosts: as in
 Koala its processes start over SSH too, to itself.
 
@@ -56,14 +58,19 @@ CPUs with every instruction set extension of the one it was built on, and a CUDA
 GPUs its architectures cover: step 1 stops the run rather than let a node die with SIGILL later.
 Build for every host's hardware then (cmake -DFUSION_NATIVE=OFF, -DCMAKE_CUDA_ARCHITECTURES=...).
 
-A warmup run (type: warmup, run_local.py's doc) saves each initial node's snapshot on that
-node's host, at the same path (paths.snapshot_dir): a later run restores it there, and a host
-whose initial nodes all start on one needs no page file.
+Every host also gets this machine's config.yaml, which its agents read (the controller runs
+here). The agents listen on every address and are known by their host's (rtier-agent
+-advertise), and each samples its node, itself and its machine for cgroups.jsonl every
+SampleInterval (1 s unless the experiment says).
 
-cluster.gpus applies on each node's own machine: node i gets the i-th entry (in turns, as in
-run_local.py), named by nvidia-smi index, UUID or PCI bus id there. cluster.resources and
-cluster.emulation emulate several machines on one (run_local.py) and are refused here, except
-cluster.resources.read_iops_per_node, the data node's own read budget.
+A warmup run ("Type": "warmup", run_local.py's doc) saves each initial node's snapshot on that
+node's host, at the same path (SnapshotDir): a later run restores it there, and a host whose
+initial nodes all start on one needs no page file.
+
+GPUs applies on each node's own machine: node i gets the i-th entry (in turns, as in
+run_local.py), named by nvidia-smi index, UUID or PCI bus id there. NodeResources and Emulation
+emulate several machines on one (run_local.py) and are refused here, except
+NodeResources.ReadIOPSPerNode, the data node's own read budget.
 
 Without an SSH server to try it on, PATH=$PWD/scripts/testing/fake_ssh:$PATH runs every remote
 command on this machine, as the remote login shell would.
@@ -71,7 +78,6 @@ command on this machine, as the remote login shell would.
 
 import concurrent.futures
 import glob
-import json
 import os
 import re
 import shlex
@@ -145,16 +151,16 @@ def hosts_of(cfg: dict) -> list:
     h = cfg.get("Hosts") or {}
     entries = h.get("Nodes") or []
     if not isinstance(entries, list) or not entries:
-        sys.exit("hosts.nodes: the host of each node, n1 first (a destination, or {ssh: DEST, addr: ADDRESS})")
+        sys.exit('Hosts.Nodes: the host of each node, n1 first (a destination, or {"SSH": DEST, "Addr": ADDRESS})')
     user, opts = h.get("User"), [str(o) for o in h.get("SSHOptions") or []]
     out, seen = [], {}
     for i, e in enumerate(entries):
         if isinstance(e, str):
             ssh, addr = e, e
-        elif isinstance(e, dict) and e.get("ssh") and set(e) <= {"ssh", "addr"}:
-            ssh, addr = e["ssh"], e.get("addr", e["ssh"])
+        elif isinstance(e, dict) and e.get("SSH") and set(e) <= {"SSH", "Addr"}:
+            ssh, addr = e["SSH"], e.get("Addr", e["SSH"])
         else:
-            sys.exit(f"hosts.nodes[{i}]: {e!r}: want a destination, or {{ssh: DEST, addr: ADDRESS}}")
+            sys.exit(f'Hosts.Nodes[{i}]: {e!r}: want a destination, or {{"SSH": DEST, "Addr": ADDRESS}}')
         key = (ssh, addr)
         if key not in seen:  # the nodes of one host share its Host
             seen[key] = Host(ssh, str(addr), user, opts)
@@ -163,7 +169,7 @@ def hosts_of(cfg: dict) -> list:
 
 
 def root_addr(cfg: dict, hosts: list) -> str:
-    """The address the nodes reach this machine at: hosts.root, or the source address of this
+    """The address the nodes reach this machine at: Hosts.Root, or the source address of this
     machine's route to the first host it reaches other than over loopback (127.0.0.1 when every
     host is this machine)."""
     if (cfg.get("Hosts") or {}).get("Root"):
@@ -174,7 +180,7 @@ def root_addr(cfg: dict, hosts: list) -> str:
                 s.connect((h.addr, 9))  # no packet: a UDP connect only picks the route
                 addr = s.getsockname()[0]
         except OSError as e:
-            sys.exit(f"hosts.root: not given, and no route to {h.addr} to find it ({e}): set it")
+            sys.exit(f"Hosts.Root: not given, and no route to {h.addr} to find it ({e}): set it")
         if not addr.startswith("127."):
             return addr
     return "127.0.0.1"
@@ -182,14 +188,13 @@ def root_addr(cfg: dict, hosts: list) -> str:
 
 def check_cluster_config(cfg: dict) -> None:
     res = cfg.get("NodeResources") or {}
-    names = {flat: k for k, (flat, _) in rl.experiment_config.SCHEMA["cluster"][1]["resources"][1].items()}
-    emulated = sorted(names.get(k, k) for k in res if k != "ReadIOPSPerNode")
+    emulated = sorted(k for k in res if k != "ReadIOPSPerNode")
     if emulated:
-        sys.exit(f"cluster.resources ({', '.join(emulated)}) emulates a machine per node on one (run_local.py); "
-                 "on a cluster each node has its hosts.nodes entry. read_iops_per_node, the data node's own "
+        sys.exit(f"NodeResources ({', '.join(emulated)}) emulates a machine per node on one (run_local.py); "
+                 "on a cluster each node has its Hosts.Nodes entry. ReadIOPSPerNode, the data node's own "
                  "read budget, is the one kept")
     if (cfg.get("Emulation") or {}).get("Netns"):
-        sys.exit("cluster.emulation emulates a network on one machine (run_local.py): not on a cluster")
+        sys.exit("Emulation emulates a network on one machine (run_local.py): not on a cluster")
 
 
 # ------------------------------------------------------------------- 1. hosts
@@ -251,7 +256,7 @@ def preflight(hosts: list, nodes: int, dirs: list, work: str, ebin: str, cfg: di
     """Step 1: every host reachable, its directories made and writable, rsync there, the engine
     runnable on its CPU and GPUs, what an earlier run of this work directory left stopped, and
     this run's node directories empty of an earlier stats log. Returns each host's GPU table
-    (nvidia-smi), for cluster.gpus."""
+    (nvidia-smi), for GPUs."""
     cache = cmake_cache(ebin)
     native = cache.get("FUSION_NATIVE", "").upper() in ("ON", "TRUE", "1")
     mine = set()
@@ -260,11 +265,12 @@ def preflight(hosts: list, nodes: int, dirs: list, work: str, ebin: str, cfg: di
         mine = cpu_features(line)
     gpu = cfg.get("Backend") == "gpu"
     arches = cuda_arches(ebin, cache) if gpu else None
-    # What an earlier run of this work directory left: its nodes' processes (their command lines
-    # name their files there). Bracketed characters keep the pattern from matching the shell
-    # that runs pkill with it.
+    # What an earlier run of this work directory left: its nodes' processes (an agent's command
+    # line names its node's directory there, rtier_node's its raw file). The pattern cannot match
+    # the shell that runs pkill with it: that script names no agent's -work and no raw file
+    # (it does name the stats logs), and its own text has [0-9]+ where a node's number would be.
     w = "".join(f"[{c}]" if c in ".*+?()|{}$" else ("\\" + c if c in "[]^\\" else c) for c in work)
-    stale = f"{w}/agent-n[0-9]+[.]json|{w}/n[0-9]+/raw[.]pages"
+    stale = f"-work {w}/n[0-9]+( |$)|{w}/n[0-9]+/raw[.]pages"
     node_dirs = {}
     for i, h in enumerate(hosts[:nodes], 1):
         node_dirs.setdefault(h, []).append(os.path.join(work, f"n{i}"))
@@ -322,7 +328,7 @@ def preflight(hosts: list, nodes: int, dirs: list, work: str, ebin: str, cfg: di
 
 
 def check_gpus(hosts: list, visible: dict, tables: dict, ebin: str) -> None:
-    """Each node's GPU (or, without cluster.gpus, every GPU of its host) must be one the CUDA build
+    """Each node's GPU (or, without GPUs, every GPU of its host) must be one the CUDA build
     has code for."""
     bad = []
     for i, h in enumerate(hosts, 1):
@@ -372,18 +378,18 @@ def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool,
     return out
 
 
-def sync(hosts: list, initial: int, binaries: list, index: str, parts: str, gens: list, graph: bool,
+def sync(hosts: list, initial: int, files: list, index: str, parts: str, gens: list, graph: bool,
          out_dir: str, restored: list) -> None:
-    """Step 3: the copies, at the same paths, to every host in parallel: the binaries and what its
-    nodes open (node_files; restored: the initial nodes that start on a warmup snapshot, which
-    read no page file). A directory a host already sees at that path -- this machine itself,
-    under any name, or a file system it shares -- is left alone: a marker file put in it here
-    shows there (Koala's syncRepo skips the local machine by its addresses). rsync copies what
-    changed only, so a host keeps the index from one run to the next."""
+    """Step 3: the copies, at the same paths, to every host in parallel: files (the binaries,
+    config.yaml) and what its nodes open (node_files; restored: the initial nodes that start on a
+    warmup snapshot, which read no page file). A directory a host already sees at that path --
+    this machine itself, under any name, or a file system it shares -- is left alone: a marker
+    file put in it here shows there (Koala's syncRepo skips the local machine by its addresses).
+    rsync copies what changed only, so a host keeps the index from one run to the next."""
     bootstrap = set(hosts[:initial])
     pages = {hosts[i - 1] for i in range(1, initial + 1) if i not in restored}
     distinct = list(dict.fromkeys(hosts))
-    plans = {h: [(os.path.dirname(f), [os.path.basename(f)]) for f in binaries] +
+    plans = {h: [(os.path.dirname(f), [os.path.basename(f)]) for f in files] +
              node_files(index, parts, gens, h in bootstrap, graph, h in pages) for h in distinct}
     srcs = list(dict.fromkeys(d for plan in plans.values() for d, _ in plan))
     marker = f".rtier-same-{os.urandom(8).hex()}"
@@ -426,7 +432,7 @@ def sync(hosts: list, initial: int, binaries: list, index: str, parts: str, gens
     if lost:
         sys.exit("the nodes open files this machine does not have: " + ", ".join(lost))
     size = {h: sum(os.path.getsize(f) for files in todo(h) for f in files) for h in far}
-    log("copying the binaries, the index and the partitions: " +
+    log("copying the binaries, config.yaml, the index and the partitions: " +
         ", ".join(f"{size[h] / 2**30:.2f} GiB to {h.dest}" for h in far))
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(far))) as ex:
@@ -479,17 +485,17 @@ class Procs(rl.Procs):
 
 
 def main(cfg_path: str, out_dir: str) -> None:
-    ecfg, cfg, reconfigs = rl.load_config(cfg_path)
+    cfg, reconfigs = rl.load_config(cfg_path)
     check_cluster_config(cfg)
     hosts = hosts_of(cfg)
     nodes = cfg.get("Nodes", len(hosts))
     if nodes > len(hosts):
-        sys.exit(f"cluster.nodes is {nodes}, hosts.nodes names {len(hosts)} hosts: one per node")
+        sys.exit(f"Nodes is {nodes}, Hosts.Nodes names {len(hosts)} hosts: one per node")
     if nodes < len(hosts):
-        log(f"hosts.nodes names {len(hosts)} hosts, cluster.nodes is {nodes}: the first {nodes}")
+        log(f"Hosts.Nodes names {len(hosts)} hosts, Nodes is {nodes}: the first {nodes}")
     initial = cfg.get("InitialNodes", 1)
     if initial > len(hosts):
-        sys.exit(f"cluster.initial_nodes is {initial}, hosts.nodes names {len(hosts)} hosts: one per node")
+        sys.exit(f"InitialNodes is {initial}, Hosts.Nodes names {len(hosts)} hosts: one per node")
     warmup = cfg.get("Type") == "warmup"
     if warmup:  # no spare: no reconfiguration
         nodes = min(nodes, initial)
@@ -503,8 +509,8 @@ def main(cfg_path: str, out_dir: str) -> None:
     gen_dirs = [d for g in gens for d in g]
     for d in gen_dirs:
         if not os.path.isdir(d):
-            sys.exit(f"reconfigurations: rebuild directory {d} does not exist")
-    rl.record(ecfg, cfg, cfg_path, out_dir)
+            sys.exit(f"Reconfigurations: rebuild directory {d} does not exist")
+    rl.record(cfg, out_dir)
 
     # 1. hosts, before the stages: a build can take hours
     log(f"{nodes} nodes on {len(set(hosts))} hosts, the controller and the load here ({root})")
@@ -512,29 +518,29 @@ def main(cfg_path: str, out_dir: str) -> None:
     visible = rl.node_gpus(cfg, nodes, lambda i: tables.get(hosts[i - 1], []))
     check_gpus(hosts, visible, tables, ebin)
 
-    # 2. index, ground truth, partitions; the warmup snapshot on the hosts; 3. copies
-    index, gt, parts = rl.stages(ecfg, cfg)
+    # 2. index, ground truth, partitions; the warmup snapshot on the hosts; 3. config.yaml, copies
+    index, gt, parts = rl.stages(cfg)
     node_args = rl.node_args_of(cfg, index, parts, reconfigs, out_dir)
     graph = any(a == "--graph" and b == "index" for a, b in zip(node_args, node_args[1:]))
     key = rl.snapshot_key(cfg, index, parts)
     snap = rl.snapshot_path(cfg, key)
     host_of = {i: hosts[i - 1] for i in range(1, initial + 1)}
     restored, manifest = ([], None) if warmup else rl.start_on_snapshot(snap, key, host_of, work, local=False)
-    sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")],
-         index, parts, gens, graph, out_dir, restored)
-
     ctl_addr = cfg.get("ControllerAddr", f"{root}:7100")
     api_addr = cfg.get("APIAddr", f"{root}:7101")
+    values = rl.system_values(cfg, ctl_addr, api_addr, index, parts, work, out_dir)
+    # The files the controller makes for the nodes (a rebuild's segments) go out from here, and
+    # every agent samples its node, itself and its machine for cgroups.jsonl here.
+    values.update(ControllerBulkAddr=f"{root}:0", SampleInterval=cfg.get("SampleInterval", "1s"))
+    rl.write_system_config(cfg, values, out_dir)
+    sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node"),
+                          rl.experiment_config.SYSTEM_CONFIG], index, parts, gens, graph, out_dir, restored)
+
     procs = Procs(out_dir)
     results = []
     try:
         # 4. controller here, then the nodes in order
-        ctl = rl.controller_config(cfg, ctl_addr, api_addr, index, parts, work, out_dir)
-        # The files the controller makes for the nodes (a rebuild's segments) go out from here.
-        ctl["bulk_listen"] = f"{root}:0"
-        ctl_cfg = os.path.join(work, "controller.json")
-        json.dump(ctl, open(ctl_cfg, "w"), indent=2)
-        procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg])
+        procs.start("controller", [f"{gbin}/rtier-controller", "-config", rl.experiment_config.SYSTEM_CONFIG])
         api = rl.connect(api_addr, procs)
         addrs = {}
         for i, h in enumerate(hosts, 1):
@@ -545,12 +551,7 @@ def main(cfg_path: str, out_dir: str) -> None:
                                                                 node_args + reuse),
                                 prefix=rl.gpu_env(visible, i), wait_line="READY tcp=", host=h)
             addrs[i] = f"{h.addr}:{ready.split('=')[1]}"
-            agent = rl.agent_config(cfg, name, ctl_addr, "0.0.0.0", addrs[i], node_dir, parts)
-            # The agent samples its node, itself and its machine for cgroups.jsonl here.
-            agent.update(advertise_host=h.addr, sample_interval="1s")
-            agent_cfg = os.path.join(work, f"agent-{name}.json")
-            h.run(f"cat > {shlex.quote(agent_cfg)}", f"{h.dest}: writing {agent_cfg}", input=json.dumps(agent, indent=2))
-            procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg],
+            procs.start(f"agent-{name}", rl.agent_command(gbin, name, "0.0.0.0", addrs[i], node_dir, advertise=h.addr),
                         prefix=rl.gpu_env(visible, i), host=h)
             rl.wait_registered(api, name, procs)
             log(f"{name} on {h.dest} ({h.addr}) registered")
@@ -571,5 +572,5 @@ def main(cfg_path: str, out_dir: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        sys.exit("usage: run_cluster.py EXPERIMENT.yaml OUT_DIR")
+        sys.exit("usage: run_cluster.py EXPERIMENT.json OUT_DIR")
     main(sys.argv[1], sys.argv[2])

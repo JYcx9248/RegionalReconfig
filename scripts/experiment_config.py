@@ -1,34 +1,37 @@
-"""Experiment configuration: YAML files of a base and overrides, read by run_local.py and
-run_cluster.py.
+"""Experiment configurations: one JSON file per experiment (configs/experiment.*.json), read by
+run_local.py and run_cluster.py.
 
-An experiment file names the file it builds on with `base:` (a path relative to it) and gives
-only what differs; the base may have a base of its own. Files merge key by key: a mapping merges
-with the base's, anything else (a number, a string, a list) replaces it, and `null` removes the
-base's value. Every key is checked against SCHEMA, so a misspelled one stops the run.
+As in Koala, the system has one configuration file, config.yaml at the repository root, which every
+process reads at startup; an experiment is a JSON file, and the runner rewrites config.yaml from it
+before the run. An experiment file is complete on its own: what it leaves out takes the runner's
+defaults (and, for config.yaml's keys, the system's). Every key is checked against SCHEMA, so a
+misspelled one stops the run; config.yaml's keys are allowed too, at the top level, and go there --
+all but RUNNER_KEYS, which the runners set from the run itself.
 
-Sections, in the order of the pipeline:
+    {
+      "Comment": "what the experiment is for",
+      "Type": "warmup",                      # optional: a warmup run (run_local.py)
+      "WorkDir", "IndexDir", "SnapshotDir", "EngineBin", "GoBin",
+      "Base", "Queries", "GroundTruth", "GroundTruthStride",
+      "Assignment": FILE | "Partition": {"Generator": "gp", "Partitions": 64, "KaMinPar": PATH, ...},
+      "BuildArgs": ["--pq-m", "64"],         # fusion_build's flags
+      "Nodes", "InitialNodes", "Protocol", "Placement", "StageTimeout", ...,   # config.yaml's keys too
+      "Backend", "GPUs", "NodeArgs", "PQCapacity", ...,
+      "NodeResources": {...}, "Emulation": {...},
+      "Hosts": {"Nodes": [HOST, {"SSH": DEST, "Addr": ADDRESS}, ...], ...},   # run_cluster.py only
+      "Load": {"Rate", "RateSteps", "Users", "DurationSeconds", ...},
+      "Calibrate": {"Rates", "SecondsPerRate"},
+      "Updates": {"Headroom", "ListHeadroom", "MaxListLen"},
+      "Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}, {..., "Plan": P},
+                           {..., "Rebuild": {"Index": DIR, "Partitions": DIR}}]
+    }
 
-    base: base/wiki-c1024.yaml
-    type: warmup                                        # optional: a warmup run (run_local.py)
-    paths:      {work_dir, engine_bin, go_bin, snapshot_dir}
-    dataset:    {vectors, queries, ground_truth, ground_truth_stride}   # fusion_gt makes it if missing
-    build:      {index_dir, pq_m, threads, ...}         # fusion_build's flags, BUILD_FLAGS; extra_args
-    partition:  {generator: file | gp | spatial | range, partitions, file, gp: {...}}
-    cluster:    {nodes, initial_nodes, protocol, placement, strategy, backend, gpus, node_args,
-                 resources: {...}, raw: {...}, emulation: {...}, ...}
-    hosts:      {nodes: [HOST, {ssh, addr}, ...], root, user, ssh_options}   # run_cluster.py only
-    load:      {k, nprobe, n, arrivals, rate, rate_steps, users, user_steps, duration_seconds, ...}
-    calibrate:  {rates, seconds_per_rate}
-    updates:    {headroom, list_headroom, max_list_len}
-    reconfigurations: [{at: 90, data_nodes: 4}, {at: 90, plan: P}, {at: 90, rebuild: {...}}]
+Paths are relative to the repository root, as run_local.py runs from there, except a plan file and
+a rebuild's directories, which are relative to the experiment file (load makes them absolute). A
+results directory keeps the configuration as it ran (experiment.json, the form the analysis scripts
+read) and the config.yaml the processes read.
 
-Paths are relative to the repository root, as run_local.py runs from there, except a plan file
-and a rebuild's directories, which are relative to the experiment file.
-
-flatten() turns a configuration into the flat form run_local.py's steps and the analysis scripts
-read (experiment.json in a results directory: "WorkDir", "Load": {"Rate"}, ...).
-
-    python3 scripts/experiment_config.py CONFIG.yaml     # the merged configuration, then flat
+    python3 scripts/experiment_config.py CONFIG.json     # checked, then printed
 """
 
 import json
@@ -38,71 +41,56 @@ import sys
 try:
     import yaml
 except ImportError:  # pragma: no cover
-    sys.exit("experiment configurations are YAML: install PyYAML (pip install --user pyyaml)")
+    sys.exit("config.yaml is YAML: install PyYAML (pip install --user pyyaml)")
 
-# fusion_build's flags, as build: keys (a flag without a value is a boolean).
-BUILD_FLAGS = {
-    "max_n": "--max-n", "dtype": "--dtype", "centroid_ratio": "--centroid-ratio", "branch": "--branch",
-    "balance": "--balance", "hnsw_m": "--hnsw-m", "hnsw_efc": "--hnsw-efc", "replicas": "--replicas",
-    "closure_eps": "--closure-eps", "rng": "--rng", "rng_factor": "--rng-factor",
-    "assign_candidates": "--assign-candidates", "pq_m": "--pq-m", "pq_train": "--pq-train",
-    "layout": "--layout", "threads": "--threads", "seed": "--seed",
-}
-BOOL_FLAGS = {"rng"}
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SYSTEM_CONFIG = os.path.join(ROOT, "config.yaml")
 
-# YAML key -> (flat key, nested schema or None). A nested schema of a list applies to its items.
+# Key -> None (a value), a nested schema (a mapping; of a list's items for a list), or "opaque".
 SCHEMA = {
-    "base": (None, None),
-    "type": ("Type", None),
-    "paths": (None, {
-        "work_dir": ("WorkDir", None), "engine_bin": ("EngineBin", None), "go_bin": ("GoBin", None),
-        "snapshot_dir": ("SnapshotDir", None)}),
-    "dataset": (None, {
-        "vectors": ("Base", None), "queries": ("Queries", None), "ground_truth": ("GroundTruth", None),
-        "ground_truth_stride": ("GroundTruthStride", None)}),
-    "build": (None, dict({"index_dir": ("IndexDir", None), "extra_args": (None, None)},
-                         **{k: (None, None) for k in BUILD_FLAGS})),
-    "partition": (None, {
-        "generator": (None, None), "file": ("Assignment", None), "partitions": (None, None),
-        "gp": (None, {"points": (None, None), "graph_source": (None, None), "weights": (None, None),
-                      "kaminpar": (None, None), "threads": (None, None)})}),
-    "cluster": (None, {
-        "nodes": ("Nodes", None), "initial_nodes": ("InitialNodes", None), "protocol": ("Protocol", None),
-        "placement": ("Placement", None), "strategy": ("Strategy", None), "raw_priority": ("RawPriority", None),
-        "transfer_rate_bytes_per_sec": ("TransferRateBytesPerSec", None),
-        "metrics_interval": ("MetricsInterval", None), "ready_timeout_seconds": ("ReadyTimeoutSeconds", None),
-        "stage_timeout": ("StageTimeout", None), "node_conns": ("NodeConns", None),
-        "pq_capacity": ("PQCapacity", None), "pq_headroom": ("PQHeadroom", None),
-        "controller_addr": ("ControllerAddr", None), "api_addr": ("APIAddr", None), "backend": ("Backend", None),
-        "gpus": ("GPUs", None), "node_args": ("NodeArgs", None), "query_sample": ("QuerySample", None),
-        "raw": (None, {"streams": ("RawStreams", None), "batch_bytes": ("RawBatchBytes", None),
-                       "path": ("RawPath", None)}),
-        "resources": ("NodeResources", {
-            "cpus_per_node": ("CPUsPerNode", None), "first_cpu": ("FirstCPU", None),
-            "memory_max": ("MemoryMax", None), "io_read_iops_max": ("IOReadIOPSMax", None),
-            "io_read_bandwidth_max": ("IOReadBandwidthMax", None), "read_iops_per_node": ("ReadIOPSPerNode", None)}),
-        "emulation": ("Emulation", {"netns": ("Netns", None), "delay": ("Delay", None), "rate": ("Rate", None)})}),
-    "hosts": ("Hosts", {
-        "nodes": ("Nodes", "opaque"), "root": ("Root", None), "user": ("User", None),
-        "ssh_options": ("SSHOptions", None)}),
-    "load": ("Load", {
-        "k": ("K", None), "nprobe": ("NProbe", None), "n": ("N", None), "arrivals": ("Arrivals", None),
-        "rate": ("Rate", None), "rate_steps": ("RateSteps", None), "users": ("Users", None),
-        "user_steps": ("UserSteps", None), "retry_for_seconds": ("RetryForSeconds", None),
-        "duration_seconds": ("DurationSeconds", None), "warmup_seconds": ("WarmupSeconds", None),
-        "drain_seconds": ("DrainSeconds", None)}),
-    "calibrate": ("Calibrate", {"rates": ("Rates", None), "seconds_per_rate": ("SecondsPerRate", None)}),
-    "updates": ("Updates", {
-        "headroom": ("Headroom", None),
-        "list_headroom": ("ListHeadroom", None), "max_list_len": ("MaxListLen", None)}),
-    "reconfigurations": ("Reconfigurations", {
-        "at": ("TriggerTimeSeconds", None), "data_nodes": ("DataNodes", None), "plan": ("Plan", "opaque"),
-        "rebuild": ("Rebuild", {
-            "index": ("Index", None), "partitions": ("Partitions", None), "spares": ("Spares", None),
-            "placement": ("Placement", None), "seed": ("Seed", None), "warmup": ("Warmup", None),
-            "warmup_concurrency": ("WarmupConcurrency", None), "stop_the_world": ("StopTheWorld", None)})}),
+    "Comment": None, "Type": None,
+    "WorkDir": None, "IndexDir": None, "SnapshotDir": None, "EngineBin": None, "GoBin": None,
+    "Base": None, "Queries": None, "GroundTruth": None, "GroundTruthStride": None,
+    "Assignment": None,
+    "Partition": {"Generator": None, "Partitions": None, "Points": None, "GraphSource": None,
+                  "Weights": None, "KaMinPar": None, "Threads": None},
+    "BuildArgs": None,
+    "Nodes": None, "ReadyTimeoutSeconds": None, "PQCapacity": None, "PQHeadroom": None,
+    "Backend": None, "GPUs": None, "NodeArgs": None,
+    "NodeResources": {"CPUsPerNode": None, "FirstCPU": None, "MemoryMax": None, "IOReadIOPSMax": None,
+                      "IOReadBandwidthMax": None, "ReadIOPSPerNode": None},
+    "Emulation": {"Netns": None, "Delay": None, "Rate": None},
+    "Hosts": {"Nodes": "opaque", "Root": None, "User": None, "SSHOptions": None},
+    "Load": {"K": None, "NProbe": None, "N": None, "Arrivals": None, "Rate": None, "RateSteps": None,
+             "Users": None, "UserSteps": None, "RetryForSeconds": None, "DurationSeconds": None,
+             "WarmupSeconds": None, "DrainSeconds": None},
+    "Calibrate": {"Rates": None, "SecondsPerRate": None},
+    "Updates": {"Headroom": None, "ListHeadroom": None, "MaxListLen": None},
+    "Reconfigurations": {
+        "TriggerTimeSeconds": None, "DataNodes": None, "Plan": "opaque",
+        "Rebuild": {"Index": None, "Partitions": None, "Spares": None, "Placement": None, "Seed": None,
+                    "Warmup": None, "WarmupConcurrency": None, "StopTheWorld": None}},
 }
-SECTIONS = list(SCHEMA)  # the order sections are written in
+
+
+# config.yaml's keys that the runners set from the run, and an experiment does not.
+RUNNER_KEYS = {
+    "PartitionsDir": "the partitions the stages make, WorkDir/partitions",
+    "MetricsPath": "metrics.jsonl in the results directory",
+    "StatsDir": "the results directory",
+    "ControllerWorkDir": "WorkDir/controller",
+    "ControllerBulkAddr": "run_cluster.py's, on this machine",
+    "AllowUpdates": 'on with "Updates"',
+}
+
+
+def system_keys() -> set:
+    """config.yaml's keys: an experiment may set any of them, by name."""
+    try:
+        with open(SYSTEM_CONFIG) as f:
+            return set(yaml.safe_load(f) or {})
+    except OSError as e:
+        sys.exit(f"{SYSTEM_CONFIG}: {e} (bin/rtier-controller -defaults writes one)")
 
 
 def merge(base, over):
@@ -120,42 +108,23 @@ def merge(base, over):
     return out
 
 
-def _relative_to(doc, d):
-    """A plan file and a rebuild's directories are relative to the file that names them."""
-    for rc in doc.get("reconfigurations") or []:
-        if isinstance(rc, dict):
-            if isinstance(rc.get("plan"), str):
-                rc["plan"] = os.path.join(d, rc["plan"])
-            rb = rc.get("rebuild")
-            if isinstance(rb, dict):
-                for k in ("index", "partitions"):
-                    if isinstance(rb.get(k), str):
-                        rb[k] = os.path.join(d, rb[k])
-
-
-def _read(path, seen):
-    path = os.path.abspath(path)
-    if path in seen:
-        raise ValueError("%s: a base cycle (%s)" % (path, " -> ".join(seen + [path])))
-    with open(path) as f:
-        doc = yaml.safe_load(f) or {}
-    if not isinstance(doc, dict):
-        raise ValueError("%s: an experiment configuration is a mapping" % path)
-    _relative_to(doc, os.path.dirname(path))
-    b = doc.pop("base", None)
-    if b is None:
-        return doc
-    return merge(_read(os.path.join(os.path.dirname(path), b), seen + [path]), doc)
-
-
-def check(cfg, schema=SCHEMA, where=""):
-    """Every key must be in the schema."""
+def check(cfg, schema=None, where=""):
+    """Every key must be in the schema (at the top level, or be one of config.yaml's)."""
+    top = schema is None
+    if top:
+        schema = SCHEMA
     if not isinstance(cfg, dict):
         raise ValueError("%s: want a mapping, got %r" % (where or "configuration", cfg))
+    system = system_keys() if top else set()
     for k, v in cfg.items():
+        if top and k in RUNNER_KEYS:
+            raise ValueError("%s: the runner sets it (%s)" % (k, RUNNER_KEYS[k]))
         if k not in schema:
-            raise ValueError("%s%s: unknown key (known: %s)" % (where, k, ", ".join(sorted(schema))))
-        sub = schema[k][1]
+            if k in system:
+                continue
+            known = sorted((set(schema) | system) - set(RUNNER_KEYS))
+            raise ValueError("%s%s: unknown key (known: %s)" % (where, k, ", ".join(known)))
+        sub = schema[k]
         if isinstance(sub, dict) and v is not None:
             if isinstance(v, list):
                 for i, item in enumerate(v):
@@ -164,96 +133,35 @@ def check(cfg, schema=SCHEMA, where=""):
                 check(v, sub, "%s%s." % (where, k))
 
 
+def _absolute(cfg, d):
+    """A plan file and a rebuild's directories are relative to the file that names them."""
+    for rc in cfg.get("Reconfigurations") or []:
+        if isinstance(rc, dict):
+            if isinstance(rc.get("Plan"), str):
+                rc["Plan"] = os.path.join(d, rc["Plan"])
+            rb = rc.get("Rebuild")
+            if isinstance(rb, dict):
+                for k in ("Index", "Partitions"):
+                    if isinstance(rb.get(k), str):
+                        rb[k] = os.path.join(d, rb[k])
+
+
 def load(path):
-    """The configuration path describes: its bases merged under it, checked against SCHEMA."""
-    cfg = _read(path, [])
-    check(cfg)
+    """The experiment at path, checked, its relative plan and rebuild paths made absolute."""
+    with open(path) as f:
+        try:
+            cfg = json.load(f)
+            check(cfg)
+        except ValueError as e:
+            raise ValueError("%s: %s" % (path, e)) from None
+    _absolute(cfg, os.path.dirname(os.path.abspath(path)))
     return cfg
-
-
-def build_args(build):
-    """fusion_build's flags from a build section."""
-    args = []
-    for k, flag in BUILD_FLAGS.items():
-        v = (build or {}).get(k)
-        if v is None:
-            continue
-        if k in BOOL_FLAGS:
-            if v:
-                args.append(flag)
-            continue
-        args += [flag, str(v)]
-    return args + [str(a) for a in (build or {}).get("extra_args", [])]
-
-
-def _flat(cfg, schema, out):
-    for k, v in cfg.items():
-        flat, sub = schema[k]
-        if sub == "opaque":
-            out[flat] = v
-        elif isinstance(sub, dict):
-            if isinstance(v, list):
-                out[flat] = [_flat(item, sub, {}) for item in v]
-            elif flat:
-                out[flat] = _flat(v, sub, {})
-            else:
-                _flat(v, sub, out)
-        elif flat:
-            out[flat] = v
-    return out
-
-
-def flatten(cfg):
-    """The flat form of a configuration that run_local.py's steps and the analysis scripts read."""
-    c = {k: v for k, v in cfg.items() if k not in ("build", "partition")}
-    out = _flat(c, SCHEMA, {})
-    if "NodeArgs" in out:  # command-line arguments: numbers may be written as numbers
-        out["NodeArgs"] = [str(a) for a in out["NodeArgs"]]
-    b = cfg.get("build") or {}
-    if b.get("index_dir") is not None:
-        out["IndexDir"] = b["index_dir"]
-    args = build_args(b)
-    if args:
-        out["BuildArgs"] = args
-    p = cfg.get("partition") or {}
-    if p.get("generator", "file") == "file" and p.get("file") is not None:
-        out["Assignment"] = p["file"]
-    return out
-
-
-def ordered(cfg, schema=SCHEMA):
-    """cfg with its keys in the schema's order, at every level."""
-    if not isinstance(cfg, dict):
-        return cfg
-    out = {}
-    for k in list(schema) + [k for k in cfg if k not in schema]:
-        if k not in cfg:
-            continue
-        v, sub = cfg[k], schema.get(k, (None, None))[1]
-        if isinstance(sub, dict):
-            v = [ordered(x, sub) for x in v] if isinstance(v, list) else ordered(v, sub)
-        out[k] = v
-    return out
-
-
-def dump(cfg):
-    """A configuration as YAML, keys in the schema's order (sections in pipeline order), short
-    lists on one line."""
-    class Dumper(yaml.SafeDumper):
-        pass
-
-    def lists(d, v):
-        flow = all(not isinstance(x, (dict, list)) for x in v)
-        return d.represent_sequence("tag:yaml.org,2002:seq", v, flow_style=flow)
-    Dumper.add_representer(list, lists)
-    return yaml.dump(ordered(cfg), Dumper=Dumper, sort_keys=False, default_flow_style=False, width=100,
-                     allow_unicode=True)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        sys.exit("usage: experiment_config.py CONFIG.yaml")
-    c = load(sys.argv[1])
-    print(dump(c))
-    print("# flat:")
-    print(json.dumps(flatten(c), indent=2))
+        sys.exit("usage: experiment_config.py CONFIG.json")
+    try:
+        print(json.dumps(load(sys.argv[1]), indent=2))
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))

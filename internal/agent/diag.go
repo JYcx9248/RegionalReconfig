@@ -32,7 +32,7 @@ import (
 //     controller's cgroups.jsonl, in the format of scripts/run_local.py's sampler (which samples
 //     the nodes itself when they all run on its machine).
 
-// forwardStats tails node_stats_file and forwards every complete line to the controller.
+// forwardStats tails NodeStatsFile (-node-stats) and forwards every complete line to the controller.
 func (a *Agent) forwardStats(ctx context.Context) {
 	path := a.cfg.NodeStatsFile
 	if path == "" {
@@ -88,7 +88,7 @@ func (a *Agent) forwardStats(ctx context.Context) {
 	}
 }
 
-// sampleLoop samples every sample_interval and forwards the records.
+// sampleLoop samples every SampleInterval and forwards the records.
 func (a *Agent) sampleLoop(ctx context.Context) {
 	iv := a.cfg.SampleInterval.Duration
 	if iv <= 0 {

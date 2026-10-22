@@ -32,8 +32,8 @@
 // resident (U1). The experiment runners size --pq-capacity from it.
 //
 // save-raw talks to a data node, not the controller: it syncs the node's raw vectors and saves
-// their presence bits next to its raw file, for a warmup snapshot (scripts/run_local.py, type:
-// warmup) that later nodes start from (rtier_node --raw-reuse).
+// their presence bits next to its raw file, for a warmup snapshot (scripts/run_local.py, "Type":
+// "warmup") that later nodes start from (rtier_node --raw-reuse).
 package main
 
 import (

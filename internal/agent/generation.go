@@ -106,7 +106,7 @@ func (a *Agent) handleRawBitmap(ctx context.Context, _ json.RawMessage) (any, er
 	return protocol.RawBitmapReply{Locations: bm.Locations, Bits: bits}, nil
 }
 
-// keep adds a client query to the sample of recent ones (query_sample), which a full rebuild's
+// keep adds a client query to the sample of recent ones (QuerySample), which a full rebuild's
 // warm-up replays.
 func (a *Agent) keep(req *query.Request) {
 	n := a.cfg.QuerySample

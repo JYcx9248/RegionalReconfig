@@ -40,10 +40,17 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   get raw vectors from peers (so do the initial nodes of `TestBootstrapFromSnapshot`, which
   start on their saved raw vectors). Every node runs with `--stream-batch 100`, so each staging
   and drain streams in many frames.
-- Experiment configurations are YAML, a base and overrides (`configs/base/*.yaml`,
-  `configs/experiment.*.yaml`); `python3 scripts/experiment_config.py CONFIG.yaml` prints one
-  merged, and every key is checked against its schema. `run_local.py` runs every node on one
-  machine; `run_cluster.py` runs them on the hosts of a `hosts:` section, over SSH.
+- Configuration as in Koala: one system configuration, `config.yaml` at the repository root
+  (the controller's and the agents' keys; `bin/rtier-controller -defaults` prints them all),
+  which every process reads at startup, and one JSON file per experiment
+  (`configs/experiment.*.json`, flat keys, complete on its own). Before each run the runner
+  rewrites `config.yaml` in place -- every key at its default, then the keys the experiment
+  sets by name, then the run's addresses and directories -- and the results keep a copy; an
+  agent's own settings (name, data node, directory) come from its flags. The committed
+  `config.yaml` holds the defaults: leave a run's rewrite out of commits. `python3
+  scripts/experiment_config.py CONFIG.json` checks an experiment: every key against its schema.
+  `run_local.py` runs every node on one machine; `run_cluster.py` runs them on the hosts of
+  `"Hosts"`, over SSH.
   `PATH=$PWD/scripts/testing/fake_ssh:$PATH` tries `run_cluster.py` on one machine without an
   SSH server; with `FAKE_SSH_PRIVATE` (directories) and `FAKE_SSH_ROOT` each host sees its own
   copy of them (a mount namespace, root only), so the copies are made and the nodes run on them.
@@ -65,12 +72,14 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `internal/design` | registry of open design questions (U1–U17) |
 | `engine/` | FusionANNS engine, `NodeEngine`, `rtier_node`, `rtier_segment` (see `engine/README.md`) |
 | `test/e2e` | end-to-end tests |
-| `configs/` | experiment configurations (YAML: bases and experiments) |
-| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the YAML format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `run_one.sh` (one run on a clean node state; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
+| `config.yaml` | the system configuration (defaults committed; the runners rewrite it before each run) |
+| `configs/` | experiments (JSON, one file each) |
+| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `run_one.sh` (one run on a clean node state; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
 
 ## Conventions
 
-- Go uses only the standard library. The module path `rtier` is a placeholder.
+- Go uses the standard library and `gopkg.in/yaml.v3` (config.yaml, as Koala), vendored
+  (`vendor/`) so that a build needs no network. The module path `rtier` is a placeholder.
 - Open design questions live in `internal/design/design.go` (U1–U17; U4 is out of scope).
   Code that reaches an undecided question returns `design.Undecided("Un", "...")` — never
   silently pick an answer. When something gets decided, update that entry (decided part, open
@@ -100,7 +109,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   moves only while neither end moves segments, PQ codes or raw vectors, `graphYield`; sources
   round-robin over entries) → flip (CAS + install) → grace (drain the old epoch) →
   reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
-  Alongside grace and reclaim, `promoteEntries` flips every `entry_flip_interval` to make
+  Alongside grace and reclaim, `promoteEntries` flips every `EntryFlipInterval` to make
   entries of the new nodes whose graph has loaded; the rescale waits for it. Raw vectors do
   not move with a scale-out: `lazy` fetches one only when a query needs it (below). Baselines:
   `lazy-stream` also streams the rest in after the flip (`StageRaw`; the rescale waits for it),
@@ -108,7 +117,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   (`rtier-client rescale -plan`) carries out any target placement. The token bucket paces only
   what goes through the agents -- segments and PQ codes (data class) and the graph (background);
   raw vectors move data node to data node (`RAW_GET`, `RAW_PULL`), unpaced, unless
-  `raw_path: agent` (then at `raw_priority`, U8).
+  `RawPath: agent` (then at `RawPriority`, U8).
 - **Listings stream** (`PQ_MISSING`, `RAW_MISSING`, `RAW_HELD_BY`; `engine/node/stream.h`): the
   node lists what it lacks, each entry once, in frames of about 1M entries, each sent when full,
   when its first entry has waited 100 ms, or as the last; the agent pulls what a frame names as
@@ -117,7 +126,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   moved away (`engine/include/fusion/pq_store.h`); placement `even-reversible-graph` (the
   default) returns partitions to former owners so a scale-in moves no PQ code. The runners give
   every node a budget (`--pq-capacity`) of the fullest node's codes at the smallest cluster size,
-  plus 10% (`cluster.pq_capacity: auto`, `rtier-client pq-share`; a run with a rebuild gets the
+  plus 10% (`"PQCapacity": "auto"`, `rtier-client pq-share`; a run with a rebuild gets the
   whole ID space).
 - **Raw vectors**: every posting carries its vector's canonical location in the index's page
   file and the node that holds it (segment v3); a node keeps a sparse local copy of that file
@@ -137,9 +146,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   node takes over the vectors only a leaving node holds, `RAW_HELD_BY` then `RAW_PULL`), so they
   can go offline. No node drops a raw vector it has held. Only bootstrap reads the index's page
   file, and not on a warmup snapshot (below).
-- **Warmup snapshots** (`type: warmup`, `run_local.py`): a run that only deploys the initial
-  nodes and saves each one's raw vectors -- its raw file and presence bits (`RAW_SAVE`,
-  `rtier-client save-raw`) -- under `paths.snapshot_dir`, on the node's machine. A later run of
+- **Warmup snapshots** (`"Type": "warmup"`, `run_local.py`): a run that only deploys the
+  initial nodes and saves each one's raw vectors -- its raw file and presence bits (`RAW_SAVE`,
+  `rtier-client save-raw`) -- under `"SnapshotDir"`, on the node's machine. A later run of
   the same index, partitions, placement and initial node count restores them (`cp
   --reflink=auto --sparse=always`) and starts those nodes with `rtier_node --raw-reuse`: their
   bootstrap copies no raw vector, `run_cluster.py` copies no page file to their hosts, and the
@@ -153,14 +162,14 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   grace, reclaim (deleted vectors' codes are freed, never cached). A major epoch splits and
   merges posting lists and ships the graph change as a patch every entry stages, searches
   through after the flip and merges after the grace period. Only with the controller's
-  `allow_updates` (`updates:` in an experiment configuration).
+  `AllowUpdates` (`"Updates"` in an experiment).
 - **Full rebuild (U14, `rebuild.go`)**: moves the cluster to the next index generation, built
   outside with the same codebook, vector IDs and raw-vector locations. Spares take every
   partition by a lazy reconfiguration; the old nodes lose their roles and switch generations
   (`SWITCH_GENERATION`, keeping PQ codes and raw vectors); the new partitions go where their raw
   vectors are (presence bitmaps, `placement.Affinity`); the old nodes load them, replay recent
   queries to warm up, and take over in one flip; the spares are released. Manual trigger only
-  (`rtier-client rebuild`, `reconfigurations: [{rebuild: ...}]`); baselines: random placement,
+  (`rtier-client rebuild`, `"Reconfigurations": [{"Rebuild": ...}]`); baselines: random placement,
   no warm-up, stop-the-world.
 - **Clients' entry lists (U17)**: a client (`rtier-loadgen`) reads the entries from the
   controller every 500 ms, and at once when an entry refuses a query under a newer epoch than
@@ -170,39 +179,41 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   long the graph waited for data), `stats-<node>.jsonl` (per-node counters, `rtier_node
   --stats-file`; `raw_bytes` sent and received) and `cgroups.jsonl` (CPU, disk, dirty pages,
   pressure; a host record with the whole disk's I/O and how busy each node's CPUs were). The
-  agents forward the stats logs (`node_stats_file`) and, on a cluster, their samples
-  (`sample_interval`; `run_local.py` samples itself with `cluster.resources`), and the
+  agents forward the stats logs (`rtier-agent -node-stats`) and, on a cluster, their samples
+  (`SampleInterval`; `run_local.py` samples itself with `"NodeResources"`), and the
   controller stamps every record and metrics report on arrival (`"t"`, on its monotonic clock;
   the node's own as `"node_t"`): one clock with `clock.json` and the load generator, without
   synchronizing the machines' clocks (Koala's metric collector).
-- **Without root** (shared servers): `cluster.resources` pins CPUs with `taskset` and limits
+- **Without root** (shared servers): `"NodeResources"` pins CPUs with `taskset` and limits
   memory in user scopes (`systemd-run --user`); per-node read IOPS come from the data node's own
-  read budget (`read_iops_per_node` → `rtier_node --read-iops`, `fusion/read_budget.h`), since
+  read budget (`"ReadIOPSPerNode"` → `rtier_node --read-iops`, `fusion/read_budget.h`), since
   the cgroup io controller is not delegated; `run_one.sh` evicts only the run's own files
   (`scripts/evict_cache.py`).
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
   controller and the load generator; it checks every host, copies with rsync, to the same
-  paths, the binaries and what the host's nodes open (the index's meta, codebook and PQ codes and
-  the partitions' manifest; where an initial node runs, also the page file (unless the host's
-  initial nodes start on a warmup snapshot), the graph and the segments; a next generation's
-  meta, codebook, PQ codes, graph and manifest), and starts the
-  nodes in order over SSH, each after the previous one registered. A remote process stops when
-  its SSH session closes. `cluster.resources` (except `read_iops_per_node`) and
-  `cluster.emulation` are for one machine and are refused.
+  paths, the binaries, `config.yaml` and what the host's nodes open (the index's meta, codebook
+  and PQ codes and the partitions' manifest; where an initial node runs, also the page file
+  (unless the host's initial nodes start on a warmup snapshot), the graph and the segments; a
+  next generation's meta, codebook, PQ codes, graph and manifest), and starts the nodes in order
+  over SSH, each after the previous one registered. A remote process stops when its SSH session
+  closes. `"NodeResources"` (except `"ReadIOPSPerNode"`) and `"Emulation"` are for one machine
+  and are refused.
 
 ## Docs
 
 - `README.md`: overview, the decided part of each open question, how to run.
 - `docs/design.md`: the design doc (Chinese), exported from claude.ai at rev 123 and brought up
-  to date here since (last on 2026-10-20); not synced with the claude.ai copy.
-- `docs/handoff.md`: a snapshot of 2026-09-27, context from the conversations that built rtier
-  -- GitHub issue drafts and diagrams; its section 5 is the case analysis of queries during a
-  reconfiguration.
+  to date here since (last on 2026-10-22); not synced with the claude.ai copy.
+- `docs/handoff.md`: what lives only in the conversations, for a new chat to continue from
+  (snapshot of 2026-10-22): how the user works, the decisions and their reasons, the state of the
+  experiments, what is next; the GitHub issue diagrams; its section 5 is the case analysis of
+  queries during a reconfiguration. Like everything under `docs/`, it is not in git: carry it
+  over from the working tree.
 - `docs/drafts/`: discussion notes and issue drafts (dataset updates, the SSD read model,
   correctness evidence, placement). `docs/server-runbook.md`: runs on the lab server.
 - `engine/README.md`: engine additions and known limits.
 
-## Current state and next steps (2026-10-21)
+## Current state and next steps (2026-10-22)
 
 Done since late September:
 - Raw vectors: a holder per posting instead of a source per list, one-hop fetches, a scale-in
@@ -211,16 +222,18 @@ Done since late September:
   (splits and merges, graph patches), and the full rebuild to a next index generation.
 - Partitioning (U2): GP on the list heads over the navigation graph, balancing list counts.
   The initial placement stays contiguous ranges (U3).
-- YAML experiment configurations; cluster deployment (`run_cluster.py`); clients catch up
-  with a stale entry list at once (U17).
-- Reference runs: `results/bigann10m-spatial-scaleout-v2` (BIGANN-10M, laptop); Wikipedia
-  c1024 runs on the lab server (`docs/design.md`, "实验结果").
+- Configuration as in Koala (2026-10-22: one `config.yaml`, rewritten by the runners from an
+  experiment's JSON; the YAML experiment files of 10-19 are gone); cluster deployment
+  (`run_cluster.py`); clients catch up with a stale entry list at once (U17).
+- Reference runs: Wikipedia c1024 on the lab server (`results/wiki-gpu`, `docs/design.md`,
+  "实验结果"); BIGANN-20M open loop on the laptop (`results/bigann20m-spatial-openloop-v2`). The
+  BIGANN-10M runs' directories are gone; their numbers are in `docs/handoff.md`, section 8.
 - Fixes from a review of the whole implementation (2026-10-21): the data node's accept loop,
   connection threads and read-budget charges; pre-connect in parallel; every long step under
-  `stage_timeout`; a run cut short keeps its latency.csv and reconfigurations.json; plot_run
+  `StageTimeout`; a run cut short keeps its latency.csv and reconfigurations.json; plot_run
   counts answers when they came; ground truth for a stride of the queries; the graph's strict
   yield to data (U16, for now); RERANK's own connection slots; each node's PQ budget sized from
-  the partitions (`cluster.pq_capacity: auto`); the listings streamed; warmup snapshots of the
+  the partitions (`"PQCapacity": "auto"`); the listings streamed; warmup snapshots of the
   initial nodes' raw vectors, and their PQ codes read in one pass (2026-10-22).
 
 Next:

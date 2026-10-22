@@ -1,0 +1,38 @@
+{
+  "Comment": "The warmup of every wiki-c1024 run that starts on 1 node: deploys them and saves the snapshot of their raw vectors those runs then start on (scripts/run_local.py, type: warmup).",
+  "Type": "warmup",
+  "WorkDir": "/netsys/chenxu/work/wiki-c1024",
+  "IndexDir": "/netsys/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/netsys/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/netsys/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/netsys/chenxu/data/wiki-c1024-gt.ibin",
+  "Assignment": "/netsys/chenxu/data/wiki-c1024-assign.bin",
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-blocks",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "MemoryMax": "24G"
+  },
+  "InitialNodes": 1,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson"
+  }
+}

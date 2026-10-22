@@ -25,8 +25,8 @@ import (
 // its transfer moves data, raw vectors included (the agent's graphYield, U16). Raw vectors are
 // not needed for the first step either: RERANK fetches the ones it lacks from their holders on
 // demand (U9), data node to data node and outside this bucket. Only a raw-vector pull that runs
-// through the agents (raw_path "agent") takes a class here: a baseline's stream after the flip
-// and a scale-in's drain at "raw_priority", background by default, and an eager baseline's copy
+// through the agents (RawPath "agent") takes a class here: a baseline's stream after the flip
+// and a scale-in's drain at RawPriority, background by default, and an eager baseline's copy
 // before the flip as data.
 type Class int
 

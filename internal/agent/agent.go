@@ -117,8 +117,8 @@ type stagingRun struct {
 // New validates the configuration and prepares an agent; Run starts it.
 func New(cfg config.Agent, opts Options) (*Agent, error) {
 	for name, v := range map[string]string{
-		"controller": cfg.Controller, "node_addr": cfg.NodeAddr,
-		"partitions_dir": cfg.PartitionsDir, "work_dir": cfg.WorkDir,
+		"ControllerAddr": cfg.Controller, "-node": cfg.NodeAddr,
+		"PartitionsDir": cfg.PartitionsDir, "-work": cfg.WorkDir,
 	} {
 		if v == "" {
 			return nil, fmt.Errorf("agent: %s is required", name)
@@ -128,7 +128,7 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 	// as long as it streams, and the pulls it feeds need another for their PQ_PUT or RAW_PULL:
 	// with a single slot the two would wait for each other until a timeout.
 	if cfg.NodeConns < 2 {
-		return nil, fmt.Errorf("agent: node_conns is %d: at least 2", cfg.NodeConns)
+		return nil, fmt.Errorf("agent: NodeConns is %d: at least 2", cfg.NodeConns)
 	}
 	m, err := partitioning.LoadManifest(cfg.PartitionsDir)
 	if err != nil {
@@ -159,7 +159,7 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 	switch cfg.RawPath {
 	case "", "node", "agent":
 	default:
-		return nil, fmt.Errorf("agent: raw_path %q: want \"node\" or \"agent\"", cfg.RawPath)
+		return nil, fmt.Errorf("agent: RawPath %q: want \"node\" or \"agent\"", cfg.RawPath)
 	}
 	a := &Agent{
 		cfg:           cfg,

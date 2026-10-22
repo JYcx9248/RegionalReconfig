@@ -262,22 +262,22 @@ func (a *Agent) fetchSegments(ctx context.Context, src protocol.Source) (int64, 
 const maxPQRounds = 3
 
 // A raw-vector stream (StageRaw: copy-then-flip's copy, lazy-stream's stream; DrainRaw's pulls
-// too) splits each source's sorted locations into raw_streams contiguous ranges pulled
-// concurrently, each with one request of about raw_batch_bytes in flight. On the lab server (4 KB vectors, 2 sources,
+// too) splits each source's sorted locations into RawStreams contiguous ranges pulled
+// concurrently, each with one request of about RawBatchBytes in flight. On the lab server (4 KB vectors, 2 sources,
 // light load) the agent path moved 148 MB/s with one 64 KB request per source -- the stream as it
 // was, ~3.3 ms a request whatever reads the sources had to spare -- 162 with one 1 MiB request,
 // 272 with two and 406 with four. On BIGANN's 128-byte vectors locally more than one did not
 // help: there the installs here bound the stream (RawStore::Put holds one lock, and buffered
-// writes to one file take its inode lock). raw_streams stays 2 by default (config.DefaultAgent;
+// writes to one file take its inode lock). RawStreams stays 2 by default (config.DefaultAgent;
 // decided 2026-10-20), and so does the fallback below for a setting of 0.
 //
-// By default the stream runs data node to data node (raw_path "node"): this node's data node
+// By default the stream runs data node to data node (RawPath "node"): this node's data node
 // pulls each batch from the holders its postings record, with RAW_GET as RERANK fetches. Through the
-// agents (raw_path "agent", PULL_RAW) every byte also crossed both agents, which cost a source
+// agents (RawPath "agent", PULL_RAW) every byte also crossed both agents, which cost a source
 // more CPU than the read itself (+0.34-0.46 CPU in its agent against +0.22-0.25 in its data node
 // at ~80 MB/s): a handicap of the baselines that the protocol does not need. Only the agent path
-// is paced by the token bucket, so a paced agent (transfer_rate_bytes_per_sec) keeps its streams
-// there unless raw_path says otherwise.
+// is paced by the token bucket, so a paced agent (TransferRateBytesPerSec) keeps its streams
+// there unless RawPath says otherwise.
 const (
 	defaultRawStreams    = 2
 	defaultRawBatchBytes = 1 << 20
@@ -615,7 +615,7 @@ func (a *Agent) handleDrainRaw(ctx context.Context, body json.RawMessage) (any, 
 }
 
 // rawPuller brings raw vectors into the data node as their listing streams in (RAW_MISSING,
-// RAW_HELD_BY), in requests of about raw_batch_bytes, raw_streams at once per holder: data node to
+// RAW_HELD_BY), in requests of about RawBatchBytes, RawStreams at once per holder: data node to
 // data node (RAW_PULL: the data node asks the holders its postings record), or through the agents
 // (PULL_RAW from the holder's bulk port, at class on its bucket). The listing names every vector
 // once, so none comes twice -- but for one a query fetches while its request is in flight, which

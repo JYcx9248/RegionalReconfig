@@ -3,7 +3,7 @@
 # would, so that scripts/run_cluster.py (and the rsync it runs over ssh) can be tried without an
 # SSH server:
 #
-#   PATH=$PWD/scripts/testing/fake_ssh:$PATH python3 scripts/run_cluster.py CONFIG.yaml OUT
+#   PATH=$PWD/scripts/testing/fake_ssh:$PATH python3 scripts/run_cluster.py CONFIG.json OUT
 #
 # ssh's options are skipped, the first other argument is the destination, and the rest, joined
 # with spaces as ssh joins them, is the command. Its input is this process's: closing it ends a

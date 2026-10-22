@@ -5,77 +5,84 @@ Adapted from Koala's scripts/runExperiment.py (config -> deploy -> load -> timed
 reconfigurations -> collect results -> clean up), without Kafka and SSH:
 
   1. build the index (fusion_build) and ground truth (fusion_gt) unless they are there
-  2. assign the posting lists to partitions (partition: a file, or a generator) and write the
-     partitions (rtier_segment)
-  3. start the controller, then one rtier_node + rtier-agent per node, each once the previous
-     one registered (n1, n2, ... get IDs 1, 2, ...); initial nodes with a warmup snapshot start
-     on it (below)
+  2. assign the posting lists to partitions (Assignment, a file, or Partition, a generator) and
+     write the partitions (rtier_segment)
+  3. rewrite config.yaml (below), start the controller, then one rtier_node + rtier-agent per
+     node, each once the previous one registered (n1, n2, ... get IDs 1, 2, ...); initial nodes
+     with a warmup snapshot start on it (below)
   4. wait for the initial deployment, start the open-loop load generator
   5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale, Rebuild)
   6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg,
      reconfigurations.json; each node's stats log (stats-<node>.jsonl) and, with
-     cluster.resources, cgroups.jsonl, both on the monotonic clock of clock.json; the
-     configuration as it ran, merged with its bases (experiment.yaml) and flat (experiment.json,
-     which the analysis scripts read), the code it ran (revision.txt, revision.diff) and the PQ
-     budget it found (pq-budget.json); a warmup run writes snapshot.json, what it saved
+     NodeResources, cgroups.jsonl, both on the monotonic clock of clock.json; the experiment as
+     it ran (experiment.json, which the analysis scripts read) and the config.yaml the processes
+     read, the code it ran (revision.txt, revision.diff) and the PQ budget it found
+     (pq-budget.json); a warmup run writes snapshot.json, what it saved
   7. stop everything
 
-    python3 scripts/run_local.py configs/experiment.example.yaml results/run1
+    python3 scripts/run_local.py configs/experiment.example.json results/run1
 
-scripts/run_cluster.py runs the same configuration with the nodes on other machines (a hosts
-section; see its doc).
+scripts/run_cluster.py runs the same experiment with the nodes on other machines (Hosts; see its
+doc).
 
-The configuration is YAML: a base and overrides (scripts/experiment_config.py has the format and
-every key; `python3 scripts/experiment_config.py CONFIG.yaml` prints one merged). The stages
-record what they were made with: an index (build.index_dir, default WORK_DIR/index) built with
-other build flags stops the run instead of being rebuilt (that can take hours), the partitions
-are made again when the index or the assignment changes, and a ground truth made of other
-vectors, queries or stride stops the run too.
+An experiment is a JSON file of flat keys, complete on its own (scripts/experiment_config.py has
+the format and every key; `python3 scripts/experiment_config.py CONFIG.json` checks one). As in
+Koala, every process reads one system configuration, config.yaml at the repository root: before
+a run this script rewrites it -- every key at its default (bin/rtier-controller -defaults), then
+the run's own values (the addresses, the index and partitions, where metrics and diagnostics
+go), then each of its keys the experiment sets by name ("Protocol", "StageTimeout",
+"NodeConns", ...) -- and an agent's own settings (its name, data node, addresses, directory)
+come on its command line. A checkout runs one experiment at a time, then.
 
-type: warmup makes a warmup run: the initial deployment (no spare node), then each initial node
-saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw),
+The stages record what they were made with: an index (IndexDir, default WorkDir/index) built
+with other build flags (BuildArgs) stops the run instead of being rebuilt (that can take hours),
+the partitions are made again when the index or the assignment changes, and a ground truth made
+of other vectors, queries or stride stops the run too.
+
+"Type": "warmup" makes a warmup run: the initial deployment (no spare node), then each initial
+node saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw),
 everything stops, and each node's raw file and bits are copied into a snapshot -- under
-paths.snapshot_dir (default WORK_DIR/snapshots), named by the number of initial nodes and a
-digest of what the vectors are made of (the index's page file, the partitions, the placement) --
-with its manifest, snapshot.json, written last; no load, no reconfiguration. A later run of the
-same index, partitions, placement and number of initial nodes copies the snapshot into each
-initial node's directory (cp --reflink=auto --sparse=always: at once on XFS or btrfs, a copy of
-the node's share elsewhere) and starts its rtier_node with --raw-reuse, so that its bootstrap
-copies no raw vector from the index; once deployed, it checks that every such node got the
-partitions its snapshot was made for. A run without one bootstraps from the index and says why.
-The PQ codes come from the index either way: all of a node's in one pass over pq_codes.bin.
+SnapshotDir (default WorkDir/snapshots), named by the number of initial nodes and a digest of
+what the vectors are made of (the index's page file, the partitions, the placement) -- with its
+manifest, snapshot.json, written last; no load, no reconfiguration. A later run of the same
+index, partitions, placement and number of initial nodes copies the snapshot into each initial
+node's directory (cp --reflink=auto --sparse=always: at once on XFS or btrfs, a copy of the
+node's share elsewhere) and starts its rtier_node with --raw-reuse, so that its bootstrap copies
+no raw vector from the index; once deployed, it checks that every such node got the partitions
+its snapshot was made for. A run without one bootstraps from the index and says why. The PQ
+codes come from the index either way: all of a node's in one pass over pq_codes.bin.
 
-partition: {generator: gp, partitions: 64, gp: {kaminpar: PATH}} makes the assignment: GP on the
-list heads over the navigation graph, with unit weights, so that the initial split balances the
-number of lists per node (the decided part of U2; the gp_kaminpar binary is built from
-scripts/testing/gp). generator: spatial or range are placeholders; generator: file takes the
-assignment in partition.file (a file of u64 n, u32 partition[n]).
+"Partition": {"Generator": "gp", "Partitions": 64, "KaMinPar": PATH} makes the assignment: GP on
+the list heads over the navigation graph, with unit weights, so that the initial split balances
+the number of lists per node (the decided part of U2; the gp_kaminpar binary is built from
+scripts/testing/gp). The generators "spatial" and "range" are placeholders; without Partition,
+"Assignment" names the assignment file (u64 n, u32 partition[n]).
 
-dataset: {ground_truth_stride: 10} gives every 10th query its ground truth, and only those
-(fusion_gt --stride; the ground truth's row r is query 10r, the load generator's -gt-stride): a
-query file longer than the run, which repeats no query, has recall measured all through the run
-for a tenth of the brute-force cost. The recall averages the queries that have it.
+"GroundTruthStride": 10 gives every 10th query its ground truth, and only those (fusion_gt
+--stride; the ground truth's row r is query 10r, the load generator's -gt-stride): a query file
+longer than the run, which repeats no query, has recall measured all through the run for a tenth
+of the brute-force cost. The recall averages the queries that have it.
 
 Two things a capacity-driven scale-out run needs:
 
-  calibrate: {rates: [50, 100, 200, 400], seconds_per_rate: 15} runs the load generator once per
-      rate and reports where the cluster stops keeping up. That number sets the rate of the
-      real run -- adding a node shows nothing under a load one node already serves. A
-      configuration with calibrate measures capacity and stops: no reconfiguration in that run.
-  load: {rate: 200, rate_steps: "30:600"} raises the offered load during the run (here to
+  "Calibrate": {"Rates": [50, 100, 200, 400], "SecondsPerRate": 15} runs the load generator once
+      per rate and reports where the cluster stops keeping up. That number sets the rate of the
+      real run -- adding a node shows nothing under a load one node already serves. An
+      experiment with Calibrate measures capacity and stops: no reconfiguration in that run.
+  "Load": {"Rate": 200, "RateSteps": "30:600"} raises the offered load during the run (here to
       600 q/s at 30 s), which is the situation a scale-out answers.
 
-load: {users: 8, user_steps: "30:24,70:8"} replaces the arrival rate with closed-loop users: 8
-concurrent users, 24 from 30 s, 8 again from 70 s, each sending its next query when the last
+"Load": {"Users": 8, "UserSteps": "30:24,70:8"} replaces the arrival rate with closed-loop users:
+8 concurrent users, 24 from 30 s, 8 again from 70 s, each sending its next query when the last
 one returned.
 
-load: {warmup_seconds: 15} marks the first 15 s of load as warm-up: scripts/compare_runs.py
-leaves those queries out of its figures and numbers.
+Load.WarmupSeconds: 15 marks the first 15 s of load as warm-up: scripts/compare_runs.py leaves
+those queries out of its figures and numbers.
 
-load: {drain_seconds: 300} (the default) is how long a run waits after the load ended for the
-answers still due: an open-loop run that ends with a backlog drains it without new arrivals.
+Load.DrainSeconds (300 by default) is how long a run waits after the load ended for the answers
+still due: an open-loop run that ends with a backlog drains it without new arrivals.
 
-load: {retry_for_seconds: 30} makes the clients wait for their answers: a query refused as
+Load.RetryForSeconds: 30 makes the clients wait for their answers: a query refused as
 unavailable (admission paused by stop-and-copy) is retried for up to 30 s after its scheduled
 time, and the wait counts in its latency. Without it a refused query is retried three times and
 then fails, so it is missing from the mean latency; comparing protocols by their mean latency
@@ -83,77 +90,77 @@ needs it (scripts/compare_runs.py). A query refused by an entry that left (a sca
 rebuild) is retried on the entries of the newer epoch at once, with or without it: the
 refusal carries that epoch, and the client reads its list again (U17).
 
-cluster: {stage_timeout: 2h} bounds each long step of a reconfiguration -- staging, the graph,
-a raw stream or drain, a grace period, a reclaim -- in the controller and in every agent (30m
-by default). A step grows with the dataset and the transfer rate: a billion vectors put a
-32-71 GB graph on every new entry. cluster.ready_timeout_seconds (600) bounds the initial
-deployment, which copies every partition's vectors from the index (unless they start on a
-warmup snapshot).
+"StageTimeout": "2h" (config.yaml's) bounds each long step of a reconfiguration -- staging, the
+graph, a raw stream or drain, a grace period, a reclaim -- in the controller and in every agent
+(30m by default). A step grows with the dataset and the transfer rate: a billion vectors put a
+32-71 GB graph on every new entry. ReadyTimeoutSeconds (600) bounds the initial deployment,
+which copies every partition's vectors from the index (unless they start on a warmup snapshot).
 
-cluster: {node_conns: 8} (the agent's default) is how many requests of each kind an aggregator
-keeps in flight to one data node, each on its own connection: RERANKs, and FILTERs (with the
-rest) -- a RERANK waits at the holders for the raw vectors it lacks, and the FILTERs of other
-queries must not wait behind it. Set it for the hardware, the data nodes' engine workers and
-the aggregators' number.
+"NodeConns": 8 (config.yaml's default) is how many requests of each kind an aggregator keeps in
+flight to one data node, each on its own connection: RERANKs, and FILTERs (with the rest) -- a
+RERANK waits at the holders for the raw vectors it lacks, and the FILTERs of other queries must
+not wait behind it. Set it for the hardware, the data nodes' engine workers and the aggregators'
+number.
 
-cluster: {backend: gpu} runs the data nodes on the GPU filter backend (a CUDA build of the
-engine); cluster.gpus: [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi
-index, UUID ("GPU-...") or PCI bus id ("06:00.0"), and nodes take turns when there are fewer
-GPUs than nodes; the log records each node's card (model, bus id, UUID). Indices can change with
-the hardware (they did on the lab server), a bus id stays with a slot, and only a UUID stays with
-a card. Without cluster.gpus every node uses the first GPU.
+"Backend": "gpu" runs the data nodes on the GPU filter backend (a CUDA build of the engine);
+"GPUs": [0, 1, 4, 5] gives node i the i-th of those GPUs, named by nvidia-smi index, UUID
+("GPU-...") or PCI bus id ("06:00.0"), and nodes take turns when there are fewer GPUs than nodes;
+the log records each node's card (model, bus id, UUID). Indices can change with the hardware
+(they did on the lab server), a bus id stays with a slot, and only a UUID stays with a card.
+Without GPUs every node uses the first GPU.
 
-cluster.raw: {streams: 2, batch_bytes: 1048576} (the agent's defaults) set how a raw-vector
+"RawStreams": 2 and "RawBatchBytes": 1048576 (config.yaml's defaults) set how a raw-vector
 stream (copy-then-flip's copy, lazy-stream's stream, a scale-in's drain) pulls from each source:
-over that many connections at once, that many bytes of vectors per request. cluster.raw.path: node (the default
-without cluster.transfer_rate_bytes_per_sec) runs it data node to data node, as lazy fetches;
-agent through both agents, the only path the transfer rate paces. path: agent with streams: 1
-and batch_bytes: 65536 is the stream as it was before 2026-10-09: one 64 KB request in flight
+over that many connections at once, that many bytes of vectors per request. "RawPath": "node"
+(the default without TransferRateBytesPerSec) runs it data node to data node, as lazy fetches;
+"agent" through both agents, the only path the transfer rate paces. "agent" with RawStreams 1
+and RawBatchBytes 65536 is the stream as it was before 2026-10-09: one 64 KB request in flight
 per source, ~80 MB/s per source on the lab server (internal/agent/control.go).
 
-reconfigurations: [{at: 90, data_nodes: 4}] rescales to 4 data nodes at 90 s, placed by the
-controller's cluster.placement policy. {at: 90, plan: P} goes to the placement plan P names
-instead -- a scale-out, a scale-in or a rebalance at the same size: {owners: {n1: [0, 1, 2], n3:
-[3, 4], ...}} gives each data node of the next epoch its partitions, nodes by name (n1, n2, ...
-as this script starts them) or ID; from_epoch is optional (protocol.Plan). P is the plan itself
-or the path of a JSON file with one, relative to the experiment file. `bin/rtier-client rescale
--dry-run -save-plan plan.json N` writes the plan the policy would carry out, to start from.
+"Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}] rescales to 4 data nodes at
+90 s, placed by the controller's placement policy (Placement). {"TriggerTimeSeconds": 90,
+"Plan": P} goes to the placement plan P names instead -- a scale-out, a scale-in or a rebalance
+at the same size: {"owners": {"n1": [0, 1, 2], "n3": [3, 4], ...}} gives each data node of the
+next epoch its partitions, nodes by name (n1, n2, ... as this script starts them) or ID;
+from_epoch is optional (protocol.Plan). P is the plan itself or the path of a JSON file with
+one, relative to the experiment file. `bin/rtier-client rescale -dry-run -save-plan plan.json N`
+writes the plan the policy would carry out, to start from.
 
-{at: 90, rebuild: {index: DIR, partitions: DIR}} moves the cluster to the next index generation
-at 90 s (U14 full rebuild, bin/rtier-client rebuild): DIR holds fusion_build's output, built
-with this index's codebook and page layout (its output directory seeded with pq_codebook.bin,
-pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the partitions rtier_segment made of it;
-relative paths are relative to the experiment file. The nodes beyond cluster.initial_nodes are
-the spares (spares: how many, default as many as the data nodes). placement: affinity (default)
-or random, warmup: recent queries replayed before the next generation goes online (0: every one
-the entries kept, cluster.query_sample per entry, default 1024; -1: none), warmup_concurrency,
-and stop_the_world: true for the baseline without spares. The data nodes need room for the next
-generation's lists (--max-list-len in cluster.node_args, or updates.max_list_len).
+{"TriggerTimeSeconds": 90, "Rebuild": {"Index": DIR, "Partitions": DIR}} moves the cluster to the
+next index generation at 90 s (U14 full rebuild, bin/rtier-client rebuild): DIR holds
+fusion_build's output, built with this index's codebook and page layout (its output directory
+seeded with pq_codebook.bin, pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the
+partitions rtier_segment made of it; relative paths are relative to the experiment file. The
+nodes beyond InitialNodes are the spares ("Spares": how many, default as many as the data
+nodes). "Placement": "affinity" (default) or "random", "Warmup": recent queries replayed before
+the next generation goes online (0: every one the entries kept, QuerySample per entry, default
+1024; -1: none), "WarmupConcurrency", and "StopTheWorld": true for the baseline without spares.
+The data nodes need room for the next generation's lists (--max-list-len in NodeArgs, or
+Updates.MaxListLen).
 
-updates: {headroom: 1.5} lets update batches (U14) run against the cluster (bin/rtier-updater;
-the controller gets "allow_updates"). Every data node leaves room for 1.5 times the index's
-vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and for lists twice as
-long as the longest (list_headroom: 2.0, or max_list_len: N; --max-list-len), and its PQ budget
-grows by the same factor (cluster.pq_capacity). Without updates the dataset is static: no room,
+"Updates": {"Headroom": 1.5} lets update batches (U14) run against the cluster
+(bin/rtier-updater; config.yaml's AllowUpdates). Every data node leaves room for 1.5 times the
+index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and for lists
+twice as long as the longest ("ListHeadroom": 2.0, or "MaxListLen": N; --max-list-len), and its
+PQ budget grows by the same factor (PQCapacity). Without Updates the dataset is static: no room,
 and the controller refuses update batches.
 
-cluster: {pq_capacity: auto} (the default) gives every data node a PQ budget (rtier_node
---pq-capacity: its GPU memory, in codes) of the most distinct vectors one node's partitions
-name at the smallest size the cluster takes -- its initial size, or a smaller one a rescale
-goes to -- or in a plan the run goes to, plus cluster.pq_headroom (0.1): a node never holds
-more codes than that (U1), and no node could hold them all, which is what partitioning is for
-(bin/rtier-client pq-share counts them; pq-budget.json in the results has what it found). A
-number sets the budget; all leaves every node room for the whole ID space (rtier_node's
-default), as does auto for a run with a rebuild, whose placement is made at run time, or for
-one whose fullest node names nearly every vector anyway. --pq-capacity in cluster.node_args
-wins over all of them.
+"PQCapacity": "auto" (the default) gives every data node a PQ budget (rtier_node --pq-capacity:
+its GPU memory, in codes) of the most distinct vectors one node's partitions name at the
+smallest size the cluster takes -- its initial size, or a smaller one a rescale goes to -- or in
+a plan the run goes to, plus PQHeadroom (0.1): a node never holds more codes than that (U1), and
+no node could hold them all, which is what partitioning is for (bin/rtier-client pq-share counts
+them; pq-budget.json in the results has what it found). A number sets the budget; "all" leaves
+every node room for the whole ID space (rtier_node's default), as does "auto" for a run with a
+rebuild, whose placement is made at run time, or for one whose fullest node names nearly every
+vector anyway. --pq-capacity in NodeArgs wins over all of them.
 
 Placeholders of decided design questions (see `bin/rtier-client design`) fail with "undecided":
-  U5  cluster.strategy: two-phase, the default, is the decided one (exactly the single-node
-      answer); proportional-quota is the placeholder.
-  U11 load.arrivals: poisson, the default, over the query file; semdn is the placeholder.
+  U5  "Strategy": "two-phase", the default, is the decided one (exactly the single-node
+      answer); "proportional-quota" is the placeholder.
+  U11 Load.Arrivals: "poisson", the default, over the query file; "semdn" is the placeholder.
 
-With cluster.emulation: {netns: true, delay: 100us, rate: 10gbit} (run as root), every node
+With "Emulation": {"Netns": true, "Delay": "100us", "Rate": "10gbit"} (run as root), every node
 runs in its own network namespace (scripts/emulation/netns.sh) and the controller listens on the
 bridge address 10.10.0.1. Delay and rate values are per-experiment choices.
 """
@@ -190,7 +197,7 @@ def run(cmd, **kw):
 
 
 def rate_steps(v) -> str:
-    """load.rate_steps as the load generator's -rate-steps: "30:400,90:800", a list of "30:400"
+    """Load.RateSteps as the load generator's -rate-steps: "30:400,90:800", a list of "30:400"
     strings, or a list of [30, 400] pairs."""
     if not v:
         return ""
@@ -244,7 +251,7 @@ def update_args(cfg: dict, index: str, parts: str) -> list:
     meta, man = read_kv(os.path.join(index, "meta.txt")), read_kv(os.path.join(parts, "manifest.txt"))
     head = float(upd.get("Headroom", 1.5))
     if head < 1:
-        raise RuntimeError("updates.headroom must be at least 1")
+        raise RuntimeError("Updates.Headroom must be at least 1")
     max_len = upd.get("MaxListLen") or math.ceil(int(man["max_list_len"]) * float(upd.get("ListHeadroom", 2.0)))
     return ["--max-vectors", str(math.ceil(int(meta["num_vectors"]) * head)),
             "--max-pages", str(math.ceil(int(man["num_pages"]) * head)),
@@ -252,13 +259,12 @@ def update_args(cfg: dict, index: str, parts: str) -> list:
 
 
 def pq_args(cfg: dict, index: str, parts: str, node_args: list, reconfigs: list, out_dir: str) -> list:
-    """--pq-capacity, unless cluster.node_args has it: cluster.pq_capacity N, all (the whole ID
-    space, rtier_node's default) or auto (the default). Auto sizes it by U1: a node never holds
-    more PQ codes than at the smallest size the cluster takes, so the budget is the most
-    distinct vectors one node's partitions name at that size -- the placement policy's split,
-    exact at the initial size, an estimate below it -- and in every plan the run goes to
-    (exact), plus cluster.pq_headroom (0.1), times updates.headroom with updates, whose inserts
-    add codes. A full rebuild's placement is made at run time: such a run gets the whole ID
+    """--pq-capacity, unless NodeArgs has it: PQCapacity N, "all" (the whole ID space,
+    rtier_node's default) or "auto" (the default). Auto sizes it by U1: a node never holds more
+    PQ codes than at the smallest size the cluster takes, so the budget is the most distinct
+    vectors one node's partitions name at that size -- the placement policy's split, exact at
+    the initial size, an estimate below it -- and in every plan the run goes to (exact), plus
+    PQHeadroom (0.1), times Updates.Headroom with updates, whose inserts add codes. A full rebuild's placement is made at run time: such a run gets the whole ID
     space. What it found goes to pq-budget.json."""
     if "--pq-capacity" in node_args:
         return []
@@ -267,10 +273,10 @@ def pq_args(cfg: dict, index: str, parts: str, node_args: list, reconfigs: list,
         return []
     if want != "auto":
         if not str(want).isdigit():
-            sys.exit(f"cluster.pq_capacity is {want!r}: auto, all or a number of PQ codes")
+            sys.exit(f"PQCapacity is {want!r}: auto, all or a number of PQ codes")
         return ["--pq-capacity", str(int(want))]
     if any(rc.get("rebuild") for rc in reconfigs):
-        log("PQ budget: the whole ID space (cluster.pq_capacity auto, and a rebuild's placement is made at run time)")
+        log("PQ budget: the whole ID space (PQCapacity auto, and a rebuild's placement is made at run time)")
         return []
     gbin = paths_of(cfg)[2]
 
@@ -318,21 +324,21 @@ def check_load(cfg: dict) -> None:
             t, r = step.split(":")
             float(t), float(r)
     except (TypeError, ValueError):
-        sys.exit(f'load.rate is {load.get("Rate")!r} and load.rate_steps {load.get("RateSteps")!r}: '
-                 'set them to numbers (rate_steps: "seconds:rate,...")')
+        sys.exit(f'Load.Rate is {load.get("Rate")!r} and Load.RateSteps {load.get("RateSteps")!r}: '
+                 'set them to numbers (RateSteps: "seconds:rate,...")')
 
 
-def reconfig_requests(cfg: dict, cfg_path: str) -> list:
+def reconfig_requests(cfg: dict) -> list:
     """The reconfigurations as Rescale and Rebuild requests, in trigger order. Plan files are read now, so a
-    missing or malformed one stops the run before the deployment."""
+    missing or malformed one stops the run before the deployment. Their paths, and a rebuild's, are
+    absolute by now (experiment_config.load)."""
     out = []
-    here = os.path.dirname(os.path.abspath(cfg_path))
     for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
         if "Rebuild" in rc:
             rb = rc["Rebuild"]
             if not rb.get("Index") or not rb.get("Partitions"):
-                sys.exit(f"reconfigurations: {rc}: a rebuild needs index and partitions")
-            src = {k: os.path.join(here, rb[key]) for k, key in (("index_dir", "Index"), ("parts_dir", "Partitions"))}
+                sys.exit(f"Reconfigurations: {rc}: a rebuild needs Index and Partitions")
+            src = {k: rb[key] for k, key in (("index_dir", "Index"), ("parts_dir", "Partitions"))}
             req = {"source": {"kind": "dir", **src}, "spares": rb.get("Spares", 0),
                    "placement": rb.get("Placement", "affinity"), "seed": rb.get("Seed", 0),
                    "warmup": rb.get("Warmup", 0), "warmup_concurrency": rb.get("WarmupConcurrency", 0),
@@ -341,22 +347,21 @@ def reconfig_requests(cfg: dict, cfg_path: str) -> list:
                         "what": f"full rebuild to {src['parts_dir']}" + (" (stop-the-world)" if req["stop_the_world"] else "")})
             continue
         if ("Plan" in rc) == ("DataNodes" in rc):
-            sys.exit(f"reconfigurations: {rc}: give data_nodes, plan or rebuild, one of them")
+            sys.exit(f"Reconfigurations: {rc}: give DataNodes, Plan or Rebuild, one of them")
         if "DataNodes" in rc:
             out.append({"at": rc["TriggerTimeSeconds"], "request": {"data_nodes": rc["DataNodes"]},
                         "data_nodes": rc["DataNodes"], "what": f"rescale to {rc['DataNodes']} data nodes"})
             continue
         plan, name = rc["Plan"], "inline"
         if isinstance(plan, str):
-            name = plan
-            path = plan if os.path.isabs(plan) else os.path.join(here, plan)
+            name = path = plan
             try:
                 with open(path) as f:
                     plan = json.load(f)
             except (OSError, ValueError) as e:
-                sys.exit(f"reconfigurations: plan {path}: {e}")
+                sys.exit(f"Reconfigurations: plan {path}: {e}")
         if not isinstance(plan, dict) or not plan.get("owners"):
-            sys.exit(f'reconfigurations: plan {name}: want {{"owners": {{"NODE": [partitions], ...}}}}')
+            sys.exit(f'Reconfigurations: plan {name}: want {{"owners": {{"NODE": [partitions], ...}}}}')
         out.append({"at": rc["TriggerTimeSeconds"], "request": {"plan": plan}, "data_nodes": len(plan["owners"]),
                     "plan": name, "what": f"reconfigure to plan {name} ({len(plan['owners'])} data nodes)"})
     return out
@@ -455,17 +460,17 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
 
     On one machine every node reads the same SSD and runs on the same cores, so adding a node
     adds no capacity: the cluster stops at what the disk serves (the two-phase RERANK reads
-    ~150 pages per query). cluster.resources emulates a node per machine instead -- each node,
-    with its agent, gets its own CPUs and its own read IOPS on the disk of WorkDir, so the total
-    stays below what the disk serves:
+    ~150 pages per query). NodeResources emulates a node per machine instead -- each node, with
+    its agent, gets its own CPUs and its own read IOPS on the disk of WorkDir, so the total stays
+    below what the disk serves:
 
-      resources: {cpus_per_node: 4, io_read_iops_max: 40000, memory_max: 2G}
+      "NodeResources": {"CPUsPerNode": 4, "IOReadIOPSMax": 40000, "MemoryMax": "2G"}
 
     As root these are cgroup limits (systemd scopes: cpuset, io, memory). Without root -- a
     shared server -- the CPUs are pinned with taskset, MemoryMax is a limit of the user's own
     scope (systemd-run --user), and the read IOPS come from the data node itself:
-    read_iops_per_node (rtier_node --read-iops, fusion/read_budget.h; it works as root too).
-    io_read_iops_max then fails, since the io controller is not delegated to users. Pinning does
+    ReadIOPSPerNode (rtier_node --read-iops, fusion/read_budget.h; it works as root too).
+    IOReadIOPSMax then fails, since the io controller is not delegated to users. Pinning does
     not keep other users' processes off a node's CPUs: cgroups.jsonl records how busy they were.
 
     Node i gets the i-th group of cpu_groups; the controller and the load generator get the
@@ -475,7 +480,7 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
         return []
     if ROOT_USER:
         if not shutil.which("systemd-run"):
-            raise RuntimeError("cluster.resources needs systemd-run (cgroup v2 cpuset and io controllers)")
+            raise RuntimeError("NodeResources needs systemd-run (cgroup v2 cpuset and io controllers)")
         props = ["-p", f"AllowedCPUs={cpu_list(cpus)}"] if cpus else []
         for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
             if res.get(key):
@@ -485,17 +490,17 @@ def isolation(cfg: dict, cpus: list, work: str, scopes: bool) -> list:
         if res.get("MemoryMax"):
             props += ["-p", f"MemoryMax={res['MemoryMax']}"]
         return ["systemd-run", "--quiet", "--scope", "--collect"] + props
-    for key, name in (("IOReadIOPSMax", "io_read_iops_max"), ("IOReadBandwidthMax", "io_read_bandwidth_max")):
+    for key in ("IOReadIOPSMax", "IOReadBandwidthMax"):
         if res.get(key):
-            raise RuntimeError(f"cluster.resources.{name} needs root (the cgroup io controller is not delegated to "
-                               "users); use read_iops_per_node, the data node's own read budget")
+            raise RuntimeError(f"NodeResources.{key} needs root (the cgroup io controller is not delegated to "
+                               "users); use ReadIOPSPerNode, the data node's own read budget")
     prefix = []
     if scopes:
         prefix = ["systemd-run", "--user", "--quiet", "--scope", "--collect"]
         if res.get("MemoryMax"):
             prefix += ["-p", f"MemoryMax={res['MemoryMax']}"]
     elif res.get("MemoryMax"):
-        raise RuntimeError('cluster.resources.memory_max without root needs systemd-run --user (a user systemd '
+        raise RuntimeError('NodeResources.MemoryMax without root needs systemd-run --user (a user systemd '
                            'instance), which does not work here')
     if cpus:
         prefix += ["taskset", "-c", cpu_list(cpus)]
@@ -514,7 +519,7 @@ def gpu_table(prefix=()) -> list:
 
 
 def gpu_matches(g, row: dict) -> bool:
-    """A cluster.gpus entry names a GPU by nvidia-smi index, UUID ("GPU-...") or PCI bus id ("06:00.0").
+    """A GPUs entry names a GPU by nvidia-smi index, UUID ("GPU-...") or PCI bus id ("06:00.0").
     Indices are not stable: on the lab server they changed between two days, with the hardware."""
     g = str(g).lower()
     return g in (row["index"], row["uuid"].lower()) or (":" in g and row["bus"].lower().endswith(g))
@@ -531,7 +536,7 @@ def data_disk(path: str) -> str:
 
 
 class CgroupSampler:
-    """With cluster.resources, samples every node and every agent ("n1", "n1-agent", ...) once a
+    """With NodeResources, samples every node and every agent ("n1", "n1-agent", ...) once a
     second into cgroups.jsonl, stamped with time.monotonic() (clock.json has the load's start
     on that clock): CPU time, I/O on the data disk, memory (anon, file, dirty and writeback page
     cache) and pressure stall times from the process's own cgroup (its systemd scope). A user
@@ -541,9 +546,9 @@ class CgroupSampler:
 
     One "host" record per sample has the data disk's counters (/proc/diskstats: everyone's I/O,
     other users' included), how busy each node's CPUs were (/proc/stat: its processes and anyone
-    else's; compare with the node's and its agent's cpu_usec), the load average and, with
-    cluster.gpus, each of those GPUs' utilization and memory in use (nvidia-smi: other users' jobs on
-    them too): on a shared machine, what tells a quiet run from a disturbed one. Counters are
+    else's; compare with the node's and its agent's cpu_usec), the load average and, with GPUs,
+    each of those GPUs' utilization and memory in use (nvidia-smi: other users' jobs on them
+    too): on a shared machine, what tells a quiet run from a disturbed one. Counters are
     cumulative; take differences between samples."""
 
     def __init__(self, path: str, disk: str, groups: dict, gpus=()):
@@ -719,12 +724,12 @@ def file_digest(path: str) -> str:
     return h.hexdigest()
 
 
-def build_index(cfg: dict, ecfg: dict, index: str, ebin: str) -> None:
-    """Stage 1: the index (fusion_build), with the build section's flags. An index that exists is
-    used if it was built with the same flags (rtier-build.json records them); with others the run
-    stops rather than rebuild it, which takes hours on a large dataset. An index built before the
-    records has none and is used as it is."""
-    want = {"vectors": os.path.abspath(cfg["Base"]), "args": experiment_config.build_args(ecfg.get("build"))}
+def build_index(cfg: dict, index: str, ebin: str) -> None:
+    """Stage 1: the index (fusion_build), with the flags of BuildArgs. An index that exists is used
+    if it was built with the same flags (rtier-build.json records them); with others the run stops
+    rather than rebuild it, which takes hours on a large dataset. An index built before the records
+    has none and is used as it is."""
+    want = {"vectors": os.path.abspath(cfg["Base"]), "args": [str(a) for a in cfg.get("BuildArgs", [])]}
     rec_path = os.path.join(index, "rtier-build.json")
     if os.path.exists(os.path.join(index, "meta.txt")):
         rec = stage_record(rec_path)
@@ -732,7 +737,7 @@ def build_index(cfg: dict, ecfg: dict, index: str, ebin: str) -> None:
             log(f"index {index}: no build record (built before run_local kept them): used as it is")
         elif rec != want:
             sys.exit(f"index {index} was built with {rec}, the configuration asks for {want}: remove it or "
-                     "set build.index_dir to another directory")
+                     "set IndexDir to another directory")
         return
     run([f"{ebin}/fusion_build", "--base", cfg["Base"], "--out", index] + want["args"])
     json.dump(want, open(rec_path, "w"), indent=2)
@@ -742,31 +747,30 @@ GENERATORS = {"range": "make_range_assignment.py", "spatial": "make_spatial_assi
               "gp": "make_gp_assignment.py"}
 
 
-def make_assignment(ecfg: dict, cfg: dict, index: str, work: str) -> str:
-    """Stage 2a: the list -> partition assignment (U2). "file" takes the one partition.file
-    names; a generator (partition.generator: gp, the decided one; spatial or range, placeholders)
-    makes one with partition.partitions partitions, again when its parameters or the index change."""
-    p = ecfg.get("partition") or {}
-    gen = p.get("generator", "file")
+def make_assignment(cfg: dict, index: str, work: str) -> str:
+    """Stage 2a: the list -> partition assignment (U2). Assignment names a file; Partition makes one
+    with a generator ("Generator": "gp", the decided one; "spatial" or "range", placeholders) and
+    "Partitions" partitions, again when its parameters or the index change."""
+    p = cfg.get("Partition") or {}
+    gen = p.get("Generator", "file")
     if gen == "file":
         if not cfg.get("Assignment"):
-            sys.exit('partition: generator "file" needs partition.file')
+            sys.exit('no assignment: give "Assignment" (a file) or "Partition" (a generator)')
         return cfg["Assignment"]
     if gen not in GENERATORS:
-        sys.exit(f"partition.generator {gen!r}: want file, " + ", ".join(GENERATORS))
-    n = p.get("partitions")
+        sys.exit(f"Partition.Generator {gen!r}: want file, " + ", ".join(GENERATORS))
+    n = p.get("Partitions")
     if not n:
-        sys.exit(f"partition: generator {gen} needs partition.partitions")
+        sys.exit(f"Partition: generator {gen} needs Partitions")
     cmd = [sys.executable, os.path.join(ROOT, "scripts/testing", GENERATORS[gen]), index, str(n)]
-    gp = p.get("gp") or {}
     extra = []
     if gen == "gp":
-        if not gp.get("kaminpar"):
-            sys.exit("partition.gp.kaminpar: the gp_kaminpar binary (scripts/testing/gp) is needed")
+        if not p.get("KaMinPar"):
+            sys.exit("Partition.KaMinPar: the gp_kaminpar binary (scripts/testing/gp) is needed")
         # The decided GP (U2): the heads, over the navigation graph, unit weights.
-        extra = ["--points", gp.get("points", "heads"), "--graph-source", gp.get("graph_source", "index"),
-                 "--weights", gp.get("weights", "unit"), "--kaminpar", gp["kaminpar"],
-                 "--threads", str(gp.get("threads", os.cpu_count()))]
+        extra = ["--points", p.get("Points", "heads"), "--graph-source", p.get("GraphSource", "index"),
+                 "--weights", p.get("Weights", "unit"), "--kaminpar", p["KaMinPar"],
+                 "--threads", str(p.get("Threads", os.cpu_count()))]
     out = os.path.join(work, f"assign-{gen}-{n}.bin")
     want = {"generator": gen, "partitions": n, "args": extra,
             "index_meta": file_digest(os.path.join(index, "meta.txt"))}
@@ -777,14 +781,20 @@ def make_assignment(ecfg: dict, cfg: dict, index: str, work: str) -> str:
     return out
 
 
-def ground_truth(cfg: dict, ecfg: dict, gt: str, ebin: str) -> None:
+def build_max_n(cfg: dict):
+    """fusion_build's --max-n among BuildArgs (None: every vector of the base file)."""
+    args = [str(a) for a in cfg.get("BuildArgs", [])]
+    return int(args[args.index("--max-n") + 1]) if "--max-n" in args[:-1] else None
+
+
+def ground_truth(cfg: dict, gt: str, ebin: str) -> None:
     """Stage 1b: the ground truth (fusion_gt), of every stride-th query ("GroundTruthStride"):
     a query file longer than a run, which repeats no query, has some all through it, for a
     fraction of the cost. Made if missing; one that exists is used unless its record (next to
     it) says it was made of other vectors, queries or stride -- then the run stops rather than
     compute it again, which takes hours at scale. Ground truth from elsewhere has no record."""
     want = {"vectors": os.path.abspath(cfg["Base"]), "queries": os.path.abspath(cfg["Queries"]),
-            "max_n": (ecfg.get("build") or {}).get("max_n"), "stride": int(cfg.get("GroundTruthStride", 1))}
+            "max_n": build_max_n(cfg), "stride": int(cfg.get("GroundTruthStride", 1))}
     rec_path = gt + ".rtier.json"
     if os.path.exists(gt):
         have = stage_record(rec_path)
@@ -792,7 +802,7 @@ def ground_truth(cfg: dict, ecfg: dict, gt: str, ebin: str) -> None:
             diff = [k for k in want if have.get(k) != want[k]]
             sys.exit(f"ground truth {gt} was made with " + ", ".join(f"{k} {have.get(k)}" for k in diff) +
                      ", this run needs " + ", ".join(f"{k} {want[k]}" for k in diff) +
-                     ": name another file (dataset.ground_truth) or remove it")
+                     ": name another file (GroundTruth) or remove it")
         return
     run([f"{ebin}/fusion_gt", "--base", cfg["Base"], "--queries", cfg["Queries"], "--out", gt, "--k", "100",
          "--stride", str(want["stride"])] + (["--max-n", str(want["max_n"])] if want["max_n"] else []))
@@ -864,16 +874,18 @@ def revision(out_dir: str) -> None:
     if head is None:
         open(os.path.join(out_dir, "revision.txt"), "w").write(f"{ROOT}: not a git checkout\n")
         return
-    diff = git("diff", "HEAD", "--", ".", ":(exclude)docs") or ""
+    # config.yaml is rewritten by every run, which keeps its own copy.
+    spec = ["--", ".", ":(exclude)docs", ":(exclude)config.yaml"]
+    diff = git("diff", "HEAD", *spec) or ""
     open(os.path.join(out_dir, "revision.txt"), "w").write(
-        f"commit {head.strip()}\n" + (git("status", "--short", "--", ".", ":(exclude)docs") or "") +
-        ("" if diff else "no changes to the commit outside docs/\n"))
+        f"commit {head.strip()}\n" + (git("status", "--short", *spec) or "") +
+        ("" if diff else "no changes to the commit outside docs/ and config.yaml\n"))
     if diff:
         open(os.path.join(out_dir, "revision.diff"), "w").write(diff)
 
 
 def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: str) -> list:
-    """rtier_node's flags beyond the ones every node has: cluster.node_args, the read budget,
+    """rtier_node's flags beyond the ones every node has: NodeArgs, the read budget,
     room for updates, the PQ budget."""
     res = cfg.get("NodeResources") or {}
     args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
@@ -884,21 +896,21 @@ def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: st
 
 def node_gpus(cfg: dict, nodes: int, table_of) -> dict:
     """Node number -> the GPU it alone sees, named to CUDA by UUID (CUDA does not take bus ids, and
-    an index can name another card after a hardware change): node i gets the i-th of cluster.gpus,
-    in turns when there are fewer. table_of(i) is nvidia-smi's list on node i's machine; without
+    an index can name another card after a hardware change): node i gets the i-th of GPUs, in
+    turns when there are fewer. table_of(i) is nvidia-smi's list on node i's machine; without
     one, the entry as given. The log records which card each got."""
     if cfg.get("Backend") != "gpu":
         return {}
     gpus = [str(g) for g in cfg.get("GPUs", [])]
     if not gpus:
-        log("GPUs: none given (cluster.gpus): every data node uses the first one")
+        log("GPUs: none given: every data node uses the first one")
         return {}
     visible = {}
     for i in range(1, nodes + 1):
         g, table = gpus[(i - 1) % len(gpus)], table_of(i)
         row = next((r for r in table if gpu_matches(g, r)), None)
         if table and row is None:
-            raise RuntimeError(f'cluster.gpus entry {g} is none of the GPUs nvidia-smi lists for n{i}: '
+            raise RuntimeError(f'GPUs entry {g} is none of the GPUs nvidia-smi lists for n{i}: '
                                + "; ".join(f"{r['index']} {r['name']} {r['bus']} {r['uuid']}" for r in table))
         visible[i] = row["uuid"] if row else g
         log(f"GPU of n{i}: {g}" + (f" = {row['name']}, {row['bus']}, {row['uuid']}" if row else ""))
@@ -906,7 +918,7 @@ def node_gpus(cfg: dict, nodes: int, table_of) -> dict:
 
 
 def gpu_env(visible: dict, i: int) -> list:
-    """The prefix that shows node i its GPU only (without nvidia-smi, the cluster.gpus entry as
+    """The prefix that shows node i its GPU only (without nvidia-smi, the GPUs entry as
     given, in PCI bus order: CUDA's default order puts the fastest first)."""
     return ["env", "CUDA_DEVICE_ORDER=PCI_BUS_ID", f"CUDA_VISIBLE_DEVICES={visible[i]}"] if i in visible else []
 
@@ -946,7 +958,7 @@ def snapshot_key(cfg: dict, index: str, parts: str) -> dict:
 
 
 def snapshot_path(cfg: dict, key: dict) -> str:
-    """The snapshot of key: under paths.snapshot_dir (WORK_DIR/snapshots), named by the initial
+    """The snapshot of key: under SnapshotDir (WorkDir/snapshots), named by the initial
     nodes and a digest of key, on every machine that runs one of its nodes."""
     root = cfg.get("SnapshotDir") or os.path.join(paths_of(cfg)[0], "snapshots")
     digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
@@ -1096,7 +1108,7 @@ def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, local: boo
         why = (snapshot_mismatch(snap, key) if local else "") if not found else "its files are missing there"
         log(", ".join(f"n{i}" for i in rest) + f": no warmup snapshot of this index, partitions, placement and "
             f"{key['initial_nodes']} initial nodes" + (f" ({why})" if why else "") +
-            ": bootstrapped from the index (a run with type: warmup makes one)")
+            ': bootstrapped from the index (a run with "Type": "warmup" makes one)')
     if found:
         started = time.monotonic()
         restore_snapshot(snap, found, host_of, work)
@@ -1127,23 +1139,42 @@ def wait_registered(api: Controller, name: str, procs, timeout: float = 120) -> 
         time.sleep(0.2)
 
 
-def controller_config(cfg: dict, ctl_addr: str, api_addr: str, index: str, parts: str, work: str,
-                      out_dir: str) -> dict:
+def system_values(cfg: dict, ctl_addr: str, api_addr: str, index: str, parts: str, work: str,
+                  out_dir: str) -> dict:
+    """config.yaml's keys a run sets itself, wherever its nodes run: the controller's addresses,
+    the index and partitions the stages made, where the metrics and the nodes' diagnostics go,
+    and how often the agents report (every second unless the experiment says)."""
+    out_dir = os.path.abspath(out_dir)
     return {
-        "listen": ctl_addr,
-        "api_listen": api_addr,
-        "index_dir": index, "partitions_dir": parts,
-        "initial_nodes": cfg.get("InitialNodes", 1),
-        "protocol": cfg.get("Protocol", "lazy"),
-        "raw_priority": cfg.get("RawPriority", "background"),
-        "placement": cfg.get("Placement", ""),  # "" = the controller's default (U3)
-        "allow_updates": "Updates" in cfg,
-        "metrics_path": os.path.join(out_dir, "metrics.jsonl"),
+        "ControllerAddr": ctl_addr, "APIAddr": api_addr,
+        "IndexDir": index, "PartitionsDir": parts,
+        "AllowUpdates": "Updates" in cfg,
+        "MetricsPath": os.path.join(out_dir, "metrics.jsonl"),
         # The nodes' stats logs arrive here through their agents, stamped on arrival.
-        "stats_dir": out_dir,
-        "work_dir": os.path.join(work, "controller"),
-        **({"stage_timeout": cfg["StageTimeout"]} if "StageTimeout" in cfg else {}),
+        "StatsDir": out_dir,
+        "ControllerWorkDir": os.path.join(work, "controller"),
+        "MetricsInterval": cfg.get("MetricsInterval", "1s"),
     }
+
+
+def write_system_config(cfg: dict, values: dict, out_dir: str) -> None:
+    """Rewrites config.yaml, which every process of the run reads at startup (Koala's
+    updateConfigYamlFile): every key at its default (rtier-controller -defaults, so that nothing
+    an earlier run wrote stays), then those the experiment sets by name, then the run's own
+    values. The results keep a copy."""
+    gbin = paths_of(cfg)[2]
+    r = subprocess.run([f"{gbin}/rtier-controller", "-defaults"], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"{gbin}/rtier-controller -defaults: {r.stderr.strip()}")
+    conf = experiment_config.yaml.safe_load(r.stdout)
+    conf.update({k: cfg[k] for k in conf if k in cfg})
+    conf.update(values)
+    text = (f"# The system configuration of the run in {os.path.abspath(out_dir)} (its experiment: "
+            f"experiment.json there), {time.strftime('%Y-%m-%d %H:%M:%S')}\n" +
+            experiment_config.yaml.safe_dump(conf, sort_keys=False, default_flow_style=False))
+    for path in (experiment_config.SYSTEM_CONFIG, os.path.join(out_dir, "config.yaml")):
+        with open(path, "w") as f:
+            f.write(text)
 
 
 def node_command(cfg: dict, ebin: str, index: str, parts: str, listen: str, node_dir: str,
@@ -1155,21 +1186,13 @@ def node_command(cfg: dict, ebin: str, index: str, parts: str, listen: str, node
             "--stats-file", os.path.join(node_dir, "stats.jsonl")] + node_args
 
 
-def agent_config(cfg: dict, name: str, ctl_addr: str, listen_host: str, node_addr: str, node_dir: str,
-                 parts: str) -> dict:
-    return {
-        "name": name, "controller": ctl_addr,
-        "query_listen": f"{listen_host}:0", "bulk_listen": f"{listen_host}:0", "node_addr": node_addr,
-        "work_dir": node_dir, "partitions_dir": parts,
-        "strategy": cfg.get("Strategy", ""),
-        "transfer_rate_bytes_per_sec": cfg.get("TransferRateBytesPerSec", 0),
-        "metrics_interval": cfg.get("MetricsInterval", "1s"),
-        # Forwarded to the controller (stats-<node>.jsonl there), as on a cluster.
-        "node_stats_file": os.path.join(node_dir, "stats.jsonl"),
-        **{k: cfg[e] for k, e in (("raw_streams", "RawStreams"), ("raw_batch_bytes", "RawBatchBytes"),
-                                  ("raw_path", "RawPath"), ("query_sample", "QuerySample"),
-                                  ("step_timeout", "StageTimeout"), ("node_conns", "NodeConns")) if e in cfg},
-    }
+def agent_command(gbin: str, name: str, listen_host: str, node_addr: str, node_dir: str, advertise: str = "") -> list:
+    """rtier-agent with config.yaml and what is its own: its name, data node, listen addresses (any
+    port), directory, the host the others reach it at, and its data node's stats log, which it
+    forwards to the controller (stats-<node>.jsonl there), as on a cluster."""
+    return [f"{gbin}/rtier-agent", "-config", experiment_config.SYSTEM_CONFIG, "-name", name, "-node", node_addr,
+            "-work", node_dir, "-query", f"{listen_host}:0", "-bulk", f"{listen_host}:0",
+            "-node-stats", os.path.join(node_dir, "stats.jsonl")] + (["-advertise", advertise] if advertise else [])
 
 
 def wait_deployment(cfg: dict, api: Controller) -> dict:
@@ -1236,7 +1259,7 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
             f"set the reconfiguration run's rate from this")
         return  # a calibration run measures capacity only: no reconfiguration in it
 
-    # 5. timed reconfigurations (Koala: "Reconfigurations" with TriggerTimeSeconds; here reconfigurations: at)
+    # 5. timed reconfigurations (Koala's "Reconfigurations", each at its TriggerTimeSeconds)
     # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
     # seconds). The zero is the one of latency.csv, which the load generator prints once it has
     # read its queries and ground truth: from its own start, a large query file would put every
@@ -1284,23 +1307,22 @@ def finish(out_dir: str) -> None:
 
 
 def load_config(cfg_path: str) -> tuple:
-    """The configuration merged with its bases, its flat form, and its reconfigurations as
-    requests; the binaries' directories must be newer than the sources."""
-    if not cfg_path.endswith((".yaml", ".yml")):
-        sys.exit(f"{cfg_path}: experiment configurations are YAML now (scripts/convert_configs.py converts "
-                 "the old JSON ones)")
-    ecfg = experiment_config.load(cfg_path)
-    cfg = experiment_config.flatten(ecfg)
+    """The experiment, checked, and its reconfigurations as requests; the binaries' directories
+    must be newer than the sources."""
+    try:
+        cfg = experiment_config.load(cfg_path)
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))
     if cfg.get("Type") not in (None, "warmup"):
-        sys.exit(f"{cfg_path}: type is {cfg['Type']!r}: warmup, or none (a run that measures)")
+        sys.exit(f"{cfg_path}: Type is {cfg['Type']!r}: warmup, or none (a run that measures)")
     if cfg.get("Type") != "warmup":
         check_load(cfg)
         if int(cfg.get("Nodes", 1)) < int(cfg.get("InitialNodes", 1)):
-            sys.exit(f"{cfg_path}: cluster.nodes ({cfg.get('Nodes', 1)}) is below cluster.initial_nodes "
+            sys.exit(f"{cfg_path}: Nodes ({cfg.get('Nodes', 1)}) is below InitialNodes "
                      f"({cfg.get('InitialNodes', 1)}): the deployment would wait for nodes that never come")
-    reconfigs = reconfig_requests(cfg, cfg_path)
+    reconfigs = reconfig_requests(cfg)
     check_fresh(*paths_of(cfg)[1:])
-    return ecfg, cfg, reconfigs
+    return cfg, reconfigs
 
 
 def paths_of(cfg: dict) -> tuple:
@@ -1309,42 +1331,39 @@ def paths_of(cfg: dict) -> tuple:
             os.path.join(ROOT, cfg.get("EngineBin", "engine/build")), os.path.join(ROOT, cfg.get("GoBin", "bin")))
 
 
-def record(ecfg: dict, cfg: dict, cfg_path: str, out_dir: str) -> None:
-    """The configuration as it ran: merged with its bases (experiment.yaml), and flat
-    (experiment.json, what the analysis scripts read)."""
+def record(cfg: dict, out_dir: str) -> None:
+    """The experiment as it ran (experiment.json, what the analysis scripts read) and the code."""
     os.makedirs(out_dir, exist_ok=True)
-    open(os.path.join(out_dir, "experiment.yaml"), "w").write(
-        f"# {os.path.abspath(cfg_path)}, merged with its bases\n" + experiment_config.dump(ecfg))
     json.dump(cfg, open(os.path.join(out_dir, "experiment.json"), "w"), indent=2)
     revision(out_dir)
 
 
-def stages(ecfg: dict, cfg: dict) -> tuple:
+def stages(cfg: dict) -> tuple:
     """Steps 1-2, on this machine wherever the nodes run: the index, the ground truth and the
     partitions, made unless they are there. Returns the index, ground truth and partition paths."""
     work, ebin, _ = paths_of(cfg)
     os.makedirs(work, exist_ok=True)
     # 1. index and ground truth
     index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
-    build_index(cfg, ecfg, index, ebin)
+    build_index(cfg, index, ebin)
     gt = cfg.get("GroundTruth", "")
     if gt and cfg.get("Type") != "warmup":  # a warmup sends no query
-        ground_truth(cfg, ecfg, gt, ebin)
+        ground_truth(cfg, gt, ebin)
 
     # 2. partitions: the assignment (U2), then the segments
     parts = os.path.join(work, "partitions")
-    segment(index, make_assignment(ecfg, cfg, index, work), parts, ebin)
+    segment(index, make_assignment(cfg, index, work), parts, ebin)
     return index, gt, parts
 
 
 def main(cfg_path: str, out_dir: str) -> None:
-    ecfg, cfg, reconfigs = load_config(cfg_path)
+    cfg, reconfigs = load_config(cfg_path)
     if cfg.get("Hosts"):
-        sys.exit(f"{cfg_path}: hosts is for scripts/run_cluster.py (run_local.py runs every node on this "
-                 "machine): run that, or set hosts: null in an override")
+        sys.exit(f"{cfg_path}: Hosts is for scripts/run_cluster.py (run_local.py runs every node on this "
+                 'machine): run that, or override it with "Hosts": null')
     work, ebin, gbin = paths_of(cfg)
-    record(ecfg, cfg, cfg_path, out_dir)
-    index, gt, parts = stages(ecfg, cfg)
+    record(cfg, out_dir)
+    index, gt, parts = stages(cfg)
 
     emu = cfg.get("Emulation", {})
     netns = bool(emu.get("Netns"))
@@ -1385,10 +1404,12 @@ def main(cfg_path: str, out_dir: str) -> None:
             subprocess.run([netns_sh, "down", str(nodes)], env=env)
             run([netns_sh, "up", str(nodes)], env=env)
 
-        # 3. controller, then nodes (spare nodes register idle and join at scale-out)
-        ctl_cfg = os.path.join(work, "controller.json")
-        json.dump(controller_config(cfg, ctl_addr, api_addr, index, parts, work, out_dir), open(ctl_cfg, "w"), indent=2)
-        procs.start("controller", [f"{gbin}/rtier-controller", "-config", ctl_cfg], prefix=rest_cpus(cfg, nodes))
+        # 3. config.yaml, the controller, then nodes (spare nodes register idle and join at scale-out).
+        # One machine samples its nodes itself (CgroupSampler): the agents do not.
+        write_system_config(cfg, dict(system_values(cfg, ctl_addr, api_addr, index, parts, work, out_dir),
+                                      SampleInterval="0s"), out_dir)
+        procs.start("controller", [f"{gbin}/rtier-controller", "-config", experiment_config.SYSTEM_CONFIG],
+                    prefix=rest_cpus(cfg, nodes))
         api = connect(api_addr, procs)
 
         addrs = {}
@@ -1410,9 +1431,7 @@ def main(cfg_path: str, out_dir: str) -> None:
             addrs[i] = f"{host}:{ready.split('=')[1]}"
             if sampler:
                 sampler.add(name, procs.procs[-1][1].pid, scoped)
-            agent_cfg = os.path.join(work, f"agent-{name}.json")
-            json.dump(agent_config(cfg, name, ctl_addr, host, addrs[i], node_dir, parts), open(agent_cfg, "w"), indent=2)
-            procs.start(f"agent-{name}", [f"{gbin}/rtier-agent", "-config", agent_cfg], prefix=prefix)
+            procs.start(f"agent-{name}", agent_command(gbin, name, host, addrs[i], node_dir), prefix=prefix)
             if sampler:
                 sampler.add(f"{name}-agent", procs.procs[-1][1].pid, scoped)
                 if i == 1:  # from here on: the deployment starts once the initial nodes registered
@@ -1439,5 +1458,5 @@ def main(cfg_path: str, out_dir: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        sys.exit("usage: run_local.py EXPERIMENT.yaml OUT_DIR")
+        sys.exit("usage: run_local.py EXPERIMENT.json OUT_DIR")
     main(sys.argv[1], sys.argv[2])

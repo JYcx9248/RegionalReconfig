@@ -1,14 +1,15 @@
 #!/bin/bash
 # One experiment run on a clean node state, as the results in results/*-v2 and later were made:
 #
-#   scripts/run_one.sh CONFIG.yaml PROTOCOL OUT_DIR ['{cluster: {placement: even-reversible-blocks}}']
+#   scripts/run_one.sh CONFIG.json PROTOCOL OUT_DIR ['{"Placement": "even-reversible-blocks"}']
 #
-# The run's configuration is a YAML file built on CONFIG (base: CONFIG) that sets
-# cluster.protocol to PROTOCOL and, with the optional YAML (or JSON) mapping, overrides any other
-# key. Before the run: the nodes' directories under the work directory are removed (the
-# partitions and the index stay), the page cache is dropped, and with swap on vm.swappiness is
-# set to 1 -- at the default 60 the kernel swaps node memory out under page-cache pressure, and a
-# run that swaps in during its load is not comparable. System memory, swap and swap-ins are
+# The run's experiment is CONFIG with "Protocol" set to PROTOCOL and, with the optional JSON
+# object, other keys overridden: an object merges into the one it overrides ('{"Load": {"Rate":
+# 200}}' changes the rate alone), anything else replaces, null removes; paths in it are relative
+# to the repository. Before the run: the nodes' directories under the work directory are
+# removed (the partitions and the index stay), the page cache is dropped, and with swap on
+# vm.swappiness is set to 1 -- at the default 60 the kernel swaps node memory out under
+# page-cache pressure, and a run that swaps in during its load is not comparable. System memory, swap and swap-ins are
 # logged every 5 s to OUT_DIR/../mem-<protocol>.log; the last line printed says how many pages
 # were swapped in. Dropping the page cache and setting swappiness need root; without it (a shared
 # server) only the run's own files leave the page cache (scripts/evict_cache.py: the work
@@ -17,21 +18,25 @@
 set -u
 cd "$(dirname "$0")/.."
 CFG=$1; P=$2; OUT=$3; OVR=${4:-"{}"}
-TMP=$(mktemp --suffix=.yaml)
-python3 - "$CFG" "$P" "$OVR" "$TMP" <<'PY'
-import os, sys, yaml
+TMP=$(mktemp --suffix=.json)
+trap 'rm -f "$TMP"' EXIT
+python3 - "$CFG" "$P" "$OVR" "$TMP" <<'PY' || exit 1
+import json, os, sys
 cfg, protocol, overrides, out = sys.argv[1:]
 sys.path.insert(0, "scripts")
 import experiment_config as ec
-c = ec.merge({"base": os.path.abspath(cfg), "cluster": {"protocol": protocol}}, yaml.safe_load(overrides) or {})
-open(out, "w").write(ec.dump(c))
-ec.load(out)  # every key known
+try:
+    over = json.loads(overrides)
+    if not isinstance(over, dict):
+        raise ValueError(f"the overrides are {overrides!r}: want a JSON object")
+    ec._absolute(over, os.getcwd())
+    c = ec.merge(dict(ec.load(cfg), Protocol=protocol), over)
+    ec.check(c)  # every key known
+    json.dump(c, open(out, "w"), indent=2)
+except (OSError, ValueError) as e:
+    sys.exit(f"run_one.sh: {e}")
 PY
-[ $? = 0 ] || exit 1
-FLAT=$(mktemp --suffix=.json)
-python3 -c "import json,sys; sys.path.insert(0, 'scripts'); import experiment_config as ec
-json.dump(ec.flatten(ec.load(sys.argv[1])), open(sys.argv[2], 'w'))" "$TMP" "$FLAT"
-W=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('WorkDir', '/tmp/rtier-run'))" "$FLAT")
+W=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('WorkDir', '/tmp/rtier-run'))" "$TMP")
 for d in "$W"/n[0-9]*; do [ -d "$d" ] && rm -rf "$d"; done
 rm -rf "$OUT"; mkdir -p "$(dirname "$OUT")"
 MEM=$(dirname "$OUT")/mem-$P.log; : > "$MEM"
@@ -43,7 +48,7 @@ if [ "$(id -u)" = 0 ]; then
 else
   [ -n "$(swapon --noheadings 2>/dev/null)" ] && echo "not root: vm.swappiness stays at $(cat /proc/sys/vm/swappiness)"
   mapfile -t OWN < <(python3 -c "import json,sys; c=json.load(open(sys.argv[1]))
-print('\n'.join(p for p in (c.get('WorkDir'), c.get('IndexDir'), c.get('Queries'), c.get('GroundTruth')) if p))" "$FLAT")
+print('\n'.join(p for p in (c.get('WorkDir'), c.get('IndexDir'), c.get('Queries'), c.get('GroundTruth')) if p))" "$TMP")
   python3 scripts/evict_cache.py "${OWN[@]}"
 fi
 echo "== $P -> $OUT $(date +%T)"
@@ -55,7 +60,6 @@ while kill -0 $RL 2>/dev/null; do
 done
 wait $RL; rc=$?
 mv "$OUT.log" "$OUT/run_local.log" 2>/dev/null
-rm -f "$TMP" "$FLAT"
 # A calibration run writes calibration.json (and calib-<rate>.csv), a warmup snapshot.json, not
 # latency.csv.
 RES=latency.csv; grep -q '"Calibrate"' "$OUT/experiment.json" 2>/dev/null && RES=calibration.json

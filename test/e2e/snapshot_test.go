@@ -12,8 +12,8 @@ import (
 	"rtier/internal/query"
 )
 
-// TestBootstrapFromSnapshot: an experiment's warmup snapshot (scripts/run_local.py, type:
-// warmup). The initial nodes bootstrap from the index, each saves the presence bits of its raw
+// TestBootstrapFromSnapshot: an experiment's warmup snapshot (scripts/run_local.py, "Type":
+// "warmup"). The initial nodes bootstrap from the index, each saves the presence bits of its raw
 // vectors (RAW_SAVE), and the cluster stops. A new cluster's initial nodes start on copies of
 // those raw files (--raw-reuse) and on the index without its page file, so that a single vector
 // copied from the index would fail the deployment: they deploy the same placement, copy no

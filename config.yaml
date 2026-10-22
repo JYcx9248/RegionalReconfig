@@ -1,0 +1,43 @@
+# The system configuration (Koala's config.yaml): the settings of the controller and the agents,
+# by key, which every process reads at startup (rtier-controller -config config.yaml, rtier-agent
+# -config config.yaml with its own flags). scripts/run_local.py and scripts/run_cluster.py
+# rewrite this file before every run: every key at its default (bin/rtier-controller -defaults),
+# then the keys the experiment (configs/experiment.*.json) sets by name, then the run's own
+# addresses and directories; each run's results keep a copy. As committed, every key is at its
+# default.
+ControllerAddr: 127.0.0.1:7100
+APIAddr: 127.0.0.1:7101
+IndexDir: ""
+PartitionsDir: ""
+InitialNodes: 1
+InitialEntries: 0
+NewNodeRoles:
+  - aggregator
+  - data
+  - entry
+Placement: even-reversible-graph
+Protocol: lazy
+EpochStore: memory
+MetricsPath: metrics.jsonl
+CallTimeout: 10s
+StageTimeout: 30m0s
+GraphPriority: background
+RawPriority: background
+EntryFlipInterval: 1s
+AllowUpdates: false
+UpdateLease: 10m0s
+StatsDir: ""
+ControllerWorkDir: ""
+ControllerBulkAddr: ""
+NodeConns: 8
+Strategy: ""
+Selector: owner
+TransferRateBytesPerSec: 0
+TransferAdapter: fixed
+ChunkBytes: 1048576
+RawStreams: 2
+RawBatchBytes: 1048576
+RawPath: ""
+MetricsInterval: 5s
+QuerySample: 1024
+SampleInterval: 0s

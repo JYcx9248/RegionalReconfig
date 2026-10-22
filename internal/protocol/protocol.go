@@ -421,7 +421,7 @@ type WaitReadyReq struct {
 // that epoch's owners, so the placement must not change underneath it.
 type BeginUpdateReq struct {
 	// LeaseSeconds: how long the lease lasts without a commit or an abort (0: the controller's
-	// update_lease).
+	// UpdateLease).
 	LeaseSeconds float64 `json:"lease_seconds,omitempty"`
 }
 

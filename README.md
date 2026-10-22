@@ -25,8 +25,8 @@ Vectors are immutable (an update deletes and inserts under a new ID, U14), so th
 the codes of partitions that moved away as a cache; they are dropped only when a later staging
 needs the room, and a staging protects the codes it needs. `rtier_node --pq-capacity N` sets a
 node's budget (its HBM, in codes); the runners size it from the partitions
-(`cluster.pq_capacity: auto`, the default: the most distinct vectors one node's partitions name
-at the smallest cluster size, plus `cluster.pq_headroom`, 10%; `bin/rtier-client pq-share`
+(`"PQCapacity": "auto"`, the default: the most distinct vectors one node's partitions name
+at the smallest cluster size, plus `"PQHeadroom"`, 10%; `bin/rtier-client pq-share`
 counts them). In fact nothing is ever dropped: a scale-out only takes partitions away and a
 reversible scale-in only gives back
 what it took, so a node's resident set stays what it held at the initial cluster size -- which
@@ -58,7 +58,7 @@ Partition directories written before locations existed (payload `lists-only`) ar
 
 **Raw vectors after a migration (decided part of U9):** a new owner goes online with posting
 lists and PQ codes only -- all it needs to filter -- and gets a raw vector only when a query first
-needs it (`"protocol": "lazy"`, the default): the point of being lazy is that queries touch a
+needs it (`Protocol: lazy`, the default): the point of being lazy is that queries touch a
 small working set of what moved, and the rest never has to. Every posting records the holder of
 its vector, the node that stores it (segment version 3), so each (list, vector) has one current
 holder: the list's owner if it has the vector, else the node its posting names. Only the owner's
@@ -66,7 +66,7 @@ copy of a list counts: a partition moves as its owner saves it, holders included
 on, a RERANK that meets a vector not there fetches it from the holder that one of the query's
 lists on that node records -- one hop, data node to data node -- waits for that fetch only,
 holding no engine worker meanwhile, nor a connection slot of the aggregator's that FILTERs use
-(RERANKs have their own, `cluster.node_conns` of each kind), and makes that posting name itself;
+(RERANKs have their own, `NodeConns` of each kind), and makes that posting name itself;
 queries that miss the same vector meanwhile wait for the one fetch. Fetched vectors are
 re-ranked from memory, and a background writer installs them on the SSD with whole-page direct
 writes, off the query path. Nothing else moves and a scale-out does
@@ -85,13 +85,13 @@ same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after t
 (`StageRaw`; the rescale waits for it and reports `raw_vectors` / `raw_seconds`),
 `"copy-then-flip"` streams them before the flip, `"stop-and-copy"` while paused. Streams and the
 drain run data node to data node by default (`RAW_PULL`), unpaced like the queries' fetches;
-only through the agents (`raw_path: agent`, the default when the agents are paced) do they take a
-token-bucket class: `"raw_priority"` (background by default) after the flip and for the drain,
+only through the agents (`RawPath: agent`, the default when the agents are paced) do they take a
+token-bucket class: `RawPriority` (background by default) after the flip and for the drain,
 data for the eager baselines' copy before the flip. The pacing stays as it is, for now (U8): a
 fixed rate, not adapted to foreground latency, and no byte rate for the drain beyond what
-`cluster.raw` and the source's read budget allow.
+`RawStreams`, `RawBatchBytes` and the source's read budget allow.
 
-**Placement (decided part of U3):** `"placement": "even-reversible-graph"` (the default) keeps
+**Placement (decided part of U3):** `Placement: even-reversible-graph` (the default) keeps
 partition counts even and moves partitions only from existing to new nodes on scale-out -- each
 donor gives its excess -- and from leaving to remaining nodes on scale-in, where it sends every
 partition it can back to a node that has owned it before. So scaling out and back in restores
@@ -125,7 +125,7 @@ partitions and answer FILTER and RERANK -- the steps that take load off the old 
 the navigation graph only for the entry role, whose navigation any existing entry can do
 meanwhile. So each new entry's graph source is assigned when the reconfiguration starts,
 round-robin over the live entries (`graph_sources` in the rescale reply), and the pull runs at
-background priority (`"graph_priority": "background"`, the default): the graph moves only while
+background priority (`GraphPriority: background`, the default): the graph moves only while
 neither its source nor its destination moves data -- segments or PQ codes through the agent,
 raw vectors through the data node (`RAW_TRAFFIC`, polled every 100 ms) -- paced or not, so it
 delays neither the flip nor a query's fetch. In the worst case, queries fetching without pause,
@@ -135,7 +135,7 @@ graph moves nothing at all while data moves, or takes the bandwidth the data lea
 settled once the experiments show what it costs (each wait counts in the agent's
 `graph.yield_ms`). `"data"` shares the source's bucket equally, as a baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
-are arriving, the controller flips every `"entry_flip_interval"` (1 s by default) to add all the
+are arriving, the controller flips every `EntryFlipInterval` (1 s by default) to add all the
 nodes that are ready, and adds the last ones at once when every pull has ended. These flips
 change only the entries, so they run alongside the grace period of the data flip. A node whose
 graph fails to load stays a data node and aggregator without holding up the others, and the
@@ -158,7 +158,7 @@ its graph, so a list kept elsewhere would change when the rescale counts as done
 node is an entry), not when a node starts working.
 
 **Aggregator (decided part of U6):** the entry navigates first, then works out which nodes own
-the probed lists, and only then picks the aggregator among them (`"selector": "owner"`, the
+the probed lists, and only then picks the aggregator among them (`Selector: owner`, the
 default): itself if it is one of the owners; the owner if a single node holds every list -- the
 query is forwarded once and both phases run where the data is, one network round trip instead of
 two; itself otherwise, since forwarding would add a hop to save one of several parallel
@@ -185,13 +185,13 @@ the PQ codebook is fixed: a modification deletes a vector and inserts it under a
 and raw-vector locations are only ever appended, so nothing a former owner keeps goes stale. The
 epoch table names a version of each partition's lists, and FILTER and RERANK name the version
 their epoch sees, so a data node holds a partition's next version next to the one the current
-epoch's queries read. Batches run only when the controller has `"allow_updates"` (off by
-default, so a static experiment cannot have its data changed; `run_local.py`'s `updates` section turns
-it on). The update controller (`internal/update`, `bin/rtier-updater`) decides a batch and the
+epoch's queries read. Batches run only when the controller has `AllowUpdates` (off by
+default, so a static experiment cannot have its data changed; an experiment's `"Updates"` turns it
+on). The update controller (`internal/update`, `bin/rtier-updater`) decides a batch and the
 nodes carry it out:
 
 1. It takes the controller's lease (`BeginUpdate`): no reconfiguration and no other batch runs
-   until it commits or aborts, or `"update_lease"` expires. Before granting it, the controller has
+   until it commits or aborts, or `UpdateLease` expires. Before granting it, the controller has
    the agents release PQ codes left staged by a staging that never ended.
 2. It gives each insert an ID and a location and routes it by the build's own rule (`ASSIGN`: the
    lists the build would have chosen, and the PQ code) on its own router: an `rtier_node` with the
@@ -258,7 +258,7 @@ or graphs. With N data nodes and N spares (idle nodes; `-spares`):
    baseline). Every posting whose vector its owner lacks names an old node that holds it, so a
    missing vector is one hop away.
 4. The old nodes load the new partitions (PQ codes from the generation's index) and graph. They
-   then replay the recent client queries the entries kept (`query_sample`, 1024 per entry) under
+   then replay the recent client queries the entries kept (`QuerySample`, 1024 per entry) under
    the new generation's draft epoch, so the raw vectors those queries need are on their owners
    before any client query arrives (`-warmup`).
 5. One flip puts the new generation online on the old nodes. After the grace period the spares,
@@ -292,11 +292,12 @@ epoch, a full rebuild and rescales.
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |
 | `test/e2e` | real `rtier_node` processes under query load: scale-out and scale-in, plans, update batches, major epochs, full rebuilds, diagnostics forwarding, a deployment on a warmup snapshot |
-| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; YAML configurations of a base and overrides, `experiment_config.py`; `convert_configs.py` turns the old JSON ones into them), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `run_one.sh` one run on a clean node state (`evict_cache.py`), `node_reads.py` each node's device reads, `emulation/netns.sh`, metrics → SQLite, Python API client |
+| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; an experiment is a JSON file, `experiment_config.py`, from which it rewrites `config.yaml`), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `run_one.sh` one run on a clean node state (`evict_cache.py`), `node_reads.py` each node's device reads, `emulation/netns.sh`, metrics → SQLite, Python API client |
 
 ## Build and test
 
-Needs Linux, CMake ≥ 3.18, a C++17 compiler with OpenMP, Go ≥ 1.24 (standard library only),
+Needs Linux, CMake ≥ 3.18, a C++17 compiler with OpenMP, Go ≥ 1.24 (the standard library and
+`gopkg.in/yaml.v3`, vendored),
 Python 3 with numpy and PyYAML for the scripts. CUDA ≥ 11 and liburing are optional.
 
 ```sh
@@ -319,29 +320,36 @@ engine/build/fusion_build --base data/syn-base.u8bin --out /tmp/rtier-run/index
 #   make_gp_assignment.py INDEX 64 OUT --points heads --graph-source index --kaminpar PATH
 # make_spatial_assignment.py (recursive bisection of the heads) is the baseline
 python3 scripts/testing/make_range_assignment.py /tmp/rtier-run/index 64 data/assign.bin
-python3 scripts/run_local.py configs/experiment.synthetic.yaml results/run1
+python3 scripts/run_local.py configs/experiment.synthetic.json results/run1
 ```
 
-Experiment configurations are YAML, a base and overrides: an experiment file
-(`configs/experiment.*.yaml`) names the file it builds on with `base:` (`configs/base/*.yaml`)
-and gives only what differs; `scripts/experiment_config.py` has every key and prints a merged
-configuration. `run_local.py` makes what is missing and records what each stage was made with:
-the index (`build`: fusion_build's flags), the ground truth, the assignment (`partition`: a
-`file`, or `generator: gp` with `partitions: N`; `spatial` and `range` are placeholders) and
-the partitions, which it makes again when the index or the assignment changes. An index built
-with other flags, or a ground truth made of other vectors, queries or stride, stops the run
-instead of being made again. `dataset.ground_truth_stride: S` computes the ground truth of every
-S-th query only (`fusion_gt --stride`), so that a query file longer than a run, which repeats no
-query, has recall measured all through it. Each results directory records the code it ran:
-`revision.txt` (the commit and the files changed on top of it) and `revision.diff`; the runners
-refuse Go or engine binaries older than their sources. `scripts/run_one.sh CONFIG PROTOCOL
-OUT ['{...}']` runs one configuration with the protocol and any other key overridden.
+As in Koala, every process reads one system configuration, `config.yaml` at the repository root
+(the controller's and the agents' settings by key; `bin/rtier-controller -defaults` prints every
+key at its default), and an experiment is a JSON file (`configs/experiment.*.json`), complete on
+its own. Before each run the runner rewrites `config.yaml`: every key at its default, then the
+keys the experiment sets by name (`"Protocol"`, `"StageTimeout"`, `"NodeConns"`, ...), then the
+run's own addresses and directories; an agent's own settings (its name, data node, directory)
+come on its command line, and the results keep a copy of `config.yaml`. The experiment's other
+keys are the runner's: the dataset, the build, the nodes (`"Nodes"`, `"NodeArgs"`, `"GPUs"`,
+...), the load and the reconfigurations; `scripts/experiment_config.py` has every key and checks
+a file. `run_local.py` makes what is missing and records what each stage was made with: the
+index (`"BuildArgs"`: fusion_build's flags), the ground truth, the assignment (`"Assignment"`, a
+file, or `"Partition": {"Generator": "gp", "Partitions": N, ...}`; `spatial` and `range` are
+placeholders) and the partitions, which it makes again when the index or the assignment
+changes. An index built with other flags, or a ground truth made of other vectors, queries or
+stride, stops the run instead of being made again. `"GroundTruthStride": S` computes the ground
+truth of every S-th query only (`fusion_gt --stride`), so that a query file longer than a run,
+which repeats no query, has recall measured all through it. Each results directory records the
+code it ran: `revision.txt` (the commit and the files changed on top of it) and `revision.diff`;
+the runners refuse Go or engine binaries older than their sources. `scripts/run_one.sh CONFIG
+PROTOCOL OUT ['{...}']` runs one experiment with the protocol and any other key overridden
+(JSON: `'{"Load": {"Rate": 200}}'` changes the rate alone).
 
 The initial deployment copies each initial node's share of the raw vectors from the index's page
 file: minutes at scale (371 s for Wikipedia's two nodes on the lab server). A warmup run does it
-once. `type: warmup` deploys the initial nodes, has each save the presence bits of its raw vectors
-next to its raw file (`rtier-client save-raw`), stops, and copies every node's raw file and bits
-into a snapshot under `paths.snapshot_dir` (default `WORK_DIR/snapshots`), with no load. A later
+once. `"Type": "warmup"` deploys the initial nodes, has each save the presence bits of its raw
+vectors next to its raw file (`rtier-client save-raw`), stops, and copies every node's raw file
+and bits into a snapshot under `"SnapshotDir"` (default `WorkDir/snapshots`), with no load. A later
 run of the same index, partitions, placement and number of initial nodes copies the snapshot into
 its initial nodes' directories (`cp --reflink=auto --sparse=always`, at once on XFS or btrfs) and
 starts them with `rtier_node --raw-reuse`: their bootstrap copies no raw vector. Once deployed, it
@@ -349,21 +357,21 @@ checks that each got the partitions its snapshot was made for. A run without a m
 bootstraps from the index and says why. The nodes start one at a time, each after the previous one
 registered, so `n1`, `n2`, ... get IDs 1, 2, ... and the same partitions every time. The PQ codes
 come from `pq_codes.bin` either way, read once in file order for all of a node's partitions
-(`PQ_FROM_INDEX`). `configs/experiment.wiki-c1024-warmup-{1,2,4}.yaml` are the warmups of the
+(`PQ_FROM_INDEX`). `configs/experiment.wiki-c1024-warmup-{1,2,4}.json` are the warmups of the
 Wikipedia runs.
 
-`configs/experiment.example.yaml` is the same run on BigANN (edit the paths). With
-`cluster.emulation: {netns: true}` (root), each node runs in its own network namespace with its
+`configs/experiment.example.json` is the same run on BigANN (edit the paths). With
+`"Emulation": {"Netns": true}` (root), each node runs in its own network namespace with its
 link shaped by `tc` (`scripts/emulation/netns.sh`; delay needs the `netem` qdisc).
 
 On one machine every node reads the same SSD, and the two-phase RERANK reads ~150 pages per
 query, so without more the cluster stops at what that disk serves and a scale-out adds no
 throughput (measured: 2 and 3 nodes both at ~130-140K reads/s, ~920 q/s on BIGANN-1M). With
-`cluster.resources: {cpus_per_node: 4, io_read_iops_max: 40000}` each node and its agent run in a
+`"NodeResources": {"CPUsPerNode": 4, "IOReadIOPSMax": 40000}` each node and its agent run in a
 cgroup of their own (`systemd-run --scope`): their own CPUs and their own read IOPS on the disk
-of `paths.work_dir`, as if each node had its machine; keep the sum below what the disk serves.
-The controller and the load generator get the CPUs after the nodes'. `memory_max` and
-`io_read_bandwidth_max` work the same way. Each node's and each agent's cgroup is then sampled
+of `"WorkDir"`, as if each node had its machine; keep the sum below what the disk serves.
+The controller and the load generator get the CPUs after the nodes'. `"MemoryMax"` and
+`"IOReadBandwidthMax"` work the same way. Each node's and each agent's cgroup is then sampled
 once a second into `cgroups.jsonl` (CPU time, reads and writes on the data disk, dirty and
 writeback page cache, pressure stall times). Every run also collects each data node's stats log,
 `stats-<node>.jsonl` (`rtier_node --stats-file`: operation counts and times, time spent waiting
@@ -372,10 +380,10 @@ which its agent forwards to the controller
 and the controller stamps on arrival (`"t"`; the node's own time stays as `"node_t"`). Both are on
 the monotonic clock of `clock.json`, whose `load_start` is the load's time 0.
 
-Without root (a shared server), `cluster.resources` uses what systemd delegates to users: each
+Without root (a shared server), `"NodeResources"` uses what systemd delegates to users: each
 node and its agent are pinned to their CPUs with `taskset` and run in a user scope
-(`systemd-run --user`) that carries `memory_max`. The io controller is not delegated, so
-`io_read_iops_max` fails; `read_iops_per_node: 40000` gives each data node a read budget of its
+(`systemd-run --user`) that carries `"MemoryMax"`. The io controller is not delegated, so
+`"IOReadIOPSMax"` fails; `"ReadIOPSPerNode": 40000` gives each data node a read budget of its
 own instead (`rtier_node --read-iops`, `engine/include/fusion/read_budget.h`): it charges
 re-ranking's page reads, the pages the fetch writer reads back and the `RAW_GET` reads the page
 cache misses, as io.max would, and works as root too. The kernel's read-ahead is not charged:
@@ -390,7 +398,7 @@ budget's `"reads"` in `stats-<node>.jsonl` counts reads). `scripts/run_one.sh` d
 run's own files from the page cache without root (`scripts/evict_cache.py`) and leaves
 `vm.swappiness` as it is.
 
-Queries run through the two-phase strategy (`cluster.strategy: two-phase`, the decided answer to
+Queries run through the two-phase strategy (`Strategy: two-phase`, the decided answer to
 U5 for now, agreed with the PI): every owner filters for its own top-n, the aggregator merges the
 global top-n and re-ranks each candidate at the owner that reported it, which is exactly the
 single-node answer. A one-round-trip quota per owner, whose answer can differ, is not pursued.
@@ -398,42 +406,47 @@ single-node answer. A one-round-trip quota per owner, whose answer can differ, i
 a vector new to a node arrives at most once: with `lazy` only when a query needs it, with the
 baselines all of them, streamed or fetched on demand.
 
-`cluster.backend: gpu` (a CUDA build of the engine) runs the data nodes on the GPU filter backend, and
-`cluster.gpus: [0, 1, 4, 5]` gives node i the i-th of those GPUs, numbered as `nvidia-smi` numbers them
+`"Backend": "gpu"` (a CUDA build of the engine) runs the data nodes on the GPU filter backend, and
+`"GPUs": [0, 1, 4, 5]` gives node i the i-th of those GPUs, numbered as `nvidia-smi` numbers them
 (the node runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID` and only its GPU visible; nodes take turns
-when there are fewer GPUs than nodes). With `cluster.resources`, the `"host"` records in
+when there are fewer GPUs than nodes). With `"NodeResources"`, the `"host"` records in
 `cgroups.jsonl` then also have those GPUs' utilization and memory in use, other users' jobs
 included.
 
-`cluster.protocol` in an experiment configuration picks the reconfiguration protocol (`lazy`, the
-default; `lazy-stream`, `copy-then-flip` and `stop-and-copy` as baselines). `cluster.raw` sets how
-a stream pulls (`streams`, `batch_bytes`, and `path`: `node`, or `agent`, the default only when
-`cluster.transfer_rate_bytes_per_sec` paces the agents), and
-`cluster.raw_priority` its class on the agent path. Each node keeps its raw vectors in
-`<WorkDir>/<node>/raw.pages`.
+`"Protocol"` picks the reconfiguration protocol (`lazy`, the default; `lazy-stream`,
+`copy-then-flip` and `stop-and-copy` as baselines). `"RawStreams"`, `"RawBatchBytes"` and
+`"RawPath"` set how a stream pulls (`"RawPath"`: `node`, or `agent`, the default only when
+`"TransferRateBytesPerSec"` paces the agents), and `"RawPriority"` its class on the agent path.
+Each node keeps its raw vectors in `<WorkDir>/<node>/raw.pages`.
 
 ## Run on a cluster
 
 ```sh
-python3 scripts/run_cluster.py configs/experiment.X.yaml results/run1
+python3 scripts/run_cluster.py configs/experiment.X.json results/run1
 ```
 
-`scripts/run_cluster.py` runs the same configuration with the data nodes on other machines, the
-way Koala's runner deploys. A `hosts` section names the host of each node:
+`scripts/run_cluster.py` runs the same experiment with the data nodes on other machines, the
+way Koala's runner deploys. `"Hosts"` names the host of each node:
 
-```yaml
-hosts:
-  nodes: [10.0.0.2, 10.0.0.3, {ssh: gpu4, addr: 10.0.0.4}]   # n1, n2, n3; a host may repeat
-  root: 10.0.0.1      # where the nodes reach this machine (default: found from the route to them)
-  user: chenxu        # the SSH login; ssh_options: more options for ssh
+```json
+"Hosts": {
+  "Nodes": ["10.0.0.2", "10.0.0.3", {"SSH": "gpu4", "Addr": "10.0.0.4"}],
+  "Root": "10.0.0.1",
+  "User": "chenxu"
+}
 ```
+
+`Nodes` are the hosts of n1, n2, n3 (a host may repeat): an SSH destination that is also the
+address the others reach it at, or both. `Root` is where the nodes reach this machine (default:
+found from the route to them), `User` the SSH login, and `SSHOptions` more options for ssh.
 
 This machine, the root, runs the stages, the controller and the load generator. It first checks
 every host over SSH: a login without a prompt, rsync, writable directories, and an engine build
 that its CPU and GPUs can run. A `-march=native` build from another CPU would die with SIGILL.
-Then it copies to each host, at this machine's paths, what its nodes open: `rtier_node` and
-`rtier-agent`; the index's meta, PQ codebook and PQ codes (`rtier_node` checks the codes at
-startup, though only the bootstrap reads them) and the partitions' manifest; where a node of the
+Then it copies to each host, at this machine's paths, `config.yaml` (its agents read it) and
+what its nodes open: `rtier_node` and `rtier-agent`; the index's meta, PQ codebook and PQ codes
+(`rtier_node` checks the codes at startup, though only the bootstrap reads them) and the
+partitions' manifest; where a node of the
 initial deployment runs, also the page file (unless every such node there starts on a warmup
 snapshot, which stays on its host), the graph and the segments it stages from -- a node
 that joins later gets these from its peers; and of each rebuild's next generation, its meta,
@@ -448,11 +461,11 @@ The results arrive on the root as on one machine. The controller writes `metrics
 each agent forwards its data node's stats log (`stats-<node>.jsonl`) and samples of its node,
 itself and its machine (`cgroups.jsonl`). The controller stamps every record on arrival, as
 Koala's metric collector does, so all of them share one clock -- the one of `clock.json` and the
-load generator -- and the hosts' clocks need no synchronization. `cluster.gpus` applies on each
-node's own machine. `cluster.resources` and `cluster.emulation` emulate several machines on one
-and are refused, except `read_iops_per_node`; `run_local.py` refuses a configuration with
-`hosts`. To try the runner without an SSH server, `PATH=$PWD/scripts/testing/fake_ssh:$PATH`
-runs every "remote" command on this machine. The hosts then share its files and nothing is
+load generator -- and the hosts' clocks need no synchronization. `"GPUs"` applies on each
+node's own machine. `"NodeResources"` and `"Emulation"` emulate several machines on one and are
+refused, except `"ReadIOPSPerNode"`; `run_local.py` refuses an experiment with `"Hosts"`. To try
+the runner without an SSH server, `PATH=$PWD/scripts/testing/fake_ssh:$PATH` runs every
+"remote" command on this machine. The hosts then share its files and nothing is
 copied; with `FAKE_SSH_PRIVATE` (directories, colon-separated) and `FAKE_SSH_ROOT`, each host
 sees a copy of its own at those paths (a mount namespace, root only), so the copies are made and
 the nodes run on them.
@@ -466,12 +479,12 @@ load one node cannot serve. Capacity first, then the scale-out:
 python3 engine/scripts/make_synthetic.py --n 200000 --nq 2000 --dim 64 --dtype uint8 --out data/small
 engine/build/fusion_build --base data/small-base.u8bin --out /tmp/rtier-small/index
 python3 scripts/testing/make_range_assignment.py /tmp/rtier-small/index 16 data/small-assign.bin
-python3 scripts/run_local.py configs/experiment.small-calibrate.yaml results/capacity
-python3 scripts/run_local.py configs/experiment.small.yaml results/scaleout
+python3 scripts/run_local.py configs/experiment.small-calibrate.json results/capacity
+python3 scripts/run_local.py configs/experiment.small.json results/scaleout
 ```
 
 The first run offers a ladder of rates to one node and reports where it stops keeping up; set
-`load.rate` below that and `load.rate_steps` above it in `configs/experiment.small.yaml`, so the
+`Load.Rate` below that and `Load.RateSteps` above it in `configs/experiment.small.json`, so the
 load outgrows one node before the rescale. The second run writes `timeline.svg` (queries offered
 and answered per second, answers counted when they came so that a stall shows, and the mean
 latency by send time, with the flips marked; `--latency tail` for p50 and p99), `timeline.csv`,
@@ -480,19 +493,19 @@ metrics, `pq-budget.json`, `revision.txt` and `revision.diff` (a warmup run writ
 what it saved, instead of a latency.csv); `scripts/plot_run.py results/scaleout` redraws them
 with another window size. A run
 cut short keeps what it measured: `reconfigurations.json` is written after each
-reconfiguration, and a load generator stopped before its backlog drained (`load.drain_seconds`
+reconfiguration, and a load generator stopped before its backlog drained (`Load.DrainSeconds`
 after the load, 300 s by default) records the queries still unanswered as `abandoned`.
 
-`cluster.transfer_rate_bytes_per_sec` matters more than it looks on a small dataset: at full speed the few
+`"TransferRateBytesPerSec"` matters more than it looks on a small dataset: at full speed the few
 MB move in milliseconds and nothing is visible around the flip. The small configs pace it at
 4 MB/s so the reconfiguration lasts seconds, the way it would with a real index.
 
 What this measures is the protocol: answers stay exact, the flip is short, and throughput
 follows the load once the second node is online. It does not show why ownership is partitioned
 at all -- with one node, its PQ codes fit by construction. That needs a budget that binds, which
-the runners give every node of a cluster that starts at two nodes or more (`cluster.pq_capacity:
-auto`, written to `pq-budget.json`): the fullest initial node's codes plus 10%, below what one
-node would need for the whole dataset. `configs/experiment.small-2to3.yaml` pins a number of its
+the runners give every node of a cluster that starts at two nodes or more (`"PQCapacity":
+"auto"`, written to `pq-budget.json`): the fullest initial node's codes plus 10%, below what one
+node would need for the whole dataset. `configs/experiment.small-2to3.json` pins a number of its
 own instead. With the range-assignment placeholder a node holds far more than its share of the
 codes (boundary vectors are replicated into up to 8 lists): each of two nodes names 88% of the
 vectors of the 200K synthetic set, and a budget below that fails the staging on purpose.
@@ -518,7 +531,7 @@ python3 scripts/compare_runs.py results/e2e/rep*/lazy results/e2e/rep*/lazy-stre
 
 Leave out `-race` when measuring: the agents run inside the test process. A mean covers
 answered queries only, so it compares protocols only if no query gave up. The test's clients
-wait for their answers. With `run_local.py`, set `load.retry_for_seconds` so that a
+wait for their answers. With `run_local.py`, set `Load.RetryForSeconds` so that a
 query refused while stop-and-copy pauses admission waits too (`rtier-loadgen -retry-for`).
 
 ## Provenance

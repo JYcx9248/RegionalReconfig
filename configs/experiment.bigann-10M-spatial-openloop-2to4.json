@@ -1,0 +1,52 @@
+{
+  "WorkDir": "/root/rtier-work/bigann10m-spatial",
+  "IndexDir": "/root/rtier-work/bigann10m/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "data/bigann-10M.u8bin",
+  "Queries": "data/bigann-query.u8bin",
+  "GroundTruth": "data/bigann-10M-gt.ibin",
+  "Assignment": "data/bigann-10M-spatial-assign.bin",
+  "BuildArgs": [
+    "--pq-m",
+    "32"
+  ],
+  "InitialNodes": 2,
+  "Protocol": "lazy",
+  "Strategy": "two-phase",
+  "Backend": "cpu",
+  "NodeArgs": [
+    "--workers",
+    "4",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Nodes": 4,
+  "Placement": "even-reversible",
+  "TransferRateBytesPerSec": 0,
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeResources": {
+    "CPUsPerNode": 4,
+    "IOReadIOPSMax": 40000
+  },
+  "Load": {
+    "K": 10,
+    "N": 200,
+    "NProbe": 32,
+    "Arrivals": "poisson",
+    "Rate": 400,
+    "RateSteps": "60:700",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 360,
+    "WarmupSeconds": 30
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "DataNodes": 4
+    }
+  ]
+}

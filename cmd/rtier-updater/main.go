@@ -20,7 +20,7 @@
 // handed out twice, not even by a batch that fails, so FILE is written once they are taken.
 // -deletes is a text file of vector IDs (one per line, # comments) or a .bin file in the engine's
 // u32 array format. The vector file must be in the index's element type. The controller must run
-// with allow_updates.
+// with AllowUpdates.
 //
 // Major epochs split and merge posting lists, and patch the navigation graph to match: -split and
 // -merge name lists for one, which runs after the batch, if any; with -split-len and -merge-len,

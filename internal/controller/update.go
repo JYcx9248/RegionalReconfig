@@ -40,9 +40,9 @@ import (
 // its graph in place, before the lease ends -- so a later reconfiguration or major epoch starts
 // from the merged graph.
 //
-// A lease that sees neither a commit nor an abort for update_lease expires, so that an update
+// A lease that sees neither a commit nor an abort for UpdateLease expires, so that an update
 // controller that died does not block reconfigurations for good; a later commit is refused.
-// Batches run only with allow_updates.
+// Batches run only with AllowUpdates.
 
 // updateLease is the lease of the batch in progress.
 type updateLease struct {
@@ -55,7 +55,7 @@ type updateLease struct {
 // returns the epoch the batch is for.
 func (c *Controller) BeginUpdate(ctx context.Context, req protocol.BeginUpdateReq) (*protocol.UpdateLease, error) {
 	if !c.cfg.AllowUpdates {
-		return nil, fmt.Errorf("controller: update batches are off (allow_updates)")
+		return nil, fmt.Errorf("controller: update batches are off (AllowUpdates)")
 	}
 	if c.Ready.IsBlocked() {
 		return nil, fmt.Errorf("controller: initial deployment has not finished (%s)", c.LastError())

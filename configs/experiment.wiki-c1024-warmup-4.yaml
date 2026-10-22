@@ -1,6 +1,0 @@
-# The warmup of every wiki-c1024 run that starts on 4 nodes: deploys them and saves
-# the snapshot of their raw vectors those runs then start on (scripts/run_local.py, type: warmup).
-base: base/wiki-c1024.yaml
-type: warmup
-cluster:
-  initial_nodes: 4

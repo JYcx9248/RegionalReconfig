@@ -57,7 +57,7 @@ var Open = map[string]Question{
 			"the current one. That holds while the cluster never shrinks below its initial size, " +
 			"the nodes that leave are the ones that joined, and placement never hands a " +
 			"partition to a node that never held it. The runners size the budget so (2026-10-21, " +
-			"cluster.pq_capacity: auto): the most distinct vectors one node's partitions name at " +
+			"PQCapacity: auto): the most distinct vectors one node's partitions name at " +
 			"the smallest size a run takes the cluster to, or in a plan it goes to, plus 10%; a run " +
 			"with a rebuild, whose placement is made at run time, gets the whole ID space. " +
 			"Inserts (U14) add to the resident set, so " +
@@ -221,7 +221,7 @@ var Open = map[string]Question{
 	"U8": {"U8", "Adaptive rate control for background transfer",
 		"a token bucket on a separate connection (implemented, fixed rate) with two priority " +
 			"classes on the sender (implemented): data -- segments and PQ codes, what a node " +
-			"needs to own partitions -- and background -- the navigation graph (graph_priority), " +
+			"needs to own partitions -- and background -- the navigation graph (GraphPriority), " +
 			"which only takes tokens no data sender is waiting for -- and, since 2026-10-21, moves " +
 			"nothing while either end of its transfer moves data, paced or not (U16, graphYield). " +
 			"With lazy (the default) the " +
@@ -229,16 +229,16 @@ var Open = map[string]Question{
 			"what goes through the agents is paced: the raw-vector paths between data nodes are " +
 			"not -- a query's fetch (RAW_GET, on the query path by design), a scale-in's drain " +
 			"and the baselines' streams on the default data-node path (RAW_PULL) -- and only the " +
-			"source's read budget bounds them. On the agent path (raw_path agent, the default " +
+			"source's read budget bounds them. On the agent path (RawPath agent, the default " +
 			"only when the agents are paced) the drain and lazy-stream's stream after the flip " +
-			"take raw_priority (background by default, so the stream shares the class equally " +
+			"take RawPriority (background by default, so the stream shares the class equally " +
 			"with a graph still arriving: a baseline's tuning, not a protocol question), and the " +
 			"eager baselines' copy before the flip takes the data class. Decided (2026-10-20, " +
 			"for now): the mechanism stays as it is. The aim is that a reconfiguration not cut " +
 			"the capacity much, and the current one is taken as enough for that: a fixed rate " +
-			"(transfer_rate, set per experiment, unpaced by default) with the two classes, no " +
+			"(TransferRateBytesPerSec, set per experiment, unpaced by default) with the two classes, no " +
 			"rate adapted to foreground latency, and no byte rate for the drain, whose pulls " +
-			"cluster.raw bounds (batch_bytes per request, streams in flight per source, shared " +
+			"RawBatchBytes and RawStreams bound (bytes per request, requests in flight per source, shared " +
 			"with the baselines' streams) besides the source's read budget",
 		"internal/transfer/adapter.go, internal/transfer/tokenbucket.go (classes), " +
 			"internal/agent/control.go (rawViaNode, rawPuller), internal/controller/reconfig.go " +
@@ -264,14 +264,14 @@ var Open = map[string]Question{
 			"the request's connection thread and takes a worker only once the vectors are there, " +
 			"so the node's FILTERs and other RERANKs keep the workers meanwhile; nor a slot a " +
 			"FILTER needs at the aggregator (2026-10-21): the clients there give RERANKs slots of " +
-			"their own, node_conns of each kind. A scale-out " +
+			"their own, NodeConns of each kind. A scale-out " +
 			"does not wait for raw vectors. A scale-in drains the nodes that leave first " +
 			"(DrainRaw: each remaining node takes over the vectors its postings say only a " +
 			"leaving node holds, RAW_HELD_BY then RAW_PULL; the rescale waits for it), so they " +
 			"can go offline when it returns. Holders stay valid because no node drops a raw " +
 			"vector it has held (vectors are immutable, and even a deleted vector's page is not " +
 			"freed); a disk budget would need the same hand-off first. Baselines: \"lazy-stream\" " +
-			"also streams the rest in after the flip (StageRaw at raw_priority; RAW_MISSING " +
+			"also streams the rest in after the flip (StageRaw at RawPriority; RAW_MISSING " +
 			"lists each missing vector once with its holder, as a stream pulled as it arrives; " +
 			"the rescale waits for it); " +
 			"\"copy-then-flip\" streams before the flip, \"stop-and-copy\" while paused. Decided " +
@@ -332,12 +332,12 @@ var Open = map[string]Question{
 			"build's own rule and gives its PQ code; RAW_ADD serves inserted vectors from memory " +
 			"and writes them after fetched ones, never while paused (PAUSE_UPDATES), within " +
 			"--update-write-mbps -- writes are not charged to the read budget yet. Batches run " +
-			"only with the controller's allow_updates (off by default: a static experiment " +
-			"refuses them; an experiment configuration's updates section turns it on and leaves " +
-			"room on the data nodes, the PQ budget included: cluster.pq_capacity auto grows by " +
-			"updates.headroom). The update controller (internal/update, " +
+			"only with the controller's AllowUpdates (off by default: a static experiment " +
+			"refuses them; an experiment's Updates turns it on and leaves " +
+			"room on the data nodes, the PQ budget included: PQCapacity auto grows by " +
+			"Updates.Headroom). The update controller (internal/update, " +
 			"rtier-updater) takes the controller's lease (BeginUpdate: no reconfiguration and no " +
-			"other batch until the commit or the abort, or until update_lease expires; the " +
+			"other batch until the commit or the abort, or until UpdateLease expires; the " +
 			"agents first release PQ codes left staged by a staging that never ended), routes " +
 			"the inserts with its own router (an rtier_node with the graph and codebook only, " +
 			"never a serving node), checks the owners' room, sends the PQ codes and raw vectors " +
@@ -434,12 +434,12 @@ var Open = map[string]Question{
 			"major epoch patches it in place (U14) and a full rebuild moves the roles to spares. " +
 			"Decided (2026-10-20): the transfer mode stays \"eager\" -- an entry without the whole " +
 			"graph serves no purpose, so each new node takes the entry role in a flip as soon as " +
-			"its graph has loaded (batched per entry_flip_interval); the \"stream\" mode (take the " +
+			"its graph has loaded (batched per EntryFlipInterval); the \"stream\" mode (take the " +
 			"role at once, forward NAVIGATE, fill in behind) is not pursued. Decided for the " +
 			"transfer itself: each new entry's source is assigned when the reconfiguration " +
 			"starts, round-robin over the live entries with a cursor that carries over between " +
 			"reconfigurations (instead of every new node pulling from the first entry), and the " +
-			"pull runs at background priority (graph_priority): FILTER and RERANK need posting " +
+			"pull runs at background priority (GraphPriority): FILTER and RERANK need posting " +
 			"lists and PQ codes, not the graph, and navigation is the smallest share of a query " +
 			"that any existing entry can do meanwhile. Decided for now (2026-10-21; final once " +
 			"the experiments show what it costs): the graph yields strictly to posting lists, PQ " +
@@ -461,7 +461,7 @@ var Open = map[string]Question{
 	"U17": {"U17", "Where the client-facing availability list lives",
 		"today the entry set is a field of the epoch table, so \"this node finished loading its " +
 			"graph\" -- a local event that has nothing to do with who owns what -- costs an epoch " +
-			"flip (batched: one per entry_flip_interval for the nodes ready by then, running " +
+			"flip (batched: one per EntryFlipInterval for the nodes ready by then, running " +
 			"alongside the grace period, so no node waits for the slowest graph), and the " +
 			"rescale still blocks until every graph transfer has ended. The alternative, not " +
 			"pursued for now: the coordinator keeps the available list outside the epoch; a node " +

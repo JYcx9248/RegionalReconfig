@@ -6,7 +6,7 @@ data disk served (cgroups.jsonl "host" records: everyone's reads, other users' i
 It tells the per-node budget from the shared disk as the limit of a run: at a node's budget, its
 reads stay flat at the budget and its wait climbs; on a saturated disk, no node reaches its
 budget and the disk's total stops growing. Ends with each node's share of the reads (the busiest
-one sets the cluster's capacity) and, with cluster.gpus, the GPUs' peak utilization and memory.
+one sets the cluster's capacity) and, with GPUs, the GPUs' peak utilization and memory.
 
     python3 scripts/node_reads.py results/wiki-gpu/calibrate-4 [--window 20] [--last 320]
 

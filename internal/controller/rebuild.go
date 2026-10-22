@@ -367,9 +367,9 @@ func (c *Controller) stageGeneration(ctx context.Context, t *epoch.Table, gen *g
 	}
 	phase("switch")
 
-	// 4. PLACE. The segments with holders are the controller's to hand out: with bulk_listen the
-	// nodes pull them from its work directory, wherever they run; without, they read them where
-	// the controller wrote them (one machine).
+	// 4. PLACE. The segments with holders are the controller's to hand out: with
+	// ControllerBulkAddr the nodes pull them from its work directory, wherever they run; without,
+	// they read them where the controller wrote them (one machine).
 	workDir := req.WorkDir
 	src := protocol.Source{Kind: "gen"}
 	switch {

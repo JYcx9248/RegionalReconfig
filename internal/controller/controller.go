@@ -52,8 +52,8 @@ type Controller struct {
 	ctrlAddr  string
 	apiAddr   string
 	lease     *updateLease // the update batch holding reconfigRunning, if any (update.go)
-	statsMu   sync.Mutex   // appends to stats_dir
-	bulkAddr  string       // where nodes pull the files the controller makes (bulk_listen)
+	statsMu   sync.Mutex   // appends to StatsDir
+	bulkAddr  string       // where nodes pull the files the controller makes (ControllerBulkAddr)
 
 	// BeforeGenerationFlip, when set, runs just before a full rebuild flips to the next index
 	// generation, with the epoch it flips to (tests: the answers expected from it on).
@@ -63,17 +63,17 @@ type Controller struct {
 // New validates cfg and loads the partition manifest.
 func New(cfg config.Controller) (*Controller, error) {
 	if cfg.PartitionsDir == "" || cfg.IndexDir == "" {
-		return nil, fmt.Errorf("controller: index_dir and partitions_dir are required")
+		return nil, fmt.Errorf("controller: IndexDir and PartitionsDir are required")
 	}
 	if cfg.InitialNodes < 1 {
-		return nil, fmt.Errorf("controller: initial_nodes must be >= 1")
+		return nil, fmt.Errorf("controller: InitialNodes must be >= 1")
 	}
 	switch cfg.Protocol {
 	case "lazy", "lazy-stream", "copy-then-flip", "stop-and-copy":
 	default:
 		return nil, fmt.Errorf("controller: unknown protocol %q (lazy | lazy-stream | copy-then-flip | stop-and-copy)", cfg.Protocol)
 	}
-	for key, v := range map[string]string{"graph_priority": cfg.GraphPriority, "raw_priority": cfg.RawPriority} {
+	for key, v := range map[string]string{"GraphPriority": cfg.GraphPriority, "RawPriority": cfg.RawPriority} {
 		switch v {
 		case "", "background", "data":
 		default:
@@ -81,10 +81,10 @@ func New(cfg config.Controller) (*Controller, error) {
 		}
 	}
 	if cfg.EntryFlipInterval.Duration <= 0 {
-		return nil, fmt.Errorf("controller: entry_flip_interval must be positive, got %v", cfg.EntryFlipInterval.Duration)
+		return nil, fmt.Errorf("controller: EntryFlipInterval must be positive, got %v", cfg.EntryFlipInterval.Duration)
 	}
 	if cfg.UpdateLease.Duration <= 0 {
-		return nil, fmt.Errorf("controller: update_lease must be positive, got %v", cfg.UpdateLease.Duration)
+		return nil, fmt.Errorf("controller: UpdateLease must be positive, got %v", cfg.UpdateLease.Duration)
 	}
 	m, err := partitioning.LoadManifest(cfg.PartitionsDir)
 	if err != nil {
@@ -158,7 +158,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		// The files the controller makes for the nodes, served over the bulk protocol: a
 		// node pulls them as it pulls a peer's segments, so no filesystem is shared.
 		if c.cfg.WorkDir == "" {
-			return fmt.Errorf("controller: bulk_listen needs work_dir")
+			return fmt.Errorf("controller: ControllerBulkAddr needs ControllerWorkDir")
 		}
 		if err := os.MkdirAll(c.cfg.WorkDir, 0o755); err != nil {
 			return err
@@ -231,7 +231,7 @@ func (c *Controller) setupAgentConn(conn *ctrl.Conn) {
 }
 
 // nodeLines appends the records a node forwarded to file (a pattern of the node's name) in
-// stats_dir, each stamped with the controller's CLOCK_MONOTONIC on arrival ("t"; the node's own
+// StatsDir, each stamped with the controller's CLOCK_MONOTONIC on arrival ("t"; the node's own
 // stamp, if any, becomes "node_t"): the clock of clock.json when the controller runs next to
 // the experiment script, so the analysis scripts read every node's records on one time axis.
 func (c *Controller) nodeLines(body json.RawMessage, file string) {
