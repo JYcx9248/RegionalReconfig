@@ -156,9 +156,15 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   the same index, partitions, placement and initial node count restores them (`cp
   --reflink=auto --sparse=always`) and starts those nodes with `rtier_node --raw-reuse`: their
   bootstrap copies no raw vector, `run_cluster.py` copies no page file to their hosts, and the
-  run checks that each got its snapshot's partitions. PQ codes still come from `pq_codes.bin`,
-  all of a node's in one pass (`PQ_FROM_INDEX`). Nodes start one at a time, each after the
-  previous one registered, so IDs, and with them the initial placement, follow the order.
+  run checks that each got its snapshot's partitions. A snapshot is keyed by content (the
+  index's `meta.txt`, the partitions' manifest, list map and segment sizes and CRCs, placement,
+  initial node count), never by path or mtime: one made on the lab server serves AWS hosts that
+  have the same files (copied, not rebuilt) and its `snapshot.json` and `n<i>/` under the same
+  `"SnapshotDir"`; `"RequireSnapshot": true` stops a run whose initial nodes lack it. PQ codes
+  still come from `pq_codes.bin`, all of a node's in one pass (`PQ_FROM_INDEX`). Nodes start one
+  at a time, each after the previous one registered, so IDs, and with them the initial
+  placement, follow the order. Stage records name files by absolute path: prepared data moves as
+  is at the same paths.
 - **Updates (U14)**: the update controller (`internal/update`, `rtier-updater`) takes the
   controller's lease and runs a batch as a content epoch: inserts routed by its own router
   (`ASSIGN`, the build's rule), PQ codes and raw vectors sent to the owners, the next version of

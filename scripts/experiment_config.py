@@ -49,7 +49,7 @@ SYSTEM_CONFIG = os.path.join(ROOT, "config.yaml")
 # Key -> None (a value), a nested schema (a mapping; of a list's items for a list), or "opaque".
 SCHEMA = {
     "Comment": None, "Type": None,
-    "WorkDir": None, "IndexDir": None, "SnapshotDir": None, "EngineBin": None, "GoBin": None,
+    "WorkDir": None, "IndexDir": None, "SnapshotDir": None, "RequireSnapshot": None, "EngineBin": None, "GoBin": None,
     "Base": None, "Queries": None, "GroundTruth": None, "GroundTruthStride": None,
     "Assignment": None,
     "Partition": {"Generator": None, "Partitions": None, "Points": None, "GraphSource": None,

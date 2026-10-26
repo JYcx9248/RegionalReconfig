@@ -43,14 +43,25 @@ of other vectors, queries or stride stops the run too.
 node saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw),
 everything stops, and each node's raw file and bits are copied into a snapshot -- under
 SnapshotDir (default WorkDir/snapshots), named by the number of initial nodes and a digest of
-what the vectors are made of (the index's page file, the partitions, the placement) -- with its
-manifest, snapshot.json, written last; no load, no reconfiguration. A later run of the same
-index, partitions, placement and number of initial nodes copies the snapshot into each initial
-node's directory (cp --reflink=auto --sparse=always: at once on XFS or btrfs, a copy of the
-node's share elsewhere) and starts its rtier_node with --raw-reuse, so that its bootstrap copies
-no raw vector from the index; once deployed, it checks that every such node got the partitions
-its snapshot was made for. A run without one bootstraps from the index and says why. The PQ
-codes come from the index either way: all of a node's in one pass over pq_codes.bin.
+what the vectors are made of -- with its manifest, snapshot.json, written last; no load, no
+reconfiguration. The digest is of content alone (the index's meta.txt; the partitions' manifest,
+list -> partition map and segments; the placement; the number of initial nodes), so a snapshot
+fits wherever the same files are: made on one machine, it serves the runs of another, given the
+same index and partition files (copied, not rebuilt: two builds of the same data differ) and the
+same SnapshotDir, under which each initial node n<i>'s machine has snapshot.json and n<i>/. A
+later run copies the snapshot into each initial node's directory (cp --reflink=auto
+--sparse=always: at once on XFS or btrfs, a copy of the node's share elsewhere) and starts its
+rtier_node with --raw-reuse, so that its bootstrap copies no raw vector from the index; once
+deployed, it checks that every such node got the partitions its snapshot was made for. A run
+without one bootstraps from the index and says why (what the closest snapshot there differs
+in); with "RequireSnapshot": true it stops instead, before anything starts. The PQ codes come
+from the index either way: all of a node's in one pass over pq_codes.bin. The backend does not
+matter to a snapshot: a warmup on the CPU backend serves GPU runs.
+
+The stage records (an index's build flags and base file, a ground truth's vectors, queries and
+stride, the partitions' index and assignment) name files by absolute path: data prepared on one
+machine is used on another as is when it sits at the same paths there (/data/..., say), as a
+cluster's hosts need anyway.
 
 "Partition": {"Generator": "gp", "Partitions": 64, "KaMinPar": PATH} makes the assignment: GP on
 the list heads over the navigation graph, with unit weights, so that the initial split balances
@@ -166,7 +177,6 @@ bridge address 10.10.0.1. Delay and rate values are per-experiment choices.
 """
 
 import concurrent.futures
-import glob
 import hashlib
 import json
 import math
@@ -174,6 +184,7 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -940,26 +951,35 @@ class Local:
 
 
 def snapshot_key(cfg: dict, index: str, parts: str) -> dict:
-    """What an initial node's raw vectors after its bootstrap are made of: the index's page file,
-    the partitions (the locations each one names) and the ones the node gets -- the placement
-    policy's split over the initial nodes, node i being the i-th to register (the runners start
-    them one after another). The run checks after the deployment that every node started on the
-    snapshot got the partitions it was made for."""
+    """What an initial node's raw vectors after its bootstrap are made of, by content alone, so
+    that a snapshot fits wherever the same files are -- made on one machine, it serves the runs of
+    another: the index's meta.txt; the partitions' manifest, list -> partition map and segments,
+    each segment by its size and the CRC-32 it ends with (a segment names every posting's vector
+    and that vector's place in the page file, so another build's layout changes it); and the
+    nodes' share -- the placement policy's split over the initial nodes, node i being the i-th to
+    register (the runners start them one after another). No path and no modification time, and
+    nothing read but small files and each segment's last bytes: the machine that runs an
+    experiment needs neither the page file nor the layout map. The files must be the same build,
+    copied: the same data built twice is not the same index byte for byte (the graph is built by
+    parallel inserts). After the deployment the run checks that every node started on the snapshot
+    got the partitions it was made for."""
     man = read_kv(os.path.join(parts, "manifest.txt"))
-    pages = os.stat(os.path.join(index, f"vectors_{man['layout']}.bin"))
     segs = hashlib.sha256()
     for p in range(int(man["num_partitions"])):
-        st = os.stat(os.path.join(parts, f"part-{p:05d}.seg"))
-        segs.update(f"{p} {st.st_size} {st.st_mtime_ns}\n".encode())
-    return {"index": os.path.abspath(index), "meta": file_digest(os.path.join(index, "meta.txt")),
-            "pages": [pages.st_size, pages.st_mtime_ns], "partitions": os.path.abspath(parts),
-            "manifest": file_digest(os.path.join(parts, "manifest.txt")), "segments": segs.hexdigest(),
+        with open(os.path.join(parts, f"part-{p:05d}.seg"), "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(size - 4, 0))
+            segs.update(f"{p} {size} {f.read(4).hex()}\n".encode())
+    return {"format": 2, "meta": file_digest(os.path.join(index, "meta.txt")),
+            "manifest": file_digest(os.path.join(parts, "manifest.txt")),
+            "list_part": file_digest(os.path.join(parts, "list_part.bin")), "segments": segs.hexdigest(),
             "placement": cfg.get("Placement") or "default", "initial_nodes": int(cfg.get("InitialNodes", 1))}
 
 
 def snapshot_path(cfg: dict, key: dict) -> str:
-    """The snapshot of key: under SnapshotDir (WorkDir/snapshots), named by the initial
-    nodes and a digest of key, on every machine that runs one of its nodes."""
+    """The snapshot of key: under SnapshotDir (WorkDir/snapshots), named by the initial nodes and a
+    digest of key -- the same name on every machine -- on each machine that runs one of its
+    nodes."""
     root = cfg.get("SnapshotDir") or os.path.join(paths_of(cfg)[0], "snapshots")
     digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
     return os.path.join(os.path.abspath(root), f"{key['initial_nodes']}n-{digest}")
@@ -975,8 +995,9 @@ def by_machine(host_of: dict) -> dict:
 
 def find_snapshot(snap: str, key: dict, host_of: dict) -> tuple:
     """The nodes (of host_of: node number -> machine) that can start on the snapshot at snap --
-    their machine has its manifest, made of key, and their files -- and the manifest."""
-    found, manifest = [], None
+    their machine has its manifest, made of key, and their files --, the manifest, and the
+    machines that have that manifest."""
+    found, manifest, matched = [], None, set()
     for h, nodes in by_machine(host_of).items():
         q = shlex.quote
         out = h.run(f"cat {q(os.path.join(snap, 'snapshot.json'))} 2>/dev/null; echo; " +
@@ -991,17 +1012,23 @@ def find_snapshot(snap: str, key: dict, host_of: dict) -> tuple:
         missing = {line.split("=", 1)[1] for line in rest.splitlines() if line.startswith("missing=")}
         if m.get("key") == key:
             manifest = m
+            matched.add(h)
             found += [i for i in nodes if f"n{i}" not in missing and f"n{i}" in m.get("nodes", {})]
-    return found, manifest
+    return found, manifest, matched
 
 
-def snapshot_mismatch(snap: str, key: dict) -> str:
-    """Why no snapshot of this machine's snapshot directory fits key: what differs in the closest."""
+def snapshot_mismatch(h, snap: str, key: dict) -> str:
+    """Why no snapshot in the snapshot directory of machine h fits key: what differs in the
+    closest."""
+    parent = shlex.quote(os.path.dirname(snap))
+    out = h.run(f"for f in {parent}/*/snapshot.json; do [ -f \"$f\" ] && printf '%s\\t' \"$f\" && "
+                "tr -d '\\n' < \"$f\" && echo; done; true", f"{h.dest}: listing the snapshots")
     best = None
-    for path in glob.glob(os.path.join(os.path.dirname(snap), "*", "snapshot.json")):
+    for line in out.splitlines():
+        path, _, text = line.partition("\t")
         try:
-            other = json.load(open(path)).get("key", {})
-        except (OSError, ValueError):
+            other = json.loads(text).get("key", {})
+        except ValueError:
             continue
         diff = sorted(k for k in key if other.get(k) != key[k])
         if best is None or len(diff) < len(best[1]):
@@ -1039,8 +1066,10 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
     gbin = paths_of(cfg)[2]
     ids = {n["name"]: n["id"] for n in st.get("nodes") or []}
     owners = st["table"]["placement"]["owners"]
-    manifest = {"key": key, "made": time.strftime("%Y-%m-%d %H:%M:%S"), "results": os.path.abspath(out_dir),
-                "nodes": {}}
+    # Where it was made is a record, not part of the key: the snapshot fits wherever its key does.
+    manifest = {"key": key, "made": time.strftime("%Y-%m-%d %H:%M:%S"), "made_on": socket.gethostname(),
+                "index": os.path.abspath(cfg.get("IndexDir") or os.path.join(paths_of(cfg)[0], "index")),
+                "results": os.path.abspath(out_dir), "nodes": {}}
     for i, addr in sorted(addrs.items()):
         r = subprocess.run([f"{gbin}/rtier-client", "save-raw", "-node", addr], capture_output=True, text=True)
         if r.returncode != 0:
@@ -1082,6 +1111,9 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
     json.dump(manifest, open(os.path.join(out_dir, "snapshot.json"), "w"), indent=2)
     log(f"snapshot of {len(addrs)} nodes in {snap}, saved in {time.monotonic() - started:.0f} s: " +
         ", ".join(f"{k} {v['vectors']} vectors ({v['bytes'] / 2**30:.2f} GiB)" for k, v in manifest["nodes"].items()))
+    log(f"to start on it elsewhere, give the machine of each initial node n<i>, at this path, {path} and "
+        f"{snap}/n<i>/ -- with the same index and partition files (copied, not rebuilt) and the same "
+        "SnapshotDir; rsync -S keeps raw.pages sparse (whole, it is as large as the page file)")
 
 
 def check_restored(st: dict, manifest: dict, restored: list, snap: str) -> None:
@@ -1097,18 +1129,27 @@ def check_restored(st: dict, manifest: dict, restored: list, snap: str) -> None:
                                f"for {want}: remove it, or run the warmup again")
 
 
-def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, local: bool) -> tuple:
+def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, required: bool) -> tuple:
     """Before the nodes start: those of host_of (node number -> machine) that can start on the
     warmup snapshot get its files (restore_snapshot); returns them and the manifest. The others
-    bootstrap from the index. local: the snapshot directory is this machine's, which says why
-    none fits."""
-    found, manifest = find_snapshot(snap, key, host_of)
+    bootstrap from the index's page file -- unless required ("RequireSnapshot"): then a node that
+    cannot start on the snapshot stops the run before anything is copied or started (on a cluster
+    its machine would get the whole page file first)."""
+    found, manifest, matched = find_snapshot(snap, key, host_of)
     rest = sorted(set(host_of) - set(found))
     if rest:
-        why = (snapshot_mismatch(snap, key) if local else "") if not found else "its files are missing there"
-        log(", ".join(f"n{i}" for i in rest) + f": no warmup snapshot of this index, partitions, placement and "
-            f"{key['initial_nodes']} initial nodes" + (f" ({why})" if why else "") +
-            ': bootstrapped from the index (a run with "Type": "warmup" makes one)')
+        why = []
+        for h, nodes in by_machine({i: host_of[i] for i in rest}).items():
+            names = ", ".join(f"n{i}" for i in nodes)
+            why.append(f"{names} on {h.dest}: " + (f"its files are missing under {snap}" if h in matched
+                                                   else snapshot_mismatch(h, snap, key)))
+        if required:
+            sys.exit(f"RequireSnapshot: no warmup snapshot {snap} to start on for " + "; ".join(why) +
+                     f". The machine of each initial node n<i> needs {os.path.join(snap, 'snapshot.json')} and "
+                     f"{snap}/n<i>/ ({', '.join(SNAPSHOT_FILES)}) as the warmup run made them (rsync -S keeps "
+                     "raw.pages sparse), and the same index and partition files")
+        log(f"no warmup snapshot of this index, partitions, placement and {key['initial_nodes']} initial nodes "
+            "for " + "; ".join(why) + ': bootstrapped from the index (a run with "Type": "warmup" makes one)')
     if found:
         started = time.monotonic()
         restore_snapshot(snap, found, host_of, work)
@@ -1392,7 +1433,8 @@ def main(cfg_path: str, out_dir: str) -> None:
     snap = snapshot_path(cfg, key)
     machine = Local()
     here = {i: machine for i in range(1, initial + 1)}  # one machine: one manifest
-    restored, manifest = ([], None) if warmup else start_on_snapshot(snap, key, here, work, local=True)
+    restored, manifest = ([], None) if warmup else start_on_snapshot(snap, key, here, work,
+                                                                     required=bool(cfg.get("RequireSnapshot")))
 
     procs = Procs(out_dir)
     results = []

@@ -355,7 +355,16 @@ run of the same index, partitions, placement and number of initial nodes copies 
 its initial nodes' directories (`cp --reflink=auto --sparse=always`, at once on XFS or btrfs) and
 starts them with `rtier_node --raw-reuse`: their bootstrap copies no raw vector. Once deployed, it
 checks that each got the partitions its snapshot was made for. A run without a matching snapshot
-bootstraps from the index and says why. The nodes start one at a time, each after the previous one
+bootstraps from the index and says why, or, with `"RequireSnapshot": true`, stops before anything
+starts. A snapshot is named by a digest of content alone -- the index's `meta.txt`; the partitions'
+manifest, list → partition map and segments (each by its size and CRC); the placement; the number
+of initial nodes -- so it serves any machine that has the same files: one made on the lab server
+starts the initial nodes of a cluster once each node's host has the snapshot's `snapshot.json` and
+the node's directory under the same `"SnapshotDir"` (`rsync -S` keeps `raw.pages` sparse). The
+files must be copied, not rebuilt: the same data built twice is not the same index byte for byte.
+The backend plays no part, so a warmup on the CPU backend serves GPU runs. The stage records name
+files by absolute path, so prepared data moves as is when it sits at the same paths on the other
+machine. The nodes start one at a time, each after the previous one
 registered, so `n1`, `n2`, ... get IDs 1, 2, ... and the same partitions every time. The PQ codes
 come from `pq_codes.bin` either way, read once in file order for all of a node's partitions
 (`PQ_FROM_INDEX`). `configs/experiment.wiki-c1024-warmup-{1,2,4}.json` are the warmups of the

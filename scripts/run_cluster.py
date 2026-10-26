@@ -65,7 +65,11 @@ SampleInterval (1 s unless the experiment says).
 
 A warmup run ("Type": "warmup", run_local.py's doc) saves each initial node's snapshot on that
 node's host, at the same path (SnapshotDir): a later run restores it there, and a host whose
-initial nodes all start on one needs no page file.
+initial nodes all start on one needs no page file. A snapshot is keyed by content, so one made
+elsewhere -- by run_local.py on one machine, say -- serves too, once each initial node n<i>'s host
+has SnapshotDir/<snapshot>/snapshot.json and its n<i>/ (rsync -S keeps raw.pages sparse);
+"RequireSnapshot": true stops a run, before anything is copied, if one has not, instead of
+copying the whole page file to its host.
 
 GPUs applies on each node's own machine: node i gets the i-th entry (in turns, as in
 run_local.py), named by nvidia-smi index, UUID or PCI bus id there. NodeResources and Emulation
@@ -525,7 +529,8 @@ def main(cfg_path: str, out_dir: str) -> None:
     key = rl.snapshot_key(cfg, index, parts)
     snap = rl.snapshot_path(cfg, key)
     host_of = {i: hosts[i - 1] for i in range(1, initial + 1)}
-    restored, manifest = ([], None) if warmup else rl.start_on_snapshot(snap, key, host_of, work, local=False)
+    restored, manifest = ([], None) if warmup else rl.start_on_snapshot(
+        snap, key, host_of, work, required=bool(cfg.get("RequireSnapshot")))
     ctl_addr = cfg.get("ControllerAddr", f"{root}:7100")
     api_addr = cfg.get("APIAddr", f"{root}:7101")
     values = rl.system_values(cfg, ctl_addr, api_addr, index, parts, work, out_dir)
