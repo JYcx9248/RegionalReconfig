@@ -11,7 +11,7 @@
 # vm.swappiness is set to 1 -- at the default 60 the kernel swaps node memory out under
 # page-cache pressure, and a run that swaps in during its load is not comparable. System memory, swap and swap-ins are
 # logged every 5 s to OUT_DIR/../mem-<protocol>.log; the last line printed says how many pages
-# were swapped in. Dropping the page cache and setting swappiness need root; without it (a shared
+# were swapped in. The runner's log is OUT_DIR/run_local.log; a run that fails prints its end. Dropping the page cache and setting swappiness need root; without it (a shared
 # server) only the run's own files leave the page cache (scripts/evict_cache.py: the work
 # directory, the index, the queries, the ground truth) and swappiness stays as it is -- check the
 # swap-ins.
@@ -61,10 +61,13 @@ while kill -0 $RL 2>/dev/null; do
   sleep 5
 done
 wait $RL; rc=$?
-mv "$OUT.log" "$OUT/run_local.log" 2>/dev/null
+# A run that stops in its checks (stale binaries, say) has not made OUT yet: its log goes there all
+# the same, and its last lines say why.
+mkdir -p "$OUT"; mv "$OUT.log" "$OUT/run_local.log" 2>/dev/null
+[ $rc = 0 ] || tail -n 3 "$OUT/run_local.log"
 # A calibration run writes calibration.json (and calib-<rate>.csv), a warmup snapshot.json, not
-# latency.csv.
-RES=latency.csv; grep -q '"Calibrate"' "$OUT/experiment.json" 2>/dev/null && RES=calibration.json
-grep -q '"Type": "warmup"' "$OUT/experiment.json" 2>/dev/null && RES=snapshot.json
+# latency.csv. The run's experiment is $TMP: OUT has no experiment.json when it stopped early.
+RES=latency.csv; grep -q '"Calibrate"' "$TMP" && RES=calibration.json
+grep -q '"Type": "warmup"' "$TMP" && RES=snapshot.json
 echo "exit $rc $(date +%T), $RES: $(test -f "$OUT/$RES" && echo yes || echo NO), min available $(sort -k2 -n "$MEM" | head -1 | awk '{print $2}') MB, swap-ins $(( $(tail -1 "$MEM" | awk '{print $4}') - $(head -1 "$MEM" | awk '{print $4}') )) pages"
 exit $rc
