@@ -253,6 +253,13 @@ def main() -> None:
         if diff:
             sys.exit(f"{args.out} was begun with other settings ({', '.join(f'{k}: {meta.get(k)!r}' for k in diff)}): "
                      f"give those, or remove {args.out}, its .json and .done to start over")
+    # Chunks listed done are skipped: without their file they would stay zeros, and without the
+    # manifest the new sample's scale would differ from the one they were quantized with.
+    listed = done_chunks(done_path)
+    lost = [p for p, gone in ((meta_path, meta is None), (args.out, not os.path.exists(args.out))) if gone]
+    if listed and lost:
+        sys.exit(f"{done_path} lists {len(listed)} chunks done, but {' and '.join(lost)} is gone: restore it, "
+                 f"or remove {args.out}, its .json and .done to start over")
 
     model = Model(args)
     log(f"{n:,} rows of {args.texts} on {model.where}")

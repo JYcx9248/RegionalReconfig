@@ -24,6 +24,10 @@ D=$R/scripts/data E=$R/engine/build
 # The full run's instruction for the queries; the pilot uses it so that what it measures holds.
 TASK="Given a product search query, retrieve relevant product information and customer reviews"
 THREADS=32  # CPU threads for the build, ground truth and search: the server is shared
+# Step 5 needs the engine: stop now rather than after the hour of steps 1-4.
+for t in fusion_build fusion_gt fusion_search; do
+  [ -x "$E/$t" ] || { echo "$E/$t is missing: build the engine in $R first (make CUDA=ON)"; exit 1; }
+done
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/pilot.log") 2>&1
 say() { echo; echo "[$(date +%T)] == $*"; }
