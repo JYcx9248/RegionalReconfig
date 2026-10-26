@@ -67,7 +67,8 @@ A warmup run ("Type": "warmup", run_local.py's doc) saves each initial node's sn
 node's host, at the same path (SnapshotDir): a later run restores it there, and a host whose
 initial nodes all start on one needs no page file. A snapshot is keyed by content, so one made
 elsewhere -- by run_local.py on one machine, say -- serves too, once each initial node n<i>'s host
-has SnapshotDir/<snapshot>/snapshot.json and its n<i>/ (rsync -S keeps raw.pages sparse);
+has SnapshotDir/<snapshot>/snapshot.json and its n<i>/ (rsync -aSz: -S writes raw.pages sparse,
+and -z keeps its holes off the wire, where rsync would send them as zeros);
 "RequireSnapshot": true stops a run, before anything is copied, if one has not, instead of
 copying the whole page file to its host.
 

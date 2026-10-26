@@ -41,7 +41,7 @@ of other vectors, queries or stride stops the run too.
 
 "Type": "warmup" makes a warmup run: the initial deployment (no spare node), then each initial
 node saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw),
-everything stops, and each node's raw file and bits are copied into a snapshot -- under
+everything stops, and each node's raw file and bits are moved into a snapshot -- under
 SnapshotDir (default WorkDir/snapshots), named by the number of initial nodes and a digest of
 what the vectors are made of -- with its manifest, snapshot.json, written last; no load, no
 reconfiguration. The digest is of content alone (the index's meta.txt; the partitions' manifest,
@@ -79,7 +79,11 @@ Two things a capacity-driven scale-out run needs:
   "Calibrate": {"Rates": [50, 100, 200, 400], "SecondsPerRate": 15} runs the load generator once
       per rate and reports where the cluster stops keeping up. That number sets the rate of the
       real run -- adding a node shows nothing under a load one node already serves. An
-      experiment with Calibrate measures capacity and stops: no reconfiguration in that run.
+      experiment with Calibrate measures capacity and stops. With Reconfigurations, it measures
+      the cluster they leave, since one larger than the initial deployment exists only after a
+      scale-out: they run first, in trigger order, without load, each to its end. Its Protocol
+      must then be one whose rescale returns with every raw vector moved (copy-then-flip,
+      stop-and-copy, lazy-stream); with lazy, the calibration would measure the fetches.
   "Load": {"Rate": 200, "RateSteps": "30:600"} raises the offered load during the run (here to
       600 q/s at 30 s), which is the situation a scale-out answers.
 
@@ -1061,7 +1065,7 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
                   procs, out_dir: str) -> None:
     """The warmup run, once the initial deployment is ready (st: its status): each node saves the
     presence bits of its raw vectors (rtier-client save-raw), everything stops, and each node's
-    raw file and bits are copied into the snapshot on its machine, synced, with the manifest
+    raw file and bits are moved into the snapshot on its machine, synced, with the manifest
     written there last: it marks a complete snapshot. addrs: node number -> data node address."""
     gbin = paths_of(cfg)[2]
     ids = {n["name"]: n["id"] for n in st.get("nodes") or []}
@@ -1076,20 +1080,22 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
             raise RuntimeError(f"n{i}: save-raw failed: {r.stderr.strip()}")
         manifest["nodes"][f"n{i}"] = {"partitions": [p for p, o in enumerate(owners) if o == ids.get(f"n{i}")],
                                       "vectors": json.loads(r.stdout)["present"]}
-    procs.stop()  # nothing runs while the files are copied
+    procs.stop()  # nothing runs while the files are moved
     started = time.monotonic()
     q = shlex.quote
     path = os.path.join(snap, "snapshot.json")
 
-    def copy(h, nodes):
+    def save(h, nodes):
         # The old manifest goes first: until the new one is there, the directory is no snapshot.
         script = [f"set -e; rm -f {q(path)}"]
         for i in nodes:
             d, src = os.path.join(snap, f"n{i}"), os.path.join(work, f"n{i}")
             script.append(f"rm -rf {q(d)}; mkdir -p {q(d)}")
-            script += [f"cp --reflink=auto --sparse=always {q(os.path.join(src, f))} {q(os.path.join(d, f))}"
-                       for f in SNAPSHOT_FILES]
-            script.append("sync " + " ".join(q(os.path.join(d, f)) for f in SNAPSHOT_FILES))
+            # Moved, not copied: the run is over and needs its own files no more, and where the
+            # file system has no reflinks (ext4) a copy takes the snapshot's size a second time. On
+            # one file system it is a rename; across two, mv copies (holes kept) and deletes.
+            script += [f"mv {q(os.path.join(src, f))} {q(os.path.join(d, f))}" for f in SNAPSHOT_FILES]
+            script.append("sync " + " ".join(q(os.path.join(d, f)) for f in SNAPSHOT_FILES) + f" {q(d)}")
             script.append(f"echo n{i}=$(du -s -B1 {q(d)} | cut -f1)")
         out = h.run("; ".join(script), f"{h.dest}: saving the snapshot", timeout=24 * 3600)
         return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
@@ -1103,7 +1109,7 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
     sizes = {}
     machines = by_machine(host_of)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(machines))) as ex:
-        for got in ex.map(lambda hn: copy(*hn), machines.items()):
+        for got in ex.map(lambda hn: save(*hn), machines.items()):
             sizes.update(got)
         for name, n in manifest["nodes"].items():
             n["bytes"] = int(sizes.get(name, 0))  # on disk: the file is sparse
@@ -1113,7 +1119,8 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
         ", ".join(f"{k} {v['vectors']} vectors ({v['bytes'] / 2**30:.2f} GiB)" for k, v in manifest["nodes"].items()))
     log(f"to start on it elsewhere, give the machine of each initial node n<i>, at this path, {path} and "
         f"{snap}/n<i>/ -- with the same index and partition files (copied, not rebuilt) and the same "
-        "SnapshotDir; rsync -S keeps raw.pages sparse (whole, it is as large as the page file)")
+        "SnapshotDir; rsync -aSz keeps raw.pages sparse and its holes off the wire (without -z, rsync "
+        "sends them as zeros: as much as the page file)")
 
 
 def check_restored(st: dict, manifest: dict, restored: list, snap: str) -> None:
@@ -1146,8 +1153,8 @@ def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, required: 
         if required:
             sys.exit(f"RequireSnapshot: no warmup snapshot {snap} to start on for " + "; ".join(why) +
                      f". The machine of each initial node n<i> needs {os.path.join(snap, 'snapshot.json')} and "
-                     f"{snap}/n<i>/ ({', '.join(SNAPSHOT_FILES)}) as the warmup run made them (rsync -S keeps "
-                     "raw.pages sparse), and the same index and partition files")
+                     f"{snap}/n<i>/ ({', '.join(SNAPSHOT_FILES)}) as the warmup run made them (rsync -aSz keeps "
+                     "raw.pages sparse and its holes off the wire), and the same index and partition files")
         log(f"no warmup snapshot of this index, partitions, placement and {key['initial_nodes']} initial nodes "
             "for " + "; ".join(why) + ': bootstrapped from the index (a run with "Type": "warmup" makes one)')
     if found:
@@ -1280,10 +1287,28 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
             cmd += ["-gt", gt, "-gt-stride", str(cfg.get("GroundTruthStride", 1))]
         return cmd
 
+    def reconfigure(rc: dict, t0: float) -> None:
+        log(rc["what"])
+        started = time.monotonic()
+        reply = api.call(rc.get("method", "Rescale"), rc["request"])
+        results.append({"data_nodes": rc.get("data_nodes"), **({"plan": rc["plan"]} if "plan" in rc else {}),
+                        **({"rebuild": True} if rc.get("rebuild") else {}),
+                        "trigger_seconds": round(started - t0, 3),
+                        "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
+        log(json.dumps(results[-1]))
+        # After each one: a later one that fails ends the run, and the timeline still has these.
+        json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
+
     # 4b. capacity first: how much this cluster serves before it falls behind. Scale-out is
-    # driven by load, so every later run's rate is set relative to this number.
+    # driven by load, so every later run's rate is set relative to this number. A cluster larger
+    # than the initial deployment exists only after a scale-out: the reconfigurations run first,
+    # without load, each to its end (load_config: under a protocol that moves every raw vector
+    # before the rescale returns), and the capacity measured is the one of what they leave.
     calib = cfg.get("Calibrate")
     if calib:
+        t0 = time.monotonic()
+        for rc in reconfigs:
+            reconfigure(rc, t0)
         table = []
         for rate in calib.get("Rates", [50, 100, 200, 400]):
             path = os.path.join(out_dir, f"calib-{rate:g}.csv")
@@ -1298,7 +1323,7 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
         json.dump(table, open(os.path.join(out_dir, "calibration.json"), "w"), indent=2)
         log(f"saturation: served up to {saturation(table):g}/s without falling behind; "
             f"set the reconfiguration run's rate from this")
-        return  # a calibration run measures capacity only: no reconfiguration in it
+        return  # a calibration run measures capacity only: no reconfiguration under load
 
     # 5. timed reconfigurations (Koala's "Reconfigurations", each at its TriggerTimeSeconds)
     # Timed with the monotonic clock: a wall clock can jump (WSL2 resyncs it by tens of
@@ -1314,16 +1339,7 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
         while time.monotonic() - t0 < rc["at"]:
             procs.check()
             time.sleep(0.2)
-        log(rc["what"])
-        started = time.monotonic()
-        reply = api.call(rc.get("method", "Rescale"), rc["request"])
-        results.append({"data_nodes": rc.get("data_nodes"), **({"plan": rc["plan"]} if "plan" in rc else {}),
-                        **({"rebuild": True} if rc.get("rebuild") else {}),
-                        "trigger_seconds": round(started - t0, 3),
-                        "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})
-        log(json.dumps(results[-1]))
-        # After each one: a later one that fails ends the run, and the timeline still has these.
-        json.dump(results, open(os.path.join(out_dir, "reconfigurations.json"), "w"), indent=2)
+        reconfigure(rc, t0)
 
     # The load generator stops sending at the duration and exits once every query it sent is
     # answered: an open-loop run that ends with a backlog needs the time to drain it
@@ -1347,6 +1363,11 @@ def finish(out_dir: str) -> None:
     log(f"results in {out_dir}")
 
 
+# The protocols whose rescale returns with every raw vector moved (internal/controller/reconfig.go:
+# rawBeforeFlip, rawStreamAfterFlip); lazy, the default, has new nodes fetch theirs on demand.
+RAW_BEFORE_RETURN = ("copy-then-flip", "stop-and-copy", "lazy-stream")
+
+
 def load_config(cfg_path: str) -> tuple:
     """The experiment, checked, and its reconfigurations as requests; the binaries' directories
     must be newer than the sources."""
@@ -1362,6 +1383,15 @@ def load_config(cfg_path: str) -> tuple:
             sys.exit(f"{cfg_path}: Nodes ({cfg.get('Nodes', 1)}) is below InitialNodes "
                      f"({cfg.get('InitialNodes', 1)}): the deployment would wait for nodes that never come")
     reconfigs = reconfig_requests(cfg)
+    if cfg.get("Calibrate") and reconfigs:
+        # It measures the cluster the reconfigurations leave: with new nodes still fetching their
+        # raw vectors on demand, it would measure the fetches.
+        if cfg.get("Protocol") not in RAW_BEFORE_RETURN:
+            sys.exit(f"{cfg_path}: a calibration after a reconfiguration needs a Protocol whose rescale returns "
+                     f"with every raw vector moved ({', '.join(RAW_BEFORE_RETURN)}), not "
+                     f"{cfg.get('Protocol', 'lazy (the default)')}")
+        if any(rc.get("rebuild") for rc in reconfigs):
+            sys.exit(f"{cfg_path}: a calibration measures the cluster rescales leave, not a full rebuild")
     check_fresh(*paths_of(cfg)[1:])
     return cfg, reconfigs
 

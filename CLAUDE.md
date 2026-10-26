@@ -151,8 +151,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   can go offline. No node drops a raw vector it has held. Only bootstrap reads the index's page
   file, and not on a warmup snapshot (below).
 - **Warmup snapshots** (`"Type": "warmup"`, `run_local.py`): a run that only deploys the
-  initial nodes and saves each one's raw vectors -- its raw file and presence bits (`RAW_SAVE`,
-  `rtier-client save-raw`) -- under `"SnapshotDir"`, on the node's machine. A later run of
+  initial nodes and moves each one's raw vectors -- its raw file and presence bits (`RAW_SAVE`,
+  `rtier-client save-raw`) -- into `"SnapshotDir"`, on the node's machine (a rename: one copy on
+  disk, even on ext4). A later run of
   the same index, partitions, placement and initial node count restores them (`cp
   --reflink=auto --sparse=always`) and starts those nodes with `rtier_node --raw-reuse`: their
   bootstrap copies no raw vector, `run_cluster.py` copies no page file to their hosts, and the

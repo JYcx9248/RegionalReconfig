@@ -349,8 +349,9 @@ PROTOCOL OUT ['{...}']` runs one experiment with the protocol and any other key 
 The initial deployment copies each initial node's share of the raw vectors from the index's page
 file: minutes at scale (371 s for Wikipedia's two nodes on the lab server). A warmup run does it
 once. `"Type": "warmup"` deploys the initial nodes, has each save the presence bits of its raw
-vectors next to its raw file (`rtier-client save-raw`), stops, and copies every node's raw file
-and bits into a snapshot under `"SnapshotDir"` (default `WorkDir/snapshots`), with no load. A later
+vectors next to its raw file (`rtier-client save-raw`), stops, and moves every node's raw file
+and bits into a snapshot under `"SnapshotDir"` (default `WorkDir/snapshots`; a rename, so that a
+file system without reflinks, such as ext4, holds them once), with no load. A later
 run of the same index, partitions, placement and number of initial nodes copies the snapshot into
 its initial nodes' directories (`cp --reflink=auto --sparse=always`, at once on XFS or btrfs) and
 starts them with `rtier_node --raw-reuse`: their bootstrap copies no raw vector. Once deployed, it
@@ -360,7 +361,8 @@ starts. A snapshot is named by a digest of content alone -- the index's `meta.tx
 manifest, list → partition map and segments (each by its size and CRC); the placement; the number
 of initial nodes -- so it serves any machine that has the same files: one made on the lab server
 starts the initial nodes of a cluster once each node's host has the snapshot's `snapshot.json` and
-the node's directory under the same `"SnapshotDir"` (`rsync -S` keeps `raw.pages` sparse). The
+the node's directory under the same `"SnapshotDir"` (`rsync -aSz`: `-S` writes `raw.pages` sparse,
+and `-z` keeps its holes off the wire, where rsync would send them as zeros). The
 files must be copied, not rebuilt: the same data built twice is not the same index byte for byte.
 The backend plays no part, so a warmup on the CPU backend serves GPU runs. The stage records name
 files by absolute path, so prepared data moves as is when it sits at the same paths on the other
@@ -495,7 +497,11 @@ python3 scripts/run_local.py configs/experiment.small.json results/scaleout
 
 The first run offers a ladder of rates to one node and reports where it stops keeping up; set
 `Load.Rate` below that and `Load.RateSteps` above it in `configs/experiment.small.json`, so the
-load outgrows one node before the rescale. The second run writes `timeline.svg` (queries offered
+load outgrows one node before the rescale. A cluster larger than the initial deployment exists
+only after a scale-out, so its capacity comes from a calibration run with `"Reconfigurations"`:
+they run first, without load and each to its end, and the ladder measures the cluster they leave,
+under a `"Protocol"` whose rescale returns with every raw vector moved (`copy-then-flip`,
+`stop-and-copy`, `lazy-stream`; the run refuses `lazy`). The second run writes `timeline.svg` (queries offered
 and answered per second, answers counted when they came so that a stall shows, and the mean
 latency by send time, with the flips marked; `--latency tail` for p50 and p99), `timeline.csv`,
 `reconfigurations.json` (when each rescale was triggered, how long it took, what it moved), the
