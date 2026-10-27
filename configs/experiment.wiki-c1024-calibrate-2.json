@@ -6,14 +6,19 @@
   "Base": "/netsys/chenxu/data/wiki-c1024.fbin",
   "Queries": "/netsys/chenxu/data/wiki-queries.fbin",
   "GroundTruth": "/netsys/chenxu/data/wiki-c1024-gt.ibin",
-  "Assignment": "/netsys/chenxu/data/wiki-c1024-assign.bin",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
   "BuildArgs": [
     "--pq-m",
     "64",
     "--threads",
     "64"
   ],
-  "Placement": "even-reversible-blocks",
+  "Placement": "even-reversible-graph",
   "Strategy": "two-phase",
   "MetricsInterval": "500ms",
   "ReadyTimeoutSeconds": 3600,
