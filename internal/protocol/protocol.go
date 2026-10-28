@@ -37,7 +37,7 @@ import (
 
 // Methods served by the agent, called by the controller.
 const (
-	StageAggregatorM = "StageAggregator" // connect to every data node of a (draft) table
+	StageAggregatorM = "StageAggregator" // connect to the data nodes (an entry: the aggregators) of a (draft) table
 	StagePartitionsM = "StagePartitions" // fetch segments, load them into the data node
 	StageGraphM      = "StageGraph"      // fetch the navigation graph, load it
 	StageRawM        = "StageRaw"        // stream the raw vectors the node's partitions lack
@@ -100,7 +100,8 @@ type RegisterReply struct {
 	ID placement.NodeID `json:"id"`
 }
 
-// StageAggregatorReq pre-connects to every data node of Table.
+// StageAggregatorReq pre-connects to every data node of Table, and an entry of Table to its
+// aggregators.
 type StageAggregatorReq struct {
 	Table *epoch.Table `json:"table"`
 }

@@ -237,9 +237,9 @@ struct FetchStats {
   uint64_t queued_peak = 0;
   uint64_t fetched = 0;          // new vectors fetched from peers
   uint64_t fetch_calls = 0;      // calls that missed a vector, fetching it or waiting for another
-                                 // query's fetch (RERANK, SEARCH_LOCAL)
-  uint64_t coalesced = 0;        // missing vectors a fetch waited for instead of fetching: another
-                                 // query was fetching them
+                                 // fetch of it (RERANK, SEARCH_LOCAL)
+  uint64_t coalesced = 0;        // missing vectors a query or a pull (RawPull) waited for instead of
+                                 // fetching: another query or pull was fetching them
   uint64_t fetch_us = 0;         // time those callers waited for them, backpressure included
   uint64_t written = 0;          // installed on the SSD by the writer
   uint64_t write_batches = 0;
@@ -431,7 +431,8 @@ class NodeEngine {
   // the vectors this node lacks -- not on the SSD and not fetched by a query already -- from the
   // holders their postings in lists[i] record, data node to data node as RERANK does, installs
   // them as RawPut does (counted as streamed, not as fetched on demand), and makes those
-  // postings name this node. RawMissingError if one has no holder.
+  // postings name this node. One a query is fetching comes with that fetch, and a query that
+  // misses one of them meanwhile waits for this pull. RawMissingError if one has no holder.
   virtual RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) = 0;
   // Which raw vectors the node holds (on the SSD, or fetched and not written yet): one bit per
   // location, 64 per word -- what a full rebuild places the new partitions by (U14).

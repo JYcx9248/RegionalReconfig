@@ -54,12 +54,16 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	})
 }
 
-// StageAggregator: connect to every data node of the given table, so the first queries after
-// the flip do not pay connection setup (Koala: waitAllInboundPeersToConnect). A node already
-// connected is left alone: its queries keep the connections open, and a scale-out comes under
-// load, when a ping would queue behind them in the pool. A new one gets the whole pool at once
-// -- a connection for every slot of both kinds, FILTER's and RERANK's (Preconnect) -- every
-// node in parallel, so the burst after the flip finds its connections open.
+// StageAggregator: connect to every node of the given table that this node's roles in it reach,
+// so the first queries after the flip do not pay connection setup (Koala:
+// waitAllInboundPeersToConnect): as an aggregator, to every data node; as an entry, to every
+// other aggregator, which it forwards queries to. A peer already connected is left alone: its
+// queries keep the connections open, and a scale-out comes under load, when a ping would queue
+// behind them in the pool. A new one gets the whole pool at once -- for a data node, a
+// connection for every slot of both kinds, FILTER's and RERANK's (Preconnect) -- every peer in
+// parallel, so the burst after the flip finds its connections open. The controller calls it
+// on the aggregators of the next epoch, and on the nodes it makes entries, before the flip
+// that does (promoteEntries).
 func (a *Agent) handleStageAggregator(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageAggregatorReq](body)
 	if err != nil || req.Table == nil {
@@ -71,34 +75,55 @@ func (a *Agent) handleStageAggregator(ctx context.Context, body json.RawMessage)
 		mu    sync.Mutex
 		first error
 	)
-	for _, id := range req.Table.Placement.Nodes() {
-		n, ok := req.Table.Node(id)
-		if !ok {
-			return nil, fmt.Errorf("table has no address for node %d", id)
-		}
-		c := a.peer(n.NodeAddr)
-		if c.Open() > 0 {
-			continue
+	connect := func(peer string, open int, preconnect func(context.Context) error) {
+		if open > 0 {
+			return
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			if err := c.Preconnect(cctx); err != nil {
+			if err := preconnect(cctx); err != nil {
 				mu.Lock()
 				if first == nil {
-					first = fmt.Errorf("data node %d (%s): %w", id, n.NodeAddr, err)
+					first = fmt.Errorf("%s: %w", peer, err)
 				}
 				mu.Unlock()
 			}
 		}()
 	}
+	t, self := req.Table, a.ID()
+	if t.IsAggregator(self) {
+		for _, id := range t.Placement.Nodes() {
+			n, ok := t.Node(id)
+			if !ok {
+				return nil, fmt.Errorf("table has no address for node %d", id)
+			}
+			c := a.peer(n.NodeAddr)
+			connect(fmt.Sprintf("data node %d (%s)", id, n.NodeAddr), c.Open(), c.Preconnect)
+		}
+	}
+	if t.IsEntry(self) {
+		for _, id := range t.Aggregators {
+			if id == self {
+				continue
+			}
+			n, ok := t.Node(id)
+			if !ok {
+				return nil, fmt.Errorf("table has no address for node %d", id)
+			}
+			c := a.aggClient(n.QueryAddr)
+			connect(fmt.Sprintf("aggregator %d (%s)", id, n.QueryAddr), c.Open(), c.Preconnect)
+		}
+	}
 	wg.Wait()
 	if first != nil {
 		return nil, first
 	}
-	a.setReady(config.RoleAggregator)
+	if t.IsAggregator(self) {
+		a.setReady(config.RoleAggregator)
+	}
 	return struct{}{}, nil
 }
 

@@ -465,7 +465,8 @@ that joins later gets these from its peers; and of each rebuild's next generatio
 codebook, PQ codes, graph and manifest (its segments come from the controller). The rest of an
 index (postings, centroids, layout maps) is the build's own and stays here. rsync sends only what
 changed, and a directory a host already sees at its path (this machine, a shared file system) is
-not copied. The nodes start in order over SSH, each after the previous one registered, so `n1`,
+not copied. Then `ldd` on every host checks that the binaries find the shared libraries they
+link, which are not copied (liburing, OpenMP, the CUDA runtime), before anything starts. The nodes start in order over SSH, each after the previous one registered, so `n1`,
 `n2`, ... get IDs 1, 2, .... A remote process stops when its SSH session closes, also when the
 runner dies.
 
@@ -503,7 +504,8 @@ they run first, without load and each to its end, and the ladder measures the cl
 under a `"Protocol"` whose rescale returns with every raw vector moved (`copy-then-flip`,
 `stop-and-copy`, `lazy-stream`; the run refuses `lazy`). The second run writes `timeline.svg` (queries offered
 and answered per second, answers counted when they came so that a stall shows, and the mean
-latency by send time, with the flips marked; `--latency tail` for p50 and p99), `timeline.csv`,
+latency by send time, with the flips marked; `--latency tail` for p50 and p99; where the nodes
+were sampled, `cgroups.jsonl`, each data node's memory, also in `memory.csv`), `timeline.csv`,
 `reconfigurations.json` (when each rescale was triggered, how long it took, what it moved), the
 metrics, `pq-budget.json`, `revision.txt` and `revision.diff` (a warmup run writes `snapshot.json`,
 what it saved, instead of a latency.csv); `scripts/plot_run.py results/scaleout` redraws them

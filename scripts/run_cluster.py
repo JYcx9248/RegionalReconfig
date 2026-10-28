@@ -446,6 +446,29 @@ def sync(hosts: list, initial: int, files: list, index: str, parts: str, gens: l
     log(f"copied in {time.monotonic() - started:.0f} s")
 
 
+def check_libraries(hosts: list, bins: list) -> None:
+    """After the copies: every host has the shared libraries the binaries link. Only the
+    binaries are copied, and a library a host lacks (liburing, OpenMP, the CUDA runtime) would
+    stop its node at its start, once the deployment has begun; ldd names it here instead, before
+    anything starts. A Go binary links none (ldd: not a dynamic executable)."""
+    script = "command -v ldd >/dev/null 2>&1 || { echo noldd; exit 0; }\n" + "\n".join(
+        f"ldd {shlex.quote(b)} 2>&1 | sed -n 's|^[[:space:]]*\\([^[:space:]]*\\) => not found.*|lack={b}: \\1|p'"
+        for b in bins) + "\ntrue"
+
+    def check(h: Host) -> list:
+        out = h.run(script, f"{h.dest}: ldd")
+        if "noldd" in out.split():
+            log(f"{h.dest}: no ldd, so the binaries' libraries are not checked there")
+        return [f"{h.dest}: {line.split('=', 1)[1]}" for line in out.splitlines() if line.startswith("lack=")]
+
+    distinct = list(dict.fromkeys(hosts))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(distinct))) as ex:
+        lack = [p for ps in ex.map(check, distinct) for p in ps]
+    if lack:
+        sys.exit("shared libraries missing on the hosts (install them there: the binaries are copied, "
+                 "the libraries they link are not):\n  " + "\n  ".join(lack))
+
+
 # ------------------------------------------------------------------- 4. processes
 
 class Procs(rl.Procs):
@@ -539,8 +562,9 @@ def main(cfg_path: str, out_dir: str) -> None:
     # every agent samples its node, itself and its machine for cgroups.jsonl here.
     values.update(ControllerBulkAddr=f"{root}:0", SampleInterval=cfg.get("SampleInterval", "1s"))
     rl.write_system_config(cfg, values, out_dir)
-    sync(hosts, initial, [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node"),
-                          rl.experiment_config.SYSTEM_CONFIG], index, parts, gens, graph, out_dir, restored)
+    bins = [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")]
+    sync(hosts, initial, bins + [rl.experiment_config.SYSTEM_CONFIG], index, parts, gens, graph, out_dir, restored)
+    check_libraries(hosts, bins)
 
     procs = Procs(out_dir)
     results = []

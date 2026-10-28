@@ -108,13 +108,15 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 - **Query**: entry NAVIGATEs → groups the lists by owner → the `owner` selector picks the
   aggregator → `TwoPhase`: FILTER (local top-n by PQ) at each owner, global top-n merge, RERANK
   of each candidate at one owner that reported it, top-k merge. Equal to the single-node answer.
-- **Reconfiguration** (`copyThenFlip`, protocol `lazy` by default): pre-connect aggregators →
+- **Reconfiguration** (`copyThenFlip`, protocol `lazy` by default): pre-connect (aggregators to
+  the data nodes, entries to the aggregators: `StageAggregator`) →
   new nodes pull segments and the PQ codes they lack (the graph last, for now strictly: it
   moves only while neither end moves segments, PQ codes or raw vectors, `graphYield`; sources
   round-robin over entries) → flip (CAS + install) → grace (drain the old epoch) →
   reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
   Alongside grace and reclaim, `promoteEntries` flips every `EntryFlipInterval` to make
-  entries of the new nodes whose graph has loaded; the rescale waits for it. Raw vectors do
+  entries of the new nodes whose graph has loaded, each connected to every aggregator first;
+  the rescale waits for it. Raw vectors do
   not move with a scale-out: `lazy` fetches one only when a query needs it (below). Baselines:
   `lazy-stream` also streams the rest in after the flip (`StageRaw`; the rescale waits for it),
   `copy-then-flip` and `stop-and-copy` stream them before the flip (eager). A rescale to a plan
@@ -143,7 +145,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   scale-in's drain (U9). A RERANK fetches before it takes an engine worker, and holds a
   connection slot of its own at the aggregator (`nodeclient`): FILTERs wait behind it in
   neither place.
-  Concurrent misses of one vector wait for one fetch. Fetched vectors are re-ranked from memory
+  Concurrent misses of one vector wait for one fetch, and a stream's or a drain's pull
+  (`RAW_PULL`) shares it with the queries both ways (`Claims`; not the stream through the agents). Fetched vectors are re-ranked from memory
   (fetch cache) until a background writer installs them with whole-page `O_DIRECT` writes
   (`WriterLoop`, `RawStore::PutPages`); INFO never waits for it (`nodeclient.InfoSettled` does,
   for tests). A scale-in drains the leaving nodes before it returns (`drainRaw`: each remaining
@@ -205,7 +208,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   paths, the binaries, `config.yaml` and what the host's nodes open (the index's meta, codebook
   and PQ codes and the partitions' manifest; where an initial node runs, also the page file
   (unless the host's initial nodes start on a warmup snapshot), the graph and the segments; a
-  next generation's meta, codebook, PQ codes, graph and manifest), and starts the nodes in order
+  next generation's meta, codebook, PQ codes, graph and manifest), checks with `ldd` that the
+  binaries find their shared libraries there, and starts the nodes in order
   over SSH, each after the previous one registered. A remote process stops when its SSH session
   closes. `"NodeResources"` (except `"ReadIOPSPerNode"`) and `"Emulation"` are for one machine
   and are refused.
@@ -264,8 +268,8 @@ Next:
 4. Full rebuild and updates, measured: affinity against random placement, warm-up on and off,
    stop-the-world; updates from the difference of two Wikipedia snapshots. The rebuild's
    figures still need an in-place baseline that holds both generations' graph and lists on
-   every node (or memory accounting in its place), compare_runs.py's transfer breakdown for
-   rebuilds, and per-node memory curves in the plots. Not implemented: the rebuild's probe-set
+   every node (or memory accounting in its place: `timeline.svg` draws each node's memory, and
+   compare_runs.py counts a rebuild's transfers, 2026-10-28). Not implemented: the rebuild's probe-set
    trigger, a generation that includes inserted vectors, a priority between the warm-up's
    fetches and the spares'.
 5. More data and scale: GP on real datasets (U2: the number of partitions), non-repeating real
@@ -274,8 +278,9 @@ Next:
    known from it, and a custom plan built from it runs at a fixed node count (`rtier-client
    rescale -plan`). We show that any plan runs without disruption and with exact answers; the
    skew policy is not part of our design.
-7. Small code items: let entries pre-connect to aggregators; heap merge in `MergeTopK`; raw path (see `engine/README.md`,
-   known limits): pulls (stream, drain) do not join the queries' fetches.
+7. Small code items (2026-10-28: entries pre-connect to aggregators, a heap merge in `MergeTopK`,
+   pulls share fetches with the queries -- done): the stream through the agents (`RawPath` agent)
+   still claims nothing (`engine/README.md`, known limits).
 8. Open design questions (the registry has them all). Decided on 2026-10-20: two-phase stays
    (U5), no aggregator outsourcing (U6), raw vectors kept in full (U1), the graph transfer stays
    eager (U16), nodes removed by a scale-in are shut down (U3), U7 closed with the failures, the

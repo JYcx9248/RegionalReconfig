@@ -66,6 +66,8 @@ func (a *Agent) handleQueryFrame(ctx context.Context, f *frame.Frame) frame.Fram
 			return badRequest(derr)
 		}
 		res, err = a.forwarded(ctx, f.Epoch, req, groups)
+	case query.OpPing:
+		return resp
 	default:
 		return badRequest(fmt.Errorf("unknown operation 0x%02x", f.Type))
 	}

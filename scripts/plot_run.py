@@ -13,6 +13,8 @@ Reads what run_local.py (or run_cluster.py) leaves in the results directory:
   reconfigurations.json  one entry per reconfiguration (a rescale, a plan or a full rebuild):
                          when it was triggered, how long it took, what it moved (older runs hold
                          the bare replies)
+  cgroups.jsonl          where there is one (NodeResources, or a cluster's agents): each node's
+                         samples, with clock.json, the load's start on their clock
 
 and writes, over the same time axis:
 
@@ -20,8 +22,13 @@ and writes, over the same time axis:
                  of the answered queries, or p50 and p99) -- with the epochs marked, so a flip
                  is visible as a line and a reconfiguration as a band. The dashed "offered"
                  line hides under "answered" exactly while the cluster keeps up: where it
-                 appears, the load is past what the nodes serve
+                 appears, the load is past what the nodes serve. With cgroups.jsonl a third:
+                 each data node's memory -- its anonymous memory (what it holds: PQ codes,
+                 posting lists, graph, caches; not the page cache), or its RSS where it has no
+                 cgroup of its own -- one line a node, up to eight (past that, the most and the
+                 least of them); what a full rebuild's placement and generations cost in memory
   timeline.csv   the same windows as numbers, for your own plotting
+  memory.csv     the memory samples the third panel draws
 
 No dependencies: the SVG is written here, in light and dark.
 
@@ -49,8 +56,11 @@ import math
 import os
 import sys
 
-# Categorical slots 1 and 2 of the reference palette, light and dark (validated as a pair).
-SERIES = [("#2a78d6", "#3987e5"), ("#eb6834", "#d95926")]
+# The categorical slots of the reference palette in their order, light and dark (validated in
+# that order on the adjacent pairs, as lines are: slots 1 and 2 for the load's panels, one a data
+# node for the memory panel).
+SERIES = [("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"), ("#eda100", "#c98500"),
+          ("#e87ba4", "#d55181"), ("#008300", "#008300"), ("#6250d6", "#9085e9"), ("#e34948", "#e66767")]
 
 
 def read_latency(path):
@@ -150,6 +160,54 @@ def summarize(rows):
     }
 
 
+def node_memory(results):
+    """Each data node's memory over the run, from cgroups.jsonl: {name: [(t, bytes, kind), ...]},
+    t on latency.csv's axis (clock.json's load_start). kind: "anon" from its cgroup, or "rss"
+    from /proc for a node without one. The agents and the host have samples of their own."""
+    try:
+        zero = json.load(open(os.path.join(results, "clock.json")))["load_start"]
+        f = open(os.path.join(results, "cgroups.jsonl"))
+    except (OSError, ValueError, KeyError):
+        return {}
+    out = {}
+    with f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue  # a run cut short leaves its last line half written
+            name, mem = r.get("node", ""), r.get("mem") or {}
+            if not (name[:1] == "n" and name[1:].isdigit()) or "t" not in r:
+                continue
+            kind = "anon" if "anon" in mem else "rss"
+            if kind in mem:
+                out.setdefault(name, []).append((r["t"] - zero, mem[kind], kind))
+    return dict(sorted(out.items(), key=lambda kv: int(kv[0][1:])))
+
+
+def memory_series(mem, span):
+    """The memory panel within [0, span]: (lines, title, unit), one line a node, n<i> in slot i,
+    or with a node past the palette's eight slots the most and the least of them, second by
+    second -- a ninth hue would be one nobody can tell apart. In GiB, or MiB below one."""
+    inside = {n: [(t, b) for t, b, _ in pts if 0 <= t <= span] for n, pts in mem.items()}
+    inside = {n: pts for n, pts in inside.items() if pts}
+    if not inside:
+        return None
+    unit, scale = ("GiB", 2.0 ** 30) if max(b for pts in inside.values() for _, b in pts) >= 2 ** 30 \
+        else ("MiB", 2.0 ** 20)
+    inside = {n: [(t, b / scale) for t, b in pts] for n, pts in inside.items()}
+    if all(int(n[1:]) <= len(SERIES) for n in inside):
+        return [(n, pts, "s%d" % int(n[1:])) for n, pts in inside.items()], "memory per data node", unit
+    per_s = {}
+    for pts in inside.values():
+        for t, v in pts:
+            per_s.setdefault(int(t), []).append(v)
+    secs = sorted(per_s)
+    return ([("most", [(t + 0.5, max(per_s[t])) for t in secs], "s1"),
+             ("least", [(t + 0.5, min(per_s[t])) for t in secs], "s2 dashed")],
+            "memory of the %d data nodes: the most and the least" % len(inside), unit)
+
+
 def reconfigurations(path):
     """Rescales as (trigger_s, elapsed_s, label). Older runs have no timing: then ()."""
     try:
@@ -191,6 +249,8 @@ def nice_ticks(hi, count=5):
     while v < hi + stepped * 0.5:
         ticks.append(v)
         v += stepped
+    if ticks[-1] < hi:  # the top tick is the panel's top: nothing may lie above it
+        ticks.append(v)
     return ticks
 
 
@@ -198,9 +258,10 @@ def esc(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def panel(svg, y0, title, series, span, marks, bands, unit):
-    """One panel: series = [(name, [(t, v), ...], css class), ...] (at most two), values in
-    `unit`. One series gets no legend: the title names it."""
+def panel(svg, y0, title, series, span, marks, bands, unit, at_ends=False):
+    """One panel: series = [(name, [(t, v), ...], css class), ...], values in `unit`. One series
+    gets no legend: the title names it. at_ends: each name stands beside its line's last value,
+    moved apart where they would overlap, instead of one under the other at the top."""
     values = [v for _, pts, _ in series for _, v in pts if v is not None]
     hi = max(values) if values else 1.0
     ticks = nice_ticks(hi)
@@ -209,9 +270,19 @@ def panel(svg, y0, title, series, span, marks, bands, unit):
     y = lambda v: y0 + PANEL_H - PANEL_H * ((v - bot) / (top - bot))
 
     svg.append('<text class="title" x="%d" y="%d">%s</text>' % (LEFT, y0 - 12, esc(title)))
-    for i, (name, _, cls) in enumerate(series if len(series) > 1 else []):  # identity never colour alone
+    named = series if len(series) > 1 else []  # identity never colour alone
+    rows = [y0 + 14 + i * 16 for i in range(len(named))]
+    if at_ends:
+        ends = [next((y(v) + 4 for _, v in reversed(pts) if v is not None), y0 + PANEL_H) for _, pts, _ in named]
+        order = sorted(range(len(named)), key=lambda i: ends[i])
+        prev = y0 + 10 - 14
+        for i in order:  # top to bottom, 14 px apart at least, then back up from the bottom edge
+            rows[i] = prev = max(ends[i], prev + 14)
+        nxt = y0 + PANEL_H + 4 + 14
+        for i in reversed(order):
+            rows[i] = nxt = min(rows[i], nxt - 14)
+    for (name, _, cls), ly in zip(named, rows):
         lx = W - RIGHT + 8
-        ly = y0 + 14 + i * 16
         svg.append('<line class="%s line" x1="%d" y1="%d" x2="%d" y2="%d"/>'
                    % (cls, lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(name)))
@@ -253,16 +324,18 @@ def fmt(v):
     return "%.2f" % v
 
 
-def svg_document(win, marks, bands, span, title, latency="mean"):
+def svg_document(win, marks, bands, span, title, latency="mean", memory=None):
     top1 = TOP
     top2 = TOP + PANEL_H + GAP
-    h = top2 + PANEL_H + BOTTOM
+    top3 = top2 + PANEL_H + GAP if memory else None
+    last = top3 or top2
+    h = last + PANEL_H + BOTTOM
     svg = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" '
            'font-family="system-ui, -apple-system, Segoe UI, sans-serif">' % (W, h, W, h)]
     svg.append("""<style>
-  svg { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --grid:#e4e3de; --s1:%s; --s2:%s; }
+  svg { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --grid:#e4e3de; %s }
   @media (prefers-color-scheme: dark) {
-    svg { --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --grid:#33322f; --s1:%s; --s2:%s; }
+    svg { --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --grid:#33322f; %s }
   }
   .bg { fill: var(--surface); }
   .title { fill: var(--ink); font-size: 13px; font-weight: 600; }
@@ -271,12 +344,15 @@ def svg_document(win, marks, bands, span, title, latency="mean"):
   .event { stroke: var(--ink2); stroke-width: 1; stroke-dasharray: 3 3; opacity: .7; }
   .band { fill: var(--ink2); opacity: .10; }
   .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-  .s1 { stroke: var(--s1); fill: none; }
-  .s2 { stroke: var(--s2); fill: none; }
+%s
+  .hit { fill: transparent; }
+  .hit:hover { fill: var(--ink2); opacity: .08; }
   /* the first of two series is dashed: when they coincide exactly -- every query answered,
      which is the good case -- it must still be visible under the second. */
   .dashed { stroke-dasharray: 5 3; }
-</style>""" % (SERIES[0][0], SERIES[1][0], SERIES[0][1], SERIES[1][1]))
+</style>""" % (" ".join("--s%d:%s;" % (i, light) for i, (light, _) in enumerate(SERIES, 1)),
+               " ".join("--s%d:%s;" % (i, dark) for i, (_, dark) in enumerate(SERIES, 1)),
+               "\n".join("  .s%d { stroke: var(--s%d); fill: none; }" % (i, i) for i in range(1, len(SERIES) + 1))))
     svg.append('<rect class="bg" x="0" y="0" width="%d" height="%d"/>' % (W, h))
     svg.append('<text class="title" x="%d" y="18">%s</text>' % (LEFT, esc(title)))
 
@@ -293,11 +369,26 @@ def svg_document(win, marks, bands, span, title, latency="mean"):
         panel(svg, top2, "mean latency of the answered queries", lat, span, marks, bands, "ms")
 
     at = lambda t: LEFT + (W - LEFT - RIGHT) * (t / span if span else 0)
+    if memory:
+        lines, mtitle, unit = memory
+        panel(svg, top3, mtitle, lines, span, marks, bands, unit, at_ends=True)
+        # Hover: every node's memory in each second, as the panel's native tooltip.
+        per_s = {}
+        for name, pts, _ in lines:
+            for t, v in pts:
+                per_s.setdefault(int(t), {})[name] = v
+        for sec in sorted(per_s):
+            if sec >= span:
+                continue
+            readout = "%d–%d s: " % (sec, sec + 1) + ", ".join(
+                "%s %.2f %s" % (n, v, unit) for n, v in per_s[sec].items())
+            svg.append('<rect class="hit" x="%.1f" y="%d" width="%.1f" height="%d"><title>%s</title></rect>'
+                       % (at(sec), top3, max(1.0, at(min(sec + 1, span)) - at(sec)), PANEL_H, esc(readout)))
     for t in nice_ticks(span, 8):
         svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
-                   % (at(t), top2 + PANEL_H + 18, esc(fmt(t))))
+                   % (at(t), last + PANEL_H + 18, esc(fmt(t))))
     svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">seconds into the run</text>'
-               % ((LEFT + W - RIGHT) / 2, top2 + PANEL_H + 38))
+               % ((LEFT + W - RIGHT) / 2, last + PANEL_H + 38))
     for t, label in marks:  # the flips, named once, above the top panel
         svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
                    % (at(t), top1 - 12, esc(label)))
@@ -330,8 +421,9 @@ def main():
     span = rows[-1]["t"]
     marks = [(t, label) for t, label in marks if t <= span]  # a flip only the backlog saw, after the load
 
+    mem = node_memory(args.results)
     svg = svg_document(win, marks, bands, span, os.path.basename(os.path.abspath(args.results)),
-                       args.latency)
+                       args.latency, memory_series(mem, span) if mem else None)
     out = os.path.join(args.results, args.out)
     with open(out, "w") as f:
         f.write(svg)
@@ -342,6 +434,13 @@ def main():
             w.writerow(["%.3f" % x["t"], "%.1f" % x["offered"], "%.1f" % x["answered"],
                         "%.1f" % x["failed"], x["p50_us"] or "", x["p99_us"] or "",
                         "%.1f" % x["mean_us"] if x["mean_us"] else ""])
+    if mem:
+        with open(os.path.join(args.results, "memory.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t_s", "node", "bytes", "kind"])
+            for name, pts in mem.items():
+                for t, b, kind in pts:
+                    w.writerow(["%.3f" % t, name, b, kind])
 
     s = summarize(rows)
     print(json.dumps(s, indent=2, sort_keys=True))
@@ -366,7 +465,7 @@ def main():
                 print("%s during the reconfigurations: up to %.0f us per %g s window (before: %.0f us)"
                       % (name, max(during), args.window, sum(before) / len(before) if key == "mean_us"
                          else pctl(sorted(before), 0.99)))
-    print("wrote %s and timeline.csv" % out)
+    print("wrote %s, timeline.csv%s" % (out, " and memory.csv" if mem else ""))
 
 
 if __name__ == "__main__":

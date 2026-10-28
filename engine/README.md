@@ -119,7 +119,10 @@ requests carry the query's lists on the node, the engine finds each missing cand
 them, fetches it from the holder that posting records (`RAW_GET`, through the server's
 `PeerPool`; one hop, since a holder has the vector; one request per holder, every holder at
 once) and makes that posting say "here" -- the one key it fetched for; other lists that name the vector keep a holder that still has it. Queries
-that miss a vector another one is fetching wait for that fetch (`coalesced` in the fetch stats).
+that miss a vector another one is fetching wait for that fetch (`coalesced` in the fetch stats),
+and so do a stream's and a drain's pulls (`RAW_PULL`), which the queries wait for in turn: each
+call claims what it fetches, fetches it, and only then waits for the claims of the others, so two
+calls never wait for each other (`Claims`).
 A posting is made to say "here" only once its vector is present or in the fetch cache, and every
 presence check looks at both under the cache's lock, since the writer marks a vector present
 before it drops it from the cache. A fetched vector is re-ranked from memory: it stays in a
@@ -192,8 +195,12 @@ Known limits of the raw-vector path:
   FILTERs do not wait behind them for a connection either (`internal/nodeclient`);
   `SEARCH_LOCAL` (tests, a single node) still fetches holding its worker,
   since its candidates come from its own FILTER. With the lazy protocol this lasts for as long
-  as queries meet vectors that have not moved. Pulls (stream, drain) do not join the queries'
-  fetches: a vector both need at once comes twice.
+  as queries meet vectors that have not moved. A query that misses a vector a stream or a drain
+  is pulling waits for that pull's request (2026-10-28): a few ms, since the agents keep a
+  request to about `RawBatchBytes` (1 MB), against fetching the vector again. A pull takes its
+  claims a holder at a time, so one holder's failure leaves the others' vectors to the queries.
+  A stream through the agents (`RawPath` agent: `PULL_RAW`, then `RAW_PUT`) claims nothing: a
+  vector it brings while a query fetches it still comes twice.
 - A peer's `RAW_GET` puts its device reads in flight together (2026-10-20): a read-ahead hint
   (`POSIX_FADV_WILLNEED`) for each page the cache lacks, then the buffered reads, at most 256 per
   request at a time. 200 vectors on random uncached pages take about 3 ms, against 29-38 ms read

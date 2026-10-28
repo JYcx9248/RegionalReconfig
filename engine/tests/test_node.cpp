@@ -1598,6 +1598,44 @@ void TestRawMigration() {
   CHECK(ra == rb && da == db && slow->fetch_stats().coalesced > 0 &&
         src->raw_stats(true).served - served1 == slow->raw_stats(true).fetched);
 
+  // A query and a pull (a stream's, a drain's) that need the same vectors at once, whichever
+  // starts first: one fetches each vector, the other waits for that fetch, and the holder is asked
+  // for each vector once. The first fetch is held until the other call waits for it (its
+  // coalesced count), so that the two meet whatever the timing.
+  for (const bool query_first : {true, false}) {
+    auto both = OpenNode(f, {}, false, f.index_nopages);
+    both->SetNodes(query_first ? 11 : 12, {{1, "node-1"}});
+    std::atomic<int> calls{0};
+    std::atomic<uint64_t> asked{0};
+    both->SetRawFetcher([&](const std::string&, const uint32_t* locs, size_t n, uint8_t* out) {
+      asked += n;
+      if (calls++ == 0)
+        for (int i = 0; i < 500 && both->fetch_stats().coalesced == 0; ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      src->RawGet(locs, n, out);
+    });
+    StageFrom(f, both.get(), src.get(), {2, 3});
+    const auto missing = both->RawMissing({2, 3});
+    uint64_t total = 0;
+    for (const auto& m : missing) total += m.locs.size();
+    std::vector<uint32_t> ids(10);
+    std::vector<float> ds(10);
+    RerankStats rs;
+    const std::function<void()> query = [&] {
+      both->Rerank(0, q, cand.data(), nc, 10, mine.data(), nullptr, static_cast<uint32_t>(mine.size()),
+                   ids.data(), ds.data(), &rs);
+    };
+    const std::function<void()> pull = [&] {
+      for (const auto& m : missing) both->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
+    };
+    std::thread first(query_first ? query : pull);
+    while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    (query_first ? pull : query)();
+    first.join();
+    CHECK(both->fetch_stats().coalesced > 0 && asked.load() == total && ids == ra && ds == da &&
+          both->raw_stats(true).present == total);
+  }
+
   // A query whose missing vectors lie at two holders fetches from both at once, one request
   // each: `split` takes partition 2 from src and partition 3 from src2, as a new node takes
   // partitions from several donors. Until one query has needed both, each fetch waits (up to

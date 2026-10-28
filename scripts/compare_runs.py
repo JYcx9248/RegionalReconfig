@@ -223,13 +223,19 @@ def summarize(label, runs, win, width, skip):
 
 # Transfer components, in the order the text lists them.
 PARTS = [("lists", "posting lists"), ("pq", "PQ codes"), ("raw_streamed", "raw streamed"),
-         ("raw_fetched", "raw fetched on demand"), ("graph", "graph")]
+         ("raw_drained", "raw drained"), ("gen_lists", "next generation's lists"),
+         ("raw_warmup", "raw fetched by the warm-up"), ("raw_fetched", "raw fetched on demand"),
+         ("graph", "graph")]
 
 
 def transfers(d):
-    """Bytes a run's reconfigurations moved, by component, summed over its rescales. On-demand
-    fetches go on after a lazy rescale returns, so with the run's metrics.jsonl they are the
-    nodes' raw.fetched counters over the whole run, not what the replies counted."""
+    """Bytes a run's reconfigurations moved, by component, summed over its rescales and rebuilds.
+    On-demand fetches go on after a lazy rescale returns, so with the run's metrics.jsonl they
+    are the nodes' raw.fetched counters over the whole run, not what the replies counted. A full
+    rebuild moves what its evacuation (a lazy rescale onto the spares) moves, the next
+    generation's segments, and the raw vectors its warm-up and the queries fetch, which the
+    warm-up's count splits; the generation's graph and PQ codes come from the nodes' own copies
+    of its files, and are not counted."""
     try:
         entries = json.load(open(os.path.join(d, "reconfigurations.json")))
     except (OSError, ValueError):
@@ -238,12 +244,19 @@ def transfers(d):
     fetched, fetched_bytes = 0, 0
     for e in entries:
         r = e.get("reply") or {}
-        out["pq"] += r.get("pq_bytes", 0)
-        out["lists"] += r.get("bytes", 0) - r.get("pq_bytes", 0)
-        out["raw_streamed"] += r.get("raw_bytes", 0)
+        moved = r
+        if e.get("rebuild") or "generation" in r:
+            moved = r.get("evacuation") or {}
+            out["gen_lists"] += r.get("segment_bytes", 0)
+            out["raw_warmup"] += r.get("warmup_fetched_bytes", 0)
+        out["pq"] += moved.get("pq_bytes", 0)
+        out["lists"] += moved.get("bytes", 0) - moved.get("pq_bytes", 0)
+        out["raw_streamed"] += moved.get("raw_bytes", 0)
+        out["raw_drained"] += moved.get("drain_bytes", 0)
+        out["graph"] += moved.get("graph_bytes", 0)
+        # A rebuild's count covers its evacuation's and its warm-up's: the reply's own, not both.
         fetched += r.get("raw_fetched", e.get("raw_fetched", 0))
         fetched_bytes += r.get("raw_fetched_bytes", e.get("raw_fetched_bytes", 0))
-        out["graph"] += r.get("graph_bytes", 0)
     out["raw_fetched"] = fetched_bytes
     metrics = os.path.join(d, "metrics.jsonl")
     vec_bytes = fetched_bytes / fetched if fetched else base_vec_bytes(d)
@@ -257,6 +270,7 @@ def transfers(d):
                     last[m["node"]] = m["value"]
         total = sum(last[n] - first[n] for n in last)
         out["raw_fetched"] = max(fetched_bytes, round(total * vec_bytes))
+    out["raw_fetched"] = max(0, out["raw_fetched"] - out["raw_warmup"])
     return out
 
 

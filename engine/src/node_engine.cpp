@@ -1316,7 +1316,7 @@ class NodeEngineImpl : public NodeEngine {
   // copy of a whole partition must not pass through the fetch cache and its writer.
   RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) override {
     const std::vector<uint32_t> absent = RawAbsent(locs, n);
-    std::map<uint16_t, std::vector<Posting>> by;  // the postings to pull through, by holder
+    std::vector<std::pair<Posting, uint16_t>> want;  // the postings to pull through, and holders
     std::map<uint32_t, std::shared_ptr<const ResidentSegment>> segs;  // by partition: the newest
     for (size_t i = 0; i < n; ++i) {
       if (!std::binary_search(absent.begin(), absent.end(), locs[i])) continue;
@@ -1330,19 +1330,72 @@ class NodeEngineImpl : public NodeEngine {
       const size_t j = it->second->Find(lists[i], locs[i]);
       FUSION_CHECK(j != SIZE_MAX, "list %u does not name location %u here", lists[i], locs[i]);
       const uint16_t h = it->second->Holder(j);
-      if (h != kSelfHolder) by[h].push_back({it->second, j});  // here: a query fetched it meanwhile
+      if (h != kSelfHolder) want.push_back({{it->second, j}, h});  // here: a query fetched it meanwhile
     }
+    // A vector a query is fetching comes with that fetch, and a query that misses one of these
+    // meanwhile waits for this pull: neither comes twice. A query waits at most for one request,
+    // which the agents keep to about RawBatchBytes. The claims are taken a holder at a time, just
+    // before its request: one that fails leaves the vectors of the others to the queries.
+    std::map<uint16_t, std::vector<Posting>> by;  // by holder
+    for (const auto& [q, h] : want) by[h].push_back(q);
     RawPutResult r;
     std::vector<uint8_t> buf;
-    for (auto& kv : by) {
+    auto pull = [&](uint16_t holder, const std::vector<Posting>& ps) {
       std::vector<uint32_t> ls;
-      for (const Posting& q : kv.second) ls.push_back(q.seg->seg.locs[q.j]);
+      for (const Posting& q : ps) ls.push_back(q.seg->seg.locs[q.j]);
       std::sort(ls.begin(), ls.end());
       ls.erase(std::unique(ls.begin(), ls.end()), ls.end());
-      FetchFrom(kv.first, ls, &buf);
+      FetchFrom(holder, ls, &buf);
       r.installed += raw_->Put(ls.data(), ls.size(), buf.data(), RawOrigin::kStreamed);
-      for (const Posting& q : kv.second) q.seg->SetHolder(q.j, kSelfHolder);
+      for (const Posting& q : ps) q.seg->SetHolder(q.j, kSelfHolder);
+      return ls;
+    };
+    std::vector<std::pair<Posting, std::shared_ptr<InFlight>>> waits;
+    for (const auto& [holder, ps] : by) {
+      Claims claims(this);
+      std::vector<Posting> mine;
+      {
+        std::lock_guard<std::mutex> l(cache_mu_);
+        for (const Posting& q : ps) {
+          if (claims.Has(q.seg->seg.locs[q.j])) {  // another posting of a vector claimed here
+            mine.push_back(q);
+            continue;
+          }
+          std::shared_ptr<InFlight> f;
+          switch (claims.TakeLocked(q.seg->seg.locs[q.j], &f)) {
+            case Claim::kHere:
+              q.seg->SetHolder(q.j, kSelfHolder);
+              break;
+            case Claim::kWait:
+              waits.emplace_back(q, std::move(f));
+              break;
+            case Claim::kMine:
+              mine.push_back(q);
+              break;
+          }
+        }
+      }
+      if (!mine.empty()) claims.Settle(pull(holder, mine), true);
     }
+    if (waits.empty()) {
+      r.skipped = n - r.installed;
+      return r;
+    }
+    fc_.coalesced.fetch_add(waits.size(), std::memory_order_relaxed);
+    std::vector<std::shared_ptr<InFlight>> fs;
+    for (const auto& w : waits) fs.push_back(w.second);
+    WaitFetches(fs);
+    // A query's fetch that failed leaves its vector to this pull, from the holder this posting
+    // records.
+    std::map<uint16_t, std::vector<Posting>> again;
+    for (const auto& [q, f] : waits) {
+      if (f->ok) {
+        q.seg->SetHolder(q.j, kSelfHolder);
+      } else if (!Held(q.seg->seg.locs[q.j])) {
+        again[q.seg->Holder(q.j)].push_back(q);
+      }
+    }
+    for (const auto& [holder, ps] : again) pull(holder, ps);
     r.skipped = n - r.installed;
     return r;
   }
@@ -1938,17 +1991,77 @@ class NodeEngineImpl : public NodeEngine {
     return FetchForQuery(miss, via);
   }
 
-  // A fetch in flight: queries that miss the same vector meanwhile wait for it instead of
-  // fetching it again.
+  // A fetch in flight -- a query's, or a stream's or a drain's (RawPull) -- that the others which
+  // miss the same vector meanwhile wait for instead of fetching it again.
   struct InFlight {
     bool done = false;
     bool ok = false;
   };
 
+  // Where Claims::TakeLocked finds a missing vector.
+  enum class Claim { kHere, kWait, kMine };
+
+  // The fetches one call makes, claimed in inflight_. Every caller fetches what it claimed before
+  // it waits for the claims of others, so two calls never wait for each other. However the call
+  // ends, its claims end with it (Settle, or the destructor: failed), so no waiter blocks for good.
+  class Claims {
+   public:
+    explicit Claims(NodeEngineImpl* e) : e_(e) {}
+    Claims(const Claims&) = delete;
+    Claims& operator=(const Claims&) = delete;
+    ~Claims() {
+      std::vector<uint32_t> rest;
+      for (const auto& kv : claimed_) rest.push_back(kv.first);
+      if (!rest.empty()) Settle(rest, false);
+    }
+    // Under cache_mu_: loc is here already (kHere), another call is fetching it (kWait, *f its
+    // fetch), or it is now this call's to fetch (kMine).
+    Claim TakeLocked(uint32_t loc, std::shared_ptr<InFlight>* f) {
+      if (e_->HeldLocked(loc)) return Claim::kHere;
+      const auto it = e_->inflight_.find(loc);
+      if (it != e_->inflight_.end()) {
+        *f = it->second;
+        return Claim::kWait;
+      }
+      auto mine = std::make_shared<InFlight>();
+      e_->inflight_.emplace(loc, mine);
+      claimed_.emplace(loc, std::move(mine));
+      return Claim::kMine;
+    }
+    bool Has(uint32_t loc) const { return claimed_.count(loc) != 0; }
+    // Ends this call's claims on locs: the vectors are here (ok), or their fetch failed.
+    void Settle(const std::vector<uint32_t>& locs, bool ok) {
+      std::lock_guard<std::mutex> l(e_->cache_mu_);
+      for (uint32_t loc : locs) {
+        const auto it = claimed_.find(loc);
+        if (it == claimed_.end()) continue;
+        it->second->done = true;
+        it->second->ok = ok;
+        e_->inflight_.erase(loc);
+        claimed_.erase(it);
+      }
+      e_->inflight_cv_.notify_all();
+    }
+
+   private:
+    NodeEngineImpl* e_;
+    std::map<uint32_t, std::shared_ptr<InFlight>> claimed_;  // by location
+  };
+
+  // Waits until the fetches fs (other calls') have ended, well or not.
+  void WaitFetches(const std::vector<std::shared_ptr<InFlight>>& fs) {
+    std::unique_lock<std::mutex> l(cache_mu_);
+    inflight_cv_.wait(l, [&] {
+      for (const auto& f : fs)
+        if (!f->done) return false;
+      return true;
+    });
+  }
+
   // Fetches miss[i] from the holder that posting via[i] records, one request per holder, and
-  // waits for those another query is fetching already; every posting used then names this node.
-  // Returns how many vectors this call installed. RawMissingError if one has no holder or a
-  // fetch fails (its own, or one it waited for).
+  // waits for those another query, a stream or a drain is fetching already; every posting used
+  // then names this node. Returns how many vectors this call installed. RawMissingError if one has
+  // no holder or a fetch fails (its own, or one it waited for).
   size_t FetchForQuery(const std::vector<uint32_t>& miss, const std::vector<Posting>& via) {
     Timer t;
     struct Count {  // also when a fetch throws
@@ -1961,50 +2074,28 @@ class NodeEngineImpl : public NodeEngine {
     } count{fc_, t};
     std::vector<size_t> mine, here;  // indices into miss: to fetch; arrived meanwhile
     std::vector<std::pair<size_t, std::shared_ptr<InFlight>>> waits;
-    std::map<uint32_t, std::shared_ptr<InFlight>> claimed;  // by location
+    Claims claims(this);  // before the fetches below, which settle its claims, and after them
     {
       std::lock_guard<std::mutex> l(cache_mu_);
       for (size_t i = 0; i < miss.size(); ++i) {
-        if (HeldLocked(miss[i])) {
-          here.push_back(i);
-          continue;
+        std::shared_ptr<InFlight> f;
+        switch (claims.TakeLocked(miss[i], &f)) {
+          case Claim::kHere:
+            here.push_back(i);
+            break;
+          case Claim::kWait:
+            waits.emplace_back(i, std::move(f));
+            break;
+          case Claim::kMine:
+            mine.push_back(i);
+            break;
         }
-        const auto it = inflight_.find(miss[i]);
-        if (it != inflight_.end()) {
-          waits.emplace_back(i, it->second);
-          continue;
-        }
-        auto f = std::make_shared<InFlight>();
-        inflight_.emplace(miss[i], f);
-        claimed.emplace(miss[i], f);
-        mine.push_back(i);
       }
     }
     if (!waits.empty()) fc_.coalesced.fetch_add(waits.size(), std::memory_order_relaxed);
-    // However this call ends, its claims end with it, so that no waiter blocks for good.
-    auto settle = [&](const std::vector<uint32_t>& locs, bool ok) {
-      std::lock_guard<std::mutex> l(cache_mu_);
-      for (uint32_t loc : locs) {
-        const auto it = claimed.find(loc);
-        if (it == claimed.end()) continue;
-        it->second->done = true;
-        it->second->ok = ok;
-        inflight_.erase(loc);
-        claimed.erase(it);
-      }
-      inflight_cv_.notify_all();
-    };
-    struct Unclaim {
-      std::function<void()> f;
-      ~Unclaim() { f(); }
-    } unclaim{[&] {
-      std::vector<uint32_t> rest;
-      for (const auto& kv : claimed) rest.push_back(kv.first);
-      if (!rest.empty()) settle(rest, false);
-    }};
     std::map<uint16_t, std::vector<size_t>> by;  // what this call fetches, by holder
-    // Claimed, but the posting says here: a stream or a drain (RawPull) brought the vector since
-    // the claim. It is here, and its claim ends well.
+    // Claimed, but the posting says here: an installer that does not claim -- a stream through
+    // the agents (RawPut) -- brought the vector since the claim. It is here, and its claim ends well.
     std::vector<uint32_t> arrived;
     size_t unknown = 0;
     uint32_t first = 0;
@@ -2024,7 +2115,7 @@ class NodeEngineImpl : public NodeEngine {
       throw RawMissingError(StrFormat("%zu raw vectors are not on this node and cannot be fetched (first: "
                                       "location %u, %s)", unknown, first,
                                       listed ? "its posting records no holder" : "no list of the query names it"));
-    if (!arrived.empty()) settle(arrived, true);
+    if (!arrived.empty()) claims.Settle(arrived, true);
     // The holders at once, one request each: a node that took partitions from several donors
     // (the graph placement picks them by the partition graph, not as contiguous ranges) meets a
     // query's misses at several holders, and the query then waits for the slowest fetch instead
@@ -2042,7 +2133,7 @@ class NodeEngineImpl : public NodeEngine {
         raw_->CountFetch();
         got[k] = Cache(ls.data(), ls.size(), buf.data());
         for (size_t i : jobs[k].second) via[i].seg->SetHolder(via[i].j, kSelfHolder);
-        settle(ls, true);
+        claims.Settle(ls, true);
       } catch (...) {
         failed[k] = std::current_exception();
       }
@@ -2069,12 +2160,9 @@ class NodeEngineImpl : public NodeEngine {
     size_t fetched = 0;
     for (size_t g : got) fetched += g;
     if (!waits.empty()) {
-      std::unique_lock<std::mutex> l(cache_mu_);
-      inflight_cv_.wait(l, [&] {
-        for (const auto& w : waits)
-          if (!w.second->done) return false;
-        return true;
-      });
+      std::vector<std::shared_ptr<InFlight>> fs;
+      for (const auto& w : waits) fs.push_back(w.second);
+      WaitFetches(fs);
       for (const auto& w : waits)
         if (!w.second->ok)
           throw RawMissingError(StrFormat("raw vector at location %u: the fetch this query waited for "

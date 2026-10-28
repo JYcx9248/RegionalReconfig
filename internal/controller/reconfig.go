@@ -297,18 +297,19 @@ const (
 // "lazy-stream" with rawStreamAfterFlip, "copy-then-flip" with rawBeforeFlip, and with
 // stopTheWorld too the stop-and-copy baseline (Koala's stop-and-restart):
 //
-//  1. PREPARE  aggregators of the next epoch pre-connect to its data nodes; destinations
-//     pull the moved partitions' posting lists and the PQ codes they lack from the current
-//     owners (separate bulk connections, paced by the senders' token buckets) -- what a node
-//     needs to filter, so it can go online; with rawBeforeFlip, the raw vectors they lack too;
-//     new entry nodes stage the graph in the background.
+//  1. PREPARE  aggregators of the next epoch pre-connect to its data nodes, and its entries to
+//     its aggregators; destinations pull the moved partitions' posting lists and the PQ codes
+//     they lack from the current owners (separate bulk connections, paced by the senders' token
+//     buckets) -- what a node needs to filter, so it can go online; with rawBeforeFlip, the raw
+//     vectors they lack too; new entry nodes stage the graph in the background.
 //  2. FLIP     compare-and-swap epoch e -> e+1 in the store, install e+1 everywhere.
 //  3. GRACE    every node waits until no query pinned to epoch e is running.
 //  4. RECLAIM  old owners evict the moved partitions (their PQ codes and raw vectors stay, as
 //     a cache).
 //  5. ENTRY    alongside 3 and 4, new nodes become entries as their graphs load: every
 //     EntryFlipInterval, one more flip adds those whose graph loaded since the previous
-//     one (promoteEntries). A node whose graph fails to load stays a data node and aggregator.
+//     one, each connected to every aggregator first (promoteEntries). A node whose graph
+//     fails to load stays a data node and aggregator.
 //  6. RAW      from the flip on, a new owner's data node fetches the raw vectors a query needs
 //     on demand, each straight from its holder: every posting records the node holding its
 //     vector (the old owner writes the moved segments for that), and with rawOnDemand nothing
@@ -454,9 +455,10 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		}
 	}()
 
-	// 1. PREPARE -- aggregator readiness: pre-connect to every data node of e+1.
-	aggNodes, _ := c.managed(draft.Aggregators)
-	if err := forEach(aggNodes, func(n *ManagedNode) error {
+	// 1. PREPARE -- readiness of the connections: each node of e+1 pre-connects to what its roles
+	// in it reach, an aggregator to every data node, an entry to every aggregator.
+	prepNodes, _ := c.managed(sortedKeys(draft.Nodes))
+	if err := forEach(prepNodes, func(n *ManagedNode) error {
 		return n.call(ctx, c.stageTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: draft}, nil)
 	}); err != nil {
 		return reply, err
@@ -800,6 +802,12 @@ func (c *Controller) promoteEntries(ctx context.Context, t *epoch.Table, done <-
 		next := t.Clone()
 		next.Epoch = t.Epoch + 1
 		next.Entries = append(next.Entries, ids(ready)...)
+		// From the flip on they forward queries to every aggregator: connected before it.
+		if err := forEach(ready, func(n *ManagedNode) error {
+			return n.call(ctx, c.stageTimeout(), protocol.StageAggregatorM, protocol.StageAggregatorReq{Table: next}, nil)
+		}); err != nil {
+			return err
+		}
 		recips, err := c.managed(sortedKeys(next.Nodes))
 		if err != nil {
 			return err

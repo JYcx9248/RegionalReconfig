@@ -1,12 +1,20 @@
 package query
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"math/rand"
+	"net"
 	"reflect"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"rtier/internal/design"
 	"rtier/internal/epoch"
+	"rtier/internal/frame"
 	"rtier/internal/nodeclient"
 	"rtier/internal/partitioning"
 	"rtier/internal/placement"
@@ -41,6 +49,61 @@ func TestMergeTopK(t *testing.T) {
 	// Order of inputs does not matter.
 	if !reflect.DeepEqual(MergeTopK([][]nodeclient.Candidate{b, a}, 4), want) {
 		t.Fatal("merge depends on input order")
+	}
+}
+
+// mergeBySort is what MergeTopK computed before the heap merge: every candidate, one entry
+// per ID at its smallest distance, all of them sorted.
+func mergeBySort(parts [][]nodeclient.Candidate, k int) []nodeclient.Candidate {
+	best := map[uint32]float32{}
+	for _, p := range parts {
+		for _, c := range p {
+			if d, ok := best[c.ID]; !ok || c.Dist < d {
+				best[c.ID] = c.Dist
+			}
+		}
+	}
+	out := make([]nodeclient.Candidate, 0, len(best))
+	for id, d := range best {
+		out = append(out, nodeclient.Candidate{ID: id, Dist: d})
+	}
+	sort.Slice(out, func(i, j int) bool { return nodeclient.Less(out[i], out[j]) })
+	if k >= 0 && len(out) > k {
+		out = out[:k]
+	}
+	return out
+}
+
+func TestMergeTopKMatchesSort(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for trial := 0; trial < 2000; trial++ {
+		// Few distinct distances and IDs: ties, and vectors several lists report, at the same
+		// distance or (another backend's rounding) a slightly different one.
+		parts := make([][]nodeclient.Candidate, rng.Intn(6))
+		for i := range parts {
+			seen := map[uint32]bool{}
+			for n := rng.Intn(30); len(parts[i]) < n; {
+				id := uint32(rng.Intn(60))
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				d := float32(id%13) + float32(rng.Intn(2))*1e-6
+				parts[i] = append(parts[i], nodeclient.Candidate{ID: id, Dist: d})
+			}
+			if rng.Intn(4) > 0 { // most come sorted, as from a node
+				sort.Slice(parts[i], func(a, b int) bool { return nodeclient.Less(parts[i][a], parts[i][b]) })
+			}
+		}
+		before := fmt.Sprint(parts)
+		k := rng.Intn(70) - 5
+		got, want := MergeTopK(parts, k), mergeBySort(parts, k)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("trial %d, k %d: got %v, want %v (parts %v)", trial, k, got, want, parts)
+		}
+		if fmt.Sprint(parts) != before {
+			t.Fatalf("trial %d: the merge changed its input", trial)
+		}
 	}
 }
 
@@ -181,5 +244,102 @@ func TestAggregateWire(t *testing.T) {
 	}
 	if _, err := DecodeRequest(EncodeRequest(req)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// fakeAgent answers every request on its query port with OK and no candidates, counting the
+// connections it accepted; drop closes them all from its side.
+func fakeAgent(t *testing.T) (addr string, conns *atomic.Int64, drop func()) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	conns = new(atomic.Int64)
+	var (
+		mu   sync.Mutex
+		open []net.Conn
+	)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conns.Add(1)
+			mu.Lock()
+			open = append(open, c)
+			mu.Unlock()
+			go func() {
+				defer c.Close()
+				for {
+					var f frame.Frame
+					if frame.Read(c, &f) != nil {
+						return
+					}
+					resp := frame.Frame{Type: f.Type, Flags: frame.FlagResponse, ReqID: f.ReqID}
+					if f.Type != OpPing {
+						resp.Body = EncodeResult(nil)
+					}
+					if frame.Write(c, &resp) != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	drop = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range open {
+			c.Close()
+		}
+	}
+	return ln.Addr().String(), conns, drop
+}
+
+func TestClientPreconnect(t *testing.T) {
+	addr, conns, drop := fakeAgent(t)
+	c := NewClient(addr, 3)
+	ctx := context.Background()
+	if err := c.Preconnect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if c.Open() != 3 || conns.Load() != 3 {
+		t.Fatalf("%d open, %d accepted: want 3", c.Open(), conns.Load())
+	}
+	// As many queries at once as the client allows find their connections open.
+	req := &Request{Vec: []byte{1, 2, 3, 4}, Params: Params{K: 10, NProbe: 4, N: 200}}
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.Query(ctx, req); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := c.Preconnect(ctx); err != nil || conns.Load() != 3 || c.Open() != 3 {
+		t.Fatalf("after the queries and a second Preconnect: %v, %d accepted, %d open", err, conns.Load(), c.Open())
+	}
+	// A connection that fails is closed and no longer counted; the next request opens another.
+	drop()
+	if _, err := c.Query(ctx, req); err == nil {
+		t.Fatal("query on a connection the agent closed succeeded")
+	}
+	if c.Open() != 2 {
+		t.Fatalf("%d open after a failed query: want 2", c.Open())
+	}
+	c.Close()
+	if c.Open() != 0 {
+		t.Fatalf("%d open after Close", c.Open())
+	}
+	if _, err := c.Query(ctx, req); err != nil || conns.Load() != 4 || c.Open() != 1 {
+		t.Fatalf("query after Close: %v, %d accepted, %d open", err, conns.Load(), c.Open())
+	}
+	if err := NewClient("127.0.0.1:1", 1).Preconnect(ctx); err == nil {
+		t.Fatal("Preconnect to a port nobody listens on succeeded")
 	}
 }

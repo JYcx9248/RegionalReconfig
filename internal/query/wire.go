@@ -22,6 +22,9 @@ const (
 	// OpAggregate: entry -> aggregator: params + the navigated lists grouped by owner + vector;
 	// the frame's epoch field is the epoch the entry pinned and routed with.
 	OpAggregate uint8 = 0x41
+	// OpPing: an empty request answered with OK whatever the node's roles, so that an entry can
+	// open its connections to an aggregator before the flip (Client.Preconnect).
+	OpPing uint8 = 0x42
 )
 
 // Query-port status codes.
@@ -200,11 +203,12 @@ type qconn struct {
 }
 
 // Client sends queries to one agent's query port (a pool of connections, one request at a
-// time on each).
+// time on each). Connections are opened when a request needs one, or by Preconnect.
 type Client struct {
 	addr    string
 	sem     chan struct{}
 	idle    chan *qconn
+	open    atomic.Int64 // connections open, idle or in use
 	nextID  atomic.Uint64
 	Timeout time.Duration
 }
@@ -219,16 +223,99 @@ func NewClient(addr string, maxConns int) *Client {
 // Addr of the agent.
 func (c *Client) Addr() string { return c.addr }
 
+// Open is the number of connections open, idle or in use.
+func (c *Client) Open() int { return int(c.open.Load()) }
+
 // Close drops idle connections.
 func (c *Client) Close() {
 	for {
 		select {
 		case q := <-c.idle:
 			q.nc.Close()
+			c.open.Add(-1)
 		default:
 			return
 		}
 	}
+}
+
+// Preconnect opens a connection for every request slot the client lacks one for, checks each
+// with a PING and leaves them idle, so that the queries an entry forwards to a new aggregator
+// after the flip pay no handshake (the agent's StageAggregator).
+func (c *Client) Preconnect(ctx context.Context) error {
+	n := cap(c.idle) - c.Open()
+	if n <= 0 {
+		return nil
+	}
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			q, err := c.dial(ctx)
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp, reusable, err := c.exchange(ctx, q, OpPing, 0, nil)
+			if err == nil && resp.Status != StatusOK {
+				err = &StatusError{Addr: c.addr, Status: resp.Status, Msg: string(resp.Body)}
+			}
+			c.release(q, err == nil && reusable)
+			errs <- err
+		}()
+	}
+	var first error
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil && first == nil {
+			first = fmt.Errorf("query client %s: %w", c.addr, err)
+		}
+	}
+	return first
+}
+
+func (c *Client) dial(ctx context.Context) (*qconn, error) {
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, "tcp", c.addr)
+	if err != nil {
+		return nil, err
+	}
+	c.open.Add(1)
+	return &qconn{nc: nc, br: bufio.NewReader(nc)}, nil
+}
+
+// release keeps a healthy connection idle, room permitting, and closes the others.
+func (c *Client) release(q *qconn, healthy bool) {
+	if healthy {
+		select {
+		case c.idle <- q:
+			return
+		default:
+		}
+	}
+	q.nc.Close()
+	c.open.Add(-1)
+}
+
+// exchange sends one request on q and reads its response. reusable is false when a
+// cancellation crossed the reply: its deadline is on the way, and back in the pool the
+// connection would fail the next request, whoever made it.
+func (c *Client) exchange(ctx context.Context, q *qconn, op uint8, epoch uint64, body []byte) (frame.Frame, bool, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(c.Timeout)
+	}
+	q.nc.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { q.nc.SetDeadline(time.Now()) })
+	id := c.nextID.Add(1)
+	err := frame.Write(q.nc, &frame.Frame{Type: op, ReqID: id, Epoch: epoch, Body: body})
+	var resp frame.Frame
+	if err == nil {
+		err = frame.Read(q.br, &resp)
+	}
+	reusable := stop()
+	if err == nil && resp.ReqID != id {
+		err = fmt.Errorf("query: mismatched response from %s", c.addr)
+	}
+	return resp, reusable, err
 }
 
 // Query sends a client query to an entry node.
@@ -253,46 +340,18 @@ func (c *Client) do(ctx context.Context, op uint8, epoch uint64, body []byte) (R
 	select {
 	case q = <-c.idle:
 	default:
-		var d net.Dialer
-		nc, err := d.DialContext(ctx, "tcp", c.addr)
-		if err != nil {
+		var err error
+		if q, err = c.dial(ctx); err != nil {
 			return Result{}, err
 		}
-		q = &qconn{nc: nc, br: bufio.NewReader(nc)}
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(c.Timeout)
-	}
-	q.nc.SetDeadline(deadline)
-	stop := context.AfterFunc(ctx, func() { q.nc.SetDeadline(time.Now()) })
-	id := c.nextID.Add(1)
-	err := frame.Write(q.nc, &frame.Frame{Type: op, ReqID: id, Epoch: epoch, Body: body})
-	var resp frame.Frame
-	if err == nil {
-		err = frame.Read(q.br, &resp)
-	}
-	// A cancellation that crossed the reply has its deadline on the way: back in the pool, the
-	// connection would fail the next request, whoever made it.
-	reusable := stop()
-	if err == nil && resp.ReqID != id {
-		err = fmt.Errorf("query: mismatched response from %s", c.addr)
-	}
+	resp, reusable, err := c.exchange(ctx, q, op, epoch, body)
+	c.release(q, err == nil && reusable)
 	if err != nil {
-		q.nc.Close()
 		if ctx.Err() != nil {
 			return Result{}, ctx.Err()
 		}
 		return Result{}, err
-	}
-	if !reusable {
-		q.nc.Close()
-	} else {
-		select {
-		case c.idle <- q:
-		default:
-			q.nc.Close()
-		}
 	}
 	if resp.Status != StatusOK {
 		return Result{Epoch: resp.Epoch}, &StatusError{Addr: c.addr, Status: resp.Status, Msg: string(resp.Body)}
