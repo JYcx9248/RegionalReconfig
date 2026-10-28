@@ -24,7 +24,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ $# -gt 0 ] || { echo "fake ssh: no destination" >&2; exit 255; }
-dest=$1
+# The host, without a user: run_cluster.py logs in as user@host, and rsync over it as -l user host.
+dest=${1##*@}
 shift
 [ -n "$FAKE_SSH_PRIVATE" ] || exec sh -c "$*"
 [ -n "$FAKE_SSH_ROOT" ] || { echo "fake ssh: FAKE_SSH_PRIVATE without FAKE_SSH_ROOT" >&2; exit 255; }

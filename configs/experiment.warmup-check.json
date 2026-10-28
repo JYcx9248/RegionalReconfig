@@ -1,0 +1,33 @@
+{
+  "Comment": "Warmup-reuse check, step 1, on the machine that makes the snapshot (the lab server): deploys 2 nodes on a small synthetic index (CPU, no GPU) and saves their raw vectors as a warmup snapshot under /netsys/chenxu/work/warmup-check/snapshots. Data first: mkdir -p /netsys/chenxu/work/warmup-check/data && python3 engine/scripts/make_synthetic.py --n 200000 --nq 2000 --dim 64 --dtype uint8 --out /netsys/chenxu/work/warmup-check/data/small. Step 2: experiment.warmup-check-reuse.json on this machine, experiment.warmup-check-reuse-cluster.json on a cluster given these files at the same paths.",
+  "Type": "warmup",
+  "WorkDir": "/netsys/chenxu/work/warmup-check",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/netsys/chenxu/work/warmup-check/data/small-base.u8bin",
+  "Queries": "/netsys/chenxu/work/warmup-check/data/small-query.u8bin",
+  "GroundTruth": "/netsys/chenxu/work/warmup-check/data/small-gt100.ibin",
+  "Partition": {
+    "Generator": "range",
+    "Partitions": 16
+  },
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "Backend": "cpu",
+  "Nodes": 2,
+  "InitialNodes": 2,
+  "MetricsInterval": "500ms",
+  "NodeArgs": [
+    "--workers",
+    "2",
+    "--max-nprobe",
+    "128",
+    "--max-rerank",
+    "1000"
+  ],
+  "Load": {
+    "K": 10,
+    "NProbe": 64,
+    "N": 200
+  }
+}
