@@ -1,12 +1,12 @@
 {
   "Comment": "2-node capacity at 80K reads/s per node, for experiment.wiki-c1024-gpu-2to4-80k.json",
-  "WorkDir": "/netsys/chenxu/work/wiki-c1024",
-  "IndexDir": "/netsys/chenxu/work/wiki-c1024/index",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
   "GoBin": "bin",
-  "Base": "/netsys/chenxu/data/wiki-c1024.fbin",
-  "Queries": "/netsys/chenxu/data/wiki-queries.fbin",
-  "GroundTruth": "/netsys/chenxu/data/wiki-c1024-gt.ibin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
   "Partition": {
     "Generator": "gp",
     "Partitions": 64,

@@ -1,12 +1,12 @@
 {
   "Comment": "2 -> 4 at 60K reads/s per node. Rate ~0.6 x C2; RateSteps 60:R1 with R1 ~1.2 x C2 and <= 0.75 x C4 = 596 (C4 = 795 measured; C2 from calibrate-2-60k)",
-  "WorkDir": "/netsys/chenxu/work/wiki-c1024",
-  "IndexDir": "/netsys/chenxu/work/wiki-c1024/index",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
   "GoBin": "bin",
-  "Base": "/netsys/chenxu/data/wiki-c1024.fbin",
-  "Queries": "/netsys/chenxu/data/wiki-queries.fbin",
-  "GroundTruth": "/netsys/chenxu/data/wiki-c1024-gt.ibin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
   "Partition": {
     "Generator": "gp",
     "Partitions": 64,

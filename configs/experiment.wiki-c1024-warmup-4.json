@@ -1,13 +1,13 @@
 {
   "Comment": "The warmup of every wiki-c1024 run that starts on 4 nodes: deploys them and saves the snapshot of their raw vectors those runs then start on (scripts/run_local.py, type: warmup).",
   "Type": "warmup",
-  "WorkDir": "/netsys/chenxu/work/wiki-c1024",
-  "IndexDir": "/netsys/chenxu/work/wiki-c1024/index",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
   "GoBin": "bin",
-  "Base": "/netsys/chenxu/data/wiki-c1024.fbin",
-  "Queries": "/netsys/chenxu/data/wiki-queries.fbin",
-  "GroundTruth": "/netsys/chenxu/data/wiki-c1024-gt.ibin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
   "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-4nodes",
   "Partition": {
     "Generator": "gp",
