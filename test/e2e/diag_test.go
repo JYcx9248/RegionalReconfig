@@ -69,6 +69,10 @@ func TestNodeDiagnosticsForwarded(t *testing.T) {
 	seen := map[string]bool{}
 	for _, r := range cg {
 		seen[r["node"].(string)] = true
+		// scripts/node_reads.py reads a cluster host's CPU share off its own records.
+		if n, _ := r["cpus"].(float64); r["node"] == "n1-host" && n < 1 {
+			t.Errorf("host sample %v: want the number of CPUs its cpus_busy_usec covers", r)
+		}
 	}
 	for _, want := range []string{"n1", "n1-agent", "n1-host"} {
 		if !seen[want] {

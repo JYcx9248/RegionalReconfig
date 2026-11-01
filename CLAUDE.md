@@ -74,7 +74,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `test/e2e` | end-to-end tests |
 | `config.yaml` | the system configuration (defaults committed; the runners rewrite it before each run) |
 | `configs/` | experiments (JSON, one file each) |
-| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `run_one.sh` (one run on a clean node state; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
+| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `run_one.sh` (one run on a clean node state; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
 
 ## Conventions
 
@@ -192,7 +192,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 - **Diagnosing a run**: `metrics.jsonl` (the agents' counters too, e.g. `graph.yield_ms`, how
   long the graph waited for data), `stats-<node>.jsonl` (per-node counters, `rtier_node
   --stats-file`; `raw_bytes` sent and received) and `cgroups.jsonl` (CPU, disk, dirty pages,
-  pressure; a host record with the whole disk's I/O and how busy each node's CPUs were). The
+  pressure; a host record with the whole disk's I/O and how busy each node's CPUs were; on a
+  cluster one per node's host, `<node>-host`, with its CPU count; `scripts/node_reads.py`). The
   agents forward the stats logs (`rtier-agent -node-stats`) and, on a cluster, their samples
   (`SampleInterval`; `run_local.py` samples itself with `"NodeResources"`), and the
   controller stamps every record and metrics report on arrival (`"t"`, on its monotonic clock;
@@ -212,7 +213,15 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   binaries find their shared libraries there, and starts the nodes in order
   over SSH, each after the previous one registered. A remote process stops when its SSH session
   closes. `"NodeResources"` (except `"ReadIOPSPerNode"`) and `"Emulation"` are for one machine
-  and are refused.
+  and are refused. On CloudLab, `scripts/cloudlab/`: a profile (a control node and N hosts on
+  one LAN at fixed addresses, 10.10.1.1 to N+1), each node's setup (`setup_node.sh`: libraries,
+  the SSD as XFS at the lab server's paths) and the control node's key on the hosts
+  (`authorize_control.sh`); the `*-cloudlab-cpu-*` experiments run the lab's Wikipedia runs on
+  CPU nodes (the CPU backend: a check of the workflow on separate machines, not the paper's
+  results, which run on GPUs). The `*-aliyun-gpu-*` experiments are the 2 → 4 runs on Alibaba
+  Cloud (one A10 instance per data node at 192.168.1.11 on, user root, a 1 TB ESSD each); their
+  control node is a CPU instance of the same Xeon, which builds the CUDA backend with
+  `-DCMAKE_CUDA_ARCHITECTURES=86` (docs/wiki/Running-on-Alibaba-Cloud.md).
 
 ## Docs
 
@@ -260,8 +269,10 @@ Next:
    under its own lifetime), and an aggregator pins a forward as soon as it reads it -- so it is
    out of scope with the failures (U13) and fails its query with a plain error. Draft of the
    case analysis in `docs/handoff.md`, section 5.
-2. A real cluster: `run_cluster.py` has run only through `fake_ssh` on one machine. Then
-   scaling curves on a multi-node GPU testbed.
+2. A real cluster: `run_cluster.py` has run only through `fake_ssh` on one machine. First on
+   CloudLab CPU nodes (`scripts/cloudlab/`, 2026-10-30: a GPU reservation did not fit
+   CloudLab's schedule, and AWS granted 8 vCPUs of G quota). Then scaling curves on a multi-node
+   GPU testbed.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

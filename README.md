@@ -292,7 +292,7 @@ epoch, a full rebuild and rescales.
 | `internal/` | ctrl RPC, protocol messages, placement, epoch store + tracker, bulk transfer, query aggregation, metrics, config, ... |
 | `engine/` | FusionANNS engine + `NodeEngine` (partitioned posting lists, query primitives), `rtier_node`, `rtier_segment` |
 | `test/e2e` | real `rtier_node` processes under query load: scale-out and scale-in, plans, update batches, major epochs, full rebuilds, diagnostics forwarding, a deployment on a warmup snapshot |
-| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; an experiment is a JSON file, `experiment_config.py`, from which it rewrites `config.yaml`), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `run_one.sh` one run on a clean node state (`evict_cache.py`), `node_reads.py` each node's device reads, `emulation/netns.sh`, metrics → SQLite, Python API client |
+| `scripts/` | `run_local.py` experiment runner (capacity ladder + timed rescales; an experiment is a JSON file, `experiment_config.py`, from which it rewrites `config.yaml`), `run_cluster.py` the same with the nodes on other machines over SSH, `plot_run.py` timeline, `compare_runs.py` mean latency of several runs overlaid, `run_one.sh` one run on a clean node state (`evict_cache.py`), `node_reads.py` each node's device reads, `emulation/netns.sh`, `cloudlab/` a CloudLab profile and node setup, metrics → SQLite, Python API client |
 
 ## Build and test
 
@@ -482,6 +482,23 @@ the runner without an SSH server, `PATH=$PWD/scripts/testing/fake_ssh:$PATH` run
 copied; with `FAKE_SSH_PRIVATE` (directories, colon-separated) and `FAKE_SSH_ROOT`, each host
 sees a copy of its own at those paths (a mount namespace, root only), so the copies are made and
 the nodes run on them.
+
+On CloudLab, `scripts/cloudlab/profile.py` is a profile of a control node (node0, 10.10.1.1) and
+N hosts (node1 to nodeN, 10.10.1.2 on) on one LAN; the addresses are fixed, so the experiment
+files name the hosts before the nodes exist. `scripts/cloudlab/setup_node.sh` prepares a node:
+the libraries the copied binaries link, and its SSD formatted as XFS at the lab server's paths
+(`/data-ssd`, `/netsys`). `scripts/cloudlab/authorize_control.sh` lets the control node log in
+to the hosts. The `configs/experiment.wiki-c1024-cloudlab-cpu-*.json` experiments are the lab
+server's Wikipedia runs on CPU nodes (`"Backend": "cpu"`), the nodes started on the lab's warmup
+snapshot: they check the reconfiguration workflow on separate machines, with a real network and
+a disk per node, before the GPU runs.
+
+The `configs/experiment.wiki-c1024-aliyun-gpu-*.json` experiments run 2 → 4 on Alibaba Cloud:
+- one GPU instance (an A10) per data node, the nodes started on the lab's 2-node warmup snapshot;
+- C4 measured on the cluster a copy-then-flip scale-out leaves;
+- a control node without a GPU. It builds the CUDA backend for GPUs it does not have: configure
+  once with `-DCMAKE_CUDA_ARCHITECTURES=86` (CMake keeps the value), on a CPU of the same family
+  as the GPU instances', since the `-march=native` build must run on them.
 
 ## The smallest experiment: one node, then two
 

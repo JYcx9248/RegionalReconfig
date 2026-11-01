@@ -288,7 +288,7 @@ func (s *procSampler) host(name string) map[string]any {
 		for _, c := range s.cpus {
 			want[c] = true
 		}
-		var busy int64
+		var busy, ncpu int64
 		for _, l := range strings.Split(string(b), "\n") {
 			f := strings.Fields(l)
 			if len(f) < 9 || !strings.HasPrefix(f[0], "cpu") || f[0] == "cpu" {
@@ -298,6 +298,7 @@ func (s *procSampler) host(name string) map[string]any {
 			if err != nil || (len(want) > 0 && !want[c]) {
 				continue
 			}
+			ncpu++
 			// user nice system idle iowait irq softirq steal: everything but idle and iowait
 			for _, i := range []int{1, 2, 3, 6, 7, 8} {
 				v, _ := strconv.ParseInt(f[i], 10, 64)
@@ -305,6 +306,9 @@ func (s *procSampler) host(name string) map[string]any {
 			}
 		}
 		r["cpus_busy_usec"] = map[string]int64{name: busy * 1_000_000 / clkTck}
+		// The share of them that was busy needs their number, which on a cluster no experiment
+		// file states (one machine has CPUsPerNode).
+		r["cpus"] = ncpu
 	}
 	if s.gpu != "" {
 		if g := gpuSample(s.gpu); g != nil {
