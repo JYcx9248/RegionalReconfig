@@ -3,9 +3,13 @@
 #   - the libraries the binaries link: run_cluster.py copies only the binaries to a host;
 #   - the data disk at the lab server's paths, /data-ssd/chenxu and /netsys/chenxu: stage
 #     records and warmup snapshots name files by absolute path;
-#   - with --control (node0, the control node), what the build needs too: only it builds.
+#   - with --control (node0, the control node), what the build needs too: only it builds;
+#   - with --gpu (c240g5), the NVIDIA driver and CUDA 12 from NVIDIA's repository for this
+#     release: the P100 (Pascal) needs the driver's proprietary modules, of a branch no newer
+#     than R580, and CUDA 12 (CUDA 13 dropped Pascal). The control node gets the toolkit, a host
+#     only the runtime the engine links (libcudart.so.12). The driver loads after a reboot.
 #
-#   bash setup_node.sh [--control] [--disk DEVICE] [--yes]
+#   bash setup_node.sh [--control] [--gpu] [--disk DEVICE] [--yes]
 #
 # Without --yes it only prints what it would do. The data disk is the node's largest SSD that
 # holds nothing mounted (--disk names one), formatted whole as XFS: a warmup snapshot is then
@@ -15,13 +19,14 @@
 # by page. The mounts are written to /etc/fstab (nofail), so a reboot keeps them.
 set -euo pipefail
 
-control=0 yes=0 disk=""
+control=0 gpu=0 yes=0 disk=""
 while [ $# -gt 0 ]; do
   case $1 in
     --control) control=1 ;;
+    --gpu) gpu=1 ;;
     --yes) yes=1 ;;
     --disk) disk=${2:?--disk needs a device}; shift ;;
-    *) sed -n '2,16p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,19p' "$0" >&2; exit 2 ;;
   esac
   shift
 done
@@ -79,6 +84,21 @@ if [ $control = 1 ]; then
       "from https://go.dev/dl/ yourself (as on the wiki page Running on AWS, section 3)" >&2
   fi
 fi
+if [ $gpu = 1 ]; then
+  echo "== NVIDIA driver and CUDA"
+  cuda=12-8 driver=570   # 570 carries CUDA 12.8, the lab server's nvcc
+  if ! dpkg -s cuda-keyring >/dev/null 2>&1; then
+    repo=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu$(. /etc/os-release; echo "${VERSION_ID/./}")/x86_64
+    run wget -q -O /tmp/cuda-keyring.deb "$repo/cuda-keyring_1.1-1_all.deb"
+    run sudo dpkg -i /tmp/cuda-keyring.deb
+    run sudo apt-get update -qq
+  fi
+  # cuda-drivers-N is the proprietary flavor (nvidia-open has no Pascal support); DKMS builds it
+  # against the running kernel's headers.
+  gpkgs="linux-headers-$(uname -r) cuda-drivers-$driver"
+  if [ $control = 1 ]; then gpkgs="$gpkgs cuda-toolkit-$cuda"; else gpkgs="$gpkgs cuda-cudart-$cuda"; fi
+  run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $gpkgs
+fi
 
 echo "== data disk"
 if mountpoint -q $data; then
@@ -133,5 +153,10 @@ df -h $data /data-ssd /netsys 2>/dev/null || true
 if [ $control = 1 ] && [ $yes = 1 ]; then
   go version || true
   cmake --version | head -1
+fi
+if [ $gpu = 1 ] && [ $yes = 1 ]; then
+  ldconfig -p | grep -q 'libcudart\.so\.12 ' || echo "warning: the loader does not find libcudart.so.12" >&2
+  nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null ||
+    echo "the NVIDIA driver loads after a reboot: sudo reboot, then nvidia-smi"
 fi
 [ $yes = 1 ] || echo "(nothing done: run again with --yes)"

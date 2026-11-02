@@ -1,0 +1,77 @@
+{
+  "Comment": "CloudLab c240g5: 2 -> 4 at 90 s under copy-then-flip. Set the rates as the lab's 2 -> 4 did (210 and 420 there, with C2 about 330 and C4 about 520): Rate about 0.65 x C2 (2to4-calibrate-2), RateSteps 60:about 0.8 x C4 (2to4-calibrate-4), the same in both protocols' files.",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-2nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "ReadIOPSPerNode": 40000
+  },
+  "Nodes": 4,
+  "InitialNodes": 2,
+  "Protocol": "copy-then-flip",
+  "TransferRateBytesPerSec": 0,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200,
+    "Rate": "SET_ME",
+    "RateSteps": "60:SET_ME",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 360,
+    "WarmupSeconds": 30
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "DataNodes": 4
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

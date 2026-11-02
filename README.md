@@ -487,11 +487,26 @@ On CloudLab, `scripts/cloudlab/profile.py` is a profile of a control node (node0
 N hosts (node1 to nodeN, 10.10.1.2 on) on one LAN; the addresses are fixed, so the experiment
 files name the hosts before the nodes exist. `scripts/cloudlab/setup_node.sh` prepares a node:
 the libraries the copied binaries link, and its SSD formatted as XFS at the lab server's paths
-(`/data-ssd`, `/netsys`). `scripts/cloudlab/authorize_control.sh` lets the control node log in
+(`/data-ssd`, `/netsys`). With `--gpu` it also installs the NVIDIA driver and CUDA 12 from
+NVIDIA's repository: the P100 of c240g5 is Pascal, which needs the driver's proprietary modules
+of a branch no newer than R580, and CUDA 12 (CUDA 13 dropped Pascal); a reboot loads the driver.
+`scripts/cloudlab/authorize_control.sh` lets the control node log in
 to the hosts. The `configs/experiment.wiki-c1024-cloudlab-cpu-*.json` experiments are the lab
 server's Wikipedia runs on CPU nodes (`"Backend": "cpu"`), the nodes started on the lab's warmup
 snapshot: they check the reconfiguration workflow on separate machines, with a real network and
 a disk per node, before the GPU runs.
+
+The `configs/experiment.wiki-c1024-cloudlab-gpu-*.json` experiments are the GPU runs on c240g5
+(one P100 per node, node0 the control node):
+- 2 → 4 (`2to4-*`) on hosts node1 to node4, the nodes started on the lab's 2-node warmup
+  snapshot, and 4 → 8 (`4to8-*`) on all 8 hosts, on the 4-node one;
+- each family with its capacities: C2 and C4 for 2 → 4 (C4 after a copy-then-flip scale-out
+  from 2, the placement those runs end in), C4 and C8 for 4 → 8 (C8 after one from 4);
+- built for sm_60: configure with `-DCMAKE_CUDA_ARCHITECTURES=60`, which CMake before 3.24
+  (Ubuntu 22.04 has 3.22) does not pick by itself.
+
+`configs/experiment.warmup-check-scaleout-{lazy,ctf}-cloudlab-gpu.json` run the smoke test on the
+GPU backend first, on the small index.
 
 The `configs/experiment.wiki-c1024-aliyun-gpu-*.json` experiments run 2 → 4 on Alibaba Cloud:
 - one GPU instance (an A10) per data node, the nodes started on the lab's 2-node warmup snapshot;

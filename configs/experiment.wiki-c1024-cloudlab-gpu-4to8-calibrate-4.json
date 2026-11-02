@@ -1,0 +1,84 @@
+{
+  "Comment": "CloudLab c240g5 (one P100 12 GB each; scripts/cloudlab/profile.py with hosts 8, node0 the control node): the 4-node capacity, the nodes started on the lab server's 4-node warmup snapshot.",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "ReadIOPSPerNode": 40000
+  },
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200
+  },
+  "Calibrate": {
+    "Rates": [
+      100,
+      200,
+      300,
+      400,
+      500,
+      600,
+      700,
+      800,
+      900
+    ],
+    "SecondsPerRate": 30
+  },
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5",
+      "10.10.1.6",
+      "10.10.1.7",
+      "10.10.1.8",
+      "10.10.1.9"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

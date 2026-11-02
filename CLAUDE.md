@@ -215,10 +215,15 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   closes. `"NodeResources"` (except `"ReadIOPSPerNode"`) and `"Emulation"` are for one machine
   and are refused. On CloudLab, `scripts/cloudlab/`: a profile (a control node and N hosts on
   one LAN at fixed addresses, 10.10.1.1 to N+1), each node's setup (`setup_node.sh`: libraries,
-  the SSD as XFS at the lab server's paths) and the control node's key on the hosts
-  (`authorize_control.sh`); the `*-cloudlab-cpu-*` experiments run the lab's Wikipedia runs on
-  CPU nodes (the CPU backend: a check of the workflow on separate machines, not the paper's
-  results, which run on GPUs). The `*-aliyun-gpu-*` experiments are the 2 → 4 runs on Alibaba
+  the SSD as XFS at the lab server's paths; `--gpu`: the NVIDIA driver and CUDA 12) and the
+  control node's key on the hosts (`authorize_control.sh`); the `*-cloudlab-cpu-*` experiments
+  run the lab's Wikipedia runs on CPU nodes (the CPU backend: a check of the workflow on
+  separate machines, not the paper's results, which run on GPUs). The `*-cloudlab-gpu-*`
+  experiments run on c240g5 (a P100 per node, node0 the control node): 2 → 4 (`2to4-*`) on the
+  2-node warmup snapshot and 4 → 8 (`4to8-*`) on the 4-node one, each with its capacities,
+  after `warmup-check-scaleout-*-cloudlab-gpu` on the small index. The P100 is sm_60, which
+  CMake before 3.24 (Ubuntu 22.04's 3.22) does not build for unless told
+  (`-DCMAKE_CUDA_ARCHITECTURES=60`). The `*-aliyun-gpu-*` experiments are the 2 → 4 runs on Alibaba
   Cloud (one A10 instance per data node at 192.168.1.11 on, user root, a 1 TB ESSD each); their
   control node is a CPU instance of the same Xeon, which builds the CUDA backend with
   `-DCMAKE_CUDA_ARCHITECTURES=86` (docs/wiki/Running-on-Alibaba-Cloud.md).
@@ -269,10 +274,10 @@ Next:
    under its own lifetime), and an aggregator pins a forward as soon as it reads it -- so it is
    out of scope with the failures (U13) and fails its query with a plain error. Draft of the
    case analysis in `docs/handoff.md`, section 5.
-2. A real cluster: `run_cluster.py` has run only through `fake_ssh` on one machine. First on
-   CloudLab CPU nodes (`scripts/cloudlab/`, 2026-10-30: a GPU reservation did not fit
-   CloudLab's schedule, and AWS granted 8 vCPUs of G quota). Then scaling curves on a multi-node
-   GPU testbed.
+2. A real cluster: `run_cluster.py` first ran on real hosts on 2026-11-01, the smoke test on
+   CloudLab CPU nodes (rs620: reuse, lazy 2 → 3 → 2, copy-then-flip 2 → 3, all answers exact).
+   Next the GPU runs on 9 c240g5 reserved from 2026-11-03 (`*-cloudlab-gpu-*`); a build for
+   sm_60 passes the end-to-end tests on the GPU backend (run on an sm_86 GPU through its PTX).
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

@@ -1,0 +1,62 @@
+{
+  "Comment": "Cluster smoke test of the GPU backend on CloudLab c240g5, as experiment.warmup-check-scaleout-lazy-cloudlab-gpu.json but 2 -> 4 at 30 s under copy-then-flip: the raw vectors are streamed between machines before the flip.",
+  "WorkDir": "/netsys/chenxu/work/warmup-check",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/netsys/chenxu/work/warmup-check/data/small-base.u8bin",
+  "Queries": "/netsys/chenxu/work/warmup-check/data/small-query.u8bin",
+  "GroundTruth": "/netsys/chenxu/work/warmup-check/data/small-gt100.ibin",
+  "Partition": {
+    "Generator": "range",
+    "Partitions": 16
+  },
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "Backend": "gpu",
+  "Nodes": 4,
+  "InitialNodes": 2,
+  "MetricsInterval": "500ms",
+  "NodeArgs": [
+    "--workers",
+    "2",
+    "--max-nprobe",
+    "128",
+    "--max-rerank",
+    "1000"
+  ],
+  "Load": {
+    "K": 10,
+    "NProbe": 64,
+    "N": 200,
+    "Rate": 50,
+    "RateSteps": "20:100",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 90,
+    "WarmupSeconds": 10
+  },
+  "RequireSnapshot": true,
+  "Protocol": "copy-then-flip",
+  "TransferRateBytesPerSec": 0,
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 30,
+      "DataNodes": 4
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}
