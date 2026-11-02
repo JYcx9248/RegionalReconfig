@@ -8,6 +8,7 @@
   "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
   "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
   "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-2nodes",
   "Partition": {
     "Generator": "gp",
     "Partitions": 64,

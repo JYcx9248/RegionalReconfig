@@ -63,7 +63,7 @@ echo "== packages"
 pkgs="rsync liburing2 libgomp1 zstd xfsprogs"
 if [ $control = 1 ]; then
   pkgs="$pkgs build-essential cmake git liburing-dev python3-numpy tmux"
-  # Go 1.24 or newer, from the release's own packages where it has them (Ubuntu 24.04):
+  # Go 1.24 or newer, from the release's own packages where it has them (Ubuntu 22.04, 24.04):
   # the Makefile sets GOTOOLCHAIN=local, so the build never fetches one.
   if apt-cache show golang-1.24 >/dev/null 2>&1; then pkgs="$pkgs golang-1.24"; go124=1; else go124=0; fi
 fi
@@ -108,7 +108,10 @@ else
       echo "no /usr/local/etc/emulab/mkextrafs.pl here: make a file system on the free space and mount it at $data" >&2
       exit 1
     fi
-    run sudo /usr/local/etc/emulab/mkextrafs.pl $data
+    run sudo mkdir -p $data    # mkextrafs wants its mount point to exist
+    # -f: on a GPT boot disk (rs620) mkextrafs adds partition 4, then refuses it for its type
+    # ("non-zero partition type ... use -f to override"); the partition is its own, just made.
+    run sudo /usr/local/etc/emulab/mkextrafs.pl -f $data
   else
     echo "$disk has file systems mounted ($(echo "$mounted" | tr '\n' ' ')) and is not the boot disk:" \
       "name the data disk with --disk" >&2
