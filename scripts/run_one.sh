@@ -11,10 +11,15 @@
 # vm.swappiness is set to 1 -- at the default 60 the kernel swaps node memory out under
 # page-cache pressure, and a run that swaps in during its load is not comparable. System memory, swap and swap-ins are
 # logged every 5 s to OUT_DIR/../mem-<protocol>.log; the last line printed says how many pages
-# were swapped in. The runner's log is OUT_DIR/run_local.log; a run that fails prints its end. Dropping the page cache and setting swappiness need root; without it (a shared
+# were swapped in. The runner's log is OUT_DIR/run_local.log (run_cluster.log); a run that fails prints its end. Dropping the page cache and setting swappiness need root; without it (a shared
 # server) only the run's own files leave the page cache (scripts/evict_cache.py: the work
 # directory, the index, the queries, the ground truth) and swappiness stays as it is -- check the
 # swap-ins.
+#
+# An experiment with "Hosts" runs on its cluster (scripts/run_cluster.py), which makes the same
+# clean state on every host: it removes the nodes' directories there, and where sudo asks no
+# password (CloudLab) drops the page cache and sets swappiness. This machine, which runs the
+# controller and the load, is cleaned as above, and its memory is what mem-<protocol>.log logs.
 set -u
 cd "$(dirname "$0")/.."
 CFG=$1; P=$2; OUT=$3; OVR=${4:-"{}"}
@@ -53,8 +58,10 @@ else
 print('\n'.join(p for p in (c.get('WorkDir'), c.get('IndexDir'), c.get('Queries'), c.get('GroundTruth')) if p))" "$TMP")
   python3 scripts/evict_cache.py "${OWN[@]}"
 fi
-echo "== $P -> $OUT $(date +%T)"
-python3 scripts/run_local.py "$TMP" "$OUT" > "$OUT.log" 2>&1 &
+RUNNER=run_local
+python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('Hosts') else 1)" "$TMP" && RUNNER=run_cluster
+echo "== $P -> $OUT $(date +%T) ($RUNNER)"
+python3 scripts/$RUNNER.py "$TMP" "$OUT" > "$OUT.log" 2>&1 &
 RL=$!
 while kill -0 $RL 2>/dev/null; do
   echo "$(cut -d' ' -f1 /proc/uptime) $(awk '/MemAvailable/{a=$2} /SwapTotal/{t=$2} /SwapFree/{f=$2} END{print int(a/1024), int((t-f)/1024)}' /proc/meminfo) $(awk '/^pswpin/{print $2}' /proc/vmstat)" >> "$MEM"
@@ -63,8 +70,8 @@ done
 wait $RL; rc=$?
 # A run that stops in its checks (stale binaries, say) has not made OUT yet: its log goes there all
 # the same, and its last lines say why.
-mkdir -p "$OUT"; mv "$OUT.log" "$OUT/run_local.log" 2>/dev/null
-[ $rc = 0 ] || tail -n 3 "$OUT/run_local.log"
+mkdir -p "$OUT"; mv "$OUT.log" "$OUT/$RUNNER.log" 2>/dev/null
+[ $rc = 0 ] || tail -n 3 "$OUT/$RUNNER.log"
 # A calibration run writes calibration.json (and calib-<rate>.csv), a warmup snapshot.json, not
 # latency.csv. The run's experiment is $TMP: OUT has no experiment.json when it stopped early.
 RES=latency.csv; grep -q '"Calibrate"' "$TMP" && RES=calibration.json

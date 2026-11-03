@@ -344,7 +344,10 @@ which repeats no query, has recall measured all through it. Each results directo
 code it ran: `revision.txt` (the commit and the files changed on top of it) and `revision.diff`;
 the runners refuse Go or engine binaries older than their sources. `scripts/run_one.sh CONFIG
 PROTOCOL OUT ['{...}']` runs one experiment with the protocol and any other key overridden
-(JSON: `'{"Load": {"Rate": 200}}'` changes the rate alone).
+(JSON: `'{"Load": {"Rate": 200}}'` changes the rate alone), on a clean node state. An
+experiment with `"Hosts"` runs on its cluster (`run_cluster.py`), which makes that state on
+every host: no node directory of an earlier run, and where sudo asks no password, an empty page
+cache and swappiness 1.
 
 The initial deployment copies each initial node's share of the raw vectors from the index's page
 file: minutes at scale (371 s for Wikipedia's two nodes on the lab server). A warmup run does it

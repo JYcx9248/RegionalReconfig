@@ -286,9 +286,15 @@ def preflight(hosts: list, nodes: int, dirs: list, work: str, ebin: str, cfg: di
         made = list(dict.fromkeys([work] + node_dirs[h] + sorted({os.path.dirname(d) for d in dirs})))
         script = "\n".join([
             f"pkill -TERM -f -- {shlex.quote(stale)} && sleep 2; pkill -KILL -f -- {shlex.quote(stale)}",
+            # The clean node state scripts/run_one.sh makes on one machine: no node directory an
+            # earlier run left, and where sudo asks no password (CloudLab) an empty page cache and,
+            # with swap on, swappiness 1 -- at 60 the kernel swaps node memory out under page-cache
+            # pressure, and a run that swaps in is not comparable.
+            *(f"rm -rf {shlex.quote(d)}" for d in node_dirs[h]),
+            "if sudo -n true 2>/dev/null; then sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null; "
+            "[ -z \"$(swapon --noheadings 2>/dev/null)\" ] || sudo -n sysctl -q -w vm.swappiness=1; fi",
             *(f"mkdir -p {shlex.quote(d)} 2>/dev/null && [ -w {shlex.quote(d)} ] || echo nodir={d}"
               for d in made),
-            *(f"rm -f {shlex.quote(os.path.join(d, 'stats.jsonl'))}" for d in node_dirs[h]),
             "command -v rsync >/dev/null 2>&1 && echo rsync=yes",
             "grep -m1 -E '^(flags|Features)' /proc/cpuinfo | sed 's/^/cpu=/'",
             "command -v nvidia-smi >/dev/null 2>&1 && "
