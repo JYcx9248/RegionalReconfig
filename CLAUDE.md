@@ -221,9 +221,13 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   separate machines, not the paper's results, which run on GPUs). The `*-cloudlab-gpu-*`
   experiments run on c240g5 (a P100 per node, node0 the control node): 2 → 4 (`2to4-*`) on the
   2-node warmup snapshot and 4 → 8 (`4to8-*`) on the 4-node one, each with its capacities,
-  after `warmup-check-scaleout-*-cloudlab-gpu` on the small index. The P100 is sm_60, which
-  CMake before 3.24 (Ubuntu 22.04's 3.22) does not build for unless told
-  (`-DCMAKE_CUDA_ARCHITECTURES=60`). The `*-aliyun-gpu-*` experiments are the 2 → 4 runs on Alibaba
+  after `warmup-check-scaleout-*-cloudlab-gpu` on the small index. They run Ubuntu 24.04. The
+  P100 is sm_60: configure with `-DCMAKE_CUDA_ARCHITECTURES=60`, since CMake otherwise builds
+  for the GPU it finds, and node0 builds before its driver is loaded. The `amazon-300m-*`
+  experiments run 4 → 8 there on 300M of the Amazon corpus's 560M documents
+  (`scripts/data/subset_base.py`; at 2 nodes the PQ codes would exceed a P100), on a 4-node
+  snapshot made on the control node (`amazon-300m-warmup-4`). The `*-aliyun-gpu-*`
+  experiments are the 2 → 4 runs on Alibaba
   Cloud (one A10 instance per data node at 192.168.1.11 on, user root, a 1 TB ESSD each); their
   control node is a CPU instance of the same Xeon, which builds the CUDA backend with
   `-DCMAKE_CUDA_ARCHITECTURES=86` (docs/wiki/Running-on-Alibaba-Cloud.md).
@@ -276,8 +280,9 @@ Next:
    case analysis in `docs/handoff.md`, section 5.
 2. A real cluster: `run_cluster.py` first ran on real hosts on 2026-11-01, the smoke test on
    CloudLab CPU nodes (rs620: reuse, lazy 2 → 3 → 2, copy-then-flip 2 → 3, all answers exact).
-   Next the GPU runs on 9 c240g5 reserved from 2026-11-03 (`*-cloudlab-gpu-*`); a build for
-   sm_60 passes the end-to-end tests on the GPU backend (run on an sm_86 GPU through its PTX).
+   Next the GPU runs on 9 c240g5, reserved for 7 days from 2026-11-03 (`*-cloudlab-gpu-*`). On
+   one c240g5 (Ubuntu 24.04, driver 570, CUDA 12.8; 2026-11-02), a build for sm_60 passes the
+   end-to-end tests on the GPU backend and `fusion_selftest` on the Wikipedia index.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

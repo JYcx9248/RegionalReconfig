@@ -1,0 +1,44 @@
+{
+  "Comment": "Amazon Reviews 2023 x AmazonQAC: 300M of the 560M deduplicated documents, a uniform random subset (scripts/data/subset_base.py, seed 20261103), 768-d int8, 1% heads, 64-byte PQ codes; the queries are the first 2M searches of the QAC stream, in time order. The warmup of every run that starts on 4 nodes: deploys them and saves the snapshot of their raw vectors those runs then start on (scripts/run_local.py, type: warmup), on the CloudLab control node from the page file, on the CPU backend, without memory limits.",
+  "Type": "warmup",
+  "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
+  "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/amazon/vec/corpus-300m.i8bin",
+  "Queries": "/data-ssd/chenxu/amazon/vec/queries-2m.i8bin",
+  "GroundTruth": "/data-ssd/chenxu/amazon/vec/corpus-300m-gt.ibin",
+  "GroundTruthStride": 200,
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/amazon-300m-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--centroid-ratio",
+    "0.01",
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "InitialNodes": 4,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson"
+  }
+}

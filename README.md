@@ -502,11 +502,20 @@ The `configs/experiment.wiki-c1024-cloudlab-gpu-*.json` experiments are the GPU 
   snapshot, and 4 → 8 (`4to8-*`) on all 8 hosts, on the 4-node one;
 - each family with its capacities: C2 and C4 for 2 → 4 (C4 after a copy-then-flip scale-out
   from 2, the placement those runs end in), C4 and C8 for 4 → 8 (C8 after one from 4);
-- built for sm_60: configure with `-DCMAKE_CUDA_ARCHITECTURES=60`, which CMake before 3.24
-  (Ubuntu 22.04 has 3.22) does not pick by itself.
+- on Ubuntu 24.04, built for sm_60: configure with `-DCMAKE_CUDA_ARCHITECTURES=60`. Without
+  it, CMake builds for the GPU it finds, which needs a loaded driver, and the control node
+  builds before its driver is loaded (it is not rebooted).
 
 `configs/experiment.warmup-check-scaleout-{lazy,ctf}-cloudlab-gpu.json` run the smoke test on the
 GPU backend first, on the small index.
+
+The `configs/experiment.amazon-300m-*.json` experiments run 4 → 8 on the same nodes, on Amazon
+Reviews 2023 × AmazonQAC: 300M of the 560M deduplicated documents, a uniform random subset
+(`scripts/data/subset_base.py`), 768-d int8 with 1% heads, and as queries the first 2M searches
+of the QAC stream, in time order. They start on 4 nodes only: at 2, the fullest node's PQ codes
+would exceed a P100's 12 GB. `amazon-300m-warmup-4` makes their 4-node snapshot on the control
+node (`scripts/run_local.py`), from the page file, and `StageTimeout` is 2 hours: a
+copy-then-flip scale-out writes about 100 GB to each new node.
 
 The `configs/experiment.wiki-c1024-aliyun-gpu-*.json` experiments run 2 → 4 on Alibaba Cloud:
 - one GPU instance (an A10) per data node, the nodes started on the lab's 2-node warmup snapshot;

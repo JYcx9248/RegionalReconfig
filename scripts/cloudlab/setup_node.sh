@@ -65,20 +65,23 @@ pick_disk() {
 }
 
 echo "== packages"
-pkgs="rsync liburing2 libgomp1 zstd xfsprogs"
+# First: a fresh image's package lists may predate golang-1.24 (Ubuntu 24.04's is an update).
+run sudo apt-get update -qq
+pkgs="rsync liburing2 libgomp1 zstd xfsprogs fio"   # fio: the runbook's check of each data disk
 if [ $control = 1 ]; then
   pkgs="$pkgs build-essential cmake git liburing-dev python3-numpy tmux"
   # Go 1.24 or newer, from the release's own packages where it has them (Ubuntu 22.04, 24.04):
   # the Makefile sets GOTOOLCHAIN=local, so the build never fetches one.
   if apt-cache show golang-1.24 >/dev/null 2>&1; then pkgs="$pkgs golang-1.24"; go124=1; else go124=0; fi
 fi
-run sudo apt-get update -qq
 # shellcheck disable=SC2086
 run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs
 if [ $control = 1 ]; then
   if [ $go124 = 1 ]; then
     # A link on PATH whatever the login shell is (CloudLab accounts may use tcsh).
     run sudo ln -sf /usr/lib/go-1.24/bin/go /usr/lib/go-1.24/bin/gofmt /usr/local/bin/
+  elif [ $yes = 0 ]; then
+    echo "golang-1.24 is not in the package lists as they are: the run with --yes updates them first"
   else
     echo "no golang-1.24 package on $(. /etc/os-release; echo "$PRETTY_NAME"): install Go 1.24 or newer" \
       "from https://go.dev/dl/ yourself (as on the wiki page Running on AWS, section 3)" >&2
@@ -111,7 +114,8 @@ else
     echo "name the data disk with --disk" >&2
     exit 1
   fi
-  [ "$(lsblk -dn -o ROTA "$disk")" = 0 ] || echo "warning: $disk is a spinning disk: random reads will be slow" >&2
+  # lsblk pads ROTA to its heading's width, even without headings.
+  [ "$(lsblk -dn -o ROTA "$disk" | tr -d ' ')" = 0 ] || echo "warning: $disk is a spinning disk: random reads will be slow" >&2
   lsblk -o NAME,ROTA,SIZE,FSTYPE,MOUNTPOINTS,MODEL "$disk"
   mounted=$(mounts_of "$disk")
   if [ -z "$mounted" ]; then
@@ -155,8 +159,13 @@ if [ $control = 1 ] && [ $yes = 1 ]; then
   cmake --version | head -1
 fi
 if [ $gpu = 1 ] && [ $yes = 1 ]; then
-  ldconfig -p | grep -q 'libcudart\.so\.12 ' || echo "warning: the loader does not find libcudart.so.12" >&2
-  nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null ||
+  # Not grep -q: under pipefail, ldconfig would die of SIGPIPE once grep exits on a match.
+  ldconfig -p | grep 'libcudart\.so\.12 ' >/dev/null || echo "warning: the loader does not find libcudart.so.12" >&2
+  # nvidia-smi prints its failure on stdout.
+  if gpus=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null); then
+    echo "$gpus"
+  else
     echo "the NVIDIA driver loads after a reboot: sudo reboot, then nvidia-smi"
+  fi
 fi
 [ $yes = 1 ] || echo "(nothing done: run again with --yes)"
