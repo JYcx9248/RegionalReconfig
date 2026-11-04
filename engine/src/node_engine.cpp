@@ -26,6 +26,7 @@
 #include "fusion/dataset.h"
 #include "fusion/distance.h"
 #include "fusion/filter.h"
+#include "fusion/graph_image.h"
 #include "fusion/graph_patch.h"
 #include "fusion/hnsw_space.h"
 #include "fusion/index_meta.h"
@@ -319,17 +320,81 @@ class NodeEngineImpl : public NodeEngine {
   // ------------------------------------------------------------------ staging
   // The build's graph (version 0), with room for the heads major epochs add.
   void LoadGraph(const std::string& path) override {
+    InstallLoaded(std::make_shared<HnswIndex>(space_.get(), path, false, Lists()->capacity), 0);
+  }
+
+  uint64_t ReadGraph(uint32_t version, uint64_t off, size_t n, std::vector<uint8_t>* out,
+                     uint64_t* stamp) const override {
+    // Pinned as a search of the graph alone: a merge or an edit in place waits for the copy.
+    const GraphRef r = Graph(version);
+    if (r.patch)
+      throw NotResidentError(StrFormat("graph version %u is a patch staged here, not merged: a graph transfer "
+                                       "sends a merged graph", version));
+    std::shared_ptr<const GraphImage> img;
+    {
+      // One layout for every chunk of a transfer, made again when the graph changes.
+      std::lock_guard<std::mutex> l(image_mu_);
+      if (!image_ || image_stamp_ != r.stamp) {
+        image_ = std::make_shared<const GraphImage>(*r.g);
+        image_stamp_ = r.stamp;
+      }
+      img = image_;
+    }
+    FUSION_CHECK(off <= img->size(), "GRAPH_GET at byte %llu of a %llu-byte graph",
+                 static_cast<unsigned long long>(off), static_cast<unsigned long long>(img->size()));
+    out->resize(static_cast<size_t>(std::min<uint64_t>(n, img->size() - off)));
+    img->Read(*r.g, off, out->size(), out->data());
+    *stamp = r.stamp;
+    return img->size();
+  }
+
+  uint64_t PutGraph(uint64_t off, const uint8_t* p, size_t n) override {
+    std::lock_guard<std::mutex> l(loader_mu_);
+    if (off == 0) {
+      loader_.reset();
+      if (n == 0) return 0;
+      loader_ = std::make_unique<GraphLoader>(space_.get(), Lists()->capacity);
+    }
+    FUSION_CHECK(loader_ != nullptr && loader_->received() == off,
+                 "GRAPH_PUT at byte %llu of a graph that has %llu bytes in", static_cast<unsigned long long>(off),
+                 static_cast<unsigned long long>(loader_ ? loader_->received() : 0));
+    try {
+      loader_->Append(p, n);
+    } catch (...) {
+      loader_.reset();  // a graph that went wrong half way is given up, with its memory
+      throw;
+    }
+    return loader_->received();
+  }
+
+  void InstallGraph(uint32_t version, uint64_t size) override {
+    std::unique_ptr<HnswIndex> g;
+    {
+      std::lock_guard<std::mutex> l(loader_mu_);
+      FUSION_CHECK(loader_ != nullptr && loader_->complete() && loader_->received() == size,
+                   "GRAPH_INSTALL of %llu bytes: %llu are in, %s", static_cast<unsigned long long>(size),
+                   static_cast<unsigned long long>(loader_ ? loader_->received() : 0),
+                   loader_ && loader_->complete() ? "a whole graph" : "not a whole graph");
+      g = loader_->Take();
+      loader_.reset();
+    }
+    InstallLoaded(std::shared_ptr<HnswIndex>(std::move(g)), version);
+  }
+
+  // The graph at `version` replaces this node's. The build's graph (version 0) has a head per
+  // list of the manifest; major epochs (U14) add heads after them, within the room.
+  void InstallLoaded(std::shared_ptr<HnswIndex> g, uint32_t version) {
     const uint32_t num_lists = Man()->num_lists;
-    auto g = std::make_shared<HnswIndex>(space_.get(), path, false, Lists()->capacity);
-    FUSION_CHECK(g->getCurrentElementCount() == num_lists,
-                 "graph has %zu heads but the partition manifest has %u lists",
+    FUSION_CHECK(version == 0 ? g->getCurrentElementCount() == num_lists : g->getCurrentElementCount() >= num_lists,
+                 "graph version %u has %zu heads but the partition manifest has %u lists", version,
                  static_cast<size_t>(g->getCurrentElementCount()), num_lists);
     g->setEf(1);  // the search width is passed per call (see NavigateImpl)
     std::lock_guard<std::mutex> l(graph_mu_);
     graph_ = std::move(g);
-    graph_version_ = 0;
+    graph_version_ = version;
     patch_.reset();
     graph_busy_ = false;
+    ++graph_stamp_;
   }
 
   bool has_graph() const override {
@@ -394,6 +459,7 @@ class NodeEngineImpl : public NodeEngine {
       old_graph = std::move(graph_);  // searches still running keep their own reference
       patch_.reset();
       graph_version_ = 0;
+      ++graph_stamp_;
       segs_.assign(man->num_partitions, {});
       std::lock_guard<std::mutex> l(gen_mu_);
       man_ = man;
@@ -465,6 +531,7 @@ class NodeEngineImpl : public NodeEngine {
     graph_version_ = version;
     patch_.reset();
     graph_busy_ = false;
+    ++graph_stamp_;
   }
 
   bool DropGraphPatch(uint32_t version) override {
@@ -472,18 +539,6 @@ class NodeEngineImpl : public NodeEngine {
     if (!patch_ || patch_->patch.version != version) return false;
     patch_.reset();
     return true;
-  }
-
-  void SaveGraphPatch(uint32_t version, const std::string& path) const override {
-    std::shared_ptr<const StagedPatch> sp;
-    {
-      std::lock_guard<std::mutex> l(graph_mu_);
-      sp = patch_;
-    }
-    if (!sp || sp->patch.version != version)
-      throw NotResidentError(StrFormat("graph patch %u is not staged", version));
-    const std::vector<uint8_t> b = sp->patch.Serialize();
-    WriteFile(path, b.data(), b.size());
   }
 
   std::vector<uint8_t> EditGraph(uint32_t version, const uint32_t* labels, const void* vecs, uint32_t nnew,
@@ -552,6 +607,7 @@ class NodeEngineImpl : public NodeEngine {
       std::lock_guard<std::mutex> l(graph_mu_);
       graph_version_ = version;
       graph_busy_ = false;
+      ++graph_stamp_;
     }
     return p.Serialize();
   }
@@ -1794,10 +1850,14 @@ class NodeEngineImpl : public NodeEngine {
     std::shared_ptr<HnswIndex> g;
     std::shared_ptr<const StagedPatch> patch;
     std::atomic<int>* plain = nullptr;
+    uint64_t stamp = 0;  // graph_stamp_ when it was taken
     GraphRef() = default;
     GraphRef(const GraphRef&) = delete;
     GraphRef& operator=(const GraphRef&) = delete;
-    GraphRef(GraphRef&& o) noexcept : g(std::move(o.g)), patch(std::move(o.patch)), plain(o.plain) { o.plain = nullptr; }
+    GraphRef(GraphRef&& o) noexcept
+        : g(std::move(o.g)), patch(std::move(o.patch)), plain(o.plain), stamp(o.stamp) {
+      o.plain = nullptr;
+    }
     ~GraphRef() {
       if (plain) plain->fetch_sub(1, std::memory_order_release);
     }
@@ -1812,6 +1872,7 @@ class NodeEngineImpl : public NodeEngine {
     GraphRef r;
     std::lock_guard<std::mutex> l(graph_mu_);
     if (!graph_) throw NoGraphError("navigation graph is not loaded on this node");
+    r.stamp = graph_stamp_;
     if (version == kNewestGraph) version = patch_ ? patch_->patch.version : graph_version_;
     if (patch_ && version == patch_->patch.version) {
       r.g = graph_;
@@ -2188,7 +2249,7 @@ class NodeEngineImpl : public NodeEngine {
   // new. Past kMaxQueuedBytes of queued vectors the fetching query installs them itself:
   // backpressure, so that a slow disk cannot grow the cache without bound.
   size_t Cache(const uint32_t* locs, size_t n, const uint8_t* vecs) {
-    static constexpr size_t kMaxQueuedBytes = 64u << 20;
+    static constexpr size_t kMaxQueuedBytes = 2u << 30;
     const uint32_t vb = raw_->layout().vec_bytes;
     std::vector<uint32_t> fresh;
     bool full = false;
@@ -2431,6 +2492,14 @@ class NodeEngineImpl : public NodeEngine {
   std::shared_ptr<const StagedPatch> patch_;
   bool graph_busy_ = false;
   mutable std::atomic<int> plain_searches_{0};
+  // Changes with every graph that replaces graph_ and every change of it in place: a transfer in
+  // chunks (ReadGraph) checks that its bytes come from one graph, and image_ is made again.
+  uint64_t graph_stamp_ = 0;
+  mutable std::mutex image_mu_;
+  mutable std::shared_ptr<const GraphImage> image_;  // the layout of graph_ for transfers
+  mutable uint64_t image_stamp_ = 0;
+  std::mutex loader_mu_;
+  std::unique_ptr<GraphLoader> loader_;  // a graph being received (PutGraph)
   std::atomic<const ListMap*> lists_{nullptr};
   std::vector<std::unique_ptr<ListMap>> list_maps_;  // under gen_mu_: every map published
   std::shared_ptr<ReadOnlyFile> pq_file_;            // under gen_mu_

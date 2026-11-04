@@ -136,12 +136,14 @@ const char* OpName(uint8_t op) {
     case kPatchLoad: return "patch_load";
     case kPatchMerge: return "patch_merge";
     case kPatchDrop: return "patch_drop";
-    case kPatchSave: return "patch_save";
     case kSwitchGeneration: return "switch_generation";
     case kRawBitmap: return "raw_bitmap";
     case kRawTraffic: return "raw_traffic";
     case kPQFromIndex: return "pq_from_index";
     case kRawSave: return "raw_save";
+    case kGraphGet: return "graph_get";
+    case kGraphPut: return "graph_put";
+    case kGraphInstall: return "graph_install";
     default: return nullptr;
   }
 }
@@ -544,6 +546,33 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
       case kLoadGraph:
         e.LoadGraph(r.Rest());
         break;
+      case kGraphGet: {
+        const uint32_t v = r.Get<uint32_t>();
+        const uint64_t off = r.Get<uint64_t>();
+        const uint32_t n = r.Get<uint32_t>();
+        Require(r.remaining() == 0, "trailing bytes in GRAPH_GET");
+        Require(n <= kMaxFrameBytes / 2, "GRAPH_GET: chunk too large");
+        std::vector<uint8_t> bytes;
+        uint64_t stamp = 0;
+        const uint64_t size = e.ReadGraph(v, off, n, &bytes, &stamp);
+        w.Put<uint64_t>(size);
+        w.Put<uint64_t>(stamp);
+        w.PutBytes(bytes.data(), bytes.size());
+        break;
+      }
+      case kGraphPut: {
+        const uint64_t off = r.Get<uint64_t>();
+        const size_t n = r.remaining();
+        w.Put<uint64_t>(e.PutGraph(off, r.Bytes(n), n));
+        break;
+      }
+      case kGraphInstall: {
+        const uint32_t v = r.Get<uint32_t>();
+        const uint64_t size = r.Get<uint64_t>();
+        Require(r.remaining() == 0, "trailing bytes in GRAPH_INSTALL");
+        e.InstallGraph(v, size);
+        break;
+      }
       case kLoadPartition: {
         const uint32_t p = r.Get<uint32_t>();
         const uint32_t version = r.Get<uint32_t>();
@@ -909,11 +938,6 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
       case kPatchDrop:
         w.Put<uint8_t>(e.DropGraphPatch(r.Get<uint32_t>()) ? 1 : 0);
         break;
-      case kPatchSave: {
-        const uint32_t v = r.Get<uint32_t>();
-        e.SaveGraphPatch(v, r.Rest());
-        break;
-      }
       case kSplitList: {
         const uint32_t n = r.Get<uint32_t>();
         const uint32_t m = r.Get<uint32_t>();

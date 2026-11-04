@@ -267,6 +267,20 @@ class NodeEngine {
   // Staging. LoadGraph/LoadPartition may run concurrently with queries. LoadGraph loads the
   // build's graph (version 0) with room for graph_headroom more elements.
   virtual void LoadGraph(const std::string& path) = 0;
+  // A graph transfer between entries, from memory to memory (U16, fusion/graph_image.h). The
+  // source: bytes [off, off + n) of its graph at `version` in hnswlib's index format, fewer at
+  // the end; returns the format's size, and *stamp, which changes whenever this node's graph
+  // does, so that a transfer in chunks can tell its bytes all come from one graph.
+  // NotResidentError if the graph is not at `version` here, or only through a staged patch (a
+  // transfer sends a merged graph).
+  virtual uint64_t ReadGraph(uint32_t version, uint64_t off, size_t n, std::vector<uint8_t>* out,
+                             uint64_t* stamp) const = 0;
+  // The destination: the next bytes of a graph in that format, built as they arrive; off 0
+  // starts a new one and drops a partial one (with n = 0, only drops it). Returns the bytes in.
+  virtual uint64_t PutGraph(uint64_t off, const uint8_t* p, size_t n) = 0;
+  // Once all `size` bytes are in, the graph they make replaces this node's, at `version`, with
+  // room for graph_headroom more elements as LoadGraph's.
+  virtual void InstallGraph(uint32_t version, uint64_t size) = 0;
   // Full rebuild (U14): moves the node to `generation`, the index at index_dir (fusion_build's
   // output) partitioned as in partitions_dir (rtier_segment's). The node must hold no partition;
   // its graph and a staged patch are dropped, and the generation's manifest, PQ code file and
@@ -291,8 +305,6 @@ class NodeEngine {
   virtual void MergeGraphPatch(uint32_t version) = 0;
   // Unstages the patch of `version`; false if it was not staged.
   virtual bool DropGraphPatch(uint32_t version) = 0;
-  // Writes the staged patch of `version` as a file, for a graph transfer to a later entry.
-  virtual void SaveGraphPatch(uint32_t version, const std::string& path) const = 0;
   // The router's side (the update controller's own node, which holds the authoritative graph and
   // stages no patch): inserts the heads `labels` (list IDs; vecs: dim() elements of dtype() each)
   // and marks the heads `deleted` deleted -- they stay as routing points, never a result -- then

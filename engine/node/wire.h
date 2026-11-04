@@ -24,6 +24,21 @@
 //                   flags bit 0 (kInfoSettle): wait until the raw vectors fetched before the
 //                   request are on the SSD (tests); without it INFO waits for nothing
 //   LOAD_GRAPH      path                                      -> -
+//                   (the build's graph from a file of the index: a bootstrap; entries that join
+//                   later get theirs from an entry's memory, GRAPH_GET to GRAPH_PUT)
+//   GRAPH_GET       u32 version, u64 offset, u32 n            -> u64 size, u64 stamp, u8 bytes[]
+//                   (bytes [offset, offset + n) -- fewer at the end -- of the graph at that version
+//                   in hnswlib's index format, read from memory: the source of a graph transfer,
+//                   fusion/graph_image.h. size: the format's; stamp changes whenever the node's
+//                   graph does. NOT_RESIDENT if the graph is not at that version here, or only
+//                   through a staged patch)
+//   GRAPH_PUT       u64 offset, u8 bytes[]                    -> u64 received
+//                   (the next bytes of a graph in that format, built in memory as they arrive;
+//                   offset 0 starts a new one and drops a partial one -- with no bytes, only
+//                   drops it)
+//   GRAPH_INSTALL   u32 version, u64 size                     -> -
+//                   (the graph received, all size bytes of it, replaces the node's, at that
+//                   version)
 //   LOAD_PARTITION  u32 partition, u32 version, u8 pq_source, -> -
 //                   path
 //                   loads (or replaces) that version of the partition; its other versions stay
@@ -139,7 +154,6 @@
 //   PATCH_MERGE     u32 version                               -> - (merged into the graph in place,
 //                                                                after the old version's grace)
 //   PATCH_DROP      u32 version                               -> u8 was_staged
-//   PATCH_SAVE      u32 version, path                         -> - (the staged patch as a file)
 //   SPLIT_LIST      u32 n, u32 m, u8 codes[n * m]             -> u32 head0, u32 head1, u8 side[n]
 //                   (the router: a balanced 2-means of PQ codes; head s = the member closest to
 //                   side s's mean)
@@ -213,12 +227,16 @@ enum Op : uint8_t {
   kPatchLoad = 0x38,
   kPatchMerge = 0x39,
   kPatchDrop = 0x3A,
-  kPatchSave = 0x3B,
+  // 0x3B: PATCH_SAVE, retired; not reused, so that an older client's request fails instead of
+  // meaning something else
   kSwitchGeneration = 0x3C,
   kRawBitmap = 0x3D,
   kRawTraffic = 0x3E,
   kPQFromIndex = 0x3F,
   kRawSave = 0x40,
+  kGraphGet = 0x41,
+  kGraphPut = 0x42,
+  kGraphInstall = 0x43,
 };
 
 enum Status : uint16_t {

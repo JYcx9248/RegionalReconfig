@@ -38,19 +38,21 @@ type pullDone struct {
 	CRCs  []uint32 `json:"crcs"`
 }
 
-// Server serves files under Root, and PQ codes and raw vectors read through PQ and Raw
-// (records.go), to pulling peers. All connections share one token bucket: it caps this node's
-// outgoing background bandwidth, and within it data transfers (segments, PQ codes) go before
-// background ones (the graph, and raw vectors pulled through the agents at RawPriority).
+// Server serves files under Root, PQ codes and raw vectors read through PQ and Raw
+// (records.go), and the navigation graph read through Graph (graph.go), to pulling peers. All
+// connections share one token bucket: it caps this node's outgoing background bandwidth, and
+// within it data transfers (segments, PQ codes) go before background ones (the graph, and raw
+// vectors pulled through the agents at RawPriority).
 type Server struct {
 	Root       string
 	PQ         PQSource     // nil = PULL_PQ is refused
 	Raw        RawSource    // nil = PULL_RAW is refused
+	Graph      GraphSource  // nil = PULL_GRAPH is refused
 	Limiter    *TokenBucket // nil = unlimited
 	ChunkBytes int          // default chunk size (Koala: StateMigrationChunkSize, 1 MiB)
-	// Yield, if set, is called before each chunk of a background file -- the navigation graph and
-	// its patches -- is read, and holds the transfer back until it returns (the agent's strict
-	// yield to data, U16); an error ends the transfer.
+	// Yield, if set, is called before each chunk of the navigation graph, or of a background file,
+	// is read, and holds the transfer back until it returns (the agent's strict yield to data,
+	// U16); an error ends the transfer.
 	Yield     func() error
 	BytesSent atomic.Int64
 }
@@ -89,6 +91,8 @@ func (s *Server) serveConn(c net.Conn) {
 			err = s.sendPQ(bw, f.Body)
 		case typePullRaw:
 			err = s.sendRaw(bw, f.Body)
+		case typePullGraph:
+			err = s.sendGraph(bw, f.Body)
 		default:
 			return
 		}

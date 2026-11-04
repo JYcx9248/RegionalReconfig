@@ -122,7 +122,6 @@ type Source struct {
 	// Versions: the version of each of Partitions in the epoch the staging is for (absent: all
 	// 0) -- the segment file to fetch and the version to load it as (U14).
 	Versions []uint32 `json:"versions,omitempty"`
-	File     string   `json:"file,omitempty"` // StageGraph: the file name at the source
 }
 
 // VersionOf is the version of Partitions[i].
@@ -187,15 +186,15 @@ type DrainRawReq struct {
 type StageGraphReq struct {
 	Source   Source `json:"source"`
 	Priority string `json:"priority,omitempty"`
-	// Graph is the version to load: the build's graph, then the patches 1..Graph that major
-	// epochs made (U14), from the same source.
+	// Graph is the version to load. A peer sends its graph at that version from memory, the
+	// patches of major epochs (U14) merged in it; a local source is the build's graph (0).
 	Graph uint32 `json:"graph,omitempty"`
 }
 
 // GraphPatchReq: once no query searches the graph without the patch of graph version Version
-// (the grace period), the entry keeps the patch as a file next to the graph -- a later entry's
-// graph transfer takes the graph and its patches from there -- and merges it in place. With
-// Drop (a commit that did not flip) it unstages the patch instead.
+// (the grace period), the entry merges it in place -- a later entry's graph transfer takes the
+// merged graph from its memory. With Drop (a commit that did not flip) it unstages the patch
+// instead.
 type GraphPatchReq struct {
 	Version uint32 `json:"version"`
 	Drop    bool   `json:"drop,omitempty"`

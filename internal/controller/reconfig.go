@@ -879,7 +879,7 @@ func (c *Controller) graphSources(t *epoch.Table, adds []*ManagedNode) (map[plac
 			srcs[dst] = protocol.Source{Kind: "local", Dir: index}
 			continue
 		}
-		srcs[dst] = protocol.Source{Kind: "peer", Addr: live[i].Info.BulkAddr, File: "graph/graph.hnsw"}
+		srcs[dst] = protocol.Source{Kind: "peer", Addr: live[i].Info.BulkAddr}
 		from[dst] = liveIDs[i]
 	}
 	return srcs, from

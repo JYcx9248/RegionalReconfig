@@ -14,6 +14,7 @@ import (
 
 	"rtier/internal/config"
 	"rtier/internal/ctrl"
+	"rtier/internal/navgraph"
 	"rtier/internal/nodeclient"
 	"rtier/internal/partitioning"
 	"rtier/internal/placement"
@@ -801,9 +802,13 @@ func (p *rawPuller) wait() (protocol.StageReply, error) {
 	return reply, p.first
 }
 
-// StageGraph: fetch the navigation graph and load it (the entry role's prerequisite). The pull
-// runs at the priority the controller asks for -- background by default: then it moves nothing
-// while its source or this node moves data, raw vectors included (graphYield).
+// StageGraph: the navigation graph for this node's data node (the entry role's prerequisite).
+// Queries search it only in memory, so it never goes through a disk here: from a peer it comes
+// from that entry's memory, at the epoch's graph version with the patches of major epochs (U14)
+// merged in it, straight into the data node's, which builds it as the bytes arrive. The pull runs
+// at the priority the controller asks for -- background by default: then it moves nothing while
+// its source or this node moves data, raw vectors included (graphYield). A local source is the
+// index's own file: a bootstrap, which the data node reads where it lies.
 func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageGraphReq](body)
 	if err != nil {
@@ -820,62 +825,54 @@ func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any
 	}
 	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
-	var gate func(context.Context) error // this end's half of the yield; the source holds its own
-	if class == transfer.Background {
-		gate = a.yield.Wait
-	}
-	const name = "graph.hnsw"
 	var st transfer.Stats
 	switch req.Source.Kind {
 	case "local":
-		st, err = transfer.CopyLocal(req.Source.Dir, []string{name}, a.graphDir())
-	case "peer":
-		st, err = transfer.PullGated(ctx, req.Source.Addr, []string{filepath.Join("graph", name)}, a.cfg.WorkDir,
-			a.cfg.ChunkBytes, class, gate)
-	default:
-		err = fmt.Errorf("unknown source kind %q", req.Source.Kind)
-	}
-	if err != nil {
-		return nil, err
-	}
-	path, _ := filepath.Abs(filepath.Join(a.graphDir(), name))
-	if err := a.localBulk.LoadGraph(ctx, path); err != nil {
-		return nil, err
-	}
-	// The patches major epochs made since the build (U14), in order, from the same source: the
-	// graph is then at the version the epoch searches.
-	for v := uint32(1); v <= req.Graph; v++ {
-		file := patchName(v)
-		if req.Source.Kind != "peer" {
-			return nil, fmt.Errorf("graph version %d: a %s graph source has no patches", req.Graph, req.Source.Kind)
+		if req.Graph != 0 {
+			return nil, fmt.Errorf("graph version %d: an index directory holds only the build's graph", req.Graph)
 		}
-		pst, err := transfer.PullGated(ctx, req.Source.Addr, []string{filepath.Join("graph", file)}, a.cfg.WorkDir,
-			a.cfg.ChunkBytes, class, gate)
+		path, _ := filepath.Abs(filepath.Join(req.Source.Dir, navgraph.File))
+		fi, err := os.Stat(path)
 		if err != nil {
 			return nil, err
 		}
-		st.Bytes += pst.Bytes
-		st.Elapsed += pst.Elapsed
-		pp, _ := filepath.Abs(filepath.Join(a.graphDir(), file))
-		if err := a.localBulk.PatchLoad(ctx, pp); err != nil {
+		start := time.Now()
+		if err := a.localBulk.LoadGraph(ctx, path); err != nil {
 			return nil, err
 		}
-		if err := a.localBulk.PatchMerge(ctx, v); err != nil {
+		st = transfer.Stats{Files: 1, Bytes: fi.Size(), Elapsed: time.Since(start)}
+	case "peer":
+		var gate func(context.Context) error // this end's half of the yield; the source holds its own
+		if class == transfer.Background {
+			gate = a.yield.Wait
+		}
+		st, err = transfer.PullGraph(ctx, req.Source.Addr, req.Graph, a.cfg.ChunkBytes, class, gate,
+			func(ctx context.Context, off int64, data []byte) error {
+				_, err := a.localBulk.GraphPut(ctx, off, data)
+				return err
+			})
+		if err == nil {
+			err = a.localBulk.GraphInstall(ctx, req.Graph, st.Bytes)
+		}
+		if err != nil {
+			// The part that arrived would hold its memory until the next graph: dropped now.
+			if _, derr := a.localBulk.GraphPut(context.WithoutCancel(ctx), 0, nil); derr != nil {
+				log.Printf("agent: dropping a partial graph: %v", derr)
+			}
 			return nil, err
 		}
+	default:
+		return nil, fmt.Errorf("unknown source kind %q", req.Source.Kind)
 	}
 	a.setReady(config.RoleEntry)
 	a.reg.Counter("bulk.bytes_received").Add(st.Bytes)
 	return protocol.StageReply{Bytes: st.Bytes, Seconds: st.Elapsed.Seconds()}, nil
 }
 
-// patchName is the file a graph patch is kept in, in the graph directory.
-func patchName(v uint32) string { return fmt.Sprintf("patch-%d.bin", v) }
-
 // GraphPatch (U14 major epochs): once no query searches the graph without the patch -- the
-// controller calls this after the grace period -- the entry writes the patch next to the graph,
-// where a later entry's graph transfer takes it, and merges it in place: queries searching
-// through the patch go on meanwhile. With Drop (a commit that did not flip), it unstages it.
+// controller calls this after the grace period -- the entry merges it in place: queries
+// searching through the patch go on meanwhile. A later entry's graph transfer then takes the
+// merged graph from memory. With Drop (a commit that did not flip), it unstages it.
 func (a *Agent) handleGraphPatch(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.GraphPatchReq](body)
 	if err != nil {
@@ -887,21 +884,7 @@ func (a *Agent) handleGraphPatch(ctx context.Context, body json.RawMessage) (any
 		_, err := a.localBulk.PatchDrop(ctx, req.Version)
 		return struct{}{}, err
 	}
-	info, err := a.localBulk.Info(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if info.Graph.Version >= req.Version {
-		return struct{}{}, nil // merged already (a retry): its file was written first
-	}
-	if err := os.MkdirAll(a.graphDir(), 0o755); err != nil {
-		return nil, err
-	}
-	path, _ := filepath.Abs(filepath.Join(a.graphDir(), patchName(req.Version)))
-	if err := a.localBulk.PatchSave(ctx, req.Version, path); err != nil {
-		return nil, err
-	}
-	return struct{}{}, a.localBulk.PatchMerge(ctx, req.Version)
+	return struct{}{}, a.localBulk.PatchMerge(ctx, req.Version) // a no-op when merged already (a retry)
 }
 
 func (a *Agent) handleInstallEpoch(ctx context.Context, body json.RawMessage) (any, error) {

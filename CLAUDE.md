@@ -112,7 +112,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   the data nodes, entries to the aggregators: `StageAggregator`) →
   new nodes pull segments and the PQ codes they lack (the graph last, for now strictly: it
   moves only while neither end moves segments, PQ codes or raw vectors, `graphYield`; sources
-  round-robin over entries) → flip (CAS + install) → grace (drain the old epoch) →
+  round-robin over entries; from the source entry's memory into the new entry's, never through a
+  disk: `GRAPH_GET`, relayed by the agents, `GRAPH_PUT`, `GRAPH_INSTALL`) → flip (CAS + install) → grace (drain the old epoch) →
   reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
   Alongside grace and reclaim, `promoteEntries` flips every `EntryFlipInterval` to make
   entries of the new nodes whose graph has loaded, each connected to every aggregator first;
@@ -282,7 +283,15 @@ Next:
    CloudLab CPU nodes (rs620: reuse, lazy 2 → 3 → 2, copy-then-flip 2 → 3, all answers exact).
    Next the GPU runs on 9 c240g5, reserved for 7 days from 2026-11-03 (`*-cloudlab-gpu-*`). On
    one c240g5 (Ubuntu 24.04, driver 570, CUDA 12.8; 2026-11-02), a build for sm_60 passes the
-   end-to-end tests on the GPU backend and `fusion_selftest` on the Wikipedia index.
+   end-to-end tests on the GPU backend and `fusion_selftest` on the Wikipedia index. The
+   Wikipedia 4 → 8 runs (2026-11-03/04, `results/cloudlab-gpu`, figures by
+   `scripts/analysis/cloudlab_gpu_figures.py`): every answer the same under both protocols;
+   copy-then-flip flips after the load. Lazy restores 8 nodes' capacity within about 70 s, but
+   for about 55 s after the flip its throughput falls below 4 nodes'. Two causes:
+   - the fetch cache of the new owners of the hottest partitions hits its 64 MB bound, and past
+     it each fetch waits for the S3500's writes (still open);
+   - each new entry wrote its 7 GB graph to the same disk. Since 2026-11-04 the graph moves from
+     memory to memory instead.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

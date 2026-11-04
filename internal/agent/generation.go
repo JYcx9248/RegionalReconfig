@@ -71,13 +71,11 @@ func (a *Agent) handleSwitchGeneration(ctx context.Context, body json.RawMessage
 		return nil, fmt.Errorf("switching to index generation %d: %w", req.Generation, err)
 	}
 	// The files peers pull from here are the generation's from now on.
-	for _, d := range []string{a.partDir(), a.graphDir()} {
-		if err := os.RemoveAll(d); err != nil {
-			return nil, err
-		}
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, err
-		}
+	if err := os.RemoveAll(a.partDir()); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(a.partDir(), 0o755); err != nil {
+		return nil, err
 	}
 	a.manifest.Store(m)
 	a.generation.Store(req.Generation)

@@ -56,12 +56,14 @@ const (
 	opPatchLoad      uint8 = 0x38
 	opPatchMerge     uint8 = 0x39
 	opPatchDrop      uint8 = 0x3A
-	opPatchSave      uint8 = 0x3B
 	opSwitchGen      uint8 = 0x3C
 	opRawBitmap      uint8 = 0x3D
 	opRawTraffic     uint8 = 0x3E
 	opPQFromIndex    uint8 = 0x3F
 	opRawSave        uint8 = 0x40
+	opGraphGet       uint8 = 0x41
+	opGraphPut       uint8 = 0x42
+	opGraphInstall   uint8 = 0x43
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -481,6 +483,56 @@ func (c *Client) info(ctx context.Context, body []byte) (*Info, error) {
 // LoadGraph makes the node load its navigation graph from path (a path on the node's host).
 func (c *Client) LoadGraph(ctx context.Context, path string) error {
 	_, err := c.do(ctx, opLoadGraph, 0, []byte(path))
+	return err
+}
+
+// GraphGet reads bytes [off, off+n) of the node's graph at version -- fewer at its end -- in
+// hnswlib's index format, from memory: the source of a graph transfer (GRAPH_GET, U16). It also
+// returns the format's size, and the node's graph stamp, which changes whenever its graph does.
+func (c *Client) GraphGet(ctx context.Context, version uint32, off int64, n int) (data []byte, size int64, stamp uint64, err error) {
+	var w frame.Writer
+	w.U32(version)
+	w.U64(uint64(off))
+	w.U32(uint32(n))
+	b, err := c.do(ctx, opGraphGet, 0, w.B)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	r := frame.NewReader(b)
+	size, stamp = int64(r.U64()), r.U64()
+	data = r.Rest()
+	if r.Err != nil {
+		return nil, 0, 0, r.Err
+	}
+	return data, size, stamp, nil
+}
+
+// GraphPut hands the node the next bytes of a graph it receives, which it builds in memory as
+// they come (GRAPH_PUT); off 0 starts a new one, and with no bytes only drops a partial one. It
+// returns the bytes the node has.
+func (c *Client) GraphPut(ctx context.Context, off int64, data []byte) (int64, error) {
+	var w frame.Writer
+	w.U64(uint64(off))
+	w.Bytes(data)
+	b, err := c.do(ctx, opGraphPut, 0, w.B)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	got := int64(r.U64())
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, fmt.Errorf("GRAPH_PUT: %d trailing bytes", r.Remaining())
+	}
+	return got, r.Err
+}
+
+// GraphInstall makes the graph received, all size bytes of it, the node's at version
+// (GRAPH_INSTALL).
+func (c *Client) GraphInstall(ctx context.Context, version uint32, size int64) error {
+	var w frame.Writer
+	w.U32(version)
+	w.U64(uint64(size))
+	_, err := c.do(ctx, opGraphInstall, 0, w.B)
 	return err
 }
 
@@ -1017,15 +1069,6 @@ func (c *Client) PatchDrop(ctx context.Context, v uint32) (bool, error) {
 		return false, err
 	}
 	return len(b) == 1 && b[0] == 1, nil
-}
-
-// PatchSave writes the staged patch of version v to path on the node's machine.
-func (c *Client) PatchSave(ctx context.Context, v uint32, path string) error {
-	var w frame.Writer
-	w.U32(v)
-	w.Str(path)
-	_, err := c.do(ctx, opPatchSave, 0, w.B)
-	return err
 }
 
 // SplitList asks the router to split a list by the PQ codes of its members (m bytes each): side

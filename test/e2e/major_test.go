@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"rtier/internal/config"
+	"rtier/internal/navgraph"
 	"rtier/internal/nodeclient"
 	"rtier/internal/partitioning"
 	"rtier/internal/placement"
@@ -200,7 +202,7 @@ func TestMajorEpoch(t *testing.T) {
 	t.Logf("minor batch: %d inserts, %d of their postings in lists the major epoch created; lengths %d lists",
 		len(b.Inserts), newLists, len(b.Lengths))
 
-	// 2. A scale-out: the joining entry gets the build's graph and the patch.
+	// 2. A scale-out: the joining entry gets the graph at version 1 from an entry's memory.
 	out, err := cl.ctl.Reconfigure(ctx, protocol.RescaleReq{DataNodes: 3})
 	if err != nil {
 		t.Fatalf("scale-out: %v", err)
@@ -271,9 +273,9 @@ func applyMajorOracle(t *testing.T, ctx context.Context, nc *nodeclient.Client, 
 	}
 }
 
-// checkGraphs: every entry's data node has its graph at version v with no patch staged, and
-// keeps the patches 1..v as files next to the graph (where a later entry's graph transfer
-// takes them).
+// checkGraphs: every entry's data node has its graph at version v with no patch staged, and no
+// agent keeps a file of a graph or a patch: a graph moves from an entry's memory to the new
+// entry's (U16), and the entries that started with one read the index's own file.
 func checkGraphs(t *testing.T, cl *cluster, v uint32) {
 	t.Helper()
 	tbl := cl.ctl.Status().Table
@@ -290,11 +292,14 @@ func checkGraphs(t *testing.T, cl *cluster, v uint32) {
 		if in.Graph.Version != v || in.Graph.Patch != 0 {
 			t.Errorf("entry %d: graph %+v, want version %d and no patch staged", id, in.Graph, v)
 		}
-		for w := uint32(1); w <= v; w++ {
-			if _, err := os.Stat(filepath.Join(cl.dirs[id], "graph", fmt.Sprintf("patch-%d.bin", w))); err != nil {
-				t.Errorf("entry %d does not keep the patch to graph version %d: %v", id, w, err)
+	}
+	for id, dir := range cl.dirs {
+		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && (d.Name() == navgraph.File || strings.HasPrefix(d.Name(), "patch-")) {
+				t.Errorf("node %d's agent keeps a graph file: %s", id, path)
 			}
-		}
+			return nil
+		})
 	}
 }
 

@@ -25,6 +25,8 @@
 #include "../node/stream.h"
 #include "fusion/builder.h"
 #include "fusion/dataset.h"
+#include "fusion/graph_image.h"
+#include "fusion/hnsw_space.h"
 #include "fusion/index_meta.h"
 #include "fusion/layout.h"
 #include "fusion/node_engine.h"
@@ -2375,6 +2377,142 @@ std::vector<std::vector<uint32_t>> NavigateAll(const Fixture& f, NodeEngine& e, 
   return out;
 }
 
+// A graph transfer between two nodes as the agents relay it (U16): GRAPH_GET's chunks from the
+// source's memory, each GRAPH_PUT into the destination's as it comes, then GRAPH_INSTALL. Every
+// chunk comes from one graph (the stamp).
+void TransferGraph(const NodeEngine& from, NodeEngine& to, uint32_t version, size_t chunk) {
+  std::vector<uint8_t> buf;
+  uint64_t off = 0, size = 0, first = 0;
+  do {
+    uint64_t stamp = 0;
+    size = from.ReadGraph(version, off, chunk, &buf, &stamp);
+    if (off == 0) first = stamp;
+    CHECK(stamp == first && !buf.empty());
+    CHECK(to.PutGraph(off, buf.data(), buf.size()) == off + buf.size());
+    off += buf.size();
+  } while (off < size);
+  to.InstallGraph(version, size);
+}
+
+std::vector<std::pair<float, size_t>> Knn(const HnswIndex& g, const float* q, size_t k) {
+  auto pq = g.searchKnn(q, k);
+  std::vector<std::pair<float, size_t>> out;
+  for (; !pq.empty(); pq.pop()) out.emplace_back(pq.top().first, pq.top().second);
+  return out;
+}
+
+// The graph from memory to memory (U16, fusion/graph_image.h): the image read from a loaded graph
+// is, at every offset, what saveIndex writes; a graph built from it in pieces of any size is the
+// one loadIndex builds from the file; and a node that gets its graph that way from another, chunk
+// by chunk, navigates as the other does.
+void TestGraphTransfer() {
+  Fixture& f = GetFixture();
+  const std::string file = JoinPath(f.index, files::kGraph);
+  const auto space = MakeL2Space(DType::kFloat, f.dim);
+  HnswIndex g(space.get(), file, false, 0);
+  const GraphImage img(g);
+  std::vector<uint8_t> all(img.size());
+  img.Read(g, 0, all.size(), all.data());
+  const std::string saved = JoinPath(TempDir(), "graph-saved.hnsw");
+  g.saveIndex(saved);
+  CHECK(ReadFile(saved) == all && ReadFile(file) == all);
+  for (size_t chunk : {size_t{1}, size_t{7}, size_t{4093}, size_t{1} << 16}) {
+    std::vector<uint8_t> got, piece;
+    for (uint64_t off = 0; off < all.size(); off += chunk) {
+      piece.resize(std::min<uint64_t>(chunk, all.size() - off));
+      img.Read(g, off, piece.size(), piece.data());
+      got.insert(got.end(), piece.begin(), piece.end());
+    }
+    CHECK(got == all);
+  }
+  CHECK(Throws([&] {
+    uint8_t b;
+    img.Read(g, all.size(), 1, &b);
+  }));
+
+  const size_t count = g.cur_element_count;
+  size_t upper = 0;
+  for (size_t i = 0; i < count; ++i) upper += g.element_levels_[i] > 0;
+  CHECK(upper > 0);  // the fixture's graph has upper levels: link records of both kinds
+  g.setEf(40);
+  for (size_t piece : {size_t{1}, size_t{13}, size_t{4096}, all.size()}) {
+    GraphLoader ld(space.get(), count + 100);
+    for (uint64_t off = 0; off < all.size(); off += piece) {
+      CHECK(!ld.complete());
+      ld.Append(all.data() + off, static_cast<size_t>(std::min<uint64_t>(piece, all.size() - off)));
+    }
+    CHECK(ld.complete() && ld.received() == all.size());
+    const std::unique_ptr<HnswIndex> h = ld.Take();
+    CHECK(h->cur_element_count == count && h->max_elements_ == count + 100 && h->maxlevel_ == g.maxlevel_ &&
+          h->enterpoint_node_ == g.enterpoint_node_ && h->num_deleted_ == g.num_deleted_ &&
+          h->label_lookup_ == g.label_lookup_);
+    CHECK(std::memcmp(h->data_level0_memory_, g.data_level0_memory_, count * g.size_data_per_element_) == 0);
+    bool same = true;
+    for (size_t i = 0; i < count && same; ++i) {
+      same = h->element_levels_[i] == g.element_levels_[i];
+      if (same && g.element_levels_[i] > 0)
+        same = std::memcmp(h->linkLists_[i], g.linkLists_[i], g.size_links_per_element_ * g.element_levels_[i]) == 0;
+    }
+    CHECK(same);
+    h->setEf(40);
+    for (uint32_t q = 0; q < f.nq; ++q) CHECK(Knn(*h, &f.queries[q * f.dim], 10) == Knn(g, &f.queries[q * f.dim], 10));
+  }
+  {
+    // The room loadIndex gives: the graph's own when the one asked is smaller than its count.
+    GraphLoader ld(space.get(), 0);
+    ld.Append(all.data(), all.size());
+    CHECK(ld.Take()->max_elements_ == g.max_elements_);
+  }
+  // Refused: a byte past the end, a graph not complete (given up, it frees what it holds), the
+  // graph of vectors of another size.
+  {
+    GraphLoader ld(space.get(), count);
+    ld.Append(all.data(), all.size());
+    const uint8_t extra = 0;
+    CHECK(Throws([&] { ld.Append(&extra, 1); }));
+  }
+  {
+    GraphLoader ld(space.get(), count);
+    ld.Append(all.data(), all.size() - 9);
+    CHECK(!ld.complete() && Throws([&] { ld.Take(); }));
+  }
+  {
+    const auto wide = MakeL2Space(DType::kFloat, f.dim * 2);
+    GraphLoader ld(wide.get(), count);
+    CHECK(Throws([&] { ld.Append(all.data(), all.size()); }));
+  }
+
+  // Between nodes: one with no graph gets the entry's.
+  auto entry = OpenNode(f, {}, true);
+  auto fresh = OpenNode(f, {}, false);
+  CHECK(!fresh->has_graph());
+  const auto want = NavigateAll(f, *entry, 0);
+  TransferGraph(*entry, *fresh, 0, 1000);
+  const GraphState gs = fresh->graph_state();
+  CHECK(gs.loaded && gs.version == 0 && gs.patch == 0 && gs.count == entry->graph_state().count &&
+        gs.capacity == entry->graph_state().capacity);
+  CHECK(NavigateAll(f, *fresh, 0) == want);
+  // A version the source does not have; bytes out of order; an install before the graph is whole,
+  // and after a partial one was dropped.
+  std::vector<uint8_t> b;
+  uint64_t s0 = 0, s1 = 0;
+  CHECK(Throws([&] { entry->ReadGraph(1, 0, 64, &b, &s0); }));
+  const uint64_t size = entry->ReadGraph(0, 0, 64, &b, &s0);
+  CHECK(b.size() == 64 && size == fresh->ReadGraph(0, 0, 1, &b, &s1));
+  entry->ReadGraph(0, 0, 64, &b, &s0);
+  auto third = OpenNode(f, {}, false);
+  CHECK(third->PutGraph(0, b.data(), b.size()) == 64);
+  CHECK(Throws([&] { third->PutGraph(1000, b.data(), b.size()); }));
+  CHECK(Throws([&] { third->InstallGraph(0, size); }));
+  CHECK(third->PutGraph(0, nullptr, 0) == 0);
+  CHECK(Throws([&] { third->InstallGraph(0, size); }));
+  CHECK(!third->has_graph());
+  // The stamp changes with the graph: a transfer across a reload would see it.
+  entry->LoadGraph(file);
+  entry->ReadGraph(0, 0, 64, &b, &s1);
+  CHECK(s1 != s0);
+}
+
 // Graph patches (U14 major epochs): the router edits its own graph and exports a patch; an entry
 // stages it next to its graph -- its own version still searches the graph alone, the next one
 // searches through the patch, exactly as the router's edited graph -- and merges it in place
@@ -2383,7 +2521,7 @@ void TestGraphPatches() {
   Fixture& f = GetFixture();
   auto router = OpenNode(f, {}, true);
   auto entry = OpenNode(f, {}, true);
-  auto later = OpenNode(f, {}, true);  // gets the patch as a file
+  auto later = OpenNode(f, {}, false);  // joins after the merge: the graph from the entry's memory
   const uint32_t nl = router->num_lists();
   const GraphState g0 = router->graph_state();
   CHECK(g0.loaded && g0.version == 0 && g0.patch == 0 && g0.count == nl && g0.deleted == 0);
@@ -2415,8 +2553,11 @@ void TestGraphPatches() {
   CHECK(NavigateAll(f, *entry, 1) == want);
   CHECK(NavigateAll(f, *entry, kNewestGraph) == want);
   CHECK(Throws([&] { NavigateAll(f, *entry, 2); }));
-  const std::string path = JoinPath(TempDir(), "patch-1.bin");
-  entry->SaveGraphPatch(1, path);
+  // A transfer sends a merged graph: the staged version is not sent, the graph's own is.
+  std::vector<uint8_t> bytes;
+  uint64_t stamp = 0;
+  CHECK(Throws([&] { entry->ReadGraph(1, 0, 64, &bytes, &stamp); }));
+  entry->ReadGraph(0, 0, 64, &bytes, &stamp);
 
   // Merged in place while queries search through the patch: none sees anything else.
   std::atomic<bool> stop{false};
@@ -2441,10 +2582,10 @@ void TestGraphPatches() {
   CHECK(Throws([&] { NavigateAll(f, *entry, 0); }));  // the old version is gone
   entry->MergeGraphPatch(1);  // merged already: nothing to do
 
-  // A later entry: the build's graph, then the patch from the file.
-  const std::vector<uint8_t> file = ReadFile(path);
-  later->StageGraphPatch(file.data(), file.size());
-  later->MergeGraphPatch(1);
+  // A later entry: the graph at version 1 from the entry's memory, the patch in it.
+  TransferGraph(*entry, *later, 1, 777);
+  const GraphState gl = later->graph_state();
+  CHECK(gl.version == 1 && gl.patch == 0 && gl.count == nl + 3 && gl.deleted == 2);
   CHECK(NavigateAll(f, *later, 1) == want);
 
   // Refused, with nothing changed: a patch for another version, a damaged one.
@@ -2846,6 +2987,7 @@ int main() {
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"read_budget", TestReadBudget},
+      {"graph_transfer", TestGraphTransfer},
       {"graph_patches", TestGraphPatches},
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},

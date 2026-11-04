@@ -363,8 +363,8 @@ var Open = map[string]Question{
 			"patch (fusion/graph_patch.h). No node holds two versions of the graph: every entry " +
 			"stages the patch next to its graph, queries of the epoch after the flip search " +
 			"through it (step by step the patched graph's search), and after the grace period " +
-			"every entry keeps it as a file -- a later entry's graph transfer brings the build's " +
-			"graph and the patches -- and merges it in place, before the lease ends. The epoch " +
+			"every entry merges it in place, before the lease ends -- a later entry's graph " +
+			"transfer takes the merged graph from an entry's memory (U16). The epoch " +
 			"table names the graph version and the lists major epochs created (list IDs, like " +
 			"vector IDs, are never reused); data nodes leave room for heads and lists " +
 			"(rtier_node --graph-headroom, 20% by default). Trigger (decided 2026-10-16): only " +
@@ -452,12 +452,19 @@ var Open = map[string]Question{
 			"whether the graph moves nothing at all while data moves, or takes the bandwidth the " +
 			"data leaves unused, as the bucket's background class does. " +
 			"Pairs with U6's warmup selector, which moves aggregation to the new node before its " +
-			"graph arrives. After major epochs (U14), the transfer brings the build's graph and " +
-			"then, from the same source, the patch of every later graph version, merged in order " +
-			"before the node takes the role",
+			"graph arrives. Decided (2026-11-04): the graph moves from the source entry's memory " +
+			"to the new entry's and never through a disk, since queries search it only in " +
+			"memory -- the source's data node reads any range of its loaded graph in hnswlib's " +
+			"index format, the agents relay the chunks through the bucket and the yield, and the " +
+			"new entry's data node builds its graph from them as they arrive -- so neither end " +
+			"writes a file or holds a second copy (on CloudLab's SATA SSDs, the 7 GB file each new " +
+			"entry wrote went to the disks its fetches needed). After major epochs (U14) the graph " +
+			"moves at the epoch's version, the patches merged in it",
 		"internal/controller/reconfig.go (graphSources, StageGraph, promoteEntries), " +
-			"internal/agent/yield.go (graphYield), internal/transfer/tokenbucket.go (classes), " +
-			"engine/src/node_engine.cpp (LoadGraph)"},
+			"internal/agent/control.go (handleStageGraph), internal/agent/yield.go (graphYield), " +
+			"internal/transfer/graph.go (PULL_GRAPH), internal/transfer/tokenbucket.go (classes), " +
+			"engine/src/graph_image.cpp (GraphImage, GraphLoader), engine/src/node_engine.cpp " +
+			"(ReadGraph, PutGraph, InstallGraph)"},
 	"U17": {"U17", "Where the client-facing availability list lives",
 		"today the entry set is a field of the epoch table, so \"this node finished loading its " +
 			"graph\" -- a local event that has nothing to do with who owns what -- costs an epoch " +

@@ -9,7 +9,7 @@
 //
 //	aggregator  connections to the data nodes of the next epoch      StageAggregator
 //	data        its partitions' posting lists and PQ codes loaded     StagePartitions
-//	entry       the navigation graph copied and loaded                StageGraph
+//	entry       the navigation graph, from an entry's memory           StageGraph
 //
 // A role is active once the controller installs an epoch that lists the node in that role. The
 // raw vectors of a data node's new partitions are not a readiness condition: its rtier_node
@@ -194,6 +194,11 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 		defer cancel()
 		return a.yield.Wait(ctx)
 	}
+	// The graph a new entry pulls from here comes from the data node's memory, where queries
+	// search it: no file of it is kept for peers (U16).
+	a.bulk.Graph = func(ctx context.Context, version uint32, off int64, n int) ([]byte, int64, uint64, error) {
+		return a.localBulk.GraphGet(ctx, version, off, n)
+	}
 	return a, nil
 }
 
@@ -211,10 +216,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
 	defer cancel()
-	for _, d := range []string{a.partDir(), a.graphDir()} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
-		}
+	if err := os.MkdirAll(a.partDir(), 0o755); err != nil {
+		return err
 	}
 
 	a.local = nodeclient.New(a.cfg.NodeAddr, a.cfg.NodeConns)
@@ -325,8 +328,7 @@ func (a *Agent) advertise(addr net.Addr) string {
 	return net.JoinHostPort(host, port)
 }
 
-func (a *Agent) partDir() string  { return filepath.Join(a.cfg.WorkDir, "partitions") }
-func (a *Agent) graphDir() string { return filepath.Join(a.cfg.WorkDir, "graph") }
+func (a *Agent) partDir() string { return filepath.Join(a.cfg.WorkDir, "partitions") }
 
 // learn records node addresses from a table.
 func (a *Agent) learn(t *epoch.Table) { a.learnNodes(t.Nodes) }

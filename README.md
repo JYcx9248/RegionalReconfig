@@ -124,7 +124,12 @@ it, U14), which is what makes this worth doing.
 partitions and answer FILTER and RERANK -- the steps that take load off the old owners -- and
 the navigation graph only for the entry role, whose navigation any existing entry can do
 meanwhile. So each new entry's graph source is assigned when the reconfiguration starts,
-round-robin over the live entries (`graph_sources` in the rescale reply), and the pull runs at
+round-robin over the live entries (`graph_sources` in the rescale reply). The graph moves from
+the source entry's memory to the new entry's and never through a disk, since queries search it
+only in memory: the source's data node reads any range of its loaded graph in hnswlib's index
+format (`GRAPH_GET`), the agents relay the chunks, and the new entry's data node builds its
+graph from them as they arrive (`GRAPH_PUT`, then `GRAPH_INSTALL`), so neither end writes a file
+or holds a second copy (`engine/include/fusion/graph_image.h`). The pull runs at
 background priority (`GraphPriority: background`, the default): the graph moves only while
 neither its source nor its destination moves data -- segments or PQ codes through the agent,
 raw vectors through the data node (`RAW_TRAFFIC`, polled every 100 ms) -- paced or not, so it
@@ -233,8 +238,8 @@ exports the bytes that changed: a patch (`engine/include/fusion/graph_patch.h`).
 stages the patch next to its graph. Queries of the epoch after the flip search through it -- a
 changed element is read from the patch, every other one from the graph, so the search is the
 patched graph's, step by step -- and those of the epoch before it search the graph alone. After
-the grace period every entry keeps the patch as a file, where a later entry's graph transfer takes
-it, and merges it in place without a pause; the lease ends after that. The epoch table names the
+the grace period every entry merges the patch in place without a pause, and the lease ends after
+that; a later entry's graph transfer takes the merged graph from an entry's memory. The epoch table names the
 graph version and the lists major epochs created; data nodes leave room for heads and lists
 (`rtier_node --graph-headroom`, 20% by default).
 
