@@ -5,6 +5,15 @@ query stream with no locality at all (internal/design/design.go, U11).
     python3 scripts/data/sample_queries.py sample --index DIR --count N --out QUERIES.fbin
         [--seed 1] [--layout bucket]
     python3 scripts/data/sample_queries.py check --gt GT.ibin --ids QUERIES.fbin.ids [--stride S]
+    python3 scripts/data/sample_queries.py join --index DIR --snapshot SNAPDIR --out DIR [--layout bucket]
+
+join is for a machine that has the index's layout map but not its page file, such as a
+cluster's control node, which runs on a warmup snapshot. Each node's raw.pages in the snapshot
+is a sparse copy of the page file at the same offsets, and its presence bits (raw.pages.present)
+mark the locations it holds. Together the nodes hold every vector. join writes the page file
+again into DIR, from the first node that holds each location, with copies of the index's meta.txt
+and layout map: DIR then serves as --index for sample and for fusion_gt. On a file system with
+shared extents (XFS), the copies take no space.
 
 sample draws N distinct vector IDs, uniformly, and writes their vectors in the order drawn: a run
 sends them in that order and repeats none while the file lasts. It reads them from the index's
@@ -24,10 +33,14 @@ Standard library only, so that it runs on whichever machine holds the index.
 
 import argparse
 import array
+import glob
 import os
 import random
+import re
+import shutil
 import struct
 import sys
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 # fbin and its kin (big-ann-benchmarks): uint32 rows, uint32 dimensions, then the rows
@@ -49,18 +62,117 @@ def read_meta(index):
     return kv
 
 
-def read_layout(index, name):
-    """(page_size, vec_bytes, vectors per page, page_of, slot_of) of layout_<name>.map."""
+def read_layout(index, name, pages=False):
+    """(page_size, vec_bytes, vectors per page, page_of, slot_of) of layout_<name>.map, and with
+    pages its page count after them."""
     with open(os.path.join(index, "layout_%s.map" % name), "rb") as f:
         page_size, vec_bytes, vpp, _ = struct.unpack("<4I", f.read(16))
-        n, _pages = struct.unpack("<2Q", f.read(16))
+        n, num_pages = struct.unpack("<2Q", f.read(16))
         page_of, slot_of = u32(), array.array("H")
         page_of.fromfile(f, n)
         slot_of.fromfile(f, n)
     if sys.byteorder != "little":
         page_of.byteswap()
         slot_of.byteswap()
-    return page_size, vec_bytes, vpp, page_of, slot_of
+    return (page_size, vec_bytes, vpp, page_of, slot_of) + ((num_pages,) if pages else ())
+
+
+def read_bits(path, page_size, vb, vpp):
+    """A raw store's presence bits (RawStore::SaveBitmap): magic, version and geometry, pages,
+    words, then a bit per location in 64-bit words, and an IEEE CRC-32 of all that."""
+    with open(path, "rb") as f:
+        b = f.read()
+    if len(b) < 44 or b[:8] != b"RTRAWBIT":
+        sys.exit("%s: not a raw store's presence bits" % path)
+    if zlib.crc32(b[:-4]) != struct.unpack("<I", b[-4:])[0]:
+        sys.exit("%s: checksum mismatch" % path)
+    version, bvb, bvpp, bps = struct.unpack("<4I", b[8:24])
+    _pages, nwords = struct.unpack("<2Q", b[24:40])
+    if version != 1 or (bvb, bvpp, bps) != (vb, vpp, page_size) or len(b) != 40 + 8 * nwords + 4:
+        sys.exit("%s: version %d, %d-byte vectors, %d a page of %d bytes, %d words in %d bytes: not this "
+                 "layout's (%d-byte vectors, %d a page of %d)" % (path, version, bvb, bvpp, bps, nwords, len(b),
+                                                                 vb, vpp, page_size))
+    words = array.array("Q")
+    assert words.itemsize == 8, "array('Q') is not 8 bytes here"
+    words.frombytes(b[40:40 + 8 * nwords])
+    if sys.byteorder != "little":
+        words.byteswap()
+    return words
+
+
+def copy_range(src, dst, off, n):
+    """Bytes [off, off + n) of src to the same place in dst: shared extents where the file system
+    can, else a kernel copy, else through here."""
+    while n > 0:
+        try:
+            k = os.copy_file_range(src, dst, n, off, off)
+        except OSError:
+            k = os.pwrite(dst, os.pread(src, min(n, 1 << 24), off), off)
+        if k <= 0:
+            raise OSError("copy stopped at byte %d" % off)
+        off, n = off + k, n - k
+
+
+def join(args):
+    read_meta(args.index)  # an index directory
+    page_size, vb, vpp, page_of, slot_of, num_pages = read_layout(args.index, args.layout, pages=True)
+    nodes = sorted(glob.glob(os.path.join(args.snapshot, "n*", "raw.pages")),
+                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(os.path.dirname(p))) or 0))
+    if not nodes:
+        sys.exit("join: no n*/raw.pages under %s" % args.snapshot)
+    nwords = (num_pages * vpp + 63) // 64
+    have = array.array("Q", bytes(8 * nwords))
+    os.makedirs(args.out, exist_ok=True)
+    out = os.path.join(args.out, "vectors_%s.bin" % args.layout)
+    tmp = out + ".partial"
+    dst = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.ftruncate(dst, num_pages * page_size)
+    whole = vpp * vb == page_size  # consecutive locations are consecutive bytes, across pages too
+
+    def flush(src, start, count):  # locations [start, start + count)
+        while count:
+            run = count if whole else min(count, vpp - start % vpp)  # within one page
+            copy_range(src, dst, (start // vpp) * page_size + (start % vpp) * vb, run * vb)
+            start, count = start + run, count - run
+
+    for raw in nodes:
+        words = read_bits(raw + ".present", page_size, vb, vpp)
+        src = os.open(raw, os.O_RDONLY)
+        took, start, count = 0, 0, 0  # the run of locations this node holds and no earlier one did
+        for w in range(min(len(words), nwords)):
+            new = words[w] & ~have[w]
+            have[w] |= words[w]
+            while new:
+                lo = (new & -new).bit_length() - 1
+                x = new >> lo
+                ones = ((~x) & (x + 1)).bit_length() - 1  # the run of ones from bit lo
+                loc = w * 64 + lo
+                if count and loc == start + count:
+                    count += ones
+                else:
+                    if count:
+                        flush(src, start, count)
+                    start, count = loc, ones
+                took += ones
+                new &= ~(((1 << ones) - 1) << lo)
+        if count:
+            flush(src, start, count)
+        os.close(src)
+        print("  %s: %d locations" % (raw, took), file=sys.stderr)
+    missing = sum(1 for i in range(len(page_of))
+                  if not have[(page_of[i] * vpp + slot_of[i]) >> 6] >> ((page_of[i] * vpp + slot_of[i]) & 63) & 1)
+    if missing:
+        os.close(dst)
+        os.unlink(tmp)
+        sys.exit("join: %d of the %d vectors are in none of %s's raw files" % (missing, len(page_of), args.snapshot))
+    os.fsync(dst)
+    os.close(dst)
+    os.rename(tmp, out)
+    for f in ("meta.txt", "layout_%s.map" % args.layout):
+        if os.path.abspath(os.path.join(args.out, f)) != os.path.abspath(os.path.join(args.index, f)):
+            shutil.copyfile(os.path.join(args.index, f), os.path.join(args.out, f))
+    print("%s: the page file again, every one of the %d vectors, from %d raw files; %s serves as --index"
+          % (out, len(page_of), len(nodes), args.out))
 
 
 def sample(args):
@@ -141,8 +253,13 @@ def main():
     c.add_argument("--gt", required=True)
     c.add_argument("--ids", required=True, help="the IDs sample drew (QUERIES.fbin.ids)")
     c.add_argument("--stride", type=int, default=1, help="the ground truth's stride (fusion_gt --stride)")
+    j = sub.add_parser("join", help="the page file again, from a warmup snapshot's raw files")
+    j.add_argument("--index", required=True, help="the index directory, with its layout map (meta.txt, layout_<layout>.map)")
+    j.add_argument("--snapshot", required=True, help="the warmup snapshot (n1/raw.pages, n1/raw.pages.present, ...)")
+    j.add_argument("--layout", default="bucket")
+    j.add_argument("--out", required=True, help="the directory to write vectors_<layout>.bin to, with meta.txt and the map")
     args = ap.parse_args()
-    (sample if args.cmd == "sample" else check)(args)
+    {"sample": sample, "check": check, "join": join}[args.cmd](args)
 
 
 if __name__ == "__main__":
