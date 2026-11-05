@@ -222,8 +222,15 @@ Known limits of the raw-vector path:
   tails share pages, and the slots of other vectors must be written back unchanged): one read per
   such page, from the node's own read IOPS. The writer's rounds let the vectors of one page that
   different queries fetched share it. One installer at a time (bootstrap, stream, writer).
-- The fetch cache holds at most 64 MB of vectors waiting for the writer; past that, the fetching
-  query installs its vectors itself (backpressure on the query path).
+- The fetch cache holds at most 2 GB of vectors waiting for the writer; past that, the fetching
+  query installs its vectors itself (backpressure on the query path). Until 2026-11-04 the
+  bound was 64 MB. That is 16,384 vectors of 4 KB. On CloudLab's SATA SSDs, the writer installed
+  6.6-8.6K vectors/s at best, below what the new owners of the hottest partitions fetched right
+  after a flip, so the cache sat at the bound for 29-50 s. Each query then waited for its own
+  writes, 100-1000 ms per fetch. The lab server's shared NVMe touched the bound for 0-5 s only.
+  The bound counts the vectors' bytes. Each cached vector also takes about 100 B of bookkeeping,
+  which is little for 4 KB vectors but about doubles the memory for 128-byte ones. The writer's
+  rate is the real limit: a larger working set or a slower disk reaches the bound again.
 - There is no disk budget: a node keeps every vector it has held (the counterpart of the PQ
   budget does not exist yet), and the local file has the page file's full logical size, sparse.
 - Presence lives in memory: a node starts empty unless it is started with `--raw-reuse` on a raw

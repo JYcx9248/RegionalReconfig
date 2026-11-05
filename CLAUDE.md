@@ -288,10 +288,18 @@ Next:
    `scripts/analysis/cloudlab_gpu_figures.py`): every answer the same under both protocols;
    copy-then-flip flips after the load. Lazy restores 8 nodes' capacity within about 70 s, but
    for about 55 s after the flip its throughput falls below 4 nodes'. Two causes:
-   - the fetch cache of the new owners of the hottest partitions hits its 64 MB bound, and past
-     it each fetch waits for the S3500's writes (still open);
+   - the fetch cache of the new owners of the hottest partitions hit its bound, 64 MB then, and
+     past it each fetch waited for the S3500's writes. The bound is 2 GB since 2026-11-04;
    - each new entry wrote its 7 GB graph to the same disk. Since 2026-11-04 the graph moves from
      memory to memory instead.
+
+   The rerun with both fixes (`results/cloudlab-gpu/4to8-v2`, 2026-11-04):
+   - lazy answers 500-545 q/s for 5 s after the flip, the offered rate within 15 s;
+   - its backlog peaks at about 9K and drains 32 s after the flip; latency afterwards is 14 ms;
+   - from the trigger on, 13% of the queries miss 200 ms, against 74-83% before;
+   - the new entries come online 69-79 s after the trigger, later than before, because the graph
+     yields to the faster fetches;
+   - copy-then-flip is unchanged, and every answer is the same in all runs.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

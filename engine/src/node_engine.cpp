@@ -2247,9 +2247,13 @@ class NodeEngineImpl : public NodeEngine {
 
   // Keeps fetched vectors for the queries and queues them for the SSD; returns how many were
   // new. Past kMaxQueuedBytes of queued vectors the fetching query installs them itself:
-  // backpressure, so that a slow disk cannot grow the cache without bound.
+  // backpressure, so that a slow disk cannot grow the cache without bound. The bound holds a new
+  // node's burst of fetches right after a flip: a SATA SSD's writer installed at most 6.6-8.6K
+  // 4 KB vectors/s, below what the new owners of the hottest partitions fetched, and a 64 MB
+  // bound put those writes on the queries for about 50 s (CloudLab, 2026-11-03/04), where a whole
+  // new node's fetches came to 1.35 GB at most.
   size_t Cache(const uint32_t* locs, size_t n, const uint8_t* vecs) {
-    static constexpr size_t kMaxQueuedBytes = 2u << 30;
+    static constexpr size_t kMaxQueuedBytes = size_t{2} << 30;
     const uint32_t vb = raw_->layout().vec_bytes;
     std::vector<uint32_t> fresh;
     bool full = false;
