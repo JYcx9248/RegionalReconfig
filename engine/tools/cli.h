@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -14,7 +15,7 @@ namespace fusion {
 
 class Args {
  public:
-  Args(int argc, char** argv, const std::set<std::string>& flags) {
+  Args(int argc, char** argv, const std::set<std::string>& flags) : flags_(flags) {
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a.rfind("--", 0) != 0) throw std::runtime_error("unexpected argument: " + a);
@@ -32,7 +33,11 @@ class Args {
   }
 
   bool Has(const std::string& k) const { return kv_.count(k) != 0; }
+  // A key read as a flag must be declared one: the parser takes any other key for an option with
+  // a value, so the argument after it would be its value -- another option lost without a word,
+  // or a stray value that stops the tool. Checked at every start, whatever the command line.
   bool Flag(const std::string& k) const {
+    if (!flags_.count(k)) throw std::logic_error("--" + k + " is read as a flag but not declared as one");
     used_.insert(k);
     return Has(k) && kv_.at(k) != "0";
   }
@@ -60,6 +65,7 @@ class Args {
   }
 
  private:
+  std::set<std::string> flags_;
   std::map<std::string, std::string> kv_;
   mutable std::set<std::string> used_;
 };

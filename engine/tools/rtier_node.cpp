@@ -71,7 +71,7 @@ static void Usage() {
 }
 
 int main(int argc, char** argv) {
-  const std::set<std::string> flags = {"no-direct", "raw-reuse", "help"};
+  const std::set<std::string> flags = {"no-direct", "raw-reuse", "peer-reads-first", "help"};
   // Descriptors grow with the cluster: a connection from each aggregator's client, one to each
   // holder per concurrent fetch. A login shell's soft limit, often 1024, runs out at a few dozen
   // nodes; the hard limit is the node's to use.
