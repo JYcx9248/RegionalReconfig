@@ -300,6 +300,18 @@ Next:
    - the new entries come online 69-79 s after the trigger, later than before, because the graph
      yields to the faster fetches;
    - copy-then-flip is unchanged, and every answer is the same in all runs.
+
+   Copy-then-flip with the stream first (`--peer-reads-first`, 2026-11-05, same directory,
+   `copy-then-flip-stream-first`; `ctf-stream.svg`, `ctf-budget.svg`, `4to8-stream-first.svg`):
+   - its stream takes 203-210 s under the load, as long as calibrate-8's with none (209 s), and
+     the flip comes 213-220 s after the trigger, against 497-526 s on one budget;
+   - the queries pay for it during the copy: 371-375 q/s against 588; the backlog peaks at 94K;
+   - the copy's reads only move in time: the last query is answered at 448-452 s, against 457 s
+     on one budget; from the trigger to the load's end, lazy answers 216K queries, copy-then-flip
+     159K on one budget and 129-133K with the stream first;
+   - each pair's stream follows its new node's buffered writes: about 118 MB/s while the page
+     cache takes them, 35-45 MB/s while the kernel writes back; the two runs differ by 7 s there;
+   - every answer is the same in all six runs.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

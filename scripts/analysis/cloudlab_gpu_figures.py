@@ -24,8 +24,12 @@ into --out:
   lazy-fetch.svg    lazy from the trigger until the new nodes are warm: answered queries, the
                     new nodes' fetch cache against its bound, the time per fetch, their disk writes
   node-reads.svg    the reads per second charged to each node's budget, lazy and copy-then-flip
-  ctf-stream.svg    copy-then-flip's raw-vector stream from each initial node, under the load and
-                    without it (calibrate-8 scales out before its load)
+                    (and copy-then-flip with the stream first, when its runs are there)
+  ctf-stream.svg    copy-then-flip's raw-vector stream from each initial node, under the load (on
+                    one budget; with the stream first, when its runs are there) and without it
+                    (calibrate-8 scales out before its load)
+  ctf-budget.svg    with the stream-first runs: each initial node's reads while copy-then-flip
+                    copies, its stream's against its queries', on one budget and the stream first
 
   lazy-before-after.svg
                     with --before: lazy in that series against lazy in this one (both repetitions
@@ -41,11 +45,12 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from compare_runs import FIXED_SLOT, PALETTE, tick_label, ticks_to  # noqa: E402
-from plot_run import esc, flip_time, nice_ticks, read_latency, windows  # noqa: E402
+from plot_run import answered_at, esc, flip_time, load_end, nice_ticks, read_latency, windows  # noqa: E402
 
 LAZY, CTF = FIXED_SLOT["lazy"], FIXED_SLOT["copy-then-flip"]
 # Two highlighted series that are not protocols (cluster sizes; the two hot new nodes): palette
@@ -54,7 +59,14 @@ LAZY, CTF = FIXED_SLOT["lazy"], FIXED_SLOT["copy-then-flip"]
 # four slots would not (green against pink: 1.6 in dark); the other nodes are context, in grey.
 HOT_A, HOT_B = 2, 6
 CTX = ("#bdbcb4", "#6e6d66")      # context lines: apart from both highlights (dE >= 18 / 15)
-REF_GREY = ("#8d8c84", "#8d8c84")  # copy-then-flip without load, against its orange (17 / 10)
+# copy-then-flip whose stream goes first: the slot compare_runs.py gives its label in
+# 4to8-stream-first.svg, the first one free after lazy's and copy-then-flip's.
+SF = 2
+# A neutral line beside copy-then-flip's orange and the stream-first green (the queries; no load):
+# the surfaces' secondary ink, apart from both in lightness (OKLab dE x 100 at the worst colour-
+# vision type: 18.3 and 23.5 in light, 20.6 and 15.7 in dark). A mid grey sits at the green's
+# lightness: 3.7 under deuteranopia.
+NEUTRAL = ("#52514e", "#c3c2b7")
 # reads/s against the 40K budget in 5K steps: one hue (OKLab 250 deg), light to dark, re-stepped
 # for the dark surface; adjacent steps dE ~9, at worst 7.3 under colour-vision deficiency, so
 # every cell also names its value on hover.
@@ -147,7 +159,7 @@ def style():
              ".grid { stroke: %s; }" % s["grid"], ".axis { stroke: %s; }" % s["axis"],
              ".ref, .ev, .cu, .hit line { stroke: %s; }" % s["ink2"],
              ".ctx { stroke: %s; } .fctx { fill: %s; }" % (CTX[m], CTX[m]),
-             ".gry { stroke: %s; } .fgry { fill: %s; }" % (REF_GREY[m], REF_GREY[m])]
+             ".neu { stroke: %s; } .fneu { fill: %s; }" % (NEUTRAL[m], NEUTRAL[m])]
         r += [".c%d { stroke: %s; } .f%d { fill: %s; }" % (i, c[m], i, c[m]) for i, c in enumerate(PALETTE)]
         r += [".h%d { fill: %s; }" % (i, c) for i, c in enumerate(HEAT[m])]
         return "\n".join("  " + x for x in r)
@@ -164,6 +176,7 @@ def style():
   .ref { stroke-width: 1; stroke-dasharray: 4 3; fill: none; }
   .ev { stroke-width: 1; stroke-dasharray: 2 3; }
   .sched { stroke-width: 2.5; stroke-dasharray: 8 5; }
+  .dash { stroke-dasharray: 6 4; }
   .dot { stroke-width: 2; }
   .hit rect { fill: transparent; }
   .hit line { stroke-width: 1; opacity: 0; }
@@ -301,10 +314,24 @@ def fmt_k(v):
 # ---------------------------------------------------------------------------------------------
 # figures
 
-def compare_specs(runset, before=None):
+def setting(runs, runset):
+    """The 4 -> 8 runs' trigger and load as the titles state them, from the series' first lazy run
+    (every protocol's file has the same)."""
+    try:
+        c = load_json(os.path.join(runs, runset, "rep1", "lazy", "experiment.json"))
+        load, trig = c["Load"], c["Reconfigurations"][0]["TriggerTimeSeconds"]
+        steps = [s.split(":") for s in str(load.get("RateSteps", "")).split(",") if s]
+        rates = " → ".join([str(load["Rate"])] + [r for _, r in steps])
+        at = " at " + ", ".join("%s s" % t for t, _ in steps) if steps else ""
+        return "Wikipedia 4 → 8 at %s s, load %s q/s%s, CloudLab c240g5" % (trig, rates, at)
+    except (OSError, KeyError, IndexError, ValueError):
+        return "Wikipedia 4 → 8, CloudLab c240g5"
+
+
+def compare_specs(runs, runset, before=None):
     """compare_runs.py figures: (name, title, run dirs under --runs, labels, slots)."""
     tag = "" if runset == "4to8" else " [%s]" % runset
-    head = "Wikipedia 4 → 8 at 90 s, load 390 → 780 q/s at 60 s, CloudLab c240g5"
+    head = setting(runs, runset)
     specs = [
         ("4to8", head + " (2 runs per protocol)" + tag,
          ["%s/rep%d/%s" % (runset, r, p) for p in ("lazy", "copy-then-flip") for r in (1, 2)], None, None),
@@ -517,6 +544,10 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
     if len(runs_) < len(rels):
         print("skipped node-reads.svg (runs missing)")
         return
+    sf = "%s/rep1/copy-then-flip-stream-first" % runset
+    if os.path.exists(os.path.join(runs, sf, "stats-n1.jsonl")):
+        runs_.append((sf, os.path.join(runs, sf)))
+    names = {"copy-then-flip-stream-first": "copy-then-flip, stream first"}
     nodes = ["n%d" % i for i in range(1, 9)]
     svg = Svg()
     pw = W - LEFT - RIGHT
@@ -530,8 +561,8 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
         proto = rc["reply"]["protocol"]
         ph = len(nodes) * (row + gap)
         # the title a row up: the moments' labels take the row right above the cells
-        p = Panel(svg, LEFT, y, pw, ph, (lo, hi), "%s (%s)" % (proto, rel.split("/")[1]), "", grid=False,
-                  title_dy=-20)
+        p = Panel(svg, LEFT, y, pw, ph, (lo, hi), "%s (%s)" % (names.get(rel.split("/")[2], proto), rel.split("/")[1]),
+                  "", grid=False, title_dy=-20)
         for i, n in enumerate(nodes):
             st = jsonl(os.path.join(run, "stats-%s.jsonl" % n))
             rs = rates(series(st, "reads.charged", t0), lo, hi, step)
@@ -548,13 +579,16 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
         sep = y + 4 * (row + gap) - gap / 2
         svg.add('<line class="axis" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (LEFT, sep, LEFT + pw, sep))
         p.vline(trig, "trigger", "end", above=True)
+        shown = sorted(e for e in entries if e <= hi)
         if flip <= hi:
-            p.vline(flip, "flip", above=True)
+            # An entry flip right after it (copy-then-flip's graph waits for the stream) takes the
+            # right of the line: the flip's label goes left.
+            near = bool(shown) and p.x(shown[0]) - p.x(flip) < 40
+            p.vline(flip, "flip", "end" if near else "start", above=True)
         else:
             svg.text(LEFT + pw - 4, y - 20, "flip at %.0f s, after the load" % flip, "note", "end")
-        for i, e in enumerate(sorted(entries)):
-            if e <= hi:
-                p.vline(e, "new entries" if i == 0 else None, above=True)
+        for i, e in enumerate(shown):
+            p.vline(e, "new entries" if i == 0 else None, above=True)
         time_axis(svg, p, y + ph, lo, hi)
         y += ph + 80
     # the colour bar: 5K steps up to the budget
@@ -570,11 +604,15 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
              "their fetches warm them up; a node at the end of the scale is at its budget and bounds the capacity.",
              "Under copy-then-flip, the new nodes serve nothing before the flip: the initial nodes carry the queries",
              "and the raw stream on one budget."]
+    if len(runs_) > 2:
+        notes += textwrap.wrap("With the stream first, the stream's reads go ahead of the queries' (ctf-budget.svg "
+                               "splits them) until the flip at %.0f s; then the new nodes take their share."
+                               % events(runs_[2][1])[1], 108)
     for i, n in enumerate(notes):
         svg.text(LEFT, y - 24 + 15 * i, n, "note")
     return svg.save(out, "node-reads.svg", y + 15 * len(notes) - 14,
                     "Reads per second charged to each node's budget, per 5 s",
-                    "the same queries in both runs; the colour scale ends at the budget, 40,000 reads/s")
+                    "the same queries in every run; the colour scale ends at the budget, 40,000 reads/s")
 
 
 def calibration_trigger(run):
@@ -585,9 +623,24 @@ def calibration_trigger(run):
     return start - load_json(os.path.join(run, "reconfigurations.json"))[0]["elapsed_seconds"]
 
 
+def span_of(vals, f="%.0f"):
+    """A range as the notes print it: one value when the runs agree, else lowest–highest."""
+    a, b = f % min(vals), f % max(vals)
+    return a if a == b else "%s–%s" % (a, b)
+
+
+def stage_raw(run):
+    return events(run)[3]["reply"]["phases"]["stage_raw"]
+
+
+def copy_runs(runs, runset, protocol):
+    """rep1/ and rep2/ of a protocol in the series, those with stats."""
+    rs = [os.path.join(runs, runset, r, protocol) for r in ("rep1", "rep2")]
+    return [r for r in rs if os.path.exists(os.path.join(r, "stats-n1.jsonl"))]
+
+
 def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=530.0):
-    loaded = [os.path.join(runs, runset, r, "copy-then-flip") for r in ("rep1", "rep2")]
-    loaded = [r for r in loaded if os.path.exists(os.path.join(r, "stats-n1.jsonl"))]
+    loaded, first = copy_runs(runs, runset, "copy-then-flip"), copy_runs(runs, runset, "copy-then-flip-stream-first")
     calm = os.path.join(runs, calibrations, "calibrate-8")
     if not loaded or not os.path.exists(os.path.join(calm, "calibration.log")):
         print("skipped ctf-stream.svg (runs missing)")
@@ -600,18 +653,15 @@ def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=530.0):
         pts = series(jsonl(os.path.join(loaded[0], "stats-%s.jsonl" % n)), "reads.charged", t0)
         share[n] = value_at(pts, 90) - value_at(pts, 30)
         total += share[n]
-    curves = {}
-    for n in sources:
-        cs = []
-        for r in loaded:
-            trig = load_start(r) + events(r)[0]
-            cs.append(("load", [(rec["t"] - trig, rec["raw_bytes"]["sent"] / 1e9)
-                                for rec in jsonl(os.path.join(r, "stats-%s.jsonl" % n))]))
-        trig = calibration_trigger(calm)
-        cs.append(("calm", [(rec["t"] - trig, rec["raw_bytes"]["sent"] / 1e9)
-                            for rec in jsonl(os.path.join(calm, "stats-%s.jsonl" % n))]))
-        curves[n] = cs
-    load_end = 360 - events(loaded[0])[0]
+
+    def sent(run, n, trig):
+        return [(rec["t"] - trig, rec["raw_bytes"]["sent"] / 1e9) for rec in jsonl(os.path.join(run, "stats-%s.jsonl" % n))]
+
+    # No load last: dashed on top, it shows where the stream-first line runs along it.
+    curves = {n: [("c%d" % CTF, sent(r, n, load_start(r) + events(r)[0])) for r in loaded] +
+                 [("c%d" % SF, sent(r, n, load_start(r) + events(r)[0])) for r in first] +
+                 [("neu dash", sent(calm, n, calibration_trigger(calm)))] for n in sources}
+    end = load_end(loaded[0]) - events(loaded[0])[0]  # the load's end, in seconds since the trigger
     svg = Svg()
     cols, gx = 2, 40
     pw = (W - LEFT - RIGHT - gx) / cols
@@ -622,26 +672,123 @@ def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=530.0):
         cx, cy = LEFT + (i % cols) * (pw + gx), 84 + (i // cols) * (ph + gy)
         p = Panel(svg, cx, cy, pw, ph, (lo, hi), "%s → %s: %.0f%% of the queries' reads" % (n, sources[n], 100 * share[n] / total),
                   "GB" if i % cols == cols - 1 else "", ymax=ymax)
-        p.vline(load_end, "load ends" if i == 0 else None)
-        for kind, pts in curves[n]:
-            p.line([(t, v) for t, v in pts if lo <= t <= hi], "c%d" % CTF if kind == "load" else "gry")
+        p.vline(end, "load ends" if i == 0 else None)
+        for cls, pts in curves[n]:
+            p.line([(t, v) for t, v in pts if lo <= t <= hi], cls)
         time_axis(svg, p, cy + ph, lo, hi, label="seconds since the trigger" if i // cols == 1 else "", count=5)
         panels.append(p)
-    svg.legend(W - RIGHT + 16, 94, [("under the load", "c%d" % CTF, "line"), ("(2 runs)", "", "none"),
-                                    ("no load", "gry", "line"), ("(calibrate-8)", "", "none")])
+    items = [("one budget", "c%d" % CTF, "line"), ("(%d runs)" % len(loaded), "", "none")]
+    if first:
+        items += [("stream first", "c%d" % SF, "line"), ("(%d runs)" % len(first), "", "none")]
+    svg.legend(W - RIGHT + 16, 94, items + [("no load", "neu dash", "line"), ("(calibrate-8)", "", "none")])
     yb = 84 + 2 * (ph + gy) - 10
-    took = sorted(events(r)[3]["elapsed_seconds"] for r in loaded)
-    calm_took = load_json(os.path.join(calm, "reconfigurations.json"))[0]["elapsed_seconds"]
-    notes = ["Copy-then-flip streams each moved partition's raw vectors from its initial owner (RAW_PULL), reading",
-             "against the same 40K/s budget as the queries. Under the load, the busiest initial nodes spend theirs on",
-             "queries and their streams barely move until the load ends and the backlog drains: the rescale takes",
-             "%s s after the trigger, against %.0f s with no load. The node with the fewest queries finishes first."
-             % ("-".join("%.0f" % t for t in (took[0], took[-1])) if len(took) > 1 else "%.0f" % took[0], calm_took)]
+    calm_raw = load_json(os.path.join(calm, "reconfigurations.json"))[0]["reply"]["phases"]["stage_raw"]
+    text = ("Copy-then-flip streams each moved partition's raw vectors from its initial owner (RAW_PULL). On one "
+            "budget of 40K reads/s, in arrival order with the queries' reads, the busiest initial nodes spend theirs "
+            "on queries, and their streams barely move until the load ends and the backlog drains: the stream takes "
+            "%s s, against %.0f s with no load." % (span_of([stage_raw(r) for r in loaded]), calm_raw))
+    if first:
+        took = [stage_raw(r) for r in first]
+        like = ("about as long as with none" if max(abs(t / calm_raw - 1) for t in took) < 0.1
+                else "against %.0f s with none" % calm_raw)
+        text += (" With the stream first (rtier_node --peer-reads-first), it takes %s s under the load, %s."
+                 % (span_of(took), like))
+    notes = textwrap.wrap(text + " The node with the fewest queries finishes first.", 108)
     for i, s in enumerate(notes):
         svg.text(LEFT, yb + 15 * i, s, "note")
     return svg.save(out, "ctf-stream.svg", yb + 15 * len(notes) + 6,
-                    "Copy-then-flip's raw-vector stream from each initial node: 43.1 GB in all",
+                    "Copy-then-flip's raw-vector stream from each initial node: %.1f GB in all"
+                    % (events(loaded[0])[3]["reply"]["raw_bytes"] / 1e9),
                     "the raw vectors each initial node has sent to its new node, cumulative")
+
+
+def answered_between(run, a, b):
+    """Queries answered per second between a and b seconds of the load."""
+    return sum(1 for r in read_latency(os.path.join(run, "latency.csv"))
+               if r["status"] == "ok" and a <= answered_at(r) < b) / (b - a)
+
+
+def ctf_budget(runs, out, runset, step=5.0):
+    """Each initial node's reads while copy-then-flip copies, its raw stream's against its queries':
+    on one budget in arrival order, and with the stream first (the first repetition of each)."""
+    cols = [("copy-then-flip", "one budget, in arrival order", CTF),
+            ("copy-then-flip-stream-first", "the stream first (--peer-reads-first)", SF)]
+    picked = [(copy_runs(runs, runset, p), head, slot) for p, head, slot in cols]
+    if not all(rs for rs, _, _ in picked):
+        print("skipped ctf-budget.svg (runs missing)")
+        return
+    sources = {"n1": "n5", "n2": "n6", "n3": "n7", "n4": "n8"}
+    budget = 40000
+    svg = Svg()
+    gx, ph, gy, top = 40, 92, 64, 124
+    pw = (W - LEFT - RIGHT - gx) / 2
+    facts = []
+    for c, (rs, head, slot) in enumerate(picked):
+        run = rs[0]
+        t0 = load_start(run)
+        trig, flip, _, rc = events(run)
+        reply = rc["reply"]
+        vb = reply["raw_bytes"] / reply["raw_vectors"]  # a streamed vector's bytes: one read each
+        start = sum(reply["phases"].get(k, 0.0) for k in ("plan", "stage_aggregator", "save_segments", "pause", "stage_data"))
+        lo, hi = 0.0, load_end(run) - trig  # from the trigger to the load's end
+        cx = LEFT + c * (pw + gx)
+        svg.text(cx, top - 46, head, "title ptitle")
+        svg.text(cx, top - 30, "flip %.0f s after the trigger%s" % (flip - trig, ", after the load" if flip - trig > hi else ""),
+                 "note")
+        panels, rows, per = [], {}, {}
+        for i, (src, dst) in enumerate(sources.items()):
+            st = jsonl(os.path.join(run, "stats-%s.jsonl" % src))
+            sent, disk = series(st, "raw_bytes.sent", t0 + trig), series(st, "fetch.rerank_disk", t0 + trig)
+            stream, queries = rates(sent, lo, hi, step, 1.0 / vb), rates(disk, lo, hi, step)
+            cy = top + i * (ph + gy)
+            # the budget as the top tick (ticks_to clears its ymax by 5%)
+            p = Panel(svg, cx, cy, pw, ph, (lo, hi), "%s → %s" % (src, dst), "reads/s" if c == 1 else "",
+                      ymax=budget / 1.06, yfmt=fmt_k)
+            p.hline(budget, "budget" if i == 0 else None)
+            if flip - trig <= hi:
+                p.vline(flip - trig, "flip" if i == 0 else None)
+            p.line(queries, "neu")
+            p.line(stream, "c%d" % slot)
+            time_axis(svg, p, cy + ph, lo, hi, label="seconds since the trigger" if i == len(sources) - 1 else "", count=6)
+            panels.append(p)
+            rows[src] = (stream, queries)
+            # the rates while this node streams, within the load
+            done = next((t for t, v in sent if v >= sent[-1][1]), hi)
+            a, b = start, min(done, hi)
+            per[src] = ((value_at(sent, b) - value_at(sent, a)) / vb / (b - a), (value_at(disk, b) - value_at(disk, a)) / (b - a))
+
+        def describe(t, rows=rows, head=head):
+            k = int(round(t / step))
+            lines = ["%s, %.0f–%.0f s after the trigger" % (head, t, t + step)]
+            for src, (s_, q_) in rows.items():
+                if k < len(s_):
+                    lines.append("%s: stream %s/s, queries %s/s" % (src, fmt_k(s_[k][1]), fmt_k(q_[k][1])))
+            return lines
+        hover(svg, panels, lo, hi, step, describe)
+        facts.append(dict(per=per, qps=answered_between(run, trig, min(flip, trig + hi)), flip=flip - trig))
+    svg.legend(W - RIGHT + 16, top - 46, [("raw stream", "c%d" % CTF, "line"), ("(one budget)", "", "none"),
+                                     ("raw stream", "c%d" % SF, "line"), ("(stream first)", "", "none"),
+                                     ("queries", "neu", "line"), ("(re-ranking)", "", "none"),
+                                     ("budget", "ref", "line")])
+    one, sf = facts
+    k = lambda v: fmt_k(round(v, -2))  # noqa: E731
+    rng = lambda vs: "%s–%s" % (k(min(vs)), k(max(vs)))  # noqa: E731
+    busiest = sorted(sources, key=lambda s: -one["per"][s][1])[:2]
+    text = ("On one budget, in arrival order, the busiest initial nodes spend it on their queries: while they stream, "
+            "%s re-rank %s vectors/s from disk and stream %s. With the stream first, n1-n4 stream %s vectors/s and "
+            "their queries get %s reads/s. The cluster answers %.0f q/s during the copy instead of %.0f, and the flip "
+            "comes %.0f s after the trigger instead of %.0f s."
+            % (" and ".join(busiest), " and ".join(k(one["per"][s][1]) for s in busiest),
+               " and ".join(k(one["per"][s][0]) for s in busiest), rng([sf["per"][s][0] for s in sources]),
+               rng([sf["per"][s][1] for s in sources]), sf["qps"], one["qps"], sf["flip"], one["flip"]))
+    notes = textwrap.wrap(text, 108)
+    yb = top + 3 * (ph + gy) + ph + 62
+    for i, s in enumerate(notes):
+        svg.text(LEFT, yb + 15 * i, s, "note")
+    return svg.save(out, "ctf-budget.svg", yb + 15 * len(notes) + 6,
+                    "Copy-then-flip's copy against the queries at each initial node (repetition 1)",
+                    "per 5 s: the vectors each initial node streams (RAW_GET) and those its queries re-rank from disk, "
+                    "both on its 40K reads/s budget")
 
 
 def main():
@@ -656,12 +803,13 @@ def main():
                     help="the fetch cache's bound the runs had (default 2048; 64 before 2026-11-04, as in 4to8)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    specs = compare_specs(args.series, args.before)
+    specs = compare_specs(args.runs, args.series, args.before)
     timelines(args.runs, args.out, specs)
     made = [capacity(args.runs, args.out, args.series, args.calibrations),
             lazy_fetch(args.runs, args.out, args.series, args.calibrations, args.fetch_bound_mb),
             node_reads(args.runs, args.out, args.series),
-            ctf_stream(args.runs, args.out, args.series, args.calibrations)]
+            ctf_stream(args.runs, args.out, args.series, args.calibrations),
+            ctf_budget(args.runs, args.out, args.series)]
     made += [os.path.join(args.out, n + ".svg") for n, _, _, _, _ in specs]
     if shutil.which("rsvg-convert"):
         for path in made:

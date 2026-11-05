@@ -513,6 +513,10 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
             if last > span:
                 svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s, ended at %.0f s ▸</text>'
                            % (end, ry, name, last))
+            elif end + 3 + 6.2 * len(name) > W - RIGHT:
+                # Beside a bar that ends near the axis' end the label would run into the legend
+                # (11 px text, about 6.2 px a character): above the bar, ending with it.
+                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, name))
             else:
                 svg.append('<text class="tick" x="%.1f" y="%d">%s</text>' % (end + 3, ry + 10, name))
         lx = W - RIGHT + 16
