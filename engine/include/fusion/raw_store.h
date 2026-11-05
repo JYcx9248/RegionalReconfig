@@ -117,8 +117,9 @@ class RawStore {
   // replacing the file there at once; returns how many vectors they mark. One installed
   // meanwhile may or may not be among them. Refused for an anonymous file.
   uint64_t SaveBitmap();
-  // Copies n vectors out (vec_bytes each, in the order of locs). Throws RawMissingError, having
-  // copied nothing, if one is not here.
+  // Copies n vectors out (vec_bytes each, in the order of locs), for a peer (RAW_GET): its device
+  // reads are a peer's to the read budget. Throws RawMissingError, having copied nothing, if one
+  // is not here.
   void Get(const uint32_t* locs, size_t n, uint8_t* out);
   // Charges the reads that reach the device to `budget`: the pages a direct install reads back,
   // and the Get reads the page cache does not serve (a cached one costs nothing, as with cgroup

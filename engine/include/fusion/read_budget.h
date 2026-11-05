@@ -18,6 +18,14 @@
 // reports itself rotational, as the virtual disk of the reference runs does (WSL2), 20 ms on
 // SSDs. With 20 ms the same load waited for the budget in bursts that io.max let through
 // (BIGANN-10M, 2 nodes at 62% of 40K reads/s: p99 latency 30-60 ms instead of 7-10 ms).
+//
+// Peers first (rtier_node --peer-reads-first) is for a baseline: copy-then-flip whose stream
+// takes the device ahead of the queries. The reads RAW_GET serves other nodes (a stream's pulls,
+// a fetch) are spaced only after the peer reads charged before them, and every read of the
+// node's own (re-ranking, the writer's read-backs) waits for those peer reads too: its queries
+// get what the transfer leaves. Own reads already waiting when a peer read comes keep their turn,
+// so for at most their queue's length the device sees both, past the rate. Off by default, every
+// read waits its turn in arrival order.
 #pragma once
 
 #include <atomic>
@@ -29,6 +37,9 @@
 
 namespace fusion {
 
+// Whose reads a charge is: the node's own, or a peer's (served by RAW_GET).
+enum class ReadClass { kOwn, kPeer };
+
 struct ReadBudgetStats {
   uint64_t reads_per_sec = 0;  // 0: no budget (nothing is charged)
   uint64_t charged = 0;        // cumulative: reads charged
@@ -39,17 +50,19 @@ class ReadBudget {
  public:
   static constexpr double kBurstSeconds = 0.1;
 
-  explicit ReadBudget(uint64_t reads_per_sec);
-  // Blocks until `reads` more reads fit the budget.
-  void Charge(uint64_t reads);
+  explicit ReadBudget(uint64_t reads_per_sec, bool peers_first = false);
+  // Blocks until `reads` more reads of class c fit the budget.
+  void Charge(uint64_t reads, ReadClass c = ReadClass::kOwn);
   ReadBudgetStats Stats() const;
 
  private:
   const uint64_t rate_;
   const double interval_ns_;  // 1 s / rate
   const double burst_ns_;
+  const bool peers_first_;
   std::mutex mu_;
-  double tat_ns_ = 0;  // when the reads charged so far are paid for, on the steady clock
+  double tat_ns_ = 0;       // when the reads charged so far are paid for, on the steady clock
+  double peer_tat_ns_ = 0;  // peers first: when the peer reads charged so far are paid for
   std::atomic<uint64_t> charged_{0}, wait_ns_{0};
 };
 

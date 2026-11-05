@@ -16,6 +16,9 @@ into --out:
   4to8.svg, 4to8-rep1.svg, 4to8-rep2.svg, 4to8to4.svg
                     compare_runs.py: lazy against copy-then-flip (both repetitions pooled, then
                     each one), and 4 -> 8 -> 4 under lazy; a .csv and a .json beside each
+  4to8-stream-first.svg
+                    with rep1/ and rep2/ copy-then-flip-stream-first: lazy, copy-then-flip, and
+                    copy-then-flip whose stream the queries yield to (--peer-reads-first)
   capacity.svg      the calibrations: answered queries and mean latency against the offered
                     rate, on 4 and on 8 nodes
   lazy-fetch.svg    lazy from the trigger until the new nodes are warm: answered queries, the
@@ -311,6 +314,11 @@ def compare_specs(runset, before=None):
          ["%s/rep2/lazy" % runset, "%s/rep2/copy-then-flip" % runset], None, None),
         ("4to8to4", "Wikipedia 4 → 8 at 90 s → 4 at 300 s under lazy; load 390 → 780 q/s at 60 s → 390 at 280 s" + tag,
          ["%s/4to8to4" % runset], "lazy", None),
+        # copy-then-flip whose stream the queries yield to (--peer-reads-first), next to the two.
+        ("4to8-stream-first", head + " (2 runs per line)" + tag,
+         ["%s/rep%d/%s" % (runset, r, p) for p in ("lazy", "copy-then-flip", "copy-then-flip-stream-first")
+          for r in (1, 2)],
+         ",".join(["lazy"] * 2 + ["copy-then-flip"] * 2 + ["ctf stream-first"] * 2), None),
     ]
     if before:
         # Both lines are lazy: lazy's own colour for this series, a validated neighbour of it (the

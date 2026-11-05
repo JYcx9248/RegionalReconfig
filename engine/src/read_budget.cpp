@@ -29,21 +29,27 @@ class Charged final : public PageReader {
 
 }  // namespace
 
-ReadBudget::ReadBudget(uint64_t reads_per_sec)
+ReadBudget::ReadBudget(uint64_t reads_per_sec, bool peers_first)
     : rate_(reads_per_sec),
       interval_ns_(1e9 / static_cast<double>(reads_per_sec)),
-      burst_ns_(kBurstSeconds * 1e9) {
+      burst_ns_(kBurstSeconds * 1e9),
+      peers_first_(peers_first) {
   FUSION_CHECK(reads_per_sec > 0, "a read budget needs a positive rate");
 }
 
-void ReadBudget::Charge(uint64_t reads) {
+void ReadBudget::Charge(uint64_t reads, ReadClass c) {
   if (reads == 0) return;
   const double now = NowNs();
+  const double cost = static_cast<double>(reads) * interval_ns_;
   double release;
   {
     std::lock_guard<std::mutex> l(mu_);
-    tat_ns_ = std::max(tat_ns_, now) + static_cast<double>(reads) * interval_ns_;
+    tat_ns_ = std::max(tat_ns_, now) + cost;  // every read: the own ones after it wait for it
     release = tat_ns_ - burst_ns_;
+    if (peers_first_ && c == ReadClass::kPeer) {
+      peer_tat_ns_ = std::max(peer_tat_ns_, now) + cost;
+      release = peer_tat_ns_ - burst_ns_;
+    }
   }
   charged_.fetch_add(reads, std::memory_order_relaxed);
   if (release > now) {

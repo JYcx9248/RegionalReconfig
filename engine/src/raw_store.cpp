@@ -520,7 +520,7 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
           r.here = true;
           continue;
         }
-        budget_->Charge(1);  // one device read per page
+        budget_->Charge(1, ReadClass::kPeer);  // one device read per page, for a peer (RAW_GET)
       }
       // Only a hint: if it fails, the read below waits out the device alone.
       ::posix_fadvise(fd_, static_cast<off_t>(r.off), static_cast<off_t>(r.count * vb), POSIX_FADV_WILLNEED);

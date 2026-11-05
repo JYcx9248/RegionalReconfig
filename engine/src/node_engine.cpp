@@ -292,7 +292,7 @@ class NodeEngineImpl : public NodeEngine {
     FUSION_CHECK(!o.raw_reuse || !o.raw_file.empty(), "raw vectors to reuse need their file (--raw-file)");
     raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io, o.raw_reuse);
     if (o.read_iops) {
-      budget_ = std::make_unique<ReadBudget>(o.read_iops);
+      budget_ = std::make_unique<ReadBudget>(o.read_iops, o.peer_reads_first);
       raw_->SetReadBudget(budget_.get());
     }
     for (int i = 0; i < o.num_workers; ++i) {
@@ -1713,7 +1713,8 @@ class NodeEngineImpl : public NodeEngine {
                    layout_name_.c_str(), raw_->path().c_str(),
                    raw_->pages().direct() ? "direct" : "buffered");
     if (budget_)
-      s += StrFormat("  read budget      : %llu device reads/s\n", (unsigned long long)opts_.read_iops);
+      s += StrFormat("  read budget      : %llu device reads/s%s\n", (unsigned long long)opts_.read_iops,
+                     opts_.peer_reads_first ? ", peers' first" : "");
     s += StrFormat("  workers          : %d, max candidates/request %u\n", num_workers(),
                    max_candidates_);
     return s;

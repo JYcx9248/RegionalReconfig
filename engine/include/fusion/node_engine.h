@@ -89,6 +89,7 @@ struct NodeOptions {
   bool direct_io = true;
   uint32_t io_depth = 64;
   int gpu_device = 0;
+  bool peer_reads_first = false;  // the reads served to peers go first (fusion/read_budget.h)
   uint64_t read_iops = 0;      // device reads per second this node may issue (fusion/read_budget.h,
                                // for several nodes on one SSD without cgroups); 0 = no budget
   // Room for inserted vectors (U14). IDs and raw-vector locations are only ever appended, so

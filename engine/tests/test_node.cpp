@@ -1726,6 +1726,26 @@ void TestReadBudget() {
     CHECK(s >= least - 0.01 && s < least + 3.0 && st.charged == 12000 && st.wait_us > 0 &&
           st.reads_per_sec == 20000);
   }
+  // Peers first (--peer-reads-first): a peer's reads do not wait behind the own reads queued
+  // before them, which they do in arrival order; among themselves they keep the rate.
+  for (const bool first : {false, true}) {
+    ReadBudget b(1000, first);
+    b.Charge(static_cast<uint64_t>(1000 * ReadBudget::kBurstSeconds));  // the idle burst, used up
+    std::thread own([&b] { b.Charge(400); });                           // 400 ms of own reads
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto t0 = Clock::now();
+    b.Charge(50, ReadClass::kPeer);
+    const double s = since(t0);
+    own.join();
+    CHECK(first ? s < 0.1 : s >= 0.35);
+  }
+  {
+    ReadBudget b(1000, true);
+    const auto t0 = Clock::now();
+    b.Charge(100, ReadClass::kPeer);  // the burst
+    b.Charge(200, ReadClass::kPeer);  // 200 ms past it
+    CHECK(since(t0) >= 0.19);
+  }
   {
     RawLayout L;
     L.vec_bytes = 1000;

@@ -46,6 +46,9 @@ static void Usage() {
   --read-iops N          device reads per second this node may issue (default 0 = no limit): a
                          node's own share of an SSD that several nodes use, where no cgroup can
                          set one (fusion/read_budget.h says what is charged)
+  --peer-reads-first     the reads served to other nodes (RAW_GET) go before this node's own,
+                         whose queries get what a transfer leaves: a baseline, copy-then-flip
+                         whose stream goes first (fusion/read_budget.h)
   --max-vectors N        vector-ID space, with room for inserted vectors (U14; default: the
                          index's vectors)
   --max-pages N          page-file pages, with room for inserted vectors' locations (default: the
@@ -100,6 +103,7 @@ int main(int argc, char** argv) {
     o.io_depth = static_cast<uint32_t>(a.U64("io-depth", 64));
     o.direct_io = !a.Flag("no-direct");
     o.read_iops = a.U64("read-iops", 0);
+    o.peer_reads_first = a.Flag("peer-reads-first");
     o.max_vectors = a.U64("max-vectors", 0);
     o.max_pages = a.U64("max-pages", 0);
     o.update_buffer_bytes = a.U64("update-buffer-mb", 256) << 20;
