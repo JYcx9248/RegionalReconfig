@@ -550,6 +550,19 @@ The `configs/experiment.wiki-c1024-aliyun-gpu-*.json` experiments run 2 → 4 on
   once with `-DCMAKE_CUDA_ARCHITECTURES=86` (CMake keeps the value), on a CPU of the same family
   as the GPU instances', since the `-march=native` build must run on them.
 
+The Wikipedia update workload (U14) comes from a newer snapshot of the same corpus, 2026-02.
+`scripts/data/wiki_diff.py diff` matches the chunks of our 2025-08 base and of the 2026-02 corpus
+by the SHA-256 of their text, and groups the chunks it cannot match by article. It refuses
+snapshots chunked, extracted or embedded differently, and it checks that every embedding row is
+its chunk's. `wiki_diff.py batches` cuts the result into batches of whole articles for
+`rtier-updater -inserts batch-K.fbin -deletes batch-K-deletes.bin`.
+- Fixed 1024-token windows make an edit change every chunk after it. Template changes at the top
+  of an article (infoboxes) or throughout it (citations) touch most articles.
+- So 62% of the base's chunks are deleted and 64% inserted. A batch of 5% of the base takes the
+  2026-02 version of about 310K articles.
+- Inserts take IDs after the base's and the earlier batches', in order (`batches.json`). Four
+  such batches need an `"Updates"` headroom of at least 1.2.
+
 ## The smallest experiment: one node, then two
 
 A node is added because one node no longer serves the load, so the run has to put it under a
