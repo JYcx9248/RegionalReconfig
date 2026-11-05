@@ -192,7 +192,7 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	if err != nil {
 		return reply, err
 	}
-	evac, err := c.copyThenFlip(ctx, cur, next, placement.Diff(cur.Placement, next), spares, nil, false, rawOnDemand)
+	evac, err := c.copyThenFlip(ctx, time.Now(), cur, next, placement.Diff(cur.Placement, next), spares, nil, false, rawOnDemand)
 	reply.Evacuation = evac
 	if evac != nil {
 		reply.ToEpoch = evac.ToEpoch

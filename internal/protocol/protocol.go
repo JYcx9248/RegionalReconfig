@@ -369,7 +369,13 @@ type RescaleReply struct {
 	// on after the rescale returns, for as long as queries meet vectors that have not moved.
 	RawFetched      int64              `json:"raw_fetched,omitempty"`
 	RawFetchedBytes int64              `json:"raw_fetched_bytes,omitempty"`
-	Phases          map[string]float64 `json:"phases"` // seconds per phase
+	Phases          map[string]float64 `json:"phases"` // seconds per phase, in turn from the trigger
+	// FlipSeconds: the flip, since the controller received the request (the trigger) -- the
+	// compare-and-swap that makes the epoch of the new placement current. Before it, every
+	// query is admitted under the old epoch; then the epoch is installed on every node (the
+	// "flip" phase), and each entry admits under it once it has it. Not the entry flips: later
+	// epochs that only add entries.
+	FlipSeconds float64 `json:"flip_seconds,omitempty"`
 	// GraphSources: which existing entry each new entry copies the graph from, assigned when
 	// the reconfiguration starts (absent: copied from the build output).
 	GraphSources map[placement.NodeID]placement.NodeID `json:"graph_sources,omitempty"`
@@ -388,7 +394,7 @@ type RescaleReply struct {
 type EntryFlip struct {
 	Epoch   uint64             `json:"epoch"`
 	Nodes   []placement.NodeID `json:"nodes"`
-	Seconds float64            `json:"seconds"` // since the reconfiguration was triggered
+	Seconds float64            `json:"seconds"` // since the controller received the request
 }
 
 // NodeSummary is the controller's view of one registered node.

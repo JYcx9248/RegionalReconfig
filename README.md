@@ -184,6 +184,24 @@ A sub-query can meet a reclaimed partition only after a failure -- a forward sti
 the entry's client times out -- and then fails its query with an error: failures are out of
 scope (U7, U13).
 
+**The flip.** A reconfiguration's flip is the compare-and-swap that makes the epoch of its new
+placement current in the epoch store.
+- Before it, every query is admitted under the old epoch and the new nodes serve nothing.
+- After it, the controller installs the new epoch on every node, in parallel (the `flip` phase, a
+  few milliseconds), and each entry admits queries under it once it has it. The new nodes own their
+  partitions and aggregate from then on.
+- A query runs under the epoch its entry had when the query arrived, not when it was sent. A query
+  that waits in a client's queue across the flip runs under the new epoch.
+- The flip is not the trigger, the moment the controller receives the request. Before the flip
+  come, in turn, working out the placement, pre-connecting, saving the segments, the lists and PQ
+  codes, and an eager protocol's raw vectors: the reply's `phases` tile the time from the trigger.
+  Every protocol stages the same lists and PQ codes, so they part at the flip.
+- Nor is it the end of the reconfiguration. After it come the grace period, the reclaim, the entry
+  flips (later epochs that only make new nodes entries as their graphs load), lazy's fetches and
+  lazy-stream's stream.
+- The reply gives it as `flip_seconds` after the trigger, and the timelines draw it at
+  `trigger_seconds` plus that. A full rebuild flips more than once, so it names its steps instead.
+
 **Dataset updates (decided part of U14, first version):** updates come in batches, and each
 batch is a content epoch that reuses staging, flip, grace and reclaim. Vectors are immutable and
 the PQ codebook is fixed: a modification deletes a vector and inserts it under a new ID, and IDs
@@ -553,7 +571,9 @@ they run first, without load and each to its end, and the ladder measures the cl
 under a `"Protocol"` whose rescale returns with every raw vector moved (`copy-then-flip`,
 `stop-and-copy`, `lazy-stream`; the run refuses `lazy`). The second run writes `timeline.svg` (queries offered
 and answered per second, answers counted when they came so that a stall shows, and the mean
-latency by send time, with the flips marked; `--latency tail` for p50 and p99; where the nodes
+latency of the queries answered in each window, with the flips marked, until the load stopped;
+`--latency tail` for p50 and p99, `--latency-at send` for the latency by send time, `--until
+answer` to draw on to the last answer; where the nodes
 were sampled, `cgroups.jsonl`, each data node's memory, also in `memory.csv`), `timeline.csv`,
 `reconfigurations.json` (when each rescale was triggered, how long it took, what it moved), the
 metrics, `pq-budget.json`, `revision.txt` and `revision.diff` (a warmup run writes `snapshot.json`,
@@ -581,7 +601,16 @@ vectors of the 200K synthetic set, and a budget below that fails the staging on 
 
 `scripts/compare_runs.py` overlays the mean latency of the answered queries per window for
 several runs, one line per run, with each run's reconfigurations in a strip under the time
-axis. Runs that share a directory name are pooled. The end-to-end test gives the smallest
+axis, a dashed line through the panels where they were triggered, and a dotted one in each line's
+colour where its runs flipped. The protocols part at the flip, not at the trigger: every one first
+stages the same posting lists and PQ codes. A query's latency counts in the window of its answer, where the cluster served it, not at
+its send time, long before it ran when it waited in a backlog (`--latency-at send` draws that
+view: what a query sent then waited). The time axis ends where the load stopped
+(`"DurationSeconds"`), so that every line covers the same period: a backlog that the cluster
+serves only after it (copy-then-flip under overload) is what the backlog panel ends with, and
+`--until answer` draws on to the last answer. Runs that share a directory name are pooled, or a name from `--labels`. A protocol keeps
+its own colour; `--slots` picks the palette slot of each label instead, for lines that are not
+protocols, such as one protocol before and after a change. The end-to-end test gives the smallest
 version: with `RTIER_E2E_TIMELINE` set, `TestReconfigUnderLoad` writes each protocol's
 queries and rescales (2 → 3 → 2 → 3 under closed-loop load) in the formats of the load
 generator and `run_local.py`. Run each protocol in its own process, so that none of them

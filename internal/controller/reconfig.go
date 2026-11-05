@@ -116,6 +116,7 @@ func (c *Controller) Rescale(ctx context.Context, dataNodes int) (*protocol.Resc
 // history that a running reconfiguration writes. A reconfiguration runs to completion even if
 // the caller disconnects: a protocol stopped half-way is worse than a late reply.
 func (c *Controller) Reconfigure(ctx context.Context, req protocol.RescaleReq) (*protocol.RescaleReply, error) {
+	triggered := time.Now() // the trigger: the reply's times (phases, flip, entry flips) start here
 	ctx = context.WithoutCancel(ctx)
 	if c.Ready.IsBlocked() {
 		return nil, fmt.Errorf("controller: initial deployment has not finished (%s)", c.LastError())
@@ -124,7 +125,7 @@ func (c *Controller) Reconfigure(ctx context.Context, req protocol.RescaleReq) (
 		return nil, fmt.Errorf("controller: another reconfiguration or an update batch is in progress, retry later")
 	}
 	defer c.reconfigRunning.Store(false)
-	reply, err := c.reconfigure(ctx, req)
+	reply, err := c.reconfigure(ctx, req, triggered)
 	if !req.DryRun {
 		c.setErr(err)
 	}
@@ -139,7 +140,7 @@ type target struct {
 	added, removed []*ManagedNode
 }
 
-func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq) (*protocol.RescaleReply, error) {
+func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq, triggered time.Time) (*protocol.RescaleReply, error) {
 	if (req.Plan == nil) == (req.DataNodes == 0) {
 		return nil, fmt.Errorf("controller: a reconfiguration takes a number of data nodes or a plan (one of them)")
 	}
@@ -162,7 +163,7 @@ func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq) (
 			Added: ids(t.added), Removed: ids(t.removed), Moved: t.changes.Moved(), Plan: plan,
 			DryRun: req.DryRun}, nil
 	}
-	reply, err := c.run(ctx, cur, t)
+	reply, err := c.run(ctx, cur, t, triggered)
 	if reply != nil {
 		reply.Plan = plan
 	}
@@ -263,17 +264,18 @@ func (c *Controller) planTarget(cur *epoch.Table, p *protocol.Plan) (target, err
 	return t, nil
 }
 
-// run carries out a reconfiguration to t with the configured protocol.
-func (c *Controller) run(ctx context.Context, cur *epoch.Table, t target) (*protocol.RescaleReply, error) {
+// run carries out a reconfiguration to t with the configured protocol, triggered when the
+// controller received its request.
+func (c *Controller) run(ctx context.Context, cur *epoch.Table, t target, triggered time.Time) (*protocol.RescaleReply, error) {
 	switch c.cfg.Protocol {
 	case "lazy":
-		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemand)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemand)
 	case "lazy-stream":
-		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, false, rawStreamAfterFlip)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawStreamAfterFlip)
 	case "copy-then-flip":
-		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, false, rawBeforeFlip)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawBeforeFlip)
 	case "stop-and-copy":
-		return c.copyThenFlip(ctx, cur, t.next, t.changes, t.added, t.removed, true, rawBeforeFlip)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, true, rawBeforeFlip)
 	}
 	return nil, fmt.Errorf("controller: unknown protocol %q", c.cfg.Protocol)
 }
@@ -325,12 +327,12 @@ const (
 // Failures: before the flip, partitions already copied to destinations are dropped again and
 // the old epoch stays in force. After the flip, the protocol stops and keeps every old copy
 // (always safe, possibly wasteful); retrying or rolling back is open question U13.
-func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next placement.Table,
+func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur *epoch.Table, next placement.Table,
 	changes placement.Changes, added, removed []*ManagedNode, stopTheWorld bool, raw rawMode) (*protocol.RescaleReply, error) {
 
 	reply := &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
 		Added: ids(added), Removed: ids(removed), Moved: changes.Moved(), Phases: map[string]float64{}}
-	triggered := time.Now()
+	// The phases tile the time from the trigger: "plan" is what working out the target took.
 	mark := triggered
 	phase := func(name string) {
 		s := time.Since(mark).Seconds()
@@ -338,6 +340,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 		c.event("reconfig."+name+"_s", s)
 		mark = time.Now()
 	}
+	phase("plan")
 	c.event("reconfig.start", float64(cur.Epoch))
 	log.Printf("controller: reconfiguration %s: epoch %d, add %v, remove %v, move %d partitions",
 		c.cfg.Protocol, cur.Epoch, reply.Added, reply.Removed, len(reply.Moved))
@@ -569,6 +572,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, cur *epoch.Table, next pl
 	if err := c.store.CompareAndSwap(cur.Epoch, draft); err != nil {
 		return reply, err
 	}
+	reply.FlipSeconds = time.Since(triggered).Seconds()
 	flipped = true
 	afterFlip := func(err error) error {
 		return fmt.Errorf("controller: reconfiguration stopped after flipping to epoch %d; old copies are "+

@@ -32,12 +32,20 @@ and writes, over the same time axis:
 
 No dependencies: the SVG is written here, in light and dark.
 
-A query counts as offered in the window of its scheduled time, as answered (or failed) in the
-window of its answer, and its latency in the window of its scheduled time -- what a query sent
-then waited, as compare_runs.py counts them. By the scheduled time alone, every query of a
+A query counts as offered in the window of its scheduled time, and as answered (or failed), with
+its latency, in the window of its answer -- where the cluster served it, within a query's service
+time of where it ran -- as compare_runs.py counts them. By the scheduled time, every query of a
 backlog would count as answered in the window it was sent, and the answered line would follow
-the offered one through the dip it is meant to show. A flip is marked where the first query of
-its epoch was answered: no query of an epoch is answered before its flip.
+the offered one through the dip it is meant to show. Its latency, too, would sit at the time it
+was sent, long before it ran: with a backlog, a flat line of queries that waited, drawn where
+none of them was served. --latency-at send draws each query's latency at its scheduled time
+instead: what a query sent then waited. A flip is marked where the first query of its epoch was
+answered: no query of an epoch is answered before its flip.
+
+The time axis ends where the load stopped ("DurationSeconds" in the run's experiment.json; the
+last query's scheduled time without one), so that every run covers the same period. What the
+cluster answers after it -- a backlog it serves only then, as copy-then-flip under overload --
+is left out of the figure, not of the summary; --until answer draws on to the last answer.
 
 What to read off it: time-to-online (trigger to the epoch line), the latency cost of the
 transition (how far the latency rises above its level before the trigger, and for how long),
@@ -93,28 +101,38 @@ def answered_at(r):
     return r["t"] + r["us"] / 1e6
 
 
-def windows(rows, width):
-    """Per window of `width` seconds, up to the last query's scheduled time: the offered rate
-    (by scheduled time), the answered and failed rates (by the time of the answer; answers after
-    the last window are left out, not piled into it), the mean and percentiles of the latency of
-    the answered queries sent in the window."""
+def windows(rows, width, latency_at="answer", end=None):
+    """Per window of `width` seconds until `end` (by default the last answer, or with latency_at
+    "send" the last query's scheduled time): the offered rate (by scheduled time), the answered
+    and failed rates (by the time of the answer), and the mean and percentiles of the latency of
+    the answered queries -- by the time of their answer ("answer") or by the time they were sent
+    ("send"). What comes after the last window is left out, not piled into it."""
     if not rows:
         return []
     out = []
-    end = rows[-1]["t"]
-    n = max(1, int(math.ceil((end + 1e-9) / width)))
+    if end is None:  # the data's own end, inside the last window
+        end = max(answered_at(r) for r in rows) if latency_at == "answer" else rows[-1]["t"]
+        n = int(end / width) + 1
+    else:
+        n = max(1, int(math.ceil(end / width - 1e-9)))
     sent = [[] for _ in range(n)]
+    lat_in = [[] for _ in range(n)]
     answered, failed = [0] * n, [0] * n
     for r in rows:
-        sent[min(n - 1, int(r["t"] / width))].append(r)
+        s = int(r["t"] / width)
+        if s < n:
+            sent[s].append(r)
         k = int(answered_at(r) / width)
         if k < n:
             if r["status"] == "ok":
                 answered[k] += 1
             else:
                 failed[k] += 1
+        j = k if latency_at == "answer" else s
+        if r["status"] == "ok" and j < n:
+            lat_in[j].append(r["us"])
     for i, b in enumerate(sent):
-        lat = sorted(r["us"] for r in b if r["status"] == "ok")
+        lat = sorted(lat_in[i])
         out.append({
             "t": i * width,
             "offered": len(b) / width,
@@ -158,6 +176,16 @@ def summarize(rows):
         "recall": round(sum(recalls) / len(recalls), 4) if recalls else None,
         "recall_queries": len(recalls),
     }
+
+
+def load_end(results):
+    """When the run's load stopped sending, in seconds of latency.csv's axis: "DurationSeconds" in
+    the run's experiment.json, or None."""
+    try:
+        v = json.load(open(os.path.join(results, "experiment.json"))).get("Load", {}).get("DurationSeconds")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return float(v) if v else None
 
 
 def node_memory(results):
@@ -206,6 +234,26 @@ def memory_series(mem, span):
     return ([("most", [(t + 0.5, max(per_s[t])) for t in secs], "s1"),
              ("least", [(t + 0.5, min(per_s[t])) for t in secs], "s2 dashed")],
             "memory of the %d data nodes: the most and the least" % len(inside), unit)
+
+
+def flip_time(t0, reply):
+    """When a reconfiguration triggered at t0 flipped (README, "The flip"): t0 plus the reply's
+    flip_seconds, the compare-and-swap of the new placement's epoch. Runs from before
+    2026-11-05 have no flip_seconds: the end of the stages before the flip then stands in for it
+    (planning, pre-connect, saving the segments, a stop-and-copy's pause, the lists and PQ codes,
+    an eager protocol's raw stream), early by the planning those replies left out (0.12 to 0.17 s
+    for the CloudLab 4 -> 8 scale-outs). None for a full rebuild, which flips more than once, and
+    for replies without phases."""
+    reply = reply or {}
+    if "generation" in reply:
+        return None
+    if reply.get("flip_seconds"):
+        return t0 + reply["flip_seconds"]
+    ph = reply.get("phases") or {}
+    if "stage_data" not in ph:
+        return None
+    return t0 + sum(ph.get(k, 0.0) for k in ("plan", "stage_aggregator", "save_segments", "pause", "stage_data",
+                                             "stage_raw"))
 
 
 def reconfigurations(path):
@@ -294,9 +342,9 @@ def panel(svg, y0, title, series, span, marks, bands, unit, at_ends=False):
                    % (LEFT - 8, y(v) + 4, esc(fmt(v))))
     svg.append('<text class="tick" x="6" y="%.1f">%s</text>' % (y0 + 12, esc(unit)))
 
-    for t0, dur, _ in bands:
+    for t0, dur, _ in bands:  # a reconfiguration can outlast the load: its band stops at the axis' end
         svg.append('<rect class="band" x="%.1f" y="%d" width="%.1f" height="%d"/>'
-                   % (x(t0), y0, max(1.5, x(t0 + dur) - x(t0)), PANEL_H))
+                   % (x(t0), y0, max(1.5, x(min(t0 + dur, span)) - x(t0)), PANEL_H))
     for t, _ in marks:
         svg.append('<line class="event" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>'
                    % (x(t), y0, x(t), y0 + PANEL_H))
@@ -324,7 +372,7 @@ def fmt(v):
     return "%.2f" % v
 
 
-def svg_document(win, marks, bands, span, title, latency="mean", memory=None):
+def svg_document(win, marks, bands, span, title, latency="mean", memory=None, stopped=None):
     top1 = TOP
     top2 = TOP + PANEL_H + GAP
     top3 = top2 + PANEL_H + GAP if memory else None
@@ -384,11 +432,12 @@ def svg_document(win, marks, bands, span, title, latency="mean", memory=None):
                 "%s %.2f %s" % (n, v, unit) for n, v in per_s[sec].items())
             svg.append('<rect class="hit" x="%.1f" y="%d" width="%.1f" height="%d"><title>%s</title></rect>'
                        % (at(sec), top3, max(1.0, at(min(sec + 1, span)) - at(sec)), PANEL_H, esc(readout)))
-    for t in nice_ticks(span, 8):
+    for t in (t for t in nice_ticks(span, 8) if t <= span * 1.001):  # the top tick may clear the axis' end
         svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
                    % (at(t), last + PANEL_H + 18, esc(fmt(t))))
-    svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">seconds into the run</text>'
-               % ((LEFT + W - RIGHT) / 2, last + PANEL_H + 38))
+    svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">%s</text>'
+               % ((LEFT + W - RIGHT) / 2, last + PANEL_H + 38, esc("seconds into the run" + (
+                   ", until the load stopped at %s s" % fmt(stopped) if stopped is not None else ""))))
     for t, label in marks:  # the flips, named once, above the top panel
         svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
                    % (at(t), top1 - 12, esc(label)))
@@ -406,6 +455,10 @@ def main():
     ap.add_argument("--out", default="timeline.svg", help="SVG name inside the results directory")
     ap.add_argument("--latency", choices=("mean", "tail"), default="mean",
                     help="latency panel: the mean (default) or p50 and p99")
+    ap.add_argument("--latency-at", choices=("answer", "send"), default="answer",
+                    help="where a query's latency counts: the window of its answer (default) or of its sending")
+    ap.add_argument("--until", choices=("load", "answer"), default="load",
+                    help="the time axis' end: where the load stopped (default) or the last answer")
     args = ap.parse_args()
 
     lat_path = os.path.join(args.results, "latency.csv")
@@ -414,16 +467,23 @@ def main():
     rows = read_latency(lat_path)
     if not rows:
         sys.exit("latency.csv is empty")
-    win = windows(rows, args.window)
+    last = max(answered_at(r) for r in rows)
+    if args.until == "answer":
+        span = last
+        win = windows(rows, args.window, args.latency_at)
+    else:  # a run cut short ends at its last answer
+        end = load_end(args.results) or rows[-1]["t"]
+        span = min(end, last)
+        win = windows(rows, args.window, args.latency_at, span)
     marks = [(t, "epoch %d" % e) for t, e in epoch_marks(rows)]
     rcs = reconfigurations(os.path.join(args.results, "reconfigurations.json"))
-    bands = [(t0, dur, label) for t0, dur, label, _ in rcs]
-    span = rows[-1]["t"]
+    bands = [(t0, dur, label) for t0, dur, label, _ in rcs if t0 < span]
     marks = [(t, label) for t, label in marks if t <= span]  # a flip only the backlog saw, after the load
 
     mem = node_memory(args.results)
     svg = svg_document(win, marks, bands, span, os.path.basename(os.path.abspath(args.results)),
-                       args.latency, memory_series(mem, span) if mem else None)
+                       args.latency, memory_series(mem, span) if mem else None,
+                       end if args.until == "load" and span >= end else None)
     out = os.path.join(args.results, args.out)
     with open(out, "w") as f:
         f.write(svg)

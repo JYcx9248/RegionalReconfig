@@ -3,10 +3,15 @@
 2026-11-03/04). No dependencies: plain SVG in light and dark, as compare_runs.py writes them.
 
     python3 scripts/analysis/cloudlab_gpu_figures.py [--runs results/cloudlab-gpu] [--out results/cloudlab-gpu-figures]
+        [--series 4to8] [--calibrations 4to8] [--before SERIES] [--fetch-bound-mb 2048]
 
 The runs directory is what came back from the control node (the runbook's section 8); the
-figures go to a directory of their own, so that copying the runs again leaves them alone.
-Writes, into --out:
+figures go to a directory of their own, so that copying the runs again leaves them alone. A
+series is a directory of the runs with rep1/ and rep2/ (lazy, copy-then-flip) and 4to8to4/, as
+run_one.sh wrote them; the calibrations (calibrate-4, calibrate-8) can come from another series,
+as for a rerun after a change. --fetch-bound-mb is the fetch cache's bound the runs had (64 before
+2026-11-04, 2048 since). Every number a figure's notes cite is computed from the runs. Writes,
+into --out:
 
   4to8.svg, 4to8-rep1.svg, 4to8-rep2.svg, 4to8to4.svg
                     compare_runs.py: lazy against copy-then-flip (both repetitions pooled, then
@@ -18,6 +23,10 @@ Writes, into --out:
   node-reads.svg    the reads per second charged to each node's budget, lazy and copy-then-flip
   ctf-stream.svg    copy-then-flip's raw-vector stream from each initial node, under the load and
                     without it (calibrate-8 scales out before its load)
+
+  lazy-before-after.svg
+                    with --before: lazy in that series against lazy in this one (both repetitions
+                    pooled), for a change that only lazy's path sees
 
 and a PNG of each when rsvg-convert is installed. Runs that are missing are skipped.
 """
@@ -33,7 +42,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from compare_runs import FIXED_SLOT, PALETTE, tick_label, ticks_to  # noqa: E402
-from plot_run import esc, nice_ticks, read_latency, windows  # noqa: E402
+from plot_run import esc, flip_time, nice_ticks, read_latency, windows  # noqa: E402
 
 LAZY, CTF = FIXED_SLOT["lazy"], FIXED_SLOT["copy-then-flip"]
 # Two highlighted series that are not protocols (cluster sizes; the two hot new nodes): palette
@@ -116,13 +125,11 @@ def host_records(run, node):
 
 
 def events(run):
-    """(trigger, flip, [entry flips]) of the run's first reconfiguration, in seconds of the load:
-    the flip follows the stages in order (pre-connect, data, raw vectors for the eager
-    protocols, the segments saved)."""
+    """(trigger, flip, [entry flips]) of the run's first reconfiguration, in seconds of the load
+    (plot_run.flip_time: the flip as README's "The flip" defines it)."""
     rc = load_json(os.path.join(run, "reconfigurations.json"))[0]
     reply, trig = rc["reply"], rc["trigger_seconds"]
-    ph = reply.get("phases", {})
-    flip = trig + sum(ph.get(k, 0) for k in ("stage_aggregator", "stage_data", "stage_raw", "save_segments"))
+    flip = flip_time(trig, reply)
     return trig, flip, [trig + e["seconds"] for e in reply.get("entry_flips", [])], rc
 
 
@@ -291,20 +298,32 @@ def fmt_k(v):
 # ---------------------------------------------------------------------------------------------
 # figures
 
-COMPARE = [
-    ("4to8", "Wikipedia 4 → 8 at 90 s, load 390 → 780 q/s at 60 s, CloudLab c240g5 (2 runs per protocol)",
-     ["4to8/rep1/lazy", "4to8/rep2/lazy", "4to8/rep1/copy-then-flip", "4to8/rep2/copy-then-flip"], None),
-    ("4to8-rep1", "Wikipedia 4 → 8 at 90 s, load 390 → 780 q/s at 60 s, CloudLab c240g5 (repetition 1)",
-     ["4to8/rep1/lazy", "4to8/rep1/copy-then-flip"], None),
-    ("4to8-rep2", "Wikipedia 4 → 8 at 90 s, load 390 → 780 q/s at 60 s, CloudLab c240g5 (repetition 2)",
-     ["4to8/rep2/lazy", "4to8/rep2/copy-then-flip"], None),
-    ("4to8to4", "Wikipedia 4 → 8 at 90 s → 4 at 300 s under lazy; load 390 → 780 q/s at 60 s → 390 at 280 s",
-     ["4to8/4to8to4"], "lazy"),
-]
+def compare_specs(runset, before=None):
+    """compare_runs.py figures: (name, title, run dirs under --runs, labels, slots)."""
+    tag = "" if runset == "4to8" else " [%s]" % runset
+    head = "Wikipedia 4 → 8 at 90 s, load 390 → 780 q/s at 60 s, CloudLab c240g5"
+    specs = [
+        ("4to8", head + " (2 runs per protocol)" + tag,
+         ["%s/rep%d/%s" % (runset, r, p) for p in ("lazy", "copy-then-flip") for r in (1, 2)], None, None),
+        ("4to8-rep1", head + " (repetition 1)" + tag,
+         ["%s/rep1/lazy" % runset, "%s/rep1/copy-then-flip" % runset], None, None),
+        ("4to8-rep2", head + " (repetition 2)" + tag,
+         ["%s/rep2/lazy" % runset, "%s/rep2/copy-then-flip" % runset], None, None),
+        ("4to8to4", "Wikipedia 4 → 8 at 90 s → 4 at 300 s under lazy; load 390 → 780 q/s at 60 s → 390 at 280 s" + tag,
+         ["%s/4to8to4" % runset], "lazy", None),
+    ]
+    if before:
+        # Both lines are lazy: lazy's own colour for this series, a validated neighbour of it (the
+        # palette's third slot) for the one before -- not copy-then-flip's orange.
+        specs.append(("lazy-before-after", head + ": lazy in %s and in %s (2 runs each)" % (before, runset),
+                      ["%s/rep%d/lazy" % (s_, r) for s_ in (before, runset) for r in (1, 2)],
+                      ",".join(["lazy (%s)" % before] * 2 + ["lazy (%s)" % runset] * 2),  # no comma: the separator
+                      "%d,%d" % (HOT_A, LAZY)))
+    return specs
 
 
-def timelines(runs, out):
-    for name, title, dirs, labels in COMPARE:
+def timelines(runs, out, specs):
+    for name, title, dirs, labels, slots in specs:
         paths = [os.path.join(runs, d) for d in dirs]
         if not all(os.path.exists(os.path.join(p, "latency.csv")) for p in paths):
             print("skipped", name, "(runs missing)")
@@ -313,19 +332,25 @@ def timelines(runs, out):
               ["--out", os.path.join(out, name), "--title", title]
         if labels:
             cmd += ["--labels", labels]
+        if slots:
+            cmd += ["--slots", slots]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
         print("wrote", os.path.join(out, name + ".svg"))
 
 
-def capacity(runs, out):
-    cals = [("4 nodes", HOT_A, os.path.join(runs, "4to8/calibrate-4")),
-            ("8 nodes", HOT_B, os.path.join(runs, "4to8/calibrate-8"))]
+def capacity(runs, out, runset, calibrations):
+    cals = [("4 nodes", HOT_A, os.path.join(runs, calibrations, "calibrate-4")),
+            ("8 nodes", HOT_B, os.path.join(runs, calibrations, "calibrate-8"))]
     cals = [(l, s, load_json(os.path.join(d, "calibration.json"))) for l, s, d in cals
             if os.path.exists(os.path.join(d, "calibration.json"))]
     if len(cals) < 2:
         print("skipped capacity.svg (calibrations missing)")
         return
-    rate = load_json(os.path.join(runs, "4to8/rep1/lazy/experiment.json"))["Load"]
+    exp = os.path.join(runs, runset, "rep1", "lazy", "experiment.json")
+    if not os.path.exists(exp):
+        print("skipped capacity.svg (no %s)" % exp)
+        return
+    rate = load_json(exp)["Load"]
     lo_rate, hi_rate = float(rate["Rate"]), float(rate["RateSteps"].split(",")[0].split(":")[1])
     svg = Svg()
     pw = W - LEFT - RIGHT
@@ -342,6 +367,7 @@ def capacity(runs, out):
     for p in (p1, p2):
         for r, lab in ((lo_rate, "runs: %.0f" % lo_rate), (hi_rate, "→ %.0f q/s" % hi_rate)):
             p.vline(r, lab if p is p1 else None)
+    plateaus = []
     for label, slot, steps in cals:
         pts1 = [(s["offered_per_s"], s["answered_in_window_per_s"]) for s in steps]
         pts2 = [(s["offered_per_s"], s["mean_us"] / 1000.0) for s in steps]
@@ -354,6 +380,7 @@ def capacity(runs, out):
                 svg.add('<circle class="dot f%d" cx="%.1f" cy="%.1f" r="4"><title>%s</title></circle>'
                         % (slot, p.x(x), p.y(v), esc(tip)))
         plateau = sum(a for _, a in pts1[-3:]) / 3
+        plateaus.append(plateau)
         x, a = pts1[-1]
         # beside the plateau, ending at its last step, on the side no other line takes: clear of
         # the legend in the right margin
@@ -362,7 +389,8 @@ def capacity(runs, out):
     svg.legend(W - RIGHT + 16, p1.y0 + 10, [(l, "c%d" % s, "line") for l, s, _ in cals])
     notes = ["The plateau is the mean of the last three steps. Every step is bound by the busiest node's",
              "budget of 40,000 reads/s (node_reads.py): its share of the reads is above 1/n, so 8 nodes carry",
-             "1.66 times what 4 carry. The runs offer 390 q/s, then 780: above 4 nodes' capacity, below 8 nodes'."]
+             "%.2f times what 4 carry. The runs offer %.0f q/s, then %.0f: above 4 nodes' capacity, below 8 nodes'."
+             % (plateaus[1] / plateaus[0], lo_rate, hi_rate)]
     for i, n in enumerate(notes):
         svg.text(LEFT, p2.y0 + p2.ph + 62 + 15 * i, n, "note")
     return svg.save(out, "capacity.svg", p2.y0 + p2.ph + 62 + 15 * len(notes) + 10,
@@ -371,14 +399,15 @@ def capacity(runs, out):
                     "8 nodes after copy-then-flip moved every raw vector")
 
 
-def lazy_fetch(runs, out, rel="4to8/rep1/lazy", lo=80.0, hi=200.0):
+def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=200.0):
+    rel = "%s/rep1/lazy" % runset
     run = os.path.join(runs, rel)
     if not os.path.exists(os.path.join(run, "stats-n5.jsonl")):
         print("skipped lazy-fetch.svg (run missing)")
         return
     t0 = load_start(run)
     trig, flip, entries, _ = events(run)
-    cal4 = os.path.join(runs, "4to8/calibrate-4/calibration.json")
+    cal4 = os.path.join(runs, calibrations, "calibrate-4", "calibration.json")
     c4 = sum(s["answered_in_window_per_s"] for s in load_json(cal4)[-3:]) / 3 if os.path.exists(cal4) else None
     exp = load_json(os.path.join(run, "experiment.json"))["Load"]
     offered = float(exp["RateSteps"].split(",")[0].split(":")[1])
@@ -397,6 +426,21 @@ def lazy_fetch(runs, out, rel="4to8/rep1/lazy", lo=80.0, hi=200.0):
     call_bin = {n: {int((t - lo) // step): v for t, v in per_call[n]} for n in new}
     writes = {n: rates([(r["t"] - t0, r["disk"]["wbytes"]) for r in host_records(run, n)], lo, hi, step, 1e-6)
               for n in new}
+    # The cache's bound (engine/src/node_engine.cpp, kMaxQueuedBytes: 64 MB until 2026-11-04, 2 GB
+    # since) in vectors of this index; drawn when it is within reach of what the cache held.
+    reply = events(run)[3]["reply"]  # the bytes per raw vector, as the rescale counted its fetches
+    vec_bytes = reply["raw_fetched_bytes"] // reply["raw_fetched"] if reply.get("raw_fetched") else 4096
+    bound = bound_mb * (1 << 20) // vec_bytes
+    peak = {n: max(v for _, v in queued[n]) for n in new}
+    top = max(peak.values()) or 1
+    show_bound = bound <= 2 * top
+    last = {n: st[n][-1]["fetch"] for n in new}
+    # the holders' budget waits in the 30 s after the flip: what a fetch from them waits behind
+    src_wait = {}
+    for n in ("n1", "n4"):
+        pts = series(jsonl(os.path.join(run, "stats-%s.jsonl" % n)), "reads.wait_us", t0)
+        a, b = value_at(pts, flip), value_at(pts, flip + 30)
+        src_wait[n] = None if a is None or b is None else (b - a) / 30 / 1e6
 
     svg = Svg()
     pw = W - LEFT - RIGHT
@@ -405,11 +449,11 @@ def lazy_fetch(runs, out, rel="4to8/rep1/lazy", lo=80.0, hi=200.0):
     p1 = Panel(svg, LEFT, ys[0], pw, 120, xr, "answered queries per second (1 s windows)", "q/s",
                ymax=max(v for _, v in answered if v is not None))
     p2 = Panel(svg, LEFT, ys[1], pw, 100, xr, "fetched raw vectors waiting for the SSD (the fetch cache)", "vectors",
-               ymax=17000)
+               ymax=max(top, bound if show_bound else 0) * 1.05)
     p3 = Panel(svg, LEFT, ys[2], pw, 100, xr, "time per fetch call (log scale)", "ms", log=(1, 10000),
                yfmt=lambda v: "{:,.0f}".format(v))
-    p4 = Panel(svg, LEFT, ys[3], pw, 100, xr, "disk writes on each new node's SSD: fetched vectors (about 30 MB/s), "
-               "then its 7 GB of graph", "MB/s", ymax=max(v for n in new for _, v in writes[n] if v is not None))
+    p4 = Panel(svg, LEFT, ys[3], pw, 100, xr, "disk writes on each new node's SSD", "MB/s",
+               ymax=max(v for n in new for _, v in writes[n] if v is not None))
     for p in (p1, p2, p3, p4):
         p.vline(trig, "trigger" if p is p1 else None, "end")
         p.vline(flip, "flip" if p is p1 else None)
@@ -419,7 +463,9 @@ def lazy_fetch(runs, out, rel="4to8/rep1/lazy", lo=80.0, hi=200.0):
     if c4:  # labelled at the right end, where the line runs above it
         p1.hline(c4, "4 nodes' capacity, %.0f q/s" % c4, dy=12)
     p1.line(answered, "c%d" % LAZY)
-    p2.hline(16384, "the bound, 64 MB: past it the query that fetched writes its vectors itself", dy=-5)
+    size = "%d GB" % (bound_mb // 1024) if bound_mb >= 1024 else "%d MB" % bound_mb
+    if show_bound:
+        p2.hline(bound, "the bound, %s: past it the query that fetched writes its vectors itself" % size, dy=-5)
     for n in ("n6", "n7", "n5", "n8"):  # context first, highlights over it
         p2.line(queued[n], cls[n])
         p3.line(per_call[n], cls[n])
@@ -440,18 +486,25 @@ def lazy_fetch(runs, out, rel="4to8/rep1/lazy", lo=80.0, hi=200.0):
 
     hover(svg, [p1, p2, p3, p4], lo, hi, 1.0, describe)
     sub = ("4 → 8, %s: the new nodes own half of the partitions from the flip on and fetch each raw vector "
-           "when a query first needs it" % rel.replace("4to8/", "").replace("/", ", "))
-    notes = ["n5 and n8 took the hot halves of n1's and n4's partitions. Their fetch cache fills to its bound within",
-             "a second of the flip: the writer installs 4-7K vectors/s on the S3500 (whole-page O_DIRECT writes into",
-             "holes of a sparse file), below what the queries fetch. Each fetch then waits for disk writes, and the",
-             "graph (7 GB per new entry) lands on the same disks from about 125 s. Same in repetition 2 and 4 → 8 → 4."]
+           "when a query first needs it" % rel.replace("/", ", "))
+    gb = lambda v: v * vec_bytes / 1e9
+    calls = lambda n: last[n]["fetch_us"] / max(last[n]["fetch_calls"], 1) / 1000.0
+    waits = ", ".join("%s %.1f s per second" % (n, w) for n, w in src_wait.items() if w is not None)
+    notes = ["n5 and n8 took the hot halves of n1's and n4's partitions. Fetch cache at its fullest: n5 %.2f GB, "
+             "n8 %.2f GB," % (gb(peak["n5"]), gb(peak["n8"])),
+             "against a bound of %s; vectors the fetching queries had to install themselves: n5 %d, n8 %d. Mean "
+             "fetch call:" % (size, last["n5"]["sync_installed"], last["n8"]["sync_installed"]),
+             "n5 %.0f ms, n8 %.0f ms. A fetch also waits for its holder's read budget: in the 30 s after the flip "
+             "its readers" % (calls("n5"), calls("n8")),
+             "waited %s (summed over the readers)." % waits]
     for i, n in enumerate(notes):
         svg.text(LEFT, p4.y0 + p4.ph + 54 + 15 * i, n, "note")
     return svg.save(out, "lazy-fetch.svg", p4.y0 + p4.ph + 54 + 15 * len(notes) + 10,
-                    "Lazy right after the flip: the new nodes' fetches wait for their disks", sub)
+                    "Lazy right after the flip: the new nodes' fetch cache, their fetches and their disks", sub)
 
 
-def node_reads(runs, out, rels=("4to8/rep1/lazy", "4to8/rep1/copy-then-flip"), lo=30.0, hi=360.0, step=5.0):
+def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
+    rels = ("%s/rep1/lazy" % runset, "%s/rep1/copy-then-flip" % runset)
     runs_ = [(r, os.path.join(runs, r)) for r in rels if os.path.exists(os.path.join(runs, r, "stats-n1.jsonl"))]
     if len(runs_) < len(rels):
         print("skipped node-reads.svg (runs missing)")
@@ -505,9 +558,10 @@ def node_reads(runs, out, rels=("4to8/rep1/lazy", "4to8/rep1/copy-then-flip"), l
         lo_k = budget / len(HEAT[0]) * (len(HEAT[0]) - 1 - k)
         svg.text(bx + 22, yy + 10, ("≥ %s" % fmt_k(lo_k)) if k == 0 else "%s–%s" % (fmt_k(lo_k), fmt_k(lo_k + budget / len(HEAT[0]))), "legend")
     svg.text(bx, by + 14 * len(HEAT[0]) + 14, "budget 40K/s", "legend")
-    notes = ["n1-n4 hold the data from the start; n5-n8 join at the flip. Under lazy, the initial nodes' reads drop",
-             "while the new nodes' fetches wait (100-155 s), then n5 and n8 run at the budget: they bound 8 nodes'",
-             "capacity. Under copy-then-flip, n1 and n4 stay at the budget, which the raw stream shares with the queries."]
+    notes = ["n1-n4 hold the data from the start; n5-n8 join at the flip. Under lazy, the new nodes take the reads as",
+             "their fetches warm them up; a node at the end of the scale is at its budget and bounds the capacity.",
+             "Under copy-then-flip, the new nodes serve nothing before the flip: the initial nodes carry the queries",
+             "and the raw stream on one budget."]
     for i, n in enumerate(notes):
         svg.text(LEFT, y - 24 + 15 * i, n, "note")
     return svg.save(out, "node-reads.svg", y + 15 * len(notes) - 14,
@@ -523,10 +577,10 @@ def calibration_trigger(run):
     return start - load_json(os.path.join(run, "reconfigurations.json"))[0]["elapsed_seconds"]
 
 
-def ctf_stream(runs, out, lo=0.0, hi=530.0):
-    loaded = [os.path.join(runs, r) for r in ("4to8/rep1/copy-then-flip", "4to8/rep2/copy-then-flip")]
+def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=530.0):
+    loaded = [os.path.join(runs, runset, r, "copy-then-flip") for r in ("rep1", "rep2")]
     loaded = [r for r in loaded if os.path.exists(os.path.join(r, "stats-n1.jsonl"))]
-    calm = os.path.join(runs, "4to8/calibrate-8")
+    calm = os.path.join(runs, calibrations, "calibrate-8")
     if not loaded or not os.path.exists(os.path.join(calm, "calibration.log")):
         print("skipped ctf-stream.svg (runs missing)")
         return
@@ -568,10 +622,13 @@ def ctf_stream(runs, out, lo=0.0, hi=530.0):
     svg.legend(W - RIGHT + 16, 94, [("under the load", "c%d" % CTF, "line"), ("(2 runs)", "", "none"),
                                     ("no load", "gry", "line"), ("(calibrate-8)", "", "none")])
     yb = 84 + 2 * (ph + gy) - 10
+    took = sorted(events(r)[3]["elapsed_seconds"] for r in loaded)
+    calm_took = load_json(os.path.join(calm, "reconfigurations.json"))[0]["elapsed_seconds"]
     notes = ["Copy-then-flip streams each moved partition's raw vectors from its initial owner (RAW_PULL), reading",
-             "against the same 40K/s budget as the queries. Under the load, n1 and n4 spend theirs on queries and",
-             "their streams barely move until the load ends and the backlog drains: the flip comes 512-519 s after",
-             "the trigger, against 246 s with no load. n3, with the fewest queries, finishes first either way."]
+             "against the same 40K/s budget as the queries. Under the load, the busiest initial nodes spend theirs on",
+             "queries and their streams barely move until the load ends and the backlog drains: the rescale takes",
+             "%s s after the trigger, against %.0f s with no load. The node with the fewest queries finishes first."
+             % ("-".join("%.0f" % t for t in (took[0], took[-1])) if len(took) > 1 else "%.0f" % took[0], calm_took)]
     for i, s in enumerate(notes):
         svg.text(LEFT, yb + 15 * i, s, "note")
     return svg.save(out, "ctf-stream.svg", yb + 15 * len(notes) + 6,
@@ -583,12 +640,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--runs", default="results/cloudlab-gpu")
     ap.add_argument("--out", default="results/cloudlab-gpu-figures")
+    ap.add_argument("--series", default="4to8", help="the runs to draw: a directory under --runs (default 4to8)")
+    ap.add_argument("--calibrations", default="4to8",
+                    help="the directory under --runs with calibrate-4 and calibrate-8 (default 4to8)")
+    ap.add_argument("--before", help="another series, whose lazy runs lazy-before-after.svg draws against these")
+    ap.add_argument("--fetch-bound-mb", type=int, default=2048,
+                    help="the fetch cache's bound the runs had (default 2048; 64 before 2026-11-04, as in 4to8)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    timelines(args.runs, args.out)
-    made = [capacity(args.runs, args.out), lazy_fetch(args.runs, args.out),
-            node_reads(args.runs, args.out), ctf_stream(args.runs, args.out)]
-    made += [os.path.join(args.out, n + ".svg") for n, _, _, _ in COMPARE]
+    specs = compare_specs(args.series, args.before)
+    timelines(args.runs, args.out, specs)
+    made = [capacity(args.runs, args.out, args.series, args.calibrations),
+            lazy_fetch(args.runs, args.out, args.series, args.calibrations, args.fetch_bound_mb),
+            node_reads(args.runs, args.out, args.series),
+            ctf_stream(args.runs, args.out, args.series, args.calibrations)]
+    made += [os.path.join(args.out, n + ".svg") for n, _, _, _, _ in specs]
     if shutil.which("rsvg-convert"):
         for path in made:
             if path and os.path.exists(path):

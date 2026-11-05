@@ -300,6 +300,14 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 		"raw vectors %d streamed + %d fetched on demand in %d round trips, phases %v, raw stream %.3f s after the flip",
 		what, out.FromEpoch, out.ToEpoch, out.Moved, out.Bytes, out.PQCodes, naive, streamed, fetched, fetches,
 		out.Phases, out.RawSeconds)
+	// The phases tile the time from the trigger, so the flip's compare-and-swap falls after the
+	// stages before it and within the flip phase.
+	staged := out.Phases["plan"] + out.Phases["stage_aggregator"] + out.Phases["save_segments"] +
+		out.Phases["pause"] + out.Phases["stage_data"] + out.Phases["stage_raw"]
+	if _, ok := out.Phases["plan"]; !ok || out.FlipSeconds < staged-1e-3 || out.FlipSeconds > staged+out.Phases["flip"]+1e-3 {
+		t.Errorf("%s: flip at %.6f s after the trigger, its stages end at %.6f s, the flip phase takes %.6f s (phases %v)",
+			what, out.FlipSeconds, staged, out.Phases["flip"], out.Phases)
+	}
 	if out.PQCodes != want {
 		t.Errorf("%s pulled %d PQ codes, want %d (the vectors new to each destination)", what, out.PQCodes, want)
 	}

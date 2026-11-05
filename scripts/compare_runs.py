@@ -16,15 +16,26 @@ reconfigurations start within about a window of each other). Writes:
   OUT.svg   the mean latency of the answered queries per window, one line per label, and under
             it one strip per label marking the reconfigurations of each of its runs: runs need
             not trigger them at the same moment (the end-to-end test starts each one when the
-            previous returned)
+            previous returned). A dashed line marks each trigger, and a dotted one, in a line's
+            colour, its runs' flip to the new placement: the protocols part at the flip, not at
+            the trigger, since every one first stages the same posting lists and PQ codes
   OUT.csv   the same windows as numbers (the chart's table view)
   OUT.json  per label: the mean latency before the first reconfiguration, during each one (the
             queries each run sent while its own reconfiguration ran), after the last one and
             over the whole run; pooled over the runs, with the lowest and highest run
 
-A query's latency counts in the window of the time it was sent: its scheduled time with the
-open-loop load generator, its first attempt in the closed-loop test; answered queries per second
-count in the window of their answer. With the open-loop load (no "users" in latency.csv) the
+A query's latency counts in the window of its answer, where the cluster served it (a query's
+service time, a few ms, after it started to run), as answered queries per second do. Drawn at
+the time a query was sent instead -- its scheduled time with the open-loop load generator, its
+first attempt in the closed-loop test -- a backlog's latency would sit long before anything
+served it: a flat line of queries that waited, where none of them ran. --latency-at send draws
+that view: what a query sent then waited. The time axis ends where the load stopped
+("DurationSeconds" in the runs' experiment.json; the last query's scheduled time without one),
+so that every line covers the same period: what the cluster answers after it -- a backlog it
+serves only then, as copy-then-flip under overload -- is left out of the figure and the CSV,
+and is in the backlog the figure ends with. --until answer draws on to the last answer. The
+means in OUT.json are by the time a query was sent (a query belongs to the period it arrived
+in) and cover every query, the peak window by the figure's windows. With the open-loop load (no "users" in latency.csv) the
 figure has no users panel: it draws the offered rate as a bold dashed line over the answered
 queries per second, and adds the backlog: queries sent and not answered yet. It grows whenever the offered rate exceeds what the cluster answers, and after a
 scale-out it drains only with the capacity left over -- what a closed loop hides, since its
@@ -47,7 +58,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from plot_run import esc, fmt, nice_ticks, read_latency, reconfigurations, windows  # noqa: E402
+from plot_run import (answered_at, esc, flip_time, fmt, load_end, nice_ticks, read_latency,  # noqa: E402
+                      reconfigurations, windows)
 
 # Categorical slots of the reference palette in their fixed order, (light, dark); validated
 # as a set (adjacent pairs, both modes; the first three all-pairs too).
@@ -133,14 +145,16 @@ def flow(rows, width, n, runs):
 
 def openloop_summary(rows, fl, width, trigger, runs, slo_us):
     """Peak backlog after the first reconfiguration's trigger, when it drained (the first
-    window after the peak back within the queries in flight: twice the backlog of the run's
+    window after the peak back within the queries in flight: twice the backlog of the load's
     last fifth plus 10, at least 50 -- a later blip of a few dozen is not a backlog; a run whose
-    last fifth still holds over 100 has not drained), and the queries sent from the trigger on
-    that were answered later than slo_us or failed."""
+    load ends with over 100 in its last fifth has not drained: once the load stops, any backlog
+    drains), and the queries sent from the trigger on that were answered later than slo_us or
+    failed."""
     after = [w for w in fl if w["t"] + width > trigger]
     if not after:
         return {}
-    tail = sorted(w["backlog"] for w in fl[-max(1, len(fl) // 5):])
+    during = [w for w in fl if w["t"] + width <= rows[-1]["t"]] or fl  # the windows go on to the last answer
+    tail = sorted(w["backlog"] for w in during[-max(1, len(during) // 5):])
     floor = tail[len(tail) // 2]
     limit = max(2 * floor + 10, 50)
     peak = max(after, key=lambda w: w["backlog"])
@@ -290,11 +304,12 @@ def mb(v):
 
 
 def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_latency=False,
-                 flows=None, offered=None):
+                 flows=None, offered=None, stopped=None):
     """lines: [(label, slot, pooled windows, [reconfigurations of each run], runs)]; users:
     [(t, n)] per window or None; moved: {label: bytes by component, mean over its runs} or {};
     flows: {label: flow()}; offered: [(t, rate)] per window with the open-loop load, else None
-    (then no backlog panel). One time axis (t_min to span) for every panel."""
+    (then no backlog panel); stopped: when the load stopped, where the axis ends, or None. One
+    time axis (t_min to span) for every panel."""
     plot_w = W - LEFT - RIGHT
     x = lambda t: LEFT + plot_w * ((t - t_min) / (span - t_min) if span > t_min else 0)
     panels = []  # (title, unit, height, series [(slot or None, [(t, v)])], dashed legend)
@@ -344,6 +359,8 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
   .span { stroke: none; }
   .dot { stroke-width: 2; }
   .sched { stroke-width: 3; stroke-dasharray: 8 5; }
+  .trig { stroke-width: 1; stroke-dasharray: 4 3; }
+  .flip { stroke-width: 1.5; stroke-dasharray: 1 3; stroke-linecap: round; }
   .hit rect { fill: transparent; }
   .hit line { stroke-width: 1; opacity: 0; }
   .hit:hover line { opacity: .6; }
@@ -357,6 +374,32 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     svg.append('<rect class="bg" x="0" y="0" width="%d" height="%d"/>' % (W, h))
     svg.append('<text class="title" x="%d" y="22">%s</text>' % (LEFT, esc(title)))
     svg.append('<text class="sub" x="%d" y="40">%s</text>' % (LEFT, esc(subtitle)))
+
+    # Each reconfiguration's trigger, as a dashed line through every panel: one neutral line where
+    # the lines' runs trigger together (within a window), one in a line's colour where only its
+    # runs do (the end-to-end test starts each rescale when the previous one returned).
+    trig = []  # (time, [slots])
+    for _, slot, _, runs_rcs, _ in lines:
+        for j in range(len(runs_rcs[0]) if runs_rcs and runs_rcs[0] else 0):
+            t = sum(rcs[j][0] for rcs in runs_rcs) / len(runs_rcs)
+            if t_min <= t <= span:
+                near = [g for g in trig if abs(g[0] - t) <= width]
+                if near:
+                    near[0][1].append(slot)
+                else:
+                    trig.append((t, [slot]))
+    trig_cls = [(t, "trig cu" if len(lines) == 1 or len(set(sl)) > 1 else "trig c%d" % sl[0]) for t, sl in trig]
+    # Each line's flips to the new placement, dotted in its colour. The protocols part there, not
+    # at the trigger: every one first stages the same lists and PQ codes.
+    flips, flip_of = [], {}  # [(time, slot)]; (line, reconfiguration) -> each run's flip
+    for li, (_, slot, _, runs_rcs, _) in enumerate(lines):
+        for j in range(len(runs_rcs[0]) if runs_rcs and runs_rcs[0] else 0):
+            ts = [flip_time(rcs[j][0], rcs[j][3]) for rcs in runs_rcs]
+            if None in ts:
+                continue
+            flip_of[(li, j)] = ts
+            if t_min <= sum(ts) / len(ts) <= span:
+                flips.append((sum(ts) / len(ts), slot))
 
     for pi, ((ptitle, unit, ph, series), y0) in enumerate(zip(panels, tops)):
         values = [v for _, pts in series for _, v in pts if v is not None]
@@ -382,6 +425,10 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                        % (LEFT - 8, y(v) + 4, esc(label(v))))
         svg.append('<text class="tick" x="%d" y="%d">%s</text>' % (W - RIGHT + 8, y0 + ph + 4, esc(unit)))
         svg.append('<line class="axis" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (LEFT, y0 + ph, W - RIGHT, y0 + ph))
+        for t, cls in trig_cls:  # under the data
+            svg.append('<line class="%s" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>' % (cls, x(t), y0, x(t), y0 + ph))
+        for t, slot in flips:
+            svg.append('<line class="flip c%d" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>' % (slot, x(t), y0, x(t), y0 + ph))
         for slot, pts in series:
             cls = ("cu sched" if series[0][0] is not None else "cu") if slot is None else "c%d" % slot
             if slot is None:  # a schedule: steps, not a trend
@@ -408,14 +455,20 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                     continue
                 run.append((x(t), y(v)))
 
+    # Round seconds since the load started, and the left edge (the warm-up's end) where no
+    # round tick is near it.
     xt = nice_ticks(span - t_min, 8)
+    step = xt[1] - xt[0] if len(xt) > 1 else 1.0
+    first = math.ceil(t_min / step - 1e-9) * step
+    xt = [first + k * step for k in range(int((span * 1.001 - first) / step) + 1)]
+    if not xt or xt[0] - t_min > step / 2:
+        xt.insert(0, t_min)
     for t in xt:
-        t += t_min
-        if t <= span * 1.001:
-            svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
-                       % (x(t), axis_y + 18, esc(tick_label(t, xt[1] - xt[0]))))
-    svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">seconds since the load started</text>'
-               % (LEFT + plot_w / 2, axis_y + 36))
+        svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
+                   % (x(t), axis_y + 18, esc(tick_label(t, step))))
+    svg.append('<text class="tick" x="%d" y="%d" text-anchor="middle">%s</text>'
+               % (LEFT + plot_w / 2, axis_y + 36, esc("seconds since the load started" + (
+                   ", until it stopped at %s s" % fmt(stopped) if stopped is not None else ""))))
 
     ly0 = tops[1 if users else 0]  # legend beside the first panel with one line per run
     for i, (label, slot, _, _, _) in enumerate(lines):
@@ -426,6 +479,14 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         lx, ly = W - RIGHT + 16, ly0 + 10 + len(lines) * 18
         svg.append('<line class="line cu sched" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">offered</text>' % (lx + 22, ly))
+    if trig_cls:
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + (1 if offered else 0)) * 18
+        svg.append('<line class="line trig cu" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
+        svg.append('<text class="legend" x="%d" y="%d">trigger</text>' % (lx + 22, ly))
+    if flips:
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + (1 if offered else 0) + (1 if trig_cls else 0)) * 18
+        svg.append('<line class="line flip cu" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
+        svg.append('<text class="legend" x="%d" y="%d">flip</text>' % (lx + 22, ly))
 
     # Reconfigurations: one strip per label, on the same time axis, every run's spans in it.
     svg.append('<text class="sub" x="%d" y="%d">reconfigurations (target data nodes)</text>'
@@ -445,6 +506,10 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                            '<title>%s: %s, %.2f s from %.2f s</title></rect>'
                            % (slot, x0, ry + 2, x1 - x0, esc(label), esc(name), dur, t0))
             name = esc(runs_rcs[0][j][2].replace("rescale to ", "→"))
+            ts = flip_of.get((i, j))
+            if ts:  # the runs' flips: their mean when they agree within a second, else the range
+                name += ", flip at %s s" % ("%.1f" % (sum(ts) / len(ts)) if max(ts) - min(ts) < 1
+                                            else "%.0f–%.0f" % (min(ts), max(ts)))
             if last > span:
                 svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s, ended at %.0f s ▸</text>'
                            % (end, ry, name, last))
@@ -504,7 +569,14 @@ def main():
     ap.add_argument("runs", nargs="+", help="results directories (latency.csv, reconfigurations.json)")
     ap.add_argument("--labels", help="comma-separated names, one per directory (default: the directory "
                     "names); directories with the same name are pooled")
+    ap.add_argument("--slots", help="comma-separated palette slots, one per label in the order they first "
+                    "appear (default: a protocol's own slot, else the next unused one): for lines that are not "
+                    "protocols, such as one protocol before and after a change")
     ap.add_argument("--window", type=float, default=0.5, help="window in seconds (default 0.5)")
+    ap.add_argument("--latency-at", choices=("answer", "send"), default="answer",
+                    help="where a query's latency counts: the window of its answer (default) or of its sending")
+    ap.add_argument("--until", choices=("load", "answer"), default="load",
+                    help="the time axis' end: where the load stopped (default) or the last answer")
     ap.add_argument("--out", help="output path without extension (default: latency-mean next to the runs)")
     ap.add_argument("--title", default="Mean latency over time")
     ap.add_argument("--log-latency", action="store_true", help="latency panel on a log scale")
@@ -532,12 +604,23 @@ def main():
                                    if len(groups[labels[0]]) > 1 else
                                    os.path.dirname(os.path.abspath(args.runs[0])), "latency-mean")
 
-    lines, summary, span, users, moved, flows = [], [], 0.0, None, {}, {}
+    lines, summary, users, moved, flows = [], [], None, {}, {}
     sched = offered_schedule(args.runs[0])
-    for label, slot in zip(labels, slots(labels)):
+    chosen = slots(labels)
+    if args.slots:
+        chosen = [int(x) for x in args.slots.split(",")]
+        if len(chosen) != len(labels) or not all(0 <= x < len(PALETTE) for x in chosen):
+            sys.exit("--slots gives %d slots in 0..%d for %d labels" % (len(chosen), len(PALETTE) - 1, len(labels)))
+    loaded = []
+    for label in labels:
         runs = load(label, groups[label], args.skip)
-        merged = sorted((r for rows, _ in runs for r in rows), key=lambda r: r["t"])
-        win = windows(merged, args.window)
+        loaded.append((runs, sorted((r for rows, _ in runs for r in rows), key=lambda r: r["t"])))
+    last = max(answered_at(r) for _, merged in loaded for r in merged)
+    ends = [e for e in (load_end(d) for d in args.runs) if e]
+    end = max(ends) if ends else max(merged[-1]["t"] for _, merged in loaded)  # where the load stopped
+    span = last if args.until == "answer" else min(end, last)  # a run cut short ends at its last answer
+    for label, slot, (runs, merged) in zip(labels, chosen, loaded):
+        win = windows(merged, args.window, args.latency_at, None if args.until == "answer" else span)
         flows[label] = flow(merged, args.window, len(win), len(runs))
         lines.append((label, slot, win, [rcs for _, rcs in runs], len(runs)))
         s = summarize(label, runs, win, args.window, args.skip)
@@ -551,7 +634,6 @@ def main():
             s["transferred_bytes"] = {k: round(v) for k, v in moved[label].items()}
             s["transferred_bytes"]["total"] = round(sum(moved[label].values()))
         summary.append(s)
-        span = max(span, merged[-1]["t"])
         if users is None and any(r["users"] for r in merged):  # the schedule, from the first line
             users = []
             for w in range(len(win)):
@@ -561,16 +643,19 @@ def main():
     offered = None
     if sched and not users:
         n = max(len(win) for _, _, win, _, _ in lines)
-        offered = [(k * args.window, rate_at(sched, k * args.window)) for k in range(n)]
+        # With --until answer a backlog's answers go on after the load stopped: the offered rate is 0 there.
+        offered = [(k * args.window, rate_at(sched, k * args.window) if k * args.window < end else 0.0)
+                   for k in range(n)]
     counts = {len(groups[l]) for l in labels}
-    subtitle = "per %s ms window: answers when they came, latency by send time" % fmt(args.window * 1000)
+    subtitle = "per %s ms window: %s" % (fmt(args.window * 1000), "answers and their latency when they came"
+                                         if args.latency_at == "answer" else "answers when they came, latency by send time")
     if counts != {1}:
         subtitle += ", pooled over %s runs per line" % (counts.pop() if len(counts) == 1 else "the")
     if args.skip:
         subtitle += "; first %s ms left out (warm-up)" % fmt(args.skip * 1000)
     with open(out + ".svg", "w") as f:
         f.write(svg_document(lines, args.skip, span, args.window, args.title, subtitle, users, moved,
-                             args.log_latency, flows, offered))
+                             args.log_latency, flows, offered, end if args.until == "load" and span >= end else None))
     with open(out + ".csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["t_s"] + [c for l in labels for c in (l + " mean_us", l + " queries sent",
