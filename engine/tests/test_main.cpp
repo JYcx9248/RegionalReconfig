@@ -527,6 +527,7 @@ void TestPageFileWindows() {
   std::vector<uint8_t> one = ReadFile(dir + "/one"), windows = ReadFile(dir + "/windows");
   CHECK(one.size() == map.num_pages * kPageSize);
   CHECK(one == windows);
+  CHECK(!FileExists(dir + "/windows.partial"));
   bool placed = true;
   for (uint64_t v = 0; v < n; ++v)
     placed = placed && std::memcmp(&one[map.Offset(static_cast<uint32_t>(v)) + map.slot_of[v] * d * 4],

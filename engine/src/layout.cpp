@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 
 namespace fusion {
@@ -193,10 +194,13 @@ void WriteVectorPages(const VectorFile& data, const LayoutMap& map, const std::s
   // The pages a window at a time, as many as `memory_bytes` holds. In page order the vectors
   // would be random reads (a bucket's members are spread over the base), so each window reads
   // its vectors by ID, in one pass over the base. Then its pages are written, synced and dropped
-  // from the page cache, as the base is.
+  // from the page cache, as the base is. The file gets its name only once complete: a build
+  // killed while writing it (that can take an hour) is resumed by skipping every stage whose
+  // file exists, and would take a cut-off page file for a whole one.
   const uint64_t window = std::max<uint64_t>(1, memory_bytes / ps);
-  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  FUSION_CHECK(fd >= 0, "cannot open %s: %s", path.c_str(), std::strerror(errno));
+  const std::string tmp = path + ".partial";
+  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  FUSION_CHECK(fd >= 0, "cannot open %s: %s", tmp.c_str(), std::strerror(errno));
   std::vector<uint8_t> buf(std::min(window, map.num_pages) * ps);
   std::vector<uint32_t> ids;  // the window's vectors, by ID
   std::vector<uint64_t> at;   // where each one goes in the window
@@ -213,14 +217,16 @@ void WriteVectorPages(const VectorFile& data, const LayoutMap& map, const std::s
     std::memset(buf.data(), 0, cnt * ps);
     data.ForEachRow(ids.data(), ids.size(),
                     [&](size_t i, const uint8_t* row) { std::memcpy(&buf[at[i]], row, vb); });
-    WriteAt(fd, buf.data(), cnt * ps, p0 * ps, path);
-    FUSION_CHECK(::fdatasync(fd) == 0, "cannot sync %s: %s", path.c_str(), std::strerror(errno));
+    WriteAt(fd, buf.data(), cnt * ps, p0 * ps, tmp);
+    FUSION_CHECK(::fdatasync(fd) == 0, "cannot sync %s: %s", tmp.c_str(), std::strerror(errno));
     DropFromPageCache(fd, p0 * ps, cnt * ps);
     if (cnt < map.num_pages)
       Log("  page file: %llu / %llu pages", (unsigned long long)(p0 + cnt),
           (unsigned long long)map.num_pages);
   }
-  FUSION_CHECK(::close(fd) == 0, "close failed for %s", path.c_str());
+  FUSION_CHECK(::close(fd) == 0, "close failed for %s", tmp.c_str());
+  FUSION_CHECK(std::rename(tmp.c_str(), path.c_str()) == 0, "cannot rename %s: %s", tmp.c_str(),
+               std::strerror(errno));
 }
 
 }  // namespace fusion
