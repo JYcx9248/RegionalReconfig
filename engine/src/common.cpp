@@ -1,7 +1,9 @@
 #include "fusion/common.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <cstdarg>
@@ -138,6 +140,23 @@ void WriteFile(const std::string& path, const void* data, size_t bytes) {
   FUSION_CHECK(f != nullptr, "cannot open %s for writing: %s", path.c_str(), std::strerror(errno));
   AppendToFile(f, data, bytes, path);
   FUSION_CHECK(std::fclose(f) == 0, "close failed for %s", path.c_str());
+}
+
+void DropFromPageCache(int fd, uint64_t off, uint64_t len) {
+  if (len == 0) return;  // posix_fadvise takes 0 for "to the end of the file"
+  static const uint64_t page = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+  const uint64_t a = off / page * page, z = CeilDiv(off + len, page) * page;
+  ::posix_fadvise(fd, static_cast<off_t>(a), static_cast<off_t>(z - a), POSIX_FADV_DONTNEED);
+}
+
+void SyncAndDropFromPageCache(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  FUSION_CHECK(fd >= 0, "cannot open %s: %s", path.c_str(), std::strerror(errno));
+  const bool synced = ::fdatasync(fd) == 0;
+  const int err = errno;
+  if (synced) DropFromPageCache(fd, 0, FileSize(path));
+  ::close(fd);
+  FUSION_CHECK(synced, "cannot sync %s: %s", path.c_str(), std::strerror(err));
 }
 
 std::vector<uint8_t> ReadFile(const std::string& path) {

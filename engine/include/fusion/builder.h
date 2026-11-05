@@ -26,6 +26,10 @@ struct BuildParams {
 
   std::string layout = "bucket";  // "bucket", "id" or "both"
   uint64_t seed = 42;
+  // Base vectors held in memory at once: the clustering's batches, the page file's windows. The
+  // base is read in passes, never mapped, so it can be larger than memory. The index does not
+  // depend on it, except for the order of its heads.
+  uint64_t memory_bytes = uint64_t{16} << 30;
   bool overwrite = false;         // rebuild stages whose outputs already exist
 };
 

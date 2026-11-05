@@ -39,6 +39,11 @@ product quantization
 SSD layout
   --layout L              bucket | id | both                  (default bucket)
 
+memory
+  --memory-gb G           base vectors held in memory at once     (default 16): the
+                          clustering's batches and the page file's windows; the base is
+                          read in passes, never mapped, and dropped from the page cache
+
 misc
   --threads T             OpenMP threads (default: all cores)
   --seed S
@@ -78,6 +83,9 @@ int main(int argc, char** argv) {
     p.pq_m = static_cast<uint32_t>(a.U64("pq-m", 0));
     p.pq_train_n = static_cast<uint32_t>(a.U64("pq-train", 100000));
     p.layout = a.Str("layout", "bucket");
+    const double memory_gb = a.F64("memory-gb", 16.0);
+    FUSION_CHECK(memory_gb > 0, "--memory-gb must be positive");
+    p.memory_bytes = static_cast<uint64_t>(memory_gb * static_cast<double>(uint64_t{1} << 30));
     p.overwrite = a.Flag("overwrite");
     if (a.Has("threads")) omp_set_num_threads(static_cast<int>(a.U64("threads", 1)));
     a.WarnUnused(flags);

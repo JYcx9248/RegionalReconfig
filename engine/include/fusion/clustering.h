@@ -29,9 +29,15 @@ struct ClusteringStats {
   double mean_leaf = 0;
 };
 
-// Returns the data IDs of the heads (one per leaf).
+// Returns the data IDs of the heads (one per leaf). Holds about `memory_bytes` of base vectors at
+// once, plus 12 bytes per vector. A node whose rows do not fit is split with its rows streamed
+// from the file. The other nodes are clustered in batches that fit, each batch's rows read in one
+// pass. A node's rows spread over the whole file, so each streamed split and each batch reads
+// about all of it: the bigger the budget, the fewer passes. The heads do not depend on
+// `memory_bytes`, but their order does.
 std::vector<uint32_t> HierarchicalBalancedClustering(const VectorFile& data,
                                                      const ClusteringParams& p,
+                                                     uint64_t memory_bytes,
                                                      ClusteringStats* stats);
 
 }  // namespace fusion

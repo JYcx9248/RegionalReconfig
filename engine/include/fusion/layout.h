@@ -73,7 +73,9 @@ LayoutMap BuildBucketLayout(const std::vector<uint32_t>& bucket_of, uint32_t num
 LayoutMap BuildSequentialLayout(uint64_t n, uint32_t vec_bytes, uint32_t page_size,
                                 LayoutStats* stats);
 
-// Writes the page file for `map`, reading vectors from `data`.
-void WriteVectorPages(const VectorFile& data, const LayoutMap& map, const std::string& path);
+// Writes the page file for `map`, reading vectors from `data`: at most `memory_bytes` of pages at
+// a time, each window's vectors read in one pass over `data`.
+void WriteVectorPages(const VectorFile& data, const LayoutMap& map, const std::string& path,
+                      uint64_t memory_bytes);
 
 }  // namespace fusion

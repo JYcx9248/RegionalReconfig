@@ -100,4 +100,12 @@ void WriteVector(FILE* f, const std::vector<T>& v, const std::string& path) {
   AppendToFile(f, v.data(), v.size() * sizeof(T), path);
 }
 
+// Drops bytes [off, off + len) of an open file from the page cache, the partial pages at either
+// end too. A pass over a file larger than memory (a build's base, its page file) then leaves
+// nothing behind. Cached or mapped, such a pass is memory pressure on a shared server, which
+// systemd-oomd answers by killing the process.
+void DropFromPageCache(int fd, uint64_t off, uint64_t len);
+// Syncs a file just written, then drops it from the page cache.
+void SyncAndDropFromPageCache(const std::string& path);
+
 }  // namespace fusion

@@ -1,7 +1,6 @@
 #include "fusion/dataset.h"
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -40,7 +39,8 @@ std::unique_ptr<VectorFile> VectorFile::Open(const std::string& path, std::optio
   FUSION_CHECK(dtype.has_value(), "cannot infer dtype of %s; pass --dtype", path.c_str());
   vf->dtype_ = *dtype;
 
-  int fd = ::open(path.c_str(), O_RDONLY);
+  vf->fd_ = ::open(path.c_str(), O_RDONLY);
+  const int fd = vf->fd_;
   FUSION_CHECK(fd >= 0, "cannot open %s: %s", path.c_str(), std::strerror(errno));
   uint64_t fsize = FileSize(path);
   const size_t esz = DTypeSize(vf->dtype_);
@@ -52,6 +52,7 @@ std::unique_ptr<VectorFile> VectorFile::Open(const std::string& path, std::optio
     vf->dim_ = static_cast<uint32_t>(d);
     vf->vec_bytes_ = vf->dim_ * esz;
     vf->stride_ = 4 + vf->vec_bytes_;
+    vf->first_ = 4;
     vf->n_ = fsize / vf->stride_;
   } else {
     uint32_t hdr[2];
@@ -60,6 +61,7 @@ std::unique_ptr<VectorFile> VectorFile::Open(const std::string& path, std::optio
     vf->dim_ = hdr[1];
     vf->vec_bytes_ = vf->dim_ * esz;
     vf->stride_ = vf->vec_bytes_;
+    vf->first_ = 8;
     FUSION_CHECK(vf->dim_ > 0, "bad dimension in %s", path.c_str());
     uint64_t avail = (fsize - 8) / vf->vec_bytes_;
     if (avail < vf->n_) {
@@ -71,18 +73,34 @@ std::unique_ptr<VectorFile> VectorFile::Open(const std::string& path, std::optio
   }
   if (max_n > 0 && max_n < vf->n_) vf->n_ = max_n;
   FUSION_CHECK(vf->n_ > 0, "%s contains no vectors", path.c_str());
-
-  vf->map_len_ = static_cast<size_t>(fsize);
-  vf->map_ = ::mmap(nullptr, vf->map_len_, PROT_READ, MAP_SHARED, fd, 0);
-  ::close(fd);
-  FUSION_CHECK(vf->map_ != MAP_FAILED, "mmap of %s failed: %s", path.c_str(), std::strerror(errno));
-  const uint8_t* p = static_cast<const uint8_t*>(vf->map_);
-  vf->base_ = IsVecsFormat(path) ? p + 4 : p + 8;
   return vf;
 }
 
 VectorFile::~VectorFile() {
-  if (map_ != nullptr && map_ != MAP_FAILED) ::munmap(map_, map_len_);
+  if (fd_ >= 0) ::close(fd_);
+}
+
+void VectorFile::Read(uint64_t b, uint64_t e, uint8_t* out) const {
+  FUSION_CHECK(b <= e && e <= n_, "rows [%llu, %llu) of %s, which has %llu", (unsigned long long)b,
+               (unsigned long long)e, path_.c_str(), (unsigned long long)n_);
+  if (stride_ == vec_bytes_) {
+    ReadBytes(Offset(b), (e - b) * vec_bytes_, out);
+    return;
+  }
+  ForSpans(e - b, [b](size_t t) { return b + t; },
+           [&](size_t t, const uint8_t* row) { std::memcpy(out + t * vec_bytes_, row, vec_bytes_); });
+}
+
+void VectorFile::ReadBytes(uint64_t off, uint64_t len, uint8_t* out) const {
+  for (uint64_t done = 0; done < len;) {
+    const size_t want = static_cast<size_t>(std::min<uint64_t>(len - done, uint64_t{1} << 30));
+    const ssize_t got = ::pread(fd_, out + done, want, static_cast<off_t>(off + done));
+    if (got < 0 && errno == EINTR) continue;
+    FUSION_CHECK(got > 0, "cannot read %s at byte %llu: %s", path_.c_str(),
+                 (unsigned long long)(off + done), got < 0 ? std::strerror(errno) : "the file ends there");
+    done += static_cast<uint64_t>(got);
+  }
+  DropFromPageCache(fd_, off, len);
 }
 
 VectorSet LoadVectors(const std::string& path, std::optional<DType> dtype, uint64_t max_n) {
@@ -92,9 +110,7 @@ VectorSet LoadVectors(const std::string& path, std::optional<DType> dtype, uint6
   vs.n = vf->size();
   vs.dim = vf->dim();
   vs.data.resize(vs.n * vs.vec_bytes());
-  for (uint64_t i = 0; i < vs.n; ++i) {
-    std::memcpy(vs.data.data() + i * vs.vec_bytes(), vf->Get(i), vs.vec_bytes());
-  }
+  vf->Read(0, vs.n, vs.data.data());
   return vs;
 }
 

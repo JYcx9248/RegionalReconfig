@@ -1,5 +1,8 @@
 #include "fusion/layout.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -154,37 +157,70 @@ LayoutMap BuildSequentialLayout(uint64_t n, uint32_t vec_bytes, uint32_t page_si
   return m;
 }
 
-void WriteVectorPages(const VectorFile& data, const LayoutMap& map, const std::string& path) {
+namespace {
+void WriteAt(int fd, const uint8_t* data, uint64_t len, uint64_t off, const std::string& path) {
+  for (uint64_t done = 0; done < len;) {
+    const size_t want = static_cast<size_t>(std::min<uint64_t>(len - done, uint64_t{1} << 30));
+    const ssize_t w = ::pwrite(fd, data + done, want, static_cast<off_t>(off + done));
+    if (w < 0 && errno == EINTR) continue;
+    FUSION_CHECK(w > 0, "cannot write %s at byte %llu: %s", path.c_str(),
+                 (unsigned long long)(off + done), std::strerror(errno));
+    done += static_cast<uint64_t>(w);
+  }
+}
+}  // namespace
+
+void WriteVectorPages(const VectorFile& data, const LayoutMap& map, const std::string& path,
+                      uint64_t memory_bytes) {
   FUSION_CHECK(map.vec_bytes == data.vec_bytes(), "layout/data vector size mismatch");
   FUSION_CHECK(map.size() == data.size(), "layout/data size mismatch");
   const uint32_t vpp = map.vectors_per_page;
   const uint32_t ps = map.page_size;
-  std::vector<uint32_t> inv(map.num_pages * vpp, kInvalidId);
-  for (uint64_t v = 0; v < map.size(); ++v) {
-    uint64_t idx = static_cast<uint64_t>(map.page_of[v]) * vpp + map.slot_of[v];
-    FUSION_CHECK(inv[idx] == kInvalidId, "two vectors mapped to page %u slot %u", map.page_of[v],
-                 map.slot_of[v]);
-    inv[idx] = static_cast<uint32_t>(v);
+  const uint32_t vb = map.vec_bytes;
+  const uint64_t n = map.size();
+  {
+    std::vector<bool> used(map.num_pages * vpp, false);
+    for (uint64_t v = 0; v < n; ++v) {
+      FUSION_CHECK(map.page_of[v] < map.num_pages && map.slot_of[v] < vpp,
+                   "vector %llu has no slot in the layout", (unsigned long long)v);
+      const uint64_t idx = static_cast<uint64_t>(map.page_of[v]) * vpp + map.slot_of[v];
+      FUSION_CHECK(!used[idx], "two vectors mapped to page %u slot %u", map.page_of[v],
+                   map.slot_of[v]);
+      used[idx] = true;
+    }
   }
 
-  FILE* f = std::fopen(path.c_str(), "wb");
-  FUSION_CHECK(f != nullptr, "cannot open %s: %s", path.c_str(), std::strerror(errno));
-  constexpr uint64_t kChunkPages = 4096;  // 16 MB per write
-  std::vector<uint8_t> buf(kChunkPages * ps);
-  for (uint64_t p0 = 0; p0 < map.num_pages; p0 += kChunkPages) {
-    const uint64_t cnt = std::min(kChunkPages, map.num_pages - p0);
-#pragma omp parallel for schedule(static)
-    for (int64_t j = 0; j < static_cast<int64_t>(cnt); ++j) {
-      uint8_t* pg = buf.data() + static_cast<uint64_t>(j) * ps;
-      std::memset(pg, 0, ps);
-      for (uint32_t slot = 0; slot < vpp; ++slot) {
-        uint32_t v = inv[(p0 + static_cast<uint64_t>(j)) * vpp + slot];
-        if (v != kInvalidId) std::memcpy(pg + slot * map.vec_bytes, data.Get(v), map.vec_bytes);
-      }
+  // The pages a window at a time, as many as `memory_bytes` holds. In page order the vectors
+  // would be random reads (a bucket's members are spread over the base), so each window reads
+  // its vectors by ID, in one pass over the base. Then its pages are written, synced and dropped
+  // from the page cache, as the base is.
+  const uint64_t window = std::max<uint64_t>(1, memory_bytes / ps);
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  FUSION_CHECK(fd >= 0, "cannot open %s: %s", path.c_str(), std::strerror(errno));
+  std::vector<uint8_t> buf(std::min(window, map.num_pages) * ps);
+  std::vector<uint32_t> ids;  // the window's vectors, by ID
+  std::vector<uint64_t> at;   // where each one goes in the window
+  for (uint64_t p0 = 0; p0 < map.num_pages; p0 += window) {
+    const uint64_t cnt = std::min(window, map.num_pages - p0);
+    ids.clear();
+    at.clear();
+    for (uint64_t v = 0; v < n; ++v) {
+      const uint64_t pg = map.page_of[v];
+      if (pg < p0 || pg >= p0 + cnt) continue;
+      ids.push_back(static_cast<uint32_t>(v));
+      at.push_back((pg - p0) * ps + static_cast<uint64_t>(map.slot_of[v]) * vb);
     }
-    AppendToFile(f, buf.data(), cnt * ps, path);
+    std::memset(buf.data(), 0, cnt * ps);
+    data.ForEachRow(ids.data(), ids.size(),
+                    [&](size_t i, const uint8_t* row) { std::memcpy(&buf[at[i]], row, vb); });
+    WriteAt(fd, buf.data(), cnt * ps, p0 * ps, path);
+    FUSION_CHECK(::fdatasync(fd) == 0, "cannot sync %s: %s", path.c_str(), std::strerror(errno));
+    DropFromPageCache(fd, p0 * ps, cnt * ps);
+    if (cnt < map.num_pages)
+      Log("  page file: %llu / %llu pages", (unsigned long long)(p0 + cnt),
+          (unsigned long long)map.num_pages);
   }
-  FUSION_CHECK(std::fclose(f) == 0, "close failed for %s", path.c_str());
+  FUSION_CHECK(::close(fd) == 0, "close failed for %s", path.c_str());
 }
 
 }  // namespace fusion

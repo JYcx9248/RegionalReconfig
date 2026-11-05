@@ -1,7 +1,6 @@
 #include "fusion/builder.h"
 
 #include <algorithm>
-#include <cstring>
 #include <random>
 #include <unordered_set>
 
@@ -72,14 +71,14 @@ void BuildIndex(const BuildParams& p) {
     Log("[1/5] hierarchical balanced clustering (target ratio %.3f)",
         p.clustering.centroid_ratio);
     ClusteringStats cs;
-    heads = HierarchicalBalancedClustering(*data, p.clustering, &cs);
+    heads = HierarchicalBalancedClustering(*data, p.clustering, p.memory_bytes, &cs);
     Log("      %u posting lists (%.2f%% of vectors), leaf size min/mean/max = %u/%.1f/%u, "
         "%u levels, %.1fs",
         cs.num_leaves, 100.0 * cs.num_leaves / static_cast<double>(n), cs.min_leaf, cs.mean_leaf,
         cs.max_leaf, cs.levels, t.Sec());
     SaveU32Array(path(files::kHeads), heads);
     std::vector<uint8_t> hv(heads.size() * vb);
-    for (size_t i = 0; i < heads.size(); ++i) std::memcpy(&hv[i * vb], data->Get(heads[i]), vb);
+    data->Gather(heads.data(), heads.size(), hv.data());
     SaveBin(path(files::kCentroids), dt, heads.size(), d, hv.data());
   } else {
     heads = LoadU32Array(path(files::kHeads));
@@ -118,6 +117,7 @@ void BuildIndex(const BuildParams& p) {
         as.avg_replicas, as.mean_list, as.max_list, as.empty_lists, t.Sec());
     lists.Save(path(files::kPostings));
     SaveU32Array(path(files::kPrimary), primary);
+    SyncAndDropFromPageCache(path(files::kPostings));
   } else {
     lists = PostingLists::Load(path(files::kPostings));
     primary = LoadU32Array(path(files::kPrimary));
@@ -126,6 +126,8 @@ void BuildIndex(const BuildParams& p) {
     Log("[3/5] assignment: reusing posting lists (%.2f replicas/vector)", as.avg_replicas);
   }
   graph.reset();  // free memory before the PQ stage
+  lists = PostingLists();
+  head_vecs = VectorSet();
 
   // ---- Stage 4: product quantization -> codes for the GPU tier --------------------------
   uint32_t pq_m = p.pq_m ? p.pq_m : DefaultPQM(d);
@@ -136,7 +138,9 @@ void BuildIndex(const BuildParams& p) {
     std::vector<float> train(idx.size() * d);
     DispatchDType(dt, [&](auto tag) {
       using T = decltype(tag);
-      for (size_t i = 0; i < idx.size(); ++i) ToFloat(data->Row<T>(idx[i]), &train[i * d], d);
+      data->ForEachRow(idx.data(), idx.size(), [&](size_t i, const uint8_t* row) {
+        ToFloat(reinterpret_cast<const T*>(row), &train[i * d], d);
+      });
     });
     PQTrainParams tp;
     tp.m = pq_m;
@@ -148,12 +152,16 @@ void BuildIndex(const BuildParams& p) {
     std::vector<uint8_t> codes(n * pq_m);
     DispatchDType(dt, [&](auto tag) {
       using T = decltype(tag);
+      data->ForEachChunk([&](uint64_t b0, uint64_t b1, const uint8_t* rows) {
 #pragma omp parallel for schedule(static, 4096)
-      for (int64_t i = 0; i < static_cast<int64_t>(n); ++i)
-        cb.Encode(data->Row<T>(static_cast<uint64_t>(i)), &codes[static_cast<uint64_t>(i) * pq_m]);
+        for (int64_t i = static_cast<int64_t>(b0); i < static_cast<int64_t>(b1); ++i)
+          cb.Encode(reinterpret_cast<const T*>(rows + (static_cast<uint64_t>(i) - b0) * vb),
+                    &codes[static_cast<uint64_t>(i) * pq_m]);
+      });
     });
     cb.Save(path(files::kPQCodebook));
     SavePQCodes(path(files::kPQCodes), codes.data(), n, pq_m);
+    SyncAndDropFromPageCache(path(files::kPQCodes));
     Log("      %.1f MB of codes (%u B/vector), %.1fs", codes.size() / 1e6, pq_m, t.Sec());
   } else {
     pq_m = PQCodebook::Load(path(files::kPQCodebook)).m();
@@ -173,7 +181,7 @@ void BuildIndex(const BuildParams& p) {
                                             kPageSize, &ls)
                         : BuildSequentialLayout(n, static_cast<uint32_t>(vb), kPageSize, &ls);
     map.Save(path(files::LayoutMap(name)));
-    WriteVectorPages(*data, map, path(files::LayoutVectors(name)));
+    WriteVectorPages(*data, map, path(files::LayoutVectors(name)), p.memory_bytes);
     Log("[5/5] layout '%s': %llu pages (%llu full + %llu packed), %u vectors/page, fill %.1f%%, "
         "%.1fs",
         name.c_str(), (unsigned long long)map.num_pages, (unsigned long long)ls.full_pages,

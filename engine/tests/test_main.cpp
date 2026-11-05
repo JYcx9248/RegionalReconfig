@@ -18,6 +18,7 @@
 #include "fusion/distance.h"
 #include "fusion/engine.h"
 #include "fusion/filter.h"
+#include "fusion/index_meta.h"
 #include "fusion/kmeans.h"
 #include "fusion/layout.h"
 #include "fusion/page_reader.h"
@@ -396,6 +397,186 @@ void TestEndToEnd() {
   }
 }
 
+// The base read with pread (VectorFile): whole, in chunks, and by ID in any order, from bin and
+// vecs files (a dimension before each row) and a prefix of them. Rows out of order or past the
+// end are refused.
+void TestVectorFile() {
+  std::string dir = TempDir();
+  const uint64_t n = 5000;
+  const uint32_t d = 1000;  // 1 KB rows: sparse IDs leave gaps wider than a span may cross
+  std::vector<uint8_t> rows(n * d);
+  std::mt19937 rng(7);
+  for (auto& x : rows) x = static_cast<uint8_t>(rng());
+  SaveBin(dir + "/a.u8bin", DType::kUInt8, n, d, rows.data());
+  {
+    FILE* f = std::fopen((dir + "/a.bvecs").c_str(), "wb");
+    for (uint64_t i = 0; i < n; ++i) {
+      const int32_t dd = static_cast<int32_t>(d);
+      std::fwrite(&dd, 4, 1, f);
+      std::fwrite(&rows[i * d], 1, d, f);
+    }
+    std::fclose(f);
+  }
+  auto row_is = [&](const uint8_t* got, uint64_t id) { return std::memcmp(got, &rows[id * d], d) == 0; };
+  for (const char* name : {"/a.u8bin", "/a.bvecs"}) {
+    auto vf = VectorFile::Open(dir + name);
+    CHECK(vf->size() == n && vf->dim() == d && vf->vec_bytes() == d);
+    std::vector<uint8_t> got(n * d);
+    vf->Read(0, n, got.data());
+    CHECK(got == rows);
+    vf->Read(17, 4321, got.data());
+    CHECK(std::memcmp(got.data(), &rows[17 * d], (4321 - 17) * d) == 0);
+    uint64_t next = 0;
+    bool chunks = true;
+    vf->ForEachChunk([&](uint64_t b0, uint64_t b1, const uint8_t* r) {
+      chunks = chunks && b0 == next && b1 > b0 && std::memcmp(r, &rows[b0 * d], (b1 - b0) * d) == 0;
+      next = b1;
+    });
+    CHECK(chunks && next == n);
+    // Dense IDs in any order with repeats, then sparse ones (each its own read).
+    std::vector<uint32_t> ids;
+    for (int i = 0; i < 3000; ++i) ids.push_back(static_cast<uint32_t>(rng() % n));
+    ids.push_back(0);
+    ids.push_back(static_cast<uint32_t>(n - 1));
+    ids.push_back(ids[5]);
+    for (const std::vector<uint32_t>& set : {ids, std::vector<uint32_t>{3, 700, 701, 1900, 4999}}) {
+      std::vector<uint8_t> g(set.size() * d);
+      vf->Gather(set.data(), set.size(), g.data());
+      bool same = true;
+      for (size_t i = 0; i < set.size(); ++i) same = same && row_is(&g[i * d], set[i]);
+      CHECK(same);
+    }
+    std::vector<uint64_t> sorted = {1, 1, 2, 900, 3000, 3001};
+    size_t calls = 0;
+    bool in_order = true;
+    vf->ForEachRow(sorted.data(), sorted.size(), [&](size_t i, const uint8_t* r) {
+      in_order = in_order && i == calls++ && row_is(r, sorted[i]);
+    });
+    CHECK(in_order && calls == sorted.size());
+
+    auto prefix = VectorFile::Open(dir + name, std::nullopt, 100);
+    CHECK(prefix->size() == 100);
+    auto refused = [&](std::vector<uint32_t> bad) {
+      try {
+        prefix->ForEachRow(bad.data(), bad.size(), [](size_t, const uint8_t*) {});
+      } catch (const std::exception&) {
+        return true;
+      }
+      return false;
+    };
+    CHECK(refused({50, 40}));
+    CHECK(refused({100}));
+    CHECK(!refused({40, 50, 99}));
+  }
+}
+
+// The clustering with too little memory for its base: nodes too big are split with their rows
+// streamed, the others clustered in batches. Its heads are those of the clustering in memory,
+// whatever the budget, also when k-means cannot separate the points (all equal).
+void TestStreamedClustering() {
+  std::string dir = TempDir();
+  ClusteringParams cp;
+  cp.centroid_ratio = 0.1;
+  cp.branch = 3;  // children of 20000 below the root, big enough to be streamed too
+  auto same_heads = [&](const std::string& path, std::vector<uint64_t> budgets) {
+    auto vf = VectorFile::Open(path);
+    ClusteringStats want_st;
+    std::vector<uint32_t> want = HierarchicalBalancedClustering(*vf, cp, uint64_t{1} << 30, &want_st);
+    std::sort(want.begin(), want.end());
+    bool same = true;
+    for (uint64_t rows : budgets) {
+      ClusteringStats st;
+      std::vector<uint32_t> heads = HierarchicalBalancedClustering(*vf, cp, rows * vf->vec_bytes(), &st);
+      std::sort(heads.begin(), heads.end());
+      same = same && heads == want && st.num_leaves == want_st.num_leaves &&
+             st.min_leaf == want_st.min_leaf && st.max_leaf == want_st.max_leaf;
+      if (heads != want)
+        std::printf("    budget %llu rows: %zu heads, %zu in memory\n", (unsigned long long)rows,
+                    heads.size(), want.size());
+    }
+    return same;
+  };
+  const uint64_t n = 60000;
+  const uint32_t d = 16;
+  std::vector<float> base, centers;
+  MakeMixture(n, d, 40, 21, &base, &centers);
+  SaveBin(dir + "/base.fbin", DType::kFloat, n, d, base.data());
+  // The root streamed, then batches of two children, of one, of single grandchildren.
+  CHECK(same_heads(dir + "/base.fbin", {45000, 25000, 1000}));
+  std::vector<float> equal(25000 * 4, 1.f);
+  SaveBin(dir + "/equal.fbin", DType::kFloat, 25000, 4, equal.data());
+  CHECK(same_heads(dir + "/equal.fbin", {1000}));
+}
+
+// The page file in windows of a few pages, each window's vectors read by ID: byte for byte the
+// page file written in one window, with every vector where the map puts it.
+void TestPageFileWindows() {
+  const uint64_t n = 7001;
+  const uint32_t d = 40;  // 160-byte vectors, 25 per page
+  std::vector<float> base, centers;
+  MakeMixture(n, d, 10, 31, &base, &centers);
+  std::string dir = TempDir();
+  SaveBin(dir + "/base.fbin", DType::kFloat, n, d, base.data());
+  auto vf = VectorFile::Open(dir + "/base.fbin");
+  std::mt19937 rng(5);
+  std::vector<uint32_t> bucket_of(n);
+  for (auto& b : bucket_of) b = static_cast<uint32_t>(rng() % 701);
+  LayoutMap map = BuildBucketLayout(bucket_of, 701, d * 4, kPageSize, nullptr);
+  WriteVectorPages(*vf, map, dir + "/one", uint64_t{1} << 30);
+  WriteVectorPages(*vf, map, dir + "/windows", 3 * kPageSize);
+  std::vector<uint8_t> one = ReadFile(dir + "/one"), windows = ReadFile(dir + "/windows");
+  CHECK(one.size() == map.num_pages * kPageSize);
+  CHECK(one == windows);
+  bool placed = true;
+  for (uint64_t v = 0; v < n; ++v)
+    placed = placed && std::memcmp(&one[map.Offset(static_cast<uint32_t>(v)) + map.slot_of[v] * d * 4],
+                                   &base[v * d], d * 4) == 0;
+  CHECK(placed);
+}
+
+// A build with memory for a tenth of its base gives the same index: the same heads, and from the
+// same heads and graph, the same posting lists, PQ codes, layouts and page files. (Two builds
+// do not share a graph: its inserts run in parallel.)
+void TestStreamedBuild() {
+  const uint64_t n = 30000;
+  const uint32_t d = 32;
+  std::vector<float> base, centers;
+  MakeMixture(n, d, 60, 41, &base, &centers);
+  std::string dir = TempDir();
+  SaveBin(dir + "/base.fbin", DType::kFloat, n, d, base.data());
+  BuildParams bp;
+  bp.base_path = dir + "/base.fbin";
+  bp.pq_m = 16;
+  bp.pq_train_n = 5000;
+  bp.layout = "both";
+  bp.out_dir = dir + "/whole";
+  BuildIndex(bp);
+  bp.memory_bytes = n * d * sizeof(float) / 10;
+  bp.out_dir = dir + "/tenth";
+  BuildIndex(bp);
+  auto heads_of = [&](const std::string& index) {
+    std::vector<uint32_t> h = LoadU32Array(JoinPath(index, files::kHeads));
+    std::sort(h.begin(), h.end());
+    return h;
+  };
+  CHECK(heads_of(dir + "/whole") == heads_of(dir + "/tenth"));
+  bp.out_dir = dir + "/reuse";
+  MakeDirs(bp.out_dir);
+  for (const char* f : {files::kHeads, files::kCentroids, files::kGraph}) {
+    std::vector<uint8_t> b = ReadFile(JoinPath(dir + "/whole", f));
+    WriteFile(JoinPath(bp.out_dir, f), b.data(), b.size());
+  }
+  BuildIndex(bp);
+  for (const std::string& f : {std::string(files::kPostings), std::string(files::kPrimary),
+                               std::string(files::kPQCodebook), std::string(files::kPQCodes),
+                               files::LayoutMap("bucket"), files::LayoutVectors("bucket"),
+                               files::LayoutMap("id"), files::LayoutVectors("id")}) {
+    const bool same = ReadFile(JoinPath(dir + "/whole", f)) == ReadFile(JoinPath(bp.out_dir, f));
+    if (!same) std::printf("    %s differs\n", f.c_str());
+    CHECK(same);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -403,6 +584,8 @@ int main() {
       {"distances", TestDistances}, {"kmeans", TestKMeans},     {"pq", TestPQ},
       {"layout", TestLayout},       {"page_readers", TestPageReaders},
       {"cpu_filter", TestCpuFilter}, {"rerank", TestRerank},    {"end_to_end", TestEndToEnd},
+      {"vector_file", TestVectorFile}, {"streamed_clustering", TestStreamedClustering},
+      {"page_file_windows", TestPageFileWindows}, {"streamed_build", TestStreamedBuild},
   };
   int failed = 0;
   for (const auto& t : tests) {
