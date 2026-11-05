@@ -1,0 +1,90 @@
+{
+  "Comment": "CloudLab c240g5, U11's worst case: the queries are 1M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. Ground truth for every 300th of the first 600K (fusion_gt --index: the base file is gone). Otherwise experiment.wiki-c1024-cloudlab-gpu-4to8-calibrate-8.json: the 8-node capacity, measured after a scale-out without load (copy-then-flip).",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-worst-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-worst-gt.ibin",
+  "GroundTruthStride": 300,
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "ReadIOPSPerNode": 40000
+  },
+  "Nodes": 8,
+  "InitialNodes": 4,
+  "Protocol": "copy-then-flip",
+  "TransferRateBytesPerSec": 0,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200
+  },
+  "Calibrate": {
+    "Rates": [
+      800,
+      1000,
+      1200,
+      1400,
+      1600,
+      2000,
+      2400,
+      3000
+    ],
+    "SecondsPerRate": 30
+  },
+  "RequireSnapshot": true,
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 0,
+      "DataNodes": 8
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.5",
+      "10.10.1.6",
+      "10.10.1.7",
+      "10.10.1.8",
+      "10.10.1.9",
+      "10.10.1.1"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

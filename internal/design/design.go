@@ -305,7 +305,7 @@ var Open = map[string]Question{
 			"ends: real queries that do not repeat (their own locality) and the worst case, queries " +
 			"sampled from the base vectors without repetition (none); the SemDN-style generator " +
 			"(\"semdn\") stays a placeholder and is not pursued",
-		"cmd/rtier-loadgen/arrivals.go"},
+		"cmd/rtier-loadgen/arrivals.go; scripts/data/sample_queries.py, the worst case's queries"},
 	"U12": {"U12", "Vector ID -> RAG chunk ID mapping returned to the caller",
 		"the tier returns vector IDs (no code path maps them yet); the chunk store and the " +
 			"fetch path are not designed",
