@@ -60,16 +60,35 @@ def main() -> None:
     rows = np.random.default_rng(args.seed).permutation(count)[: args.n]
     rows.sort()
     rows = rows.astype(np.uint32)
-    src = np.memmap(args.base, dtype=np.uint8, mode="r", offset=8, shape=(count, row))
 
+    # Plain reads of each chunk's span, not a memory map, and every span read or written is
+    # dropped from the page cache at once. On a shared server with less memory than the base, a
+    # map keeps what it read in this process's resident set, and the copy's churn through the
+    # page cache is memory pressure: either makes it what an OOM killer or systemd-oomd stops
+    # first (a 560M-row run was killed at 95%, its tmux with it).
+    fd = os.open(args.base, os.O_RDONLY)
     tmp = args.out + ".partial"
     with open(tmp, "wb") as f:
         f.write(struct.pack("<II", args.n, dim))
         step = max(1, args.n // 20)
         for i in range(0, args.n, args.chunk):
-            f.write(src[rows[i : i + args.chunk]].tobytes())
+            r = rows[i : i + args.chunk]
+            lo, hi = int(r[0]), int(r[-1]) + 1
+            span = np.empty((hi - lo, row), dtype=np.uint8)
+            view, done = memoryview(span).cast("B"), 0
+            while done < len(view):  # one read returns at most about 2 GB
+                got = os.preadv(fd, [view[done:]], 8 + lo * row + done)
+                if got == 0:
+                    sys.exit(f"{args.base}: ends before row {hi}")
+                done += got
+            os.posix_fadvise(fd, 8 + lo * row, (hi - lo) * row, os.POSIX_FADV_DONTNEED)
+            span[r - lo].tofile(f)
+            f.flush()
+            os.fdatasync(f.fileno())
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
             if (i + args.chunk) // step > i // step:
                 log(f"{min(i + args.chunk, args.n)} of {args.n} rows")
+    os.close(fd)
     np.save(args.out + ".rows.npy", rows)
     record["subset"] = {
         "of": os.path.abspath(args.base), "of_count": count, "n": args.n, "seed": args.seed,
