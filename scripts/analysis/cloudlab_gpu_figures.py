@@ -3,7 +3,7 @@
 2026-11-03/04). No dependencies: plain SVG in light and dark, as compare_runs.py writes them.
 
     python3 scripts/analysis/cloudlab_gpu_figures.py [--runs results/cloudlab-gpu] [--out results/cloudlab-gpu-figures]
-        [--series 4to8] [--calibrations 4to8] [--before SERIES] [--fetch-bound-mb 2048]
+        [--series 4to8] [--calibrations 4to8] [--before SERIES] [--fetch-bound-mb 2048] [--drained]
 
 The runs directory is what came back from the control node (the runbook's section 8); the
 figures go to a directory of their own, so that copying the runs again leaves them alone. A
@@ -34,6 +34,9 @@ into --out:
   lazy-before-after.svg
                     with --before: lazy in that series against lazy in this one (both repetitions
                     pooled), for a change that only lazy's path sees
+  NAME-drained.svg  with --drained: each compare_runs.py timeline again, past the load's end until
+                    every query is answered (compare_runs.py --until answer), for a series whose
+                    backlogs outlast the load
 
 and a PNG of each when rsvg-convert is installed. Runs that are missing are skipped.
 """
@@ -357,14 +360,17 @@ def compare_specs(runs, runset, before=None):
     return specs
 
 
-def timelines(runs, out, specs):
+def timelines(runs, out, specs, until="load"):
+    """compare_runs.py's timelines. until "answer": past the load's end until every query is
+    answered, the backlogs drained, as NAME-drained.svg beside the ones cut at the load's end."""
     for name, title, dirs, labels, slots in specs:
         paths = [os.path.join(runs, d) for d in dirs]
         if not all(os.path.exists(os.path.join(p, "latency.csv")) for p in paths):
             print("skipped", name, "(runs missing)")
             continue
+        name += "-drained" if until == "answer" else ""
         cmd = [sys.executable, os.path.join(os.path.dirname(HERE), "compare_runs.py")] + paths + \
-              ["--out", os.path.join(out, name), "--title", title]
+              ["--out", os.path.join(out, name), "--title", title, "--until", until]
         if labels:
             cmd += ["--labels", labels]
         if slots:
@@ -389,7 +395,8 @@ def capacity(runs, out, runset, calibrations):
     lo_rate, hi_rate = float(rate["Rate"]), float(rate["RateSteps"].split(",")[0].split(":")[1])
     svg = Svg()
     pw = W - LEFT - RIGHT
-    xr = (0, 1700)
+    top = max(s["offered_per_s"] for _, _, st in cals for s in st)
+    xr = (0, 1700 if top <= 1700 else ticks_to(top)[-1])  # every step on the axis, its dot and label too
     top_ans = max(s["answered_in_window_per_s"] for _, _, st in cals for s in st)
     p1 = Panel(svg, LEFT, 84, pw, 230, xr, "answered queries per second (in the 30 s window of each step)", "q/s",
                ymax=max(top_ans, 1000))
@@ -434,7 +441,7 @@ def capacity(runs, out, runset, calibrations):
                     "8 nodes after copy-then-flip moved every raw vector")
 
 
-def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=200.0):
+def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=None):
     rel = "%s/rep1/lazy" % runset
     run = os.path.join(runs, rel)
     if not os.path.exists(os.path.join(run, "stats-n5.jsonl")):
@@ -442,15 +449,21 @@ def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=200.0):
         return
     t0 = load_start(run)
     trig, flip, entries, _ = events(run)
+    new = ["n5", "n6", "n7", "n8"]
+    st = {n: jsonl(os.path.join(run, "stats-%s.jsonl" % n)) for n in new}
+    if hi is None:
+        # Until the new nodes' fetch caches have emptied, and 20 s more: about 200 s with the
+        # Wikipedia queries. Without locality (U11's worst case) they do not empty during the load.
+        end = load_end(run) or 360.0
+        busy = [r["t"] - t0 for n in new for r in st[n] if r["fetch"]["queued"] and r["t"] - t0 <= end]
+        hi = min(end, max(200.0, (max(busy) if busy else flip) + 20.0))
     cal4 = os.path.join(runs, calibrations, "calibrate-4", "calibration.json")
     c4 = sum(s["answered_in_window_per_s"] for s in load_json(cal4)[-3:]) / 3 if os.path.exists(cal4) else None
     exp = load_json(os.path.join(run, "experiment.json"))["Load"]
     offered = float(exp["RateSteps"].split(",")[0].split(":")[1])
     win = {round(w["t"]): w["answered"] for w in windows(read_latency(os.path.join(run, "latency.csv")), 1.0)}
     answered = [(t + 0.5, win.get(t)) for t in range(int(lo), int(hi))]
-    new = ["n5", "n6", "n7", "n8"]
     cls = {"n5": "c%d" % HOT_A, "n8": "c%d" % HOT_B, "n6": "ctx thin", "n7": "ctx thin"}
-    st = {n: jsonl(os.path.join(run, "stats-%s.jsonl" % n)) for n in new}
     queued = {n: [(r["t"] - t0, r["fetch"]["queued"]) for r in st[n]] for n in new}
     step = 2.0  # a fetch call can take a second: per 2 s, most bins have some
     per_call = {}
@@ -492,7 +505,7 @@ def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=200.0):
     for p in (p1, p2, p3, p4):
         p.vline(trig, "trigger" if p is p1 else None, "end")
         p.vline(flip, "flip" if p is p1 else None)
-        for i, e in enumerate(sorted(entries)):
+        for i, e in enumerate(sorted(e for e in entries if e <= hi)):  # later ones: after the window
             p.vline(e, ("new entries" if i == 0 else None) if p is p1 else None)
     p1.hline(offered, "offered %.0f q/s" % offered, cls="cu sched", anchor="start", dy=-5)
     if c4:  # labelled at the right end, where the line runs above it
@@ -801,16 +814,21 @@ def main():
     ap.add_argument("--before", help="another series, whose lazy runs lazy-before-after.svg draws against these")
     ap.add_argument("--fetch-bound-mb", type=int, default=2048,
                     help="the fetch cache's bound the runs had (default 2048; 64 before 2026-11-04, as in 4to8)")
+    ap.add_argument("--drained", action="store_true",
+                    help="also draw each timeline until every query is answered, the backlogs drained (NAME-drained.svg)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     specs = compare_specs(args.runs, args.series, args.before)
     timelines(args.runs, args.out, specs)
+    if args.drained:
+        timelines(args.runs, args.out, specs, until="answer")
     made = [capacity(args.runs, args.out, args.series, args.calibrations),
             lazy_fetch(args.runs, args.out, args.series, args.calibrations, args.fetch_bound_mb),
             node_reads(args.runs, args.out, args.series),
             ctf_stream(args.runs, args.out, args.series, args.calibrations),
             ctf_budget(args.runs, args.out, args.series)]
-    made += [os.path.join(args.out, n + ".svg") for n, _, _, _, _ in specs]
+    made += [os.path.join(args.out, n + suffix + ".svg") for n, _, _, _, _ in specs
+             for suffix in ("", "-drained") if suffix == "" or args.drained]
     if shutil.which("rsvg-convert"):
         for path in made:
             if path and os.path.exists(path):

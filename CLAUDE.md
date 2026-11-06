@@ -312,6 +312,21 @@ Next:
    - each pair's stream follows its new node's buffered writes: about 118 MB/s while the page
      cache takes them, 35-45 MB/s while the kernel writes back; the two runs differ by 7 s there;
    - every answer is the same in all six runs.
+
+   U11's worst case (2026-11-05, `results/cloudlab-gpu/4to8-worst`):
+   - **Setup:** 1M queries drawn from the base without repetition (`scripts/data/sample_queries.py`),
+     load 550 → 1100 q/s. The reads spread 28/26/24/23% over the nodes, so C4 = 742 and
+     C8 = 1466 q/s.
+   - **Lazy still leads.** From the trigger to the load's end it answers 296-299K queries, against
+     196K on one budget and 153-154K with the stream first. 8-12K queries wait at the load's end,
+     against 112K and 154K.
+   - **Without locality it pays:**
+     - it fetches 27.7 GB, 64% of the copy;
+     - it reaches the offered rate 105-110 s after the flip, against 3-7 s;
+     - the 2 GB fetch cache fills on n5: 7.3K-12.5K installs on the query's path, and 1 s stalls;
+     - the new entries come online only after the load, 314-328 s after the trigger: the graph
+       yields to data strictly (U16), and data moves the whole run.
+   - Every answer is the same in all six runs.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).
