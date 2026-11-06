@@ -95,19 +95,27 @@ def log(msg):
     print(msg, flush=True)
 
 
-def load_index(index_dir):
-    """Heads (as float32), and the lists as CSR (offsets, vector IDs)."""
+def load_index(index_dir, need_heads, need_ids):
+    """The number of heads; their vectors as float32 if need_heads (a kNN graph over them); the
+    lists as CSR: offsets, and the vector IDs if need_ids (--points vectors). Only what the run
+    needs: at scale the two are most of the memory, and --points heads over the index's graph
+    needs neither (Amazon 300M: 3.1M heads of 768 dims, 9.6 GB as float32; 2.4G postings with
+    almost 8 replicas per vector, 9.5 GB of IDs)."""
     meta = dict(l.strip().split("=", 1) for l in open(os.path.join(index_dir, "meta.txt")) if "=" in l)
     with open(os.path.join(index_dir, "centroids.bin"), "rb") as f:
         n, dim = struct.unpack("<II", f.read(8))
-        heads = np.fromfile(f, dtype=DTYPES[meta["dtype"]], count=n * dim).reshape(n, dim)
-    with open(os.path.join(index_dir, "postings.bin"), "rb") as f:
+        heads = (np.fromfile(f, dtype=DTYPES[meta["dtype"]], count=n * dim).reshape(n, dim).astype(np.float32)
+                 if need_heads else None)
+    path = os.path.join(index_dir, "postings.bin")
+    with open(path, "rb") as f:
         num_lists, num_ids = struct.unpack("<QQ", f.read(16))
         offsets = np.fromfile(f, dtype=np.uint64, count=num_lists + 1)
-        ids = np.fromfile(f, dtype=np.uint32, count=num_ids)
-    if num_lists != n or len(ids) != num_ids:
+        ids = np.fromfile(f, dtype=np.uint32, count=num_ids) if need_ids else None
+    if num_lists != n:
         sys.exit("centroids.bin has %d heads, postings.bin %d lists" % (n, num_lists))
-    return heads.astype(np.float32), offsets.astype(np.int64), ids
+    if os.path.getsize(path) < 16 + 8 * (num_lists + 1) + 4 * num_ids:
+        sys.exit("%s is cut off: %d lists of %d IDs in all do not fit" % (path, num_lists, num_ids))
+    return n, heads, offsets.astype(np.int64), ids
 
 
 def load_vectors(path):
@@ -284,7 +292,8 @@ def main():
     if a.points == "vectors" and (a.graph_source != "knn" or a.weights != "unit"):
         sys.exit("--graph-source index and --weights postings are for --points heads")
 
-    heads, offsets, ids = load_index(a.index_dir)
+    num_heads, heads, offsets, ids = load_index(a.index_dir, need_heads=a.points == "heads" and a.graph_source == "knn",
+                                                need_ids=a.points == "vectors")
     sizes = np.diff(offsets)
     if a.graph_source == "index":
         t = time.monotonic()
@@ -303,7 +312,7 @@ def main():
         if a.graph:
             write_graph(a.graph, xadj, adj)
     n = len(xadj) - 1
-    want = len(heads) if a.points == "heads" else int(ids.max()) + 1
+    want = num_heads if a.points == "heads" else int(ids.max()) + 1
     if n != want:
         sys.exit("the graph has %d points, the %s have %d" % (n, a.points, want))
 
