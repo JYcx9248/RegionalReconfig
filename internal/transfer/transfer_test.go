@@ -182,6 +182,34 @@ func TestPullPQ(t *testing.T) {
 	}
 }
 
+// A pull whose sink cancels its context fails, and the failed pull closes the Puller, while the
+// cancellation's hook (which interrupts a pull blocked on the connection) may still be on its
+// way. The hook must not find the Puller closed: a staging cancels its pulls this way when a
+// PQ_PUT fails (2026-11-08: a nil connection there panicked the agent).
+func TestPullerCancelledFromItsSink(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	srv := &Server{}
+	srv.PQ = func(_ context.Context, ids []uint32) (int, []byte, error) {
+		return 4, make([]byte, 4*len(ids)), nil
+	}
+	go srv.Serve(ln)
+	ids := []uint32{1, 2, 3}
+	for range 500 {
+		pl := NewPuller(ln.Addr().String())
+		ctx, cancel := context.WithCancel(context.Background())
+		_, err := pl.PullPQ(ctx, ids, 0, func([]uint32, int, []byte) error {
+			cancel()
+			return ctx.Err()
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pull cancelled by its sink: %v", err)
+		}
+		pl.Close()
+	}
+	time.Sleep(50 * time.Millisecond) // the last hooks run
+}
+
 // Raw vectors come through the same record protocol at the class the client asks for; a
 // server without a raw-vector source refuses.
 func TestPullRaw(t *testing.T) {

@@ -44,9 +44,10 @@ const DefaultPQBatch = 1 << 16
 // a batch is at most 32 MB).
 const DefaultRawBatch = 1 << 13
 
-// Keys the server asks its data node for at a time.
+// Keys the server asks its data node for at a time. A PULL_PQ request is one PQ_GET: in 4 of 16K
+// codes, one after the other, the node's work was a fifth of a request's time (2026-11-08).
 const (
-	nodePQBatch  = 1 << 14
+	nodePQBatch  = DefaultPQBatch
 	nodeRawBatch = 1 << 12
 )
 
@@ -237,7 +238,10 @@ func (p *Puller) pull(ctx context.Context, k recordKind, class Class, keys []uin
 			p.Close()
 		}
 	}()
-	stop := context.AfterFunc(ctx, func() { p.c.SetDeadline(time.Now()) })
+	// The connection as it is now: a failed pull closes the Puller (p.c = nil), and the function
+	// can still run after that, once stop no longer holds it back.
+	c := p.c
+	stop := context.AfterFunc(ctx, func() { c.SetDeadline(time.Now()) })
 	defer stop()
 	for first := 0; first < len(keys); first += batch {
 		end := min(first+batch, len(keys))
@@ -300,6 +304,9 @@ func readRecords(br *bufio.Reader, addr string, k recordKind, n int) (int, []byt
 				return 0, nil, fmt.Errorf("transfer: bad %s chunk from %s", k.what, addr)
 			}
 			size = fs
+			if data == nil && n*fs <= frame.MaxFrameBytes { // the whole answer at once, not copied as it grows
+				data = make([]byte, 0, n*fs)
+			}
 			data = append(data, part...)
 			crc = crc32.Update(crc, crc32.IEEETable, part)
 		case k.done:

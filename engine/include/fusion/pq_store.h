@@ -35,7 +35,9 @@
 // they find a referenced code's slot and location without it too (Locate, SlotOf): a load, a
 // reclaim or a peer's PQ_GET never holds a query back. The lock guards the references and the
 // slots' states; a load holds it once, over the segment's distinct vectors in ID order, and does
-// the per-posting work outside it, so that several partitions load at once.
+// the per-posting work outside it, so that several partitions load at once. A Put holds it only
+// to hand out slots: it claims its IDs and writes their codes without it, so that a staging's
+// PQ_PUTs install side by side.
 //
 // The store is also where the node looks up a vector's raw-vector location (fusion/layout.h,
 // RawLayout): the segments carry it next to every posting, and Ref records it with the code.
@@ -93,8 +95,9 @@ class PQStore {
  public:
   static constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
   static constexpr uint32_t kNoLoc = 0xFFFFFFFFu;
-  // Called (under the store's lock) after Put wrote new codes into `slots` (ascending) of
-  // codes(); the GPU filter copies them into device memory. If it throws, the Put is undone.
+  // Called after Put wrote new codes into `slots` (ascending) of codes(), before it publishes
+  // them, without the store's lock (Puts may call it concurrently); the GPU filter copies them
+  // into device memory. If it throws, the Put is undone.
   using Mirror = std::function<void(const uint32_t* slots, uint32_t n)>;
 
   // num_vectors: size of the ID space; m: bytes per code; capacity: slots (<= num_vectors).
@@ -111,10 +114,11 @@ class PQStore {
   // Same, for a staging: the codes that ARE here are protected (staged) until a partition
   // that names them loads, or ReleaseStaged, so that no Put of the same staging drops them.
   std::vector<uint32_t> Reserve(const uint32_t* ids, size_t n);
-  // Installs n codes (m bytes each, in the order of ids) as staged. IDs already held are
-  // skipped (their code is kept). Cached codes are dropped if the new ones do not fit
-  // otherwise; if they still do not fit, throws PQCapacityError and changes nothing. Returns
-  // the number of codes installed.
+  // Installs n codes (m bytes each, in the order of ids) as staged. IDs already held, or being
+  // installed by a concurrent Put, are skipped (their code is kept). Cached codes are dropped if
+  // the new ones do not fit otherwise; if they still do not fit, throws PQCapacityError and
+  // changes nothing. Returns the number of codes installed. Puts run concurrently, but for the
+  // slots' accounting.
   size_t Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigin origin);
   // Copies the codes of ids[0..n) into out (n x m bytes). Throws PQMissingError if one is absent.
   void Get(const uint32_t* ids, size_t n, uint8_t* out);
@@ -170,9 +174,17 @@ class PQStore {
   void FreeLocked(uint32_t slot);
   void EvictLocked(uint64_t count);  // drops `count` cached codes; caller checked they exist
 
-  // Their entries are written under the lock and read without it by Locate and SlotOf.
-  uint32_t SlotLocked(uint32_t id) const { return slot_of_[id].load(std::memory_order_relaxed); }
-  void SetSlot(uint32_t id, uint32_t s) { slot_of_[id].store(s, std::memory_order_relaxed); }
+  // slot_of_ is written under the lock, except by Put, which claims an ID (kPending) and
+  // publishes its slot without it; Locate and SlotOf read it without the lock. A slot is
+  // published after its code is written (release), so a reader that finds it (acquire) finds the
+  // code. loc_ is written under the lock and read without it by Locate.
+  uint32_t SlotLocked(uint32_t id) const { return slot_of_[id].load(std::memory_order_acquire); }
+  void SetSlot(uint32_t id, uint32_t s) { slot_of_[id].store(s, std::memory_order_release); }
+  // The slot of id's code, or kNoSlot: none here, or a Put of it in progress (kPending).
+  uint32_t Held(uint32_t id) const {
+    const uint32_t s = SlotLocked(id);
+    return s < capacity_ ? s : kNoSlot;
+  }
   uint32_t LocLocked(uint32_t s) const { return loc_[s].load(std::memory_order_relaxed); }
   void SetLoc(uint32_t s, uint32_t loc) { loc_[s].store(loc, std::memory_order_relaxed); }
 

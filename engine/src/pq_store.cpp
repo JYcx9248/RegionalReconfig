@@ -102,7 +102,7 @@ std::vector<uint32_t> PQStore::Missing(const uint32_t* ids, size_t n) const {
   if (!v.empty() && v.back() >= n_)
     throw std::invalid_argument(StrFormat("vector ID %u out of range", v.back()));
   std::lock_guard<std::mutex> l(mu_);
-  v.erase(std::remove_if(v.begin(), v.end(), [&](uint32_t id) { return SlotLocked(id) != kNoSlot; }),
+  v.erase(std::remove_if(v.begin(), v.end(), [&](uint32_t id) { return Held(id) != kNoSlot; }),
           v.end());
   return v;
 }
@@ -115,8 +115,8 @@ std::vector<uint32_t> PQStore::Reserve(const uint32_t* ids, size_t n) {
   missing.reserve(v.size());
   std::lock_guard<std::mutex> l(mu_);
   for (uint32_t id : v) {
-    const uint32_t s = SlotLocked(id);
-    if (s == kNoSlot) {
+    const uint32_t s = Held(id);
+    if (s == kNoSlot) {  // or a Put of it in progress: listed again, the later Put skips it
       missing.push_back(id);
       continue;
     }
@@ -131,86 +131,105 @@ std::vector<uint32_t> PQStore::Reserve(const uint32_t* ids, size_t n) {
   return missing;
 }
 
+// Concurrent Puts run side by side (a staging installs the codes of several sources at once):
+// most of a Put is a random access per ID into slot_of_, about 30 ms for 62K codes on
+// CloudLab's c240g5, and under the lock a node's PQ_PUTs went one at a time (2026-11-08). So
+// each new ID is claimed with a CAS (kNoSlot -> kPending), which also leaves a repeated ID to
+// its first claim, in this batch or another; the lock only hands out the slots and keeps the
+// accounting; the codes, the mirror and the slots' publication happen outside it. Until its
+// slot is published, a claimed ID reads as absent everywhere (Held: kNoSlot), and its
+// slot -- staged, never referenced -- is left alone (EvictLocked drops only cached codes,
+// ReleaseStaged only published ones).
 size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigin origin) {
-  std::lock_guard<std::mutex> l(mu_);
+  for (size_t i = 0; i < n; ++i)
+    if (ids[i] >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", ids[i]));
   // Everything that allocates happens before the first change, so an allocation failure
   // leaves the store as it was.
   std::vector<size_t> fresh;
   fresh.reserve(n);
   std::vector<uint32_t> slots;
   slots.reserve(n);
-  std::vector<uint32_t> sorted;
-  if (mirror_) sorted.reserve(n);
-  // Pass 1: find the new IDs (also deduplicates within the batch) without changing anything
-  // visible; undone if the batch is rejected.
-  auto undo_pending = [&] {
+  for (size_t i = 0; i < n; ++i) {
+    uint32_t was = kNoSlot;
+    if (slot_of_[ids[i]].compare_exchange_strong(was, kPending, std::memory_order_relaxed)) fresh.push_back(i);
+  }
+  auto unclaim = [&] {
     for (size_t i : fresh) SetSlot(ids[i], kNoSlot);
   };
-  for (size_t i = 0; i < n; ++i) {
-    const uint32_t id = ids[i];
-    if (id >= n_) {
-      undo_pending();
-      throw std::invalid_argument(StrFormat("vector ID %u out of range", id));
-    }
-    if (SlotLocked(id) == kNoSlot) {
-      SetSlot(id, kPending);
-      fresh.push_back(i);
-    }
-  }
-  const uint64_t free_slots = capacity_ - st_.resident;
-  if (fresh.size() > free_slots) {
-    const uint64_t need = fresh.size() - free_slots;
-    if (need > st_.cached) {
-      undo_pending();
-      throw PQCapacityError(StrFormat(
-          "PQ capacity exceeded: %zu new codes, %llu of %llu slots free, %llu cached codes to drop",
-          fresh.size(), static_cast<unsigned long long>(free_slots),
-          static_cast<unsigned long long>(capacity_), static_cast<unsigned long long>(st_.cached)));
-    }
-    EvictLocked(need);  // cached codes make room; live and staged ones are never dropped
-  }
-  // Pass 2: take slots and copy the codes.
-  slots.resize(fresh.size());
-  for (size_t k = 0; k < fresh.size(); ++k) {
-    uint32_t s;
-    if (!free_.empty()) {
-      s = free_.back();
-      free_.pop_back();
-    } else {
-      s = static_cast<uint32_t>(next_++);
-    }
-    const uint32_t id = ids[fresh[k]];
-    SetLoc(s, kNoLoc);       // known once a partition that names it loads (Ref)
-    SetSlot(id, s);
-    id_of_[s] = id;
-    refs_[s] = 0;
-    flags_[s] = kProtected;  // staged until a partition that names it loads
-    std::memcpy(codes_.get() + static_cast<uint64_t>(s) * m_, codes + fresh[k] * m_, m_);
-    slots[k] = s;
-  }
-  if (mirror_ && !slots.empty()) {
-    sorted.assign(slots.begin(), slots.end());  // within the reserved capacity
-    std::sort(sorted.begin(), sorted.end());
+  Mirror mirror;
+  {
+    std::lock_guard<std::mutex> l(mu_);
     try {
-      mirror_(sorted.data(), static_cast<uint32_t>(sorted.size()));
+      mirror = mirror_;  // std::function may allocate
     } catch (...) {
-      for (uint32_t s : slots) {
-        SetSlot(id_of_[s], kNoSlot);
+      unclaim();
+      throw;
+    }
+    const uint64_t free_slots = capacity_ - st_.resident;
+    if (fresh.size() > free_slots) {
+      const uint64_t need = fresh.size() - free_slots;
+      if (need > st_.cached) {
+        unclaim();
+        throw PQCapacityError(StrFormat(
+            "PQ capacity exceeded: %zu new codes, %llu of %llu slots free, %llu cached codes to drop",
+            fresh.size(), static_cast<unsigned long long>(free_slots),
+            static_cast<unsigned long long>(capacity_), static_cast<unsigned long long>(st_.cached)));
+      }
+      EvictLocked(need);  // cached codes make room; live and staged ones are never dropped
+    }
+    slots.resize(fresh.size());
+    for (size_t k = 0; k < fresh.size(); ++k) {
+      uint32_t s;
+      if (!free_.empty()) {
+        s = free_.back();
+        free_.pop_back();
+      } else {
+        s = static_cast<uint32_t>(next_++);
+      }
+      SetLoc(s, kNoLoc);  // known once a partition that names it loads (Ref)
+      id_of_[s] = ids[fresh[k]];
+      refs_[s] = 0;
+      flags_[s] = kProtected;  // staged until a partition that names it loads
+      slots[k] = s;
+    }
+    st_.resident += fresh.size();
+    st_.staged += fresh.size();
+    switch (origin) {
+      case PQOrigin::kIndex: st_.from_index += fresh.size(); break;
+      case PQOrigin::kSnapshot: st_.restored += fresh.size(); break;
+      case PQOrigin::kReceived: st_.received += fresh.size(); break;
+    }
+    st_.skipped += n - fresh.size();
+  }
+  for (size_t k = 0; k < fresh.size(); ++k)
+    std::memcpy(codes_.get() + static_cast<uint64_t>(slots[k]) * m_, codes + fresh[k] * m_, m_);
+  if (mirror && !slots.empty()) {
+    try {
+      std::vector<uint32_t> sorted(slots);
+      std::sort(sorted.begin(), sorted.end());
+      mirror(sorted.data(), static_cast<uint32_t>(sorted.size()));
+    } catch (...) {
+      std::lock_guard<std::mutex> l(mu_);
+      for (size_t k = 0; k < fresh.size(); ++k) {
+        const uint32_t s = slots[k];
+        SetSlot(ids[fresh[k]], kNoSlot);
         id_of_[s] = kNoSlot;
         flags_[s] = 0;
-        free_.push_back(s);
+        free_.push_back(s);  // within its reserved capacity
       }
+      st_.resident -= fresh.size();
+      st_.staged -= fresh.size();
+      switch (origin) {
+        case PQOrigin::kIndex: st_.from_index -= fresh.size(); break;
+        case PQOrigin::kSnapshot: st_.restored -= fresh.size(); break;
+        case PQOrigin::kReceived: st_.received -= fresh.size(); break;
+      }
+      st_.skipped -= n - fresh.size();
       throw;
     }
   }
-  st_.resident += fresh.size();
-  st_.staged += fresh.size();
-  switch (origin) {
-    case PQOrigin::kIndex: st_.from_index += fresh.size(); break;
-    case PQOrigin::kSnapshot: st_.restored += fresh.size(); break;
-    case PQOrigin::kReceived: st_.received += fresh.size(); break;
-  }
-  st_.skipped += n - fresh.size();
+  // Last: a reader that finds a slot (SlotLocked, Held, SlotOf: acquire) finds its code written.
+  for (size_t k = 0; k < fresh.size(); ++k) SetSlot(ids[fresh[k]], slots[k]);
   return fresh.size();
 }
 
@@ -219,7 +238,7 @@ void PQStore::Get(const uint32_t* ids, size_t n, uint8_t* out) {
   for (size_t i = 0; i < n; ++i) {
     const uint32_t id = ids[i];
     if (id >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", id));
-    const uint32_t s = SlotLocked(id);
+    const uint32_t s = Held(id);
     if (s == kNoSlot) throw PQMissingError(StrFormat("no PQ code for vector %u on this node", id));
     std::memcpy(out + i * m_, codes_.get() + static_cast<uint64_t>(s) * m_, m_);
   }
@@ -239,7 +258,7 @@ void PQStore::Ref(const uint32_t* ids, size_t n, uint32_t* slots_out, const uint
   uint32_t first = 0;
   for (size_t i = 0; i < n; ++i) {
     const uint32_t id = ids[i];
-    const uint32_t s = SlotLocked(id);
+    const uint32_t s = Held(id);
     if (s == kNoSlot) {
       if (missing++ == 0) first = id;
       continue;
@@ -253,7 +272,7 @@ void PQStore::Ref(const uint32_t* ids, size_t n, uint32_t* slots_out, const uint
     throw PQMissingError(StrFormat("%zu vectors a segment names have no PQ code on this node "
                                    "(first: vector %u)", missing, first));
   for (size_t i = 0; i < n; ++i) {
-    const uint32_t s = SlotLocked(ids[i]);
+    const uint32_t s = Held(ids[i]);  // published: a slot only goes away under the lock
     const Category before = CategoryOf(s);
     ++refs_[s];
     flags_[s] = static_cast<uint8_t>((flags_[s] & ~kProtected) | kEverReferenced);
@@ -268,8 +287,7 @@ void PQStore::Ref(const uint32_t* ids, size_t n, uint32_t* slots_out, const uint
 
 uint32_t PQStore::SlotOf(uint32_t id) const {
   if (id >= n_) return kNoSlot;
-  const uint32_t s = SlotLocked(id);
-  return s < capacity_ ? s : kNoSlot;  // kPending: a Put of it in progress
+  return Held(id);
 }
 
 size_t PQStore::Locate(const uint32_t* ids, size_t n, uint32_t* locs_out) const {
@@ -307,6 +325,7 @@ size_t PQStore::ReleaseStaged() {
   for (uint64_t i = 0; i < next_; ++i) {
     const uint32_t s = static_cast<uint32_t>(i);
     if (id_of_[s] == kNoSlot || !(flags_[s] & kProtected)) continue;
+    if (SlotLocked(id_of_[s]) != s) continue;  // a Put's, not published yet: it ends after this
     if (refs_[s] == 0 && !(flags_[s] & kEverReferenced)) {  // installed for the staging, unused
       FreeLocked(s);
       ++freed;
@@ -332,7 +351,7 @@ size_t PQStore::Forget(const uint32_t* ids, size_t n, bool deleted) {
   size_t freed = 0;
   for (size_t i = 0; i < n; ++i) {
     if (ids[i] >= n_) continue;
-    const uint32_t s = SlotLocked(ids[i]);
+    const uint32_t s = Held(ids[i]);
     if (s == kNoSlot) continue;
     if (CategoryOf(s) == kCached) {
       FreeLocked(s);
@@ -383,7 +402,7 @@ uint64_t PQStore::Save(const std::string& path, uint32_t codebook_crc) const {
   std::vector<uint32_t> ids;
   ids.reserve(st_.resident);
   for (uint64_t id = 0; id < n_; ++id)
-    if (SlotLocked(static_cast<uint32_t>(id)) != kNoSlot) ids.push_back(static_cast<uint32_t>(id));
+    if (Held(static_cast<uint32_t>(id)) != kNoSlot) ids.push_back(static_cast<uint32_t>(id));
   std::string tmp = path + ".tmp.XXXXXX";
   const int fd = ::mkstemp(&tmp[0]);
   FUSION_CHECK(fd >= 0, "cannot create %s: %s", tmp.c_str(), std::strerror(errno));
@@ -402,7 +421,7 @@ uint64_t PQStore::Save(const std::string& path, uint32_t codebook_crc) const {
       const size_t k = std::min<size_t>(kSnapChunk, ids.size() - i);
       buf.resize(k * m_);
       for (size_t j = 0; j < k; ++j)
-        std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(SlotLocked(ids[i + j])) * m_, m_);
+        std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(Held(ids[i + j])) * m_, m_);
       WriteAll(fd, buf.data(), buf.size(), tmp);
     }
     FUSION_CHECK(::fsync(fd) == 0, "fsync %s: %s", tmp.c_str(), std::strerror(errno));

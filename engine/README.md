@@ -97,7 +97,12 @@ the first posting of each, takes their references under the store's lock in ID o
 (`PQStore::Ref`, whose slots then come mostly in order too), and resolves each posting's slot
 (`PQStore::SlotOf`) and holder (the raw store's presence bits and a view of the fetch cache,
 `HeldView`) outside it. The reclaimer gives the references back by the slots the segment kept
-(`ref_slots`), and RERANK finds its candidates' locations without the lock (`Locate`). At
+(`ref_slots`), and RERANK finds its candidates' locations without the lock (`Locate`).
+Concurrent `PQ_PUT`s install side by side: `PQStore::Put` claims each new ID with a CAS (the
+ID reads as absent until its slot is published), takes the lock only to hand out the slots and
+count them, and writes the codes, the GPU mirror's copy and finally the slots (release) outside
+it. On a laptop at the scale below, 49M codes in 62K Puts: 3.7 s one at a time, as under the
+lock, 1.15 s four at once, 0.75 s eight (under the lock, any number took 3.6-3.9 s). At
 Amazon 300M's scale (37M postings over 7M vectors a partition, 49M codes on the node), on a
 laptop: a load 3.4 s instead of 27 -- 20 of which went to sorting the postings' locations and
 binary-searching each posting's among them, 5.7 to a reference per posting under the lock --

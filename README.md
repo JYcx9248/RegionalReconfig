@@ -28,7 +28,12 @@ vector's code once, however many of its postings name the vector: a load finds i
 vectors with a bit per ID, takes their references under the PQ store's lock and does the
 per-posting work outside it, and the agent loads 8 partitions at once (2026-11-07; one at a time,
 a partition of Amazon 300M took 26 s). Queries find codes' slots and locations without the lock,
-so neither a load nor a reclaim holds one back. `rtier_node --pq-capacity N` sets a
+so neither a load nor a reclaim holds one back. PQ_PUTs install side by side: a Put claims each
+new ID with a CAS and writes the codes outside the lock, which only hands out the slots; the
+agent keeps 4 `PULL_PQ` requests in flight to each source and 4 `PQ_PUT`s to its node, and
+takes the whole listing as it streams, so that no source waits for another (2026-11-08; before,
+Amazon 300M's new nodes collected their 49M codes in 38-44 s, at 80-110 MB/s, neither end half
+busy). `rtier_node --pq-capacity N` sets a
 node's budget (its HBM, in codes); the runners size it from the partitions
 (`"PQCapacity": "auto"`, the default: the most distinct vectors one node's partitions name
 at the smallest cluster size, plus `"PQHeadroom"`, 10%; `bin/rtier-client pq-share`

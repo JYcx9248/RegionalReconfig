@@ -804,6 +804,113 @@ void TestStageVersions() {
   CHECK(refused);
 }
 
+// Concurrent Puts, as a staging's PQ_PUTs from several sources run: each ID is installed once,
+// by whichever Put claims it first, and skipped by the others; every code is the one sent; the
+// accounting adds up; a reader never finds a slot before its code is whole. With room for only
+// half the codes, the Puts that do not fit change nothing: no ID stays claimed.
+void TestPQStoreConcurrentPuts() {
+  constexpr uint32_t kIds = 20000, kM = 8;
+  constexpr int kWriters = 8;
+  auto code = [](uint32_t id, uint32_t j) { return static_cast<uint8_t>(id * 7 + j * 13); };
+  std::vector<std::vector<uint32_t>> lists(kWriters);  // each a random third of the IDs, shuffled
+  std::mt19937 rng(5);
+  for (auto& l : lists) {
+    for (uint32_t id = 0; id < kIds; ++id)
+      if (rng() % 3 == 0) l.push_back(id);
+    std::shuffle(l.begin(), l.end(), rng);
+  }
+  std::set<uint32_t> distinct;
+  for (const auto& l : lists) distinct.insert(l.begin(), l.end());
+  // Writers put their lists in batches of 500, a reader Gets random IDs throughout. Returns the
+  // codes installed, the IDs offered, the Puts refused for capacity, the codes read wrong.
+  struct Result {
+    uint64_t installed = 0, offered = 0, refused = 0, wrong = 0, unsorted = 0, mirrored = 0;
+  };
+  auto run = [&](PQStore& s) {
+    std::atomic<uint64_t> installed{0}, offered{0}, refused{0}, wrong{0}, unsorted{0}, mirrored{0};
+    s.SetMirror([&](const uint32_t* slots, uint32_t n) {
+      if (!std::is_sorted(slots, slots + n)) ++unsorted;
+      mirrored += n;
+    });
+    std::atomic<bool> done{false};
+    std::thread reader([&] {
+      std::vector<uint8_t> out(kM);
+      std::mt19937 r(9);
+      while (!done) {
+        const uint32_t id = static_cast<uint32_t>(r() % kIds);
+        try {
+          s.Get(&id, 1, out.data());
+          for (uint32_t j = 0; j < kM; ++j)
+            if (out[j] != code(id, j)) ++wrong;
+        } catch (const PQMissingError&) {
+        }
+      }
+    });
+    std::vector<std::thread> writers;
+    for (int w = 0; w < kWriters; ++w)
+      writers.emplace_back([&, w] {
+        const auto& l = lists[w];
+        std::vector<uint8_t> c;
+        for (size_t lo = 0; lo < l.size(); lo += 500) {
+          const size_t n = std::min<size_t>(500, l.size() - lo);
+          c.resize(n * kM);
+          for (size_t i = 0; i < n; ++i)
+            for (uint32_t j = 0; j < kM; ++j) c[i * kM + j] = code(l[lo + i], j);
+          try {
+            installed += s.Put(l.data() + lo, n, c.data(), PQOrigin::kReceived);
+            offered += n;
+          } catch (const PQCapacityError&) {
+            ++refused;
+          }
+        }
+      });
+    for (auto& t : writers) t.join();
+    done = true;
+    reader.join();
+    s.SetMirror(nullptr);
+    return Result{installed, offered, refused, wrong, unsorted, mirrored};
+  };
+  auto codes_right = [&](PQStore& s, uint64_t* present) {  // and no two IDs share a slot
+    std::set<uint32_t> slots;
+    std::vector<uint8_t> out(kM);
+    bool right = true;
+    for (uint32_t id = 0; id < kIds; ++id) {
+      const uint32_t slot = s.SlotOf(id);
+      if (slot == PQStore::kNoSlot) continue;
+      slots.insert(slot);
+      s.Get(&id, 1, out.data());
+      for (uint32_t j = 0; j < kM; ++j) right = right && out[j] == code(id, j);
+    }
+    *present = slots.size();
+    return right;
+  };
+
+  PQStore s(kIds, kM, kIds);
+  const Result r = run(s);
+  PQStats st = s.Stats();
+  uint64_t present = 0;
+  CHECK(r.refused == 0 && r.installed == distinct.size() && r.mirrored == distinct.size());
+  CHECK(st.resident == distinct.size() && st.staged == distinct.size() && st.received == distinct.size() &&
+        st.skipped == r.offered - distinct.size());
+  CHECK(r.wrong == 0 && r.unsorted == 0);
+  CHECK(codes_right(s, &present) && present == distinct.size());
+
+  PQStore half(kIds, kM, distinct.size() / 2);
+  const Result h = run(half);
+  st = half.Stats();
+  CHECK(h.refused > 0 && h.installed == st.resident && h.mirrored == st.resident && h.wrong == 0);
+  CHECK(codes_right(half, &present) && present == st.resident);
+  // Every refused ID went back to absent: once the staged codes are released, all of them fit
+  // again, one Put at a time (an ID left claimed would be skipped).
+  CHECK(half.ReleaseStaged() == st.resident && half.Stats().resident == 0);
+  std::vector<uint32_t> some(distinct.begin(), distinct.end());
+  some.resize(half.capacity());
+  std::vector<uint8_t> c(some.size() * kM);
+  for (size_t i = 0; i < some.size(); ++i)
+    for (uint32_t j = 0; j < kM; ++j) c[i * kM + j] = code(some[i], j);
+  CHECK(half.Put(some.data(), some.size(), c.data(), PQOrigin::kReceived) == some.size());
+}
+
 void TestPQStore() {
   PQStore s(100, 2, 5);  // IDs 0..99, 2-byte codes, room for 5 codes
   auto codes_of = [](const std::vector<uint32_t>& ids) {
@@ -3333,6 +3440,7 @@ int main() {
       {"inserted_vectors", TestInsertedVectors},
       {"stage_versions", TestStageVersions},
       {"pq_store", TestPQStore},
+      {"pq_store_concurrent_puts", TestPQStoreConcurrentPuts},
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},
       {"pq_from_index", TestPQFromIndex},

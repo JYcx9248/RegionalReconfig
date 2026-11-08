@@ -139,7 +139,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   moved away (`engine/include/fusion/pq_store.h`). A resident partition references each code
   once; a load takes its distinct vectors' references under the store's lock and does the
   per-posting work outside it, 8 partitions at once (`loadStreams`), and RERANK's lookups take
-  no lock (2026-11-07). Placement `even-reversible-graph` (the
+  no lock (2026-11-07). A Put claims its new IDs with a CAS and writes the codes outside the
+  lock, so a staging's PQ_PUTs install side by side; the agent keeps 4 `PULL_PQ`s in flight per
+  source and 4 `PQ_PUT`s to its node (`pqStreams`, `pqPutters`, 2026-11-08). Placement
+  `even-reversible-graph` (the
   default) returns partitions to former owners so a scale-in moves no PQ code. The runners give
   every node a budget (`--pq-capacity`) of the fullest node's codes at the smallest cluster size,
   plus 10% (`"PQCapacity": "auto"`, `rtier-client pq-share`; a run with a rebuild gets the

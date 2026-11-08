@@ -461,13 +461,20 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 	return nil
 }
 
-// pqStreams is how many PULL_PQ requests are in flight to one source at once.
-const pqStreams = 2
+// A staging keeps pqStreams PULL_PQ requests in flight to each source, and pqPutters PQ_PUTs to
+// its own data node: a worker hands the codes it pulled to a putter and asks its source for the
+// next batch at once, so that neither end waits for the other (the node installs concurrent
+// PQ_PUTs side by side, PQStore::Put). With 2 requests per source, each waiting for its own
+// PQ_PUT, Amazon 300M's new nodes took 38-44 s for their 49M codes, at 80-110 MB/s, while
+// neither end was half busy (2026-11-08).
+const (
+	pqStreams = 4
+	pqPutters = 4
+)
 
 // pullMissingPQ has the data node list the PQ codes the sources' partitions need that it lacks
 // (each under one source only) and pulls them from those sources as the listing streams in, in
-// requests of up to DefaultPQBatch codes, pqStreams at once per source: the first codes come
-// while the rest are listed.
+// requests of up to DefaultPQBatch codes: the first codes come while the rest are listed.
 func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, reply *protocol.StageReply) error {
 	groups := make([][]nodeclient.Segment, len(sources))
 	for i, src := range sources {
@@ -475,67 +482,155 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 			groups[i] = append(groups[i], nodeclient.Segment{Partition: p, Version: src.VersionOf(j)})
 		}
 	}
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
 		mu    sync.Mutex
 		first error
-		wg    sync.WaitGroup
 	)
-	queues := make([]chan []uint32, len(sources))
+	fail := func(err error) {
+		mu.Lock()
+		if first == nil {
+			first = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+	// The PQ_PUTs. Not cancelled with ctx: pullMissingPQ returns once every one has been answered,
+	// so that a cleanup that follows a failure (PQ_RELEASE) sees all the codes installed. After a
+	// failure the putters only empty their queue.
+	type put struct {
+		ids   []uint32
+		m     int
+		codes []byte
+	}
+	puts := make(chan put, pqPutters)
+	var putters sync.WaitGroup
+	for range pqPutters {
+		putters.Add(1)
+		go func() {
+			defer putters.Done()
+			for pt := range puts {
+				if ctx.Err() != nil {
+					continue
+				}
+				pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+				_, _, err := a.localBulk.PQPut(pctx, pt.ids, pt.m, pt.codes)
+				pcancel()
+				if err != nil {
+					fail(fmt.Errorf("installing PQ codes: %w", err))
+				}
+			}
+		}()
+	}
+	queues := make([]*idQueue, len(sources))
+	var workers sync.WaitGroup
 	for i := range sources {
-		queues[i] = make(chan []uint32, pqStreams)
+		queues[i] = newIDQueue()
 		for range pqStreams {
-			wg.Add(1)
+			workers.Add(1)
 			go func() {
-				defer wg.Done()
+				defer workers.Done()
 				pl := transfer.NewPuller(sources[i].Addr) // one connection for this worker's requests
 				defer pl.Close()
-				for ids := range queues[i] {
+				for {
+					ids, ok := queues[i].pop()
+					if !ok {
+						return
+					}
 					if ctx.Err() != nil {
 						continue // after a failure: only empties the queue
 					}
 					st, err := pl.PullPQ(ctx, ids, 0, func(ids []uint32, m int, codes []byte) error {
-						// Not cancelled with ctx: once every pull has returned, every PQ_PUT has been
-						// answered, so a cleanup that follows a failure sees all installed codes.
-						pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-						defer cancel()
-						_, _, err := a.localBulk.PQPut(pctx, ids, m, codes)
-						return err
+						select { // the codes are this batch's own: the putter may keep them
+						case puts <- put{ids, m, codes}:
+							return nil
+						case <-ctx.Done():
+							return ctx.Err()
+						}
 					})
 					mu.Lock()
 					reply.PQCodes += st.Codes
 					reply.PQBytes += st.Bytes
-					if err != nil && first == nil {
-						first = fmt.Errorf("PQ codes from %s: %w", sources[i].Addr, err)
-						cancel()
-					}
 					mu.Unlock()
+					if err != nil && ctx.Err() == nil {
+						fail(fmt.Errorf("PQ codes from %s: %w", sources[i].Addr, err))
+					}
 				}
 			}()
 		}
 	}
-	lerr := a.localBulk.PQMissing(ctx, groups, func(g int, ids []uint32) error {
+	if err := a.localBulk.PQMissing(ctx, groups, func(g int, ids []uint32) error {
 		for lo := 0; lo < len(ids); lo += transfer.DefaultPQBatch {
-			select {
-			case queues[g] <- ids[lo:min(lo+transfer.DefaultPQBatch, len(ids))]:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+			queues[g].push(ids[lo:min(lo+transfer.DefaultPQBatch, len(ids))])
 		}
 		return nil
-	})
-	for _, q := range queues {
-		close(q)
+	}); err != nil {
+		fail(fmt.Errorf("listing the PQ codes to fetch: %w", err))
 	}
-	wg.Wait()
+	for _, q := range queues {
+		q.close()
+	}
+	workers.Wait()
+	close(puts)
+	putters.Wait()
 	if first != nil {
 		return first
 	}
-	if lerr != nil {
-		return fmt.Errorf("listing the PQ codes to fetch: %w", lerr)
+	// Cancelled from outside once the listing was done: the workers and putters stopped early,
+	// and a failed pull or put after that is not recorded as the cause.
+	return parent.Err()
+}
+
+// idQueue holds the IDs a PQ listing named for one source until that source's workers pull them.
+// push never waits: the listing streams from the data node source after source, and a reader
+// held up by one source's workers would hold back the IDs of every source listed after it, so
+// that the sources took turns (2026-11-08: a new node with 6 partitions from n1 and 2 from n2
+// pulled from n2 only once n1 was done). The queue holds at most the IDs of the codes the node
+// lacks, 4 bytes each: 196 MB for Amazon 300M's 49M codes per new node, at the worst.
+type idQueue struct {
+	mu      sync.Mutex
+	ready   *sync.Cond
+	batches [][]uint32
+	closed  bool
+}
+
+func newIDQueue() *idQueue {
+	q := &idQueue{}
+	q.ready = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *idQueue) push(ids []uint32) {
+	q.mu.Lock()
+	q.batches = append(q.batches, ids)
+	q.mu.Unlock()
+	q.ready.Signal()
+}
+
+// close: no more pushes; the workers take what is left, then pop reports the end.
+func (q *idQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.ready.Broadcast()
+}
+
+// pop takes the oldest batch, waiting for one; false once the queue is closed and empty.
+func (q *idQueue) pop() ([]uint32, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.batches) == 0 && !q.closed {
+		q.ready.Wait()
 	}
-	return nil
+	if len(q.batches) == 0 {
+		return nil, false
+	}
+	b := q.batches[0]
+	q.batches[0] = nil // the slice's array outlives the batch
+	q.batches = q.batches[1:]
+	return b, true
 }
 
 // loadPartition loads the segment file of version v of partition p as that version.

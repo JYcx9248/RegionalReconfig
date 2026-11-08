@@ -55,7 +55,11 @@ var Open = map[string]Question{
 			"slot outside it, so that partitions load in parallel; queries look slots and " +
 			"locations up without the lock, so neither a load nor a reclaim holds one back (Amazon " +
 			"300M: a load a partition at a time took 26 s, and a reclaim stopped the answers for " +
-			"75 s). As the design stands nothing is ever dropped: a " +
+			"75 s). Concurrent PQ_PUTs install side by side (2026-11-08): a Put claims its new IDs " +
+			"with a CAS and writes their codes outside the lock, and the agent keeps several " +
+			"PULL_PQ requests in flight per source and several PQ_PUTs to its node (Amazon 300M's " +
+			"new nodes took 38-44 s for their 49M codes, neither end half busy). As the design " +
+			"stands nothing is ever dropped: a " +
 			"scale-out only takes partitions away from a node and a reversible scale-in only " +
 			"returns what it took (U3), so a node's resident set stays what it held at the " +
 			"initial cluster size, which fits its budget or the deployment would not have " +
