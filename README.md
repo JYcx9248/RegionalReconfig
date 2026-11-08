@@ -31,9 +31,9 @@ a partition of Amazon 300M took 26 s). Queries find codes' slots and locations w
 so neither a load nor a reclaim holds one back. PQ_PUTs install side by side: a Put claims each
 new ID with a CAS and writes the codes outside the lock, which only hands out the slots; the
 agent keeps 4 `PULL_PQ` requests in flight to each source and 4 `PQ_PUT`s to its node, and
-takes the whole listing as it streams, so that no source waits for another (2026-11-08; before,
-Amazon 300M's new nodes collected their 49M codes in 38-44 s, at 80-110 MB/s, neither end half
-busy). `rtier_node --pq-capacity N` sets a
+takes the whole listing as it streams, so that no source waits for another (2026-11-08: Amazon
+300M's new nodes collect their 49M codes in 13-17 s, against 38-44 s at 80-110 MB/s before, when
+neither end was half busy). `rtier_node --pq-capacity N` sets a
 node's budget (its HBM, in codes); the runners size it from the partitions
 (`"PQCapacity": "auto"`, the default: the most distinct vectors one node's partitions name
 at the smallest cluster size, plus `"PQHeadroom"`, 10%; `bin/rtier-client pq-share`
@@ -151,14 +151,16 @@ files (23-24 s for Amazon 300M's 4 → 8, 11.9 GB), and each new node wrote its 
 and read it back twice. Only a bootstrap and a full rebuild's next generation load segment files.
 The graph's pull runs at
 background priority (`GraphPriority: background`, the default): the graph moves only while
-neither its source nor its destination moves data -- posting lists or PQ codes through the agent,
-raw vectors through the data node (`RAW_TRAFFIC`, polled every 100 ms) -- paced or not, so it
-delays neither the flip nor a query's fetch. In the worst case, queries fetching without pause,
-a new node becomes an entry only once the fetching subsides; only navigation waits for it,
-which the existing entries do meanwhile. This strict yield is decided for now: whether the
-graph moves nothing at all while data moves, or takes the bandwidth the data leaves unused, is
-settled once the experiments show what it costs (each wait counts in the agent's
-`graph.yield_ms`). `"data"` shares the source's bucket equally, as a baseline. A new node
+neither its source nor its destination stages posting lists or PQ codes through its agent,
+paced or not, so it never delays a flip (each wait counts in the agent's `graph.yield_ms`). It
+does not wait for raw vectors (decided 2026-11-08). From 2026-10-21 it did -- for any raw-vector
+byte through either data node, polled every 100 ms -- and on Amazon 300M the queries' fetches,
+5-35 MB/s for the whole cluster, never stopped while the load lasted: the new entries came only
+after the load, 282-297 s after the trigger, and 4 -> 8 -> 4's scale-in waited for them. The
+graph moves from memory to memory, so it shares only the network with the fetches, which their
+disks and read budgets bound, and takes what the bucket's background class gets: all of it,
+unless `TransferRateBytesPerSec` paces the agents. `"data"` shares the source's bucket equally,
+as a baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
 are arriving, the controller flips every `EntryFlipInterval` (1 s by default) to add all the
 nodes that are ready, and adds the last ones at once when every pull has ended. These flips

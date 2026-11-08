@@ -110,9 +110,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   of each candidate at one owner that reported it, top-k merge. Equal to the single-node answer.
 - **Reconfiguration** (`copyThenFlip`, protocol `lazy` by default): pre-connect (aggregators to
   the data nodes, entries to the aggregators: `StageAggregator`) →
-  new nodes pull the moved posting lists and the PQ codes they lack (the graph last, for now
-  strictly: it moves only while neither end moves posting lists, PQ codes or raw vectors,
-  `graphYield`; sources round-robin over entries) → flip (CAS + install) → grace (drain the old
+  new nodes pull the moved posting lists and the PQ codes they lack (the graph after them: it
+  moves only while neither end stages posting lists or PQ codes, `graphYield`, and does not wait
+  for raw vectors, 2026-11-08; sources round-robin over entries) → flip (CAS + install) → grace (drain the old
   epoch) → reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
   Lists and graph go from the source's memory into the new node's, never through a disk, the
   agents relaying the chunks: the graph `GRAPH_GET` → `GRAPH_PUT` → `GRAPH_INSTALL`; a
@@ -406,6 +406,28 @@ Next:
      - the scale-in started at 504 s, after the load.
    - The 1,152 queries with ground truth answered in all eight 4 → 8 runs, old and new, have the
      same recall.
+
+   The rerun with the PQ pipeline (2026-11-08, `results/cloudlab-gpu/amazon-4to8-v3`, ec247ac;
+   4to8to4 at 917b4ad, its rates the right way round; figures `--series amazon-4to8-v3
+   --calibrations amazon-4to8 --before amazon-4to8-v2`):
+   - **Each new node collects its PQ codes in 13-17 s** (36-44 s before). The listing takes 6-8 s
+     and no longer waits for the pulls. A new node installs up to about 100 PQ_PUTs a second
+     (about 400 MB/s, 2.5 of the 4 putters busy). The sources' 64K PQ_GETs now queue on their
+     store's lock: 31-49 ms a call.
+   - **Lazy flips 44-45 s after the trigger** (70-72 s). The lists (16-24 s) are now the longest
+     step, then the PQ codes (13-17 s) and the 8 loads (7-9 s).
+   - **Lazy reaches the offered rate 5-6 s after the flip** (13-15 s). Its backlog peaks at
+     10.0-10.2K (13.3-13.7K) and clears at 223-226 s (265-268 s). 45-46% of the queries miss
+     200 ms from the trigger on (60%), and its mean latency is 4.1-4.2 s (6.8-7.1 s).
+   - The staging still costs the queries 5-8% for a few seconds, as before.
+   - **Copy-then-flip** stages in 42-45 s and still flips 1636-1718 s after the trigger: its
+     stream sets the time.
+   - **The new entries still come online only after the load,** 282-297 s after the trigger. In
+     4to8to4 the new nodes still fetch 5-7 MB/s at 350 q/s from 280 s on, and every graph transfer
+     waits until the load ends (480 s). The entries come at 497-509 s, and the scale-in starts at
+     509 s, after the load (it takes 59 s, its flip at 43 s).
+   - No query fails in any run. The 1,152 queries with ground truth answered in all twelve 4 → 8
+     runs (v1, v2, v3) have the same recall, and so do 4to8to4's in v1 and v3 (the same rates).
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).
@@ -429,10 +451,11 @@ Next:
    (U5), no aggregator outsourcing (U6), raw vectors kept in full (U1), the graph transfer stays
    eager (U16), nodes removed by a scale-in are shut down (U3), U7 closed with the failures, the
    pacing stays as it is (U8), the entry list stays in the epoch table (U17), no workload
-   generator of our own (U11: real queries that do not repeat, and the worst case). Still open:
-   - on the protocol: placement by per-tier bytes (U3); whether the graph moves nothing at all
-     while data moves (U16: strictly for now, settled once the experiments show the cost; on
-     Amazon 300M, 2026-11-08, lazy's fetches hold the new entries until the load ends);
+   generator of our own (U11: real queries that do not repeat, and the worst case). Decided on
+   2026-11-08: the graph yields to the staging's posting lists and PQ codes, not to raw vectors,
+   with no rate of its own (U16: on Amazon 300M, lazy's fetches, even at 5-7 MB/s, held the new
+   entries until the load ended, and 4to8to4's scale-in after them). Still open:
+   - on the protocol: placement by per-tier bytes (U3);
    - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
      batch size and period are set aside); a batch over budget (scale out first?); writes
      against queries during a scale-out; staged versions left by an expired lease;

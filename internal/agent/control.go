@@ -989,8 +989,9 @@ func (p *rawPuller) wait() (protocol.StageReply, error) {
 // from that entry's memory, at the epoch's graph version with the patches of major epochs (U14)
 // merged in it, straight into the data node's, which builds it as the bytes arrive. The pull runs
 // at the priority the controller asks for -- background by default: then it moves nothing while
-// its source or this node moves data, raw vectors included (graphYield). A local source is the
-// index's own file: a bootstrap, which the data node reads where it lies.
+// its source or this node stages posting lists or PQ codes (graphYield), and does not wait for
+// raw vectors. A local source is the index's own file: a bootstrap, which the data node reads
+// where it lies.
 func (a *Agent) handleStageGraph(ctx context.Context, body json.RawMessage) (any, error) {
 	req, err := ctrl.Decode[protocol.StageGraphReq](body)
 	if err != nil {

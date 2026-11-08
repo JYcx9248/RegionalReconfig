@@ -185,10 +185,6 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 	a.agg = &query.Aggregator{Nodes: a, Strategy: strategy}
 	a.bulk = &transfer.Server{Root: cfg.WorkDir, Limiter: a.limiter, ChunkBytes: cfg.ChunkBytes}
 	a.yield = &graphYield{dataMoving: a.dataMoving, poll: graphPoll,
-		rawBytes: func(ctx context.Context) (uint64, error) {
-			sent, received, err := a.localBulk.RawTraffic(ctx)
-			return sent + received, err
-		},
 		// Every wait, at either end: how much later the graph arrived for the data.
 		waited: func(d time.Duration) { a.reg.Counter("graph.yield_ms").Add(d.Milliseconds()) }}
 	a.bulk.Yield = func() error {

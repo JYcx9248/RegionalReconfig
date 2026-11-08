@@ -22,9 +22,10 @@ import (
 // the smallest share of a query's work, which any existing entry can do meanwhile. So what the
 // first step needs goes first: here, background takes only the tokens data transfers leave
 // unused. The graph yields further, outside the bucket: it moves no byte while either end of
-// its transfer moves data, raw vectors included (the agent's graphYield, U16). Raw vectors are
-// not needed for the first step either: RERANK fetches the ones it lacks from their holders on
-// demand (U9), data node to data node and outside this bucket. Only a raw-vector pull that runs
+// its transfer stages posting lists or PQ codes, paced or not (the agent's graphYield, U16), and
+// it does not wait for raw vectors. Those are not needed for the first step either: RERANK
+// fetches the ones it lacks from their holders on demand (U9), data node to data node and
+// outside this bucket, for as long as the load lasts. Only a raw-vector pull that runs
 // through the agents (RawPath "agent") takes a class here: a baseline's stream after the flip
 // and a scale-in's drain at RawPriority, background by default, and an eager baseline's copy
 // before the flip as data.

@@ -58,7 +58,8 @@ var Open = map[string]Question{
 			"75 s). Concurrent PQ_PUTs install side by side (2026-11-08): a Put claims its new IDs " +
 			"with a CAS and writes their codes outside the lock, and the agent keeps several " +
 			"PULL_PQ requests in flight per source and several PQ_PUTs to its node (Amazon 300M's " +
-			"new nodes took 38-44 s for their 49M codes, neither end half busy). As the design " +
+			"new nodes collect their 49M codes in 13-17 s, against 38-44 s before, when neither end " +
+			"was half busy). As the design " +
 			"stands nothing is ever dropped: a " +
 			"scale-out only takes partitions away from a node and a reversible scale-in only " +
 			"returns what it took (U3), so a node's resident set stays what it held at the " +
@@ -232,8 +233,9 @@ var Open = map[string]Question{
 		"a token bucket on a separate connection (implemented, fixed rate) with two priority " +
 			"classes on the sender (implemented): data -- segments and PQ codes, what a node " +
 			"needs to own partitions -- and background -- the navigation graph (GraphPriority), " +
-			"which only takes tokens no data sender is waiting for -- and, since 2026-10-21, moves " +
-			"nothing while either end of its transfer moves data, paced or not (U16, graphYield). " +
+			"which only takes tokens no data sender is waiting for -- and moves nothing while " +
+			"either end of its transfer stages posting lists or PQ codes, paced or not (U16, " +
+			"graphYield). " +
 			"With lazy (the default) the " +
 			"graph is the only background transfer, while new entries join a scale-out. Only " +
 			"what goes through the agents is paced: the raw-vector paths between data nodes are " +
@@ -450,16 +452,16 @@ var Open = map[string]Question{
 			"reconfigurations (instead of every new node pulling from the first entry), and the " +
 			"pull runs at background priority (GraphPriority): FILTER and RERANK need posting " +
 			"lists and PQ codes, not the graph, and navigation is the smallest share of a query " +
-			"that any existing entry can do meanwhile. Decided for now (2026-10-21; final once " +
-			"the experiments show what it costs): the graph yields strictly to posting lists, PQ " +
-			"codes and raw vectors, paced or not, at both ends of its transfer -- it moves no byte " +
-			"while its source or its destination moves posting lists or PQ codes through its agent, or " +
-			"raw vectors through its data node (RAW_TRAFFIC, polled every 100 ms) -- so it delays " +
-			"neither the flip nor a query's fetch. In the worst case, queries fetching without " +
-			"pause, a new node becomes an entry only once the fetching subsides (accepted for now: " +
-			"only navigation waits, which existing entries do). Open until the experiments: " +
-			"whether the graph moves nothing at all while data moves, or takes the bandwidth the " +
-			"data leaves unused, as the bucket's background class does. " +
+			"that any existing entry can do meanwhile. Decided (2026-11-08): the graph yields to " +
+			"the staging, at both ends of its transfer -- it moves no byte while its source or its " +
+			"destination moves posting lists or PQ codes through its agent, paced or not -- so it " +
+			"never delays a flip; it does not wait for raw vectors, and takes what the bucket's " +
+			"background class gets, with no rate of its own. From 2026-10-21 it also waited for raw " +
+			"vectors through either data node (polled every 100 ms): on Amazon 300M the queries' " +
+			"fetches, 5-35 MB/s for the whole cluster, never stopped while the load lasted, the new " +
+			"entries came only after the load (282-297 s after the trigger), and 4 -> 8 -> 4's " +
+			"scale-in waited for them. Since the graph moves from memory to memory (below), it " +
+			"shares only the network with the fetches, which their disks and read budgets bound. " +
 			"Pairs with U6's warmup selector, which moves aggregation to the new node before its " +
 			"graph arrives. Decided (2026-11-04): the graph moves from the source entry's memory " +
 			"to the new entry's and never through a disk, since queries search it only in " +

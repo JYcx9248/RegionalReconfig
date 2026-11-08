@@ -57,7 +57,6 @@ const (
 	opPatchDrop      uint8 = 0x3A
 	opSwitchGen      uint8 = 0x3C
 	opRawBitmap      uint8 = 0x3D
-	opRawTraffic     uint8 = 0x3E
 	opPQFromIndex    uint8 = 0x3F
 	opRawSave        uint8 = 0x40
 	opGraphGet       uint8 = 0x41
@@ -702,21 +701,6 @@ func (c *Client) PQSave(ctx context.Context, path string) (uint64, error) {
 		return 0, fmt.Errorf("PQ_SAVE: %d trailing bytes", r.Remaining())
 	}
 	return n, r.Err
-}
-
-// RawTraffic returns the raw-vector bytes the node has sent (RAW_GET) and received (fetched from
-// peers, on demand or by RAW_PULL, or put with RAW_PUT) since it started.
-func (c *Client) RawTraffic(ctx context.Context) (sent, received uint64, err error) {
-	b, err := c.do(ctx, opRawTraffic, 0, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-	r := frame.NewReader(b)
-	sent, received = r.U64(), r.U64()
-	if r.Err == nil && r.Remaining() != 0 {
-		return 0, 0, fmt.Errorf("RAW_TRAFFIC: %d trailing bytes", r.Remaining())
-	}
-	return sent, received, r.Err
 }
 
 // PQFromIndex has the node install, for its bootstrap, the PQ codes the segment files at paths
