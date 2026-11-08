@@ -50,7 +50,7 @@
     "NProbe": 128,
     "N": 200,
     "Rate": "350",
-    "RateSteps": "60:350,280:700",
+    "RateSteps": "60:700,280:350",
     "RetryForSeconds": 30,
     "DurationSeconds": 480,
     "WarmupSeconds": 30
