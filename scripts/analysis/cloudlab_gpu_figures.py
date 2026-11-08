@@ -38,6 +38,10 @@ into --out:
   lazy-before-after.svg
                     with --before: lazy in that series against lazy in this one (both repetitions
                     pooled), for a change that only lazy's path sees
+  lazy-staging.svg  with --before: lazy's rescale step by step in that series and in this one
+                    (repetition 1 of each): the answers, each new node's lists, PQ codes and
+                    partition loads up to the flip and its graph up to its entry, the initial
+                    nodes' saving of the moved partitions as files and their reclaim
   lazy-keepup.svg   lazy through the whole load, both repetitions: answered against offered, the
                     backlog, the latency against 8 warm nodes', and the raw vectors fetched against
                     what copy-then-flip copies (calibrate-8)
@@ -401,10 +405,11 @@ def compare_specs(runs, runset, before=None):
     ]
     if before:
         # Both lines are lazy: lazy's own colour for this series, a validated neighbour of it (the
-        # palette's third slot) for the one before -- not copy-then-flip's orange.
-        specs.append(("lazy-before-after", head + ": lazy in %s and in %s (2 runs each)" % (before, runset),
+        # palette's third slot) for the one before -- not copy-then-flip's orange. The labels stay
+        # short enough for the legend (about 16 characters); the title names the two series.
+        specs.append(("lazy-before-after", head + ": lazy before (%s) and after (%s), 2 runs each" % (before, runset),
                       ["%s/rep%d/lazy" % (s_, r) for s_ in (before, runset) for r in (1, 2)],
-                      ",".join(["lazy (%s)" % before] * 2 + ["lazy (%s)" % runset] * 2),  # no comma: the separator
+                      ",".join(["lazy (before)"] * 2 + ["lazy (after)"] * 2),  # no comma inside a label: the separator
                       "%d,%d" % (HOT_A, LAZY)))
     return specs
 
@@ -778,6 +783,197 @@ def lazy_stall(runs, out, runset, step=5.0):
                     "%s; from the trigger until every query is answered" % schedule(run))
 
 
+def counter_rises(st, op, key, t0, lo, hi):
+    """When one of a node's op counters rose within [lo, hi] (seconds of the load): [(the sample
+    before, the sample it rose at)]. A call's count rises when it starts, its busy time when it ends."""
+    pts = [(r["t"] - t0, r["ops"][op][key]) for r in st if op in r.get("ops", {})]
+    return [(ta, tb) for (ta, va), (tb, vb) in zip(pts, pts[1:]) if vb > va and tb >= lo and ta <= hi]
+
+
+def staging_bars(run):
+    """A lazy rescale's steps from its nodes' counters (1 s samples), in seconds since the trigger:
+    per new node its phases [(phase, start, end)], its partition loads (each one's end, the busy
+    time per load) and its graph (from the first chunk to the install); the initial nodes' phases
+    (the moved partitions saved as files, before 2026-11-07, and the reclaim); the flip, each new
+    entry, the load's end."""
+    t0 = load_start(run)
+    trig, flip, _, rc = events(run)
+    reply, ph = rc["reply"], rc["reply"]["phases"]
+    lo, hi = trig - 1.0, trig + rc["elapsed_seconds"] + 5.0
+    pre = ph.get("plan", 0.0) + ph.get("stage_aggregator", 0.0)
+    saved = pre + ph.get("save_segments", 0.0)
+    nodes = {}
+    for n in ["n%d" % a for a in reply.get("added", [])]:
+        st = jsonl(os.path.join(run, "stats-%s.jsonl" % n))
+
+        def rose(op, key="count"):
+            return [(a - trig, b - trig) for a, b in counter_rises(st, op, key, t0, lo, hi)]
+        bars = []
+        seg, pqm, pqp = rose("segment_put"), rose("pq_missing"), rose("pq_put")
+        if seg:  # straight from the old owners' memory (since 2026-11-07)
+            bars.append(("lists", seg[0][0], seg[-1][1]))
+        elif pqm and ph.get("save_segments"):  # files the old owners saved first: their copy
+            bars.append(("lists", saved, pqm[0][0]))
+        if pqm and pqp:
+            bars.append(("PQ codes", pqm[0][0], pqp[-1][1]))
+        op = "segment_install" if rose("segment_install") else "load_partition"
+        starts, ends = rose(op), rose(op, "busy_us")
+        if starts and ends:
+            bars.append(("loads", starts[0][0], ends[-1][1]))
+        last = st[-1]["ops"].get(op, {})
+        gp, gi = rose("graph_put"), rose("graph_install")
+        # The graph ends at its install; the run's last sample can come before the last entry's
+        # (the runner stops when the rescale returns), and its entry flip then marks the end.
+        entry = next((e["seconds"] for e in reply.get("entry_flips", []) if int(n[1:]) in e["nodes"]), None)
+        done = gi[0][1] if gi else entry
+        nodes[n] = dict(bars=bars, ends=[b for _, b in ends], op=op, loads=last.get("count", 0),
+                        per_load=last.get("busy_us", 0) / 1e6 / max(last.get("count", 0), 1),
+                        graph=(gp[0][0], done) if gp and done is not None else None)
+    old = [("lists", pre, saved)] if ph.get("save_segments") else []
+    reclaim = flip - trig + ph.get("drain", 0.0)
+    old.append(("reclaim", reclaim, reclaim + ph.get("reclaim", 0.0)))
+    entries = {"n%d" % n: e["seconds"] for e in reply.get("entry_flips", []) for n in e["nodes"]}
+    return dict(nodes=nodes, old=old, flip=flip - trig, entries=entries, end=(load_end(run) or 360.0) - trig,
+                elapsed=rc["elapsed_seconds"], trig=trig, phases=ph)
+
+
+def lazy_staging(runs, out, runset, before, step=5.0):
+    """With --before: where lazy's rescale spends its time, in that series and in this one
+    (repetition 1 of each), on one axis of seconds since the trigger. Per series, the answers,
+    then per new node its posting lists, PQ codes and partition loads up to the flip, and its
+    graph up to its entry; the initial nodes' saving of the moved partitions as files (before
+    2026-11-07) and their reclaim after the flip. For a change to the staging: on 2026-11-07,
+    lists from memory, partitions loaded 8 at once with a PQ reference per partition and vector."""
+    if not before:
+        return None
+    sets = [("before", before), ("after", runset)]
+    paths = [os.path.join(runs, s, "rep1", "lazy") for _, s in sets]
+    if not all(os.path.exists(os.path.join(r, "stats-n5.jsonl")) for r in paths):
+        print("skipped lazy-staging.svg (runs missing)")
+        return None
+    data, lo_ = [], -10.0
+    for (name, s), run in zip(sets, paths):
+        b = staging_bars(run)
+        rows = read_latency(os.path.join(run, "latency.csv"))
+        trig, end = b["trig"], b["end"]
+        exp = load_json(os.path.join(run, "experiment.json"))["Load"]
+        rate, sched = float(exp["Rate"]), []
+        steps = sorted((float(a), float(r)) for a, r in (x.split(":") for x in str(exp.get("RateSteps", "")).split(",") if x))
+        for t, r in [(0.0, rate)] + steps:  # the offered rate, its steps drawn upright
+            if sched:
+                sched.append((t - trig, sched[-1][1]))
+            sched.append((t - trig, r))
+        sched += [(end, sched[-1][1]), (end, 0.0)]
+        sched = [(lo_, next(r for t, r in reversed(sched) if t <= lo_))] + [q for q in sched if q[0] > lo_]
+        b.update(name=name, series=s, run=run, sched=sched,
+                 answered=[(w["t"] + step / 2 - trig, w["answered"]) for w in windows(rows, step)],
+                 failed=sum(1 for x in rows if x["status"] != "ok"),
+                 last=max(answered_at(x) for x in rows) - trig, sources=plan_moves(run)[0])
+        data.append(b)
+    lo = lo_
+    hi = max(max(b["elapsed"], b["last"], b["old"][-1][2]) for b in data) + 10.0
+    left = LEFT + 40  # room for the rows' names, "n5 ← n1, n2"
+    pw = W - left - RIGHT
+    tp_h, lane, gap, pitch = 70, 12, 3, 26  # the answers' panel; a row's lanes: data, then graph
+    names = sorted(data[0]["nodes"], key=lambda n: int(n[1:]))
+    block = 34 + tp_h + 26 + pitch * (len(names) + 1)
+    # headroom over the answers for the events' labels
+    ymax = max(max(v for _, v in b["answered"]) for b in data) * 1.25
+    svg = Svg()
+    cls = {"lists": "f0", "PQ codes": "f1", "loads": "f2", "reclaim": "fneu"}
+    what = {"lists": "posting lists", "PQ codes": "PQ codes", "loads": "partition loads", "reclaim": "reclaim"}
+
+    def bar(x0, x1, y, h, c, tip):
+        # 2 px of surface between bars that touch: each gives up 1 px at both ends
+        w = max(x1 - x0 - 2, 2.0)
+        svg.add('<rect class="%s" x="%.1f" y="%.1f" width="%.1f" height="%d" rx="2"><title>%s</title></rect>'
+                % (c, x0 + 1, y, w, h, esc(tip)))
+
+    y = 84
+    p = None
+    for b in data:
+        p = Panel(svg, left, y + 20, pw, tp_h, (lo, hi), "%s: %s%s, repetition 1 · answered queries per second, per %g s"
+                  % (b["name"], b["series"], revision(b["run"], " (commit ", ")"), step), "q/s", ymax=ymax)
+        p.line([(t, v) for t, v in b["sched"] if lo <= t <= hi], "ref")
+        p.line([(t, v) for t, v in b["answered"] if lo <= t <= hi], "neu")
+        gy = y + 20 + tp_h + 22  # the rows
+        rows_h = pitch * (len(names) + 1)
+        for t, label, anchor in ((0.0, "trigger", "start"), (b["flip"], "flip", "start"), (b["end"], "load ends", "end"),
+                                 (b["elapsed"], "rescale ends", "start")):
+            x = p.x(t)
+            svg.add('<line class="ev" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (x, y + 20, x, gy + rows_h - 6))
+            svg.text(x + (3 if anchor == "start" else -3), y + 31, label, "note", anchor)
+        for i, n in enumerate(names + ["old"]):
+            ry = gy + i * pitch
+            if n == "old":
+                svg.text(left - 8, ry + 10, "n1–n4", anchor="end")
+                for ph_, a, z in b["old"]:
+                    tip = ("n1–n4: the moved partitions saved as files (save_segments), %.1f–%.1f s" % (a, z)
+                           if ph_ == "lists" else "n1–n4: reclaim of the moved partitions, %.1f–%.1f s after the trigger" % (a, z))
+                    bar(p.x(a), p.x(z), ry, lane, cls[ph_], tip)
+                continue
+            node = b["nodes"][n]
+            svg.text(left - 8, ry + 10, "%s ← %s" % (n, ", ".join(b["sources"].get(n, []))), anchor="end")
+            for ph_, a, z in node["bars"]:
+                tip = "%s: %s, %.1f–%.1f s after the trigger (%.1f s)" % (n, what[ph_], a, z, z - a)
+                if ph_ == "loads":
+                    tip += "; %d loads (%s), %.1f s each" % (node["loads"], node["op"].upper(), node["per_load"])
+                bar(p.x(a), p.x(z), ry, lane, cls[ph_], tip)
+                if ph_ == "loads":  # each load's end, as a cut in the bar
+                    for e in node["ends"][:-1]:
+                        svg.add('<line class="dot" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (p.x(e), ry, p.x(e), ry + lane))
+            if node["graph"]:
+                a, z = node["graph"]
+                bar(p.x(a), p.x(z), ry + lane + gap, 5, "fctx", "%s: the graph, first chunk %.1f s, installed %.1f s "
+                    "after the trigger" % (n, a, z))
+            if n in b["entries"]:
+                e = b["entries"][n]
+                svg.add('<circle class="fneu" cx="%.1f" cy="%.1f" r="3.5"><title>%s</title></circle>'
+                        % (p.x(e), ry + lane + gap + 2.5, esc("%s is an entry %.1f s after the trigger" % (n, e))))
+        y += block
+    base = y - block + 20 + tp_h + 22 + pitch * (len(names) + 1) - 6  # under the last rows
+    svg.add('<line class="axis" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (left, base, left + pw, base))
+    time_axis(svg, p, base, lo, hi, label="seconds since the trigger")
+    svg.legend(W - RIGHT + 16, 84 + 20 + tp_h + 32,
+               [("posting lists", "f0", "box"), ("PQ codes", "f1", "box"), ("partition loads", "f2", "box"),
+                ("graph", "fctx", "box"), ("entry online", "", "none"), ("reclaim", "fneu", "box"),
+                ("answered", "neu", "line"), ("offered", "ref", "line")])
+    ey = 84 + 20 + tp_h + 32 + 4 * 18  # the entry's dot beside its label
+    svg.add('<circle class="fneu" cx="%d" cy="%d" r="3.5"/>' % (W - RIGHT + 16 + 7, ey - 4))
+
+    def phase(b, name, f):  # over the new nodes: f of each one's span of a phase
+        return [f(a, z) for nd in b["nodes"].values() for ph_, a, z in nd["bars"] if ph_ == name]
+    old, new = data
+    rng = lambda vals, f="%.0f": span_of(vals, f) if vals else "–"  # noqa: E731
+    text = ("Before (%s): lazy flips %.0f s after the trigger. The initial nodes first save the moved partitions "
+            "as files (%.0f s); the new nodes copy them, then list and fetch their PQ codes until %s s, then load "
+            "their partitions one at a time, %s s each, until %s s. After the flip the initial nodes' reclaim takes "
+            "%.0f s, and %d queries fail. "
+            % (old["series"], old["flip"], old["phases"].get("save_segments", 0.0), rng(phase(old, "PQ codes", lambda a, z: z)),
+               rng([nd["per_load"] for nd in old["nodes"].values()]), rng(phase(old, "loads", lambda a, z: z)),
+               old["phases"].get("reclaim", 0.0), old["failed"]))
+    text += ("After (%s): the lists come from the initial nodes' memory by %s s, the PQ codes by %s s; the %d "
+             "partitions of each new node load at once in %s s (%s s of work each), and lazy flips %.0f s after the "
+             "trigger. The reclaim takes %.1f s; %d queries fail. "
+             % (new["series"], rng(phase(new, "lists", lambda a, z: z)), rng(phase(new, "PQ codes", lambda a, z: z)),
+                max(nd["loads"] for nd in new["nodes"].values()), rng(phase(new, "loads", lambda a, z: z - a)),
+                rng([nd["per_load"] for nd in new["nodes"].values()], "%.1f"), new["flip"],
+                new["phases"].get("reclaim", 0.0), new["failed"]))
+    ent = list(new["entries"].values())
+    if ent:
+        text += ("The graph moves only while no data moves at either end of its transfer (U16), and the queries' "
+                 "fetches go on %s: the new entries come online %s s after the trigger%s, where the rescale ends."
+                 % ("until the load ends, %.0f s after the trigger" % new["end"] if min(ent) > new["end"] else "after the flip",
+                    rng(ent), "" if min(ent) <= new["end"] else ", after the load"))
+    notes = textwrap.wrap(text, 112)
+    yb = base + 56
+    for i, s in enumerate(notes):
+        svg.text(LEFT, yb + 15 * i, s, "note")
+    return svg.save(out, "lazy-staging.svg", yb + 15 * len(notes) + 6,
+                    "Lazy's rescale step by step, before and after the 2026-11-07 staging changes",
+                    schedule(paths[1]))
+
+
 def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
     rels = ("%s/rep1/lazy" % runset, "%s/rep1/copy-then-flip" % runset)
     runs_ = [(r, os.path.join(runs, r)) for r in rels if os.path.exists(os.path.join(runs, r, "stats-n1.jsonl"))]
@@ -878,6 +1074,17 @@ def stage_raw(run):
     return events(run)[3]["reply"]["phases"]["stage_raw"]
 
 
+def revision(run, before="", after=""):
+    """The commit a run ran (revision.txt's first line), short, between before and after; "" if
+    unknown."""
+    try:
+        with open(os.path.join(run, "revision.txt")) as f:
+            words = f.readline().split()
+    except OSError:
+        return ""
+    return before + words[1][:7] + after if len(words) > 1 and words[0] == "commit" else ""
+
+
 def copy_runs(runs, runset, protocol):
     """rep1/ and rep2/ of a protocol in the series, those with stats."""
     rs = [os.path.join(runs, runset, r, protocol) for r in ("rep1", "rep2")]
@@ -951,7 +1158,16 @@ def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=None):
                 else "against %.0f s with none" % calm_raw)
         text += (" With the stream first (rtier_node --peer-reads-first), it takes %s s under the load, %s."
                  % (span_of(took), like))
-    notes = textwrap.wrap(text + (" The node with the fewest queries finishes first." if began < end else ""), 108)
+    text += " The node with the fewest queries finishes first." if began < end else ""
+    # The calibrations can come from another series, staged by older code: say where its stream
+    # starts, so that its line is read for its slope, not its place.
+    calm_began = min((next((t for t, v in pts if v > 0), float("inf"))
+                      for cs in curves.values() for cls, pts in cs if cls == "neu dash" and pts), default=float("inf"))
+    if math.isfinite(calm_began) and math.isfinite(began) and abs(calm_began - began) > 30:
+        text += (" The run with no load (%s/calibrate-8%s) began to stream %.0f s after its trigger, against %.0f s in "
+                 "these runs%s; compare the slopes." % (calibrations, revision(calm, ", commit "), calm_began, began,
+                                                        revision(loaded[0], " (commit ", ")")))
+    notes = textwrap.wrap(text, 108)
     for i, s in enumerate(notes):
         svg.text(LEFT, yb + 15 * i, s, "note")
     return svg.save(out, "ctf-stream.svg", yb + 15 * len(notes) + 6,
@@ -1119,7 +1335,8 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     p4 = Panel(svg, LEFT, ys[3], pw, 140, xr, "raw vectors the new nodes fetched, cumulative", "GB", ymax=copy / 1e9)
     sched = [(lo, rate0 if lo < s1 else rate1), (s1, rate0), (s1, rate1), (hi, rate1)] if lo < s1 else [(lo, rate1), (hi, rate1)]
     p1.line(sched, "cu sched")
-    p1.hline(c8, "8 nodes' capacity, %.0f q/s" % c8)
+    # below its line: above it, near the panel's top, it would run into the events' labels
+    p1.hline(c8, "8 nodes' capacity, %.0f q/s" % c8, dy=14)
     if c4:
         p1.hline(c4, "4 nodes' capacity, %.0f q/s" % c4, dy=14)
     p3.hline(warm, "8 nodes with every raw vector local, at %.0f q/s: %.1f ms" % (rate1, warm), dy=14)
@@ -1150,15 +1367,18 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     if all(q["cleared"] for q in per):
         still = (", while its new nodes still fetch %s MB/s, and %s MB/s at the load's end" % (rng("rate_from"), rng("rate_to"))
                  if max(q["rate_from"] or 0 for q in per) >= 1 else "; its new nodes have stopped fetching by then")
+        # "as warm nodes do" only when it is so (within 15%); else the two numbers
+        like = ("as 8 nodes with every raw vector local do" if max(q["steady_mean"] for q in per) <= 1.15 * warm
+                else "against %.1f ms on 8 nodes with every raw vector local" % warm)
         text += ("Lazy's backlog clears under the load at %s s. From 20 s later to the load's end it answers %s q/s "
-                 "against %.0f offered, at a mean latency of %s ms (p99 %s ms), as 8 nodes with every raw vector local "
-                 "do%s. " % (rng("cleared"), rng("steady_qps"), rate1, rng("steady_mean", "%.1f"), rng("steady_p99"), still))
+                 "against %.0f offered, at a mean latency of %s ms (p99 %s ms), %s%s. "
+                 % (rng("cleared"), rng("steady_qps"), rate1, rng("steady_mean", "%.1f"), rng("steady_p99"), like, still))
     else:
         text += ("Lazy's backlog does not clear before the load ends: %s queries still wait then. "
                  % span_of([q["backlog"][-1][1] for q in per]))
     text += ("By the load's end its new nodes have fetched %s GB, %s%% of what copy-then-flip streams before it "
              "serves anything new." % (rng("fetched_end", "%.1f"), span_of([100 * q["fetched_end"] * 1e9 / copy for q in per])))
-    online = [min(e - q["trig"] for e in q["entries"]) for q in per if q["entries"]]
+    online = [e - q["trig"] for q in per for e in q["entries"]]  # the first new entry to the last
     if online:
         text += " The new entries come online %s s after the trigger%s." % (
             span_of(online), " (U16's strict yield: data moves until then)" if min(online) > hi - first["trig"] else "")
@@ -1217,6 +1437,7 @@ def main():
     made = [capacity(args.runs, args.out, args.series, args.calibrations),
             lazy_fetch(args.runs, args.out, args.series, args.calibrations, args.fetch_bound_mb),
             lazy_stall(args.runs, args.out, args.series),
+            lazy_staging(args.runs, args.out, args.series, args.before),
             node_reads(args.runs, args.out, args.series),
             ctf_stream(args.runs, args.out, args.series, args.calibrations),
             ctf_budget(args.runs, args.out, args.series),

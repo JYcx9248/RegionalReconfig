@@ -371,10 +371,38 @@ Next:
      `Ref`). The 4to8to4 scale-in starts only after the load: its scale-out ends at 504 s.
    - The 1,152 queries with ground truth answered in all four 4 → 8 runs have the same recall
      (0.80) in each.
-   - **Fixed since (2026-11-07, not yet rerun):** a partition moves from memory to memory, so
-     no `save_segments`; a load no longer sorts the postings and references each code once per
-     partition (3.4 s instead of 27 at this scale on a laptop), 8 load at once; RERANK's
-     `Locate` takes no lock, so the reclaim stalls no query.
+   - **Fixed on 2026-11-07:** a partition moves from memory to memory, so no `save_segments`; a
+     load no longer sorts the postings and references each code once per partition (3.4 s
+     instead of 27 at this scale on a laptop), 8 load at once; RERANK's `Locate` takes no lock,
+     so the reclaim stalls no query.
+
+   The rerun with these fixes (2026-11-08, `results/cloudlab-gpu/amazon-4to8-v2`, commit
+   f77fd51; figures `--series amazon-4to8-v2 --calibrations amazon-4to8 --before amazon-4to8`
+   in `results/cloudlab-gpu-figures/amazon-4to8-v2`, `lazy-staging.svg` the new one):
+   - **Lazy flips under the load,** 70-72 s after the trigger. Its stage_data takes 70-72 s:
+     lists by 16-24 s, PQ codes by 54-66 s, then the 8 loads at once in 6-9 s (4.4-5.8 s of work
+     each). The reclaim takes 1.2-1.5 s, nothing stalls, and no query fails in any run.
+   - **Lazy answers the offered rate 13-15 s after the flip** and clears its backlog (13.5K at
+     the peak) at 265-270 s. From the trigger to the load's end it answers 192K queries, against
+     152K under copy-then-flip (149K under both before). Its mean latency over the run is 7 s,
+     against 32 s (42 s before).
+   - **The drain runs at about C8, with n4 at its read budget:** n4 serves its own queries and
+     n7's fetches, and its readers wait 23 s/s. After the drain, the mean latency is 24 ms,
+     against 13.9 ms on 8 warm nodes; the new nodes still fetch 12-14 MB/s.
+   - **The new entries come online only after the load,** 282-292 s after the trigger. The
+     graph yields to data at both ends (U16), and the fetches never stop while the load runs.
+     The four old entries keep up meanwhile: navigation takes 2.5-3 ms a query and half a core
+     per entry.
+   - **Copy-then-flip:** stage_data takes 67-69 s, but its stream now starts under the load and
+     takes longer (1587-1664 s). It flips 1657-1731 s after the trigger, as before.
+   - **Deployment** on the snapshot takes 238-240 s, against 578-588 s.
+   - **4to8to4 shows nothing new:**
+     - its committed rates are reversed: 350 until 280 s, then 700. The Comment and the first
+       run had 700, then 350;
+     - the scale-out's entries came after the load, 403-414 s after the trigger;
+     - the scale-in started at 504 s, after the load.
+   - The 1,152 queries with ground truth answered in all eight 4 → 8 runs, old and new, have the
+     same recall.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).
@@ -400,7 +428,8 @@ Next:
    pacing stays as it is (U8), the entry list stays in the epoch table (U17), no workload
    generator of our own (U11: real queries that do not repeat, and the worst case). Still open:
    - on the protocol: placement by per-tier bytes (U3); whether the graph moves nothing at all
-     while data moves (U16: strictly for now, settled once the experiments show the cost);
+     while data moves (U16: strictly for now, settled once the experiments show the cost; on
+     Amazon 300M, 2026-11-08, lazy's fetches hold the new entries until the load ends);
    - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
      batch size and period are set aside); a batch over budget (scale out first?); writes
      against queries during a scale-out; staged versions left by an expired lease;

@@ -56,6 +56,7 @@ import json
 import math
 import os
 import sys
+import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plot_run import (answered_at, esc, flip_time, fmt, load_end, nice_ticks, read_latency,  # noqa: E402
@@ -70,6 +71,9 @@ PALETTE = [("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"
 FIXED_SLOT = {"lazy": 0, "copy-then-flip": 1, "stop-and-copy": 2, "lazy-stream": 3}
 
 W, LEFT, RIGHT, TOP, PLOT_H = 900, 64, 132, 60, 260
+# A title longer than this wraps: about what fits across the figure at 14 px, semibold, in the
+# widest of the usual sans fonts (DejaVu Sans, as rsvg-convert renders it: about 8.1 px a character).
+TITLE_CHARS = 98
 STRIP_ROW, STRIP_GAP = 20, 64  # one strip row per label, below the x axis
 
 
@@ -328,7 +332,9 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     panels.append(("mean latency of the answered queries" + (" (log scale)" if log_latency else ""), "ms", 210,
                    [(slot, [(w["t"] + width / 2, w["mean_us"] / 1000.0 if w["mean_us"] else None) for w in win])
                     for _, slot, win, _, _ in lines]))
-    tops, yy = [], (TOP if title else 10) + 24  # no title: a paper figure, its caption carries it
+    title_lines = textwrap.wrap(title, TITLE_CHARS) if title else []
+    below = 18 * (len(title_lines) - 1) if title_lines else 0  # each wrapped line moves the rest down
+    tops, yy = [], (TOP + below if title else 10) + 24  # no title: a paper figure, its caption carries it
     for _, _, ph, _ in panels:
         tops.append(yy)
         yy += ph + 44
@@ -373,8 +379,9 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                colours(1, "#1a1a19", "#ffffff", "#c3c2b7", "#2c2c2a", "#383835")))
     svg.append('<rect class="bg" x="0" y="0" width="%d" height="%d"/>' % (W, h))
     if title:
-        svg.append('<text class="title" x="%d" y="22">%s</text>' % (LEFT, esc(title)))
-        svg.append('<text class="sub" x="%d" y="40">%s</text>' % (LEFT, esc(subtitle)))
+        for i, line in enumerate(title_lines):
+            svg.append('<text class="title" x="%d" y="%d">%s</text>' % (LEFT, 22 + 18 * i, esc(line)))
+        svg.append('<text class="sub" x="%d" y="%d">%s</text>' % (LEFT, 40 + below, esc(subtitle)))
 
     # Each reconfiguration's trigger, as a dashed line through every panel: one neutral line where
     # the lines' runs trigger together (within a window), one in a line's colour where only its
@@ -495,7 +502,17 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     for i, (label, slot, _, runs_rcs, _) in enumerate(lines):
         ry = strip_top + i * STRIP_ROW
         svg.append('<line class="grid" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (LEFT, ry + 6, W - RIGHT, ry + 6))
+        labels = []  # (end of the bars, the label's text, whether they run past the axis' end)
         for j in range(len(runs_rcs[0]) if runs_rcs else 0):
+            starts = [rcs[j][0] for rcs in runs_rcs]
+            if min(starts) >= span and labels:
+                # A reconfiguration that waited past the axis' end for the one before it (a
+                # scale-in behind a scale-out that ends after the load): no bar, and its label
+                # would sit on the one before, both ending at the axis' end; that one names it.
+                x1, text, _ = labels[-1]
+                labels[-1] = (x1, text + "; %s from %.0f s" % (
+                    esc(runs_rcs[0][j][2].replace("rescale to ", "→")), min(starts)), True)
+                continue
             end, last = 0.0, 0.0
             for rcs in runs_rcs:
                 t0, dur, name, _ = rcs[j]
@@ -511,15 +528,16 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
             if ts:  # the runs' flips: their mean when they agree within a second, else the range
                 name += ", flip at %s s" % ("%.1f" % (sum(ts) / len(ts)) if max(ts) - min(ts) < 1
                                             else "%.0f–%.0f" % (min(ts), max(ts)))
-            if last > span:
-                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s, ended at %.0f s ▸</text>'
-                           % (end, ry, name, last))
-            elif end + 3 + 6.2 * len(name) > W - RIGHT:
+            labels.append((end, name + (", ended at %.0f s" % last if last > span else ""), last > span))
+        for end, text, past in labels:  # names are escaped above
+            if past:
+                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s ▸</text>' % (end, ry, text))
+            elif end + 3 + 6.2 * len(text) > W - RIGHT:
                 # Beside a bar that ends near the axis' end the label would run into the legend
                 # (11 px text, about 6.2 px a character): above the bar, ending with it.
-                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, name))
+                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, text))
             else:
-                svg.append('<text class="tick" x="%.1f" y="%d">%s</text>' % (end + 3, ry + 10, name))
+                svg.append('<text class="tick" x="%.1f" y="%d">%s</text>' % (end + 3, ry + 10, text))
         lx = W - RIGHT + 16
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ry + 6, lx + 16, ry + 6))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ry + 10, esc(label)))
