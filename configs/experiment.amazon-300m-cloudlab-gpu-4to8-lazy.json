@@ -49,8 +49,8 @@
     "Arrivals": "poisson",
     "NProbe": 128,
     "N": 200,
-    "Rate": "SET_ME",
-    "RateSteps": "60:SET_ME",
+    "Rate": "350",
+    "RateSteps": "60:700",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
     "WarmupSeconds": 30
