@@ -38,14 +38,13 @@ import (
 // Methods served by the agent, called by the controller.
 const (
 	StageAggregatorM = "StageAggregator" // connect to the data nodes (an entry: the aggregators) of a (draft) table
-	StagePartitionsM = "StagePartitions" // fetch segments, load them into the data node
+	StagePartitionsM = "StagePartitions" // bring partitions' lists and PQ codes, load them into the data node
 	StageGraphM      = "StageGraph"      // fetch the navigation graph, load it
 	StageRawM        = "StageRaw"        // stream the raw vectors the node's partitions lack
 	DrainRawM        = "DrainRaw"        // before nodes leave: take over the raw vectors only they hold
 	InstallEpochM    = "InstallEpoch"    // switch routing to a new table
 	WaitDrainedM     = "WaitDrained"     // grace period: queries pinned to <= epoch finished
 	EvictM           = "Evict"           // drop partitions and their files
-	SavePartitionsM  = "SavePartitions"  // write versions of resident partitions as segment files (U14)
 	DropVersionsM    = "DropVersions"    // drop versions an update batch replaced, and their files (U14)
 	GraphPatchM      = "GraphPatch"      // merge (or drop) a staged graph patch (U14 major epochs)
 	SetAdmissionM    = "SetAdmission"    // pause/resume client queries (stop-and-copy baseline)
@@ -106,21 +105,21 @@ type StageAggregatorReq struct {
 	Table *epoch.Table `json:"table"`
 }
 
-// Source is where staged files come from. The raw vectors of the partitions are not: each
-// posting of a segment records the node holding its vector, and the destination fetches from
-// that node.
+// Source is where staged partitions come from. Their raw vectors do not: each posting records
+// the node holding its vector, and the destination fetches from that node.
 type Source struct {
-	// "peer": another agent's bulk port; "local": a directory, loaded as a bootstrap (the PQ codes
-	// and raw vectors the node lacks come from the index); "gen": a full rebuild's segments (U14),
-	// loaded with the PQ codes from the generation's index and the raw vectors from the holders
-	// the postings record -- pulled from Addr's bulk port (the controller's) from under Dir, or
-	// without Addr read from the directory Dir.
+	// "peer": the owner, through its agent's bulk port -- the lists from its data node's memory,
+	// and the PQ codes the destination lacks; "local": a directory, loaded as a bootstrap (the PQ
+	// codes and raw vectors the node lacks come from the index); "gen": a full rebuild's segments
+	// (U14), loaded with the PQ codes from the generation's index and the raw vectors from the
+	// holders the postings record -- pulled from Addr's bulk port (the controller's) from under
+	// Dir, or without Addr read from the directory Dir.
 	Kind       string `json:"kind"`
 	Addr       string `json:"addr,omitempty"`
 	Dir        string `json:"dir,omitempty"`
 	Partitions []int  `json:"partitions,omitempty"`
 	// Versions: the version of each of Partitions in the epoch the staging is for (absent: all
-	// 0) -- the segment file to fetch and the version to load it as (U14).
+	// 0) -- the lists to fetch and the version to load them as (U14).
 	Versions []uint32 `json:"versions,omitempty"`
 }
 
@@ -215,18 +214,11 @@ type EvictReq struct {
 	ReleaseStagedPQ bool `json:"release_staged_pq,omitempty"`
 }
 
-// SavePartitionsReq asks the agent to write these versions of resident partitions as segment
-// files in its partition directory, where the nodes they move to pull them: a version an update
-// batch made exists only in the data node's memory until then (U14).
-type SavePartitionsReq struct {
-	Versions []PartitionVersion `json:"versions"`
-}
-
 // DropVersionsReq is the reclaim of an update batch on one node (U14), after the grace period
 // of the epochs that read the replaced versions. Deleted: the vectors the batch deleted; the
 // node frees their PQ codes -- now if nothing names them (a former owner's cached copies), with
 // the dropped versions otherwise -- so that none becomes a cached code. Then it drops Versions,
-// the versions the batch replaced on this node, and their segment files.
+// the versions the batch replaced on this node (and the segment file a bootstrap left for one).
 type DropVersionsReq struct {
 	Versions []PartitionVersion `json:"versions,omitempty"`
 	Deleted  []uint32           `json:"deleted,omitempty"`
@@ -344,7 +336,7 @@ type RescaleReply struct {
 	Added     []placement.NodeID `json:"added"`
 	Removed   []placement.NodeID `json:"removed"`
 	Moved     []int              `json:"moved"`
-	Bytes     int64              `json:"bytes"`    // segment files + PQ codes received by destinations
+	Bytes     int64              `json:"bytes"`    // posting lists + PQ codes received by destinations
 	PQCodes   int64              `json:"pq_codes"` // PQ codes pulled (deduplicated per destination)
 	PQBytes   int64              `json:"pq_bytes"`
 	// Raw vectors streamed to the destinations (deduplicated per destination): none with the

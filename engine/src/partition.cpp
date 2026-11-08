@@ -176,6 +176,117 @@ ListSegment ListSegment::Load(const std::string& path) {
   return s;
 }
 
+uint64_t SegmentImageSize(const ListSegment& s) {
+  return 16 + s.list_ids.size() * 4 + s.offsets.size() * 8 + s.ids.size() * 10;
+}
+
+void ReadSegmentImage(const ListSegment& s, uint64_t off, size_t n, uint8_t* out, const HolderReader& holders) {
+  FUSION_CHECK(s.offsets.size() == s.list_ids.size() + 1 && s.locs.size() == s.ids.size(),
+               "segment of partition %u is malformed", s.partition);
+  const uint64_t size = SegmentImageSize(s);
+  FUSION_CHECK(off <= size && n <= size - off, "bytes [%llu, %llu) of a %llu-byte segment image",
+               static_cast<unsigned long long>(off), static_cast<unsigned long long>(off + n),
+               static_cast<unsigned long long>(size));
+  const uint32_t header[4] = {kSegMagic, kSegVersion, s.partition, static_cast<uint32_t>(s.list_ids.size())};
+  struct Part {
+    const void* p;  // null: the holders
+    uint64_t bytes;
+  };
+  const Part parts[] = {{header, sizeof(header)},
+                        {s.list_ids.data(), s.list_ids.size() * 4},
+                        {s.offsets.data(), s.offsets.size() * 8},
+                        {s.ids.data(), s.ids.size() * 4},
+                        {s.locs.data(), s.locs.size() * 4},
+                        {nullptr, s.ids.size() * 2}};
+  uint64_t at = 0;  // where the part starts in the image
+  std::vector<uint16_t> hs;
+  for (const Part& part : parts) {
+    const uint64_t lo = std::max(off, at), hi = std::min(off + n, at + part.bytes);
+    if (lo < hi) {
+      if (part.p) {
+        std::memcpy(out + (lo - off), static_cast<const uint8_t*>(part.p) + (lo - at), hi - lo);
+      } else {  // the holders of the postings these bytes cover, even part of one
+        const size_t first = (lo - at) / 2, last = (hi - at + 1) / 2;
+        hs.resize(last - first);
+        holders(first, hs.size(), hs.data());
+        std::memcpy(out + (lo - off), reinterpret_cast<const uint8_t*>(hs.data()) + (lo - at) % 2, hi - lo);
+      }
+    }
+    at += part.bytes;
+  }
+}
+
+SegmentLoader::SegmentLoader(uint32_t partition, uint64_t max_lists, uint32_t max_list_len)
+    : max_lists_(max_lists), max_list_len_(max_list_len) {
+  s_.partition = partition;
+  dst_ = reinterpret_cast<uint8_t*>(header_);
+  left_ = sizeof(header_);
+}
+
+void SegmentLoader::Append(const uint8_t* p, size_t n) {
+  while (n > 0) {
+    FUSION_CHECK(section_ != kDone, "partition %u: %zu bytes past the end of its segment", s_.partition, n);
+    const size_t k = std::min(n, left_);
+    std::memcpy(dst_, p, k);
+    dst_ += k;
+    left_ -= k;
+    p += k;
+    n -= k;
+    received_ += k;
+    if (left_ == 0) Next();
+  }
+}
+
+void SegmentLoader::Next() {
+  auto fill = [&](void* p, size_t bytes) {
+    dst_ = static_cast<uint8_t*>(p);
+    left_ = bytes;
+  };
+  do {
+    switch (++section_) {
+      case kListIds:
+        FUSION_CHECK(header_[0] == kSegMagic && header_[1] == kSegVersion,
+                     "partition %u: not a segment image of version %u", s_.partition, kSegVersion);
+        FUSION_CHECK(header_[2] == s_.partition, "the segment of partition %u, not of %u", header_[2], s_.partition);
+        FUSION_CHECK(header_[3] <= max_lists_, "partition %u: a segment of %u lists, more than the %llu there are",
+                     s_.partition, header_[3], static_cast<unsigned long long>(max_lists_));
+        s_.list_ids.resize(header_[3]);
+        fill(s_.list_ids.data(), s_.list_ids.size() * 4);
+        break;
+      case kOffsets:
+        FUSION_CHECK(std::is_sorted(s_.list_ids.begin(), s_.list_ids.end()),
+                     "partition %u: list IDs not sorted", s_.partition);
+        s_.offsets.resize(s_.list_ids.size() + 1);
+        fill(s_.offsets.data(), s_.offsets.size() * 8);
+        break;
+      case kIds:
+        // Every list within max_list_len, before the postings are allocated by the last offset.
+        FUSION_CHECK(s_.offsets[0] == 0, "partition %u: offsets do not start at 0", s_.partition);
+        for (size_t i = 0; i + 1 < s_.offsets.size(); ++i)
+          FUSION_CHECK(s_.offsets[i] <= s_.offsets[i + 1] && s_.offsets[i + 1] - s_.offsets[i] <= max_list_len_,
+                       "partition %u: list %u holds %lld postings, more than the %u a request may gather "
+                       "(--max-list-len), or the offsets are out of order",
+                       s_.partition, s_.list_ids[i], static_cast<long long>(s_.offsets[i + 1] - s_.offsets[i]),
+                       max_list_len_);
+        s_.ids.resize(s_.offsets.back());
+        fill(s_.ids.data(), s_.ids.size() * 4);
+        break;
+      case kLocs:
+        s_.locs.resize(s_.ids.size());
+        fill(s_.locs.data(), s_.locs.size() * 4);
+        break;
+      case kHolders:
+        s_.holders.resize(s_.ids.size());
+        fill(s_.holders.data(), s_.holders.size() * 2);
+        break;
+      case kDone:
+        dst_ = nullptr;
+        left_ = 0;
+        return;
+    }
+  } while (left_ == 0);
+}
+
 std::vector<uint64_t> WritePartitions(const PostingLists& lists,
                                       const std::vector<uint32_t>& list_part,
                                       uint32_t num_partitions, const std::string& out_dir,

@@ -221,7 +221,7 @@ func TestStreamedListings(t *testing.T) {
 	c := New(addr, 1)
 	ctx := context.Background()
 	var got []uint32
-	if err := c.PQMissing(ctx, [][]string{{"a.seg"}, {"b.seg"}}, func(g int, ids []uint32) error {
+	if err := c.PQMissing(ctx, [][]Segment{{{Partition: 0}}, {{Partition: 1, Version: 2}}}, func(g int, ids []uint32) error {
 		if g != 1 {
 			t.Errorf("group %d", g)
 		}
@@ -251,13 +251,13 @@ func TestStreamedListings(t *testing.T) {
 		t.Fatalf("RAW_MISSING ending in an error: %v, %d groups, %d open", err, raw, c.Open())
 	}
 	stopped := errors.New("enough")
-	if err := c.PQMissing(ctx, [][]string{{"a.seg"}, {"b.seg"}}, func(int, []uint32) error { return stopped }); !errors.Is(err, stopped) {
+	if err := c.PQMissing(ctx, [][]Segment{{{Partition: 0}}, {{Partition: 1, Version: 2}}}, func(int, []uint32) error { return stopped }); !errors.Is(err, stopped) {
 		t.Fatalf("PQ_MISSING stopped by fn: %v", err)
 	}
 	if o := c.Open(); o != 0 || conns.Load() != 1 {
 		t.Fatalf("%d open, %d accepted: the stopped stream's connection must go", o, conns.Load())
 	}
-	if err := c.PQMissing(ctx, [][]string{{"a.seg"}, {"b.seg"}}, func(int, []uint32) error { return nil }); err != nil || conns.Load() != 2 {
+	if err := c.PQMissing(ctx, [][]Segment{{{Partition: 0}}, {{Partition: 1, Version: 2}}}, func(int, []uint32) error { return nil }); err != nil || conns.Load() != 2 {
 		t.Fatalf("after a stopped stream: %v, %d accepted", err, conns.Load())
 	}
 }

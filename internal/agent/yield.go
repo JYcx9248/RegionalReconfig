@@ -16,15 +16,14 @@ const graphPoll = 100 * time.Millisecond
 // of U16, 2026-10-21). A new node needs posting lists, PQ codes and raw vectors to serve its
 // partitions, and the graph only for the entry role, whose navigation -- the first step of a
 // query -- any existing entry does meanwhile. So the graph goes last, at both ends of its
-// transfer: it moves no byte while the agent moves segments or PQ codes, in (a staging) or out
-// (writing the moved lists, the bucket's data class), or while the data node moves raw vectors,
-// in or out, on demand or streamed, which no bucket paces (RAW_TRAFFIC). Unlike the bucket's
-// background class it takes none of the bandwidth data leaves unused: it waits for the data to
-// stop, paced or not. In the worst case -- queries fetching without pause -- a new node becomes
+// transfer: it moves no byte while the agent moves posting lists or PQ codes, in (a staging) or
+// out (the bucket's data class), or while the data node moves raw vectors, in or out, on demand
+// or streamed, which no bucket paces (RAW_TRAFFIC). Unlike the bucket's background class it
+// takes none of the bandwidth data leaves unused: it waits for the data to stop, paced or not. In the worst case -- queries fetching without pause -- a new node becomes
 // an entry only once its fetching subsides, within the step timeout; the data flip never waits
 // for it.
 type graphYield struct {
-	dataMoving func() bool                               // segments or PQ codes, in or out
+	dataMoving func() bool                               // posting lists or PQ codes, in or out
 	rawBytes   func(ctx context.Context) (uint64, error) // the data node's, sent plus received
 	poll       time.Duration
 	waited     func(time.Duration) // if not nil: how long a Wait held the graph back
@@ -81,11 +80,11 @@ func (y *graphYield) rawMoved(ctx context.Context) (bool, error) {
 	return y.moved, nil
 }
 
-// dataMoving: a staging in flight (segments and PQ codes coming in), the moved lists being
-// written as segments, or a data-class transfer going out.
+// dataMoving: a staging in flight (posting lists and PQ codes coming in), or a data-class
+// transfer going out.
 func (a *Agent) dataMoving() bool {
 	a.mu.Lock()
 	staging := len(a.stagings) > 0
 	a.mu.Unlock()
-	return staging || a.saving.Load() > 0 || a.limiter.Active(transfer.Data) > 0
+	return staging || a.limiter.Active(transfer.Data) > 0
 }

@@ -92,3 +92,51 @@ func TestPullGraph(t *testing.T) {
 		t.Fatalf("pull from a node that does not serve its graph: %v", err)
 	}
 }
+
+// A partition's pull hands every chunk, in order, to put, at the data class (no yield); a
+// partition or version the source does not hold ends it, and so does a segment loaded again
+// under it.
+func TestPullSegment(t *testing.T) {
+	data := bytes.Repeat([]byte("postings"), 30000) // 240 KB
+	var calls atomic.Int64
+	src := func(ctx context.Context, p int, v uint32, off int64, n int) ([]byte, int64, uint64, error) {
+		if p != 5 || v != 2 {
+			return nil, 0, 0, fmt.Errorf("partition %d is not resident at version %d", p, v)
+		}
+		stamp := uint64(1)
+		if calls.Add(1) > 10 { // loaded again after the first pull's chunks
+			stamp = 2
+		}
+		return data[off:min(off+int64(n), int64(len(data)))], int64(len(data)), stamp, nil
+	}
+	var yields atomic.Int64
+	addr := serveGraph(t, &Server{Segment: src, Limiter: NewTokenBucket(0, 0), ChunkBytes: 64 << 10,
+		Yield: func() error { yields.Add(1); return nil }})
+	ctx := context.Background()
+	var got []byte
+	put := func(ctx context.Context, off int64, b []byte) error {
+		if off != int64(len(got)) {
+			return fmt.Errorf("chunk at %d after %d bytes", off, len(got))
+		}
+		got = append(got, b...)
+		return nil
+	}
+	st, err := PullSegment(ctx, addr, 5, 2, 0, Data, put)
+	if err != nil || st.Bytes != int64(len(data)) || !bytes.Equal(got, data) || yields.Load() != 0 || calls.Load() != 4 {
+		t.Fatalf("pull: %+v, %v (%d of %d bytes, %d yields, %d reads for 4 chunks)", st, err, len(got), len(data),
+			yields.Load(), calls.Load())
+	}
+	got = nil
+	if _, err := PullSegment(ctx, addr, 5, 3, 0, Data, put); err == nil || !strings.Contains(err.Error(), "not resident") {
+		t.Fatalf("pull of a version the source does not hold: %v", err)
+	}
+	got = nil
+	calls.Store(8)
+	if _, err := PullSegment(ctx, addr, 5, 2, 0, Data, put); err == nil || !strings.Contains(err.Error(), "partition 5 changed") {
+		t.Fatalf("pull across a load: %v", err)
+	}
+	if _, err := PullSegment(ctx, serveGraph(t, &Server{}), 5, 2, 0, Data, put); err == nil ||
+		!strings.Contains(err.Error(), "does not serve its partitions") {
+		t.Fatalf("pull from a node that does not serve its partitions: %v", err)
+	}
+}

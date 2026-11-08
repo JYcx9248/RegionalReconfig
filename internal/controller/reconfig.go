@@ -300,10 +300,11 @@ const (
 // stopTheWorld too the stop-and-copy baseline (Koala's stop-and-restart):
 //
 //  1. PREPARE  aggregators of the next epoch pre-connect to its data nodes, and its entries to
-//     its aggregators; destinations pull the moved partitions' posting lists and the PQ codes
-//     they lack from the current owners (separate bulk connections, paced by the senders' token
-//     buckets) -- what a node needs to filter, so it can go online; with rawBeforeFlip, the raw
-//     vectors they lack too; new entry nodes stage the graph in the background.
+//     its aggregators; destinations pull the moved partitions' posting lists, from the current
+//     owners' memory into their own as the graph moves, and the PQ codes they lack (separate
+//     bulk connections, paced by the senders' token buckets) -- what a node needs to filter, so
+//     it can go online; with rawBeforeFlip, the raw vectors they lack too; new entry nodes stage
+//     the graph in the background.
 //  2. FLIP     compare-and-swap epoch e -> e+1 in the store, install e+1 everywhere.
 //  3. GRACE    every node waits until no query pinned to epoch e is running.
 //  4. RECLAIM  old owners evict the moved partitions (their PQ codes and raw vectors stay, as
@@ -314,7 +315,7 @@ const (
 //     fails to load stays a data node and aggregator.
 //  6. RAW      from the flip on, a new owner's data node fetches the raw vectors a query needs
 //     on demand, each straight from its holder: every posting records the node holding its
-//     vector (the old owner writes the moved segments for that), and with rawOnDemand nothing
+//     vector (the old owner sends each moved posting with it), and with rawOnDemand nothing
 //     else moves -- what no query needs stays where it is, and the rescale does not wait for
 //     any of it. With rawStreamAfterFlip, alongside 3-5, the destinations also stream in the
 //     rest from the holders (RawPriority, background by default), and the rescale waits for it.
@@ -402,12 +403,11 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 		return reply, err
 	}
 	// Each destination pulls from the moved partitions' current owners, over their bulk port:
-	// the segment files, which the owners write for the move (every posting records the node
-	// holding its raw vector as of now), and the PQ codes it lacks. It loads each partition at
-	// its version in e, which the reconfiguration does not change: a partition that update
-	// batches changed moves with its current lists (U14). Raw vectors come from the holders.
+	// the posting lists, from the owners' memory (every posting with the node holding its raw
+	// vector as it is sent), and the PQ codes it lacks. It loads each partition at its version in
+	// e, which the reconfiguration does not change: a partition that update batches changed moves
+	// with its current lists, which exist only in memory (U14). Raw vectors come from the holders.
 	sources := map[placement.NodeID][]protocol.Source{}
-	saves := map[placement.NodeID][]protocol.PartitionVersion{} // by source
 	for _, d := range dests {
 		for _, pull := range plan[d] {
 			from, ok := c.nodes.Get(pull.From)
@@ -417,7 +417,6 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 			src := protocol.Source{Kind: "peer", Addr: from.Info.BulkAddr, Partitions: pull.Partitions}
 			for i, p := range pull.Partitions {
 				v := cur.Version(p)
-				saves[pull.From] = append(saves[pull.From], protocol.PartitionVersion{Partition: p, Version: v})
 				if v == 0 {
 					continue
 				}
@@ -492,22 +491,6 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 		}(n)
 	}
 
-	// The old owners write the moved partitions as segment files, from memory: every posting
-	// records where its raw vector is now (the owner itself for those it holds), and a version
-	// that an update batch made exists only in memory until then (U14).
-	if len(saves) > 0 {
-		saveNodes, err := c.managed(sortedKeys(saves))
-		if err != nil {
-			return reply, err
-		}
-		if err := forEach(saveNodes, func(n *ManagedNode) error {
-			return n.call(ctx, c.stageTimeout(), protocol.SavePartitionsM, protocol.SavePartitionsReq{Versions: saves[n.ID]}, nil)
-		}); err != nil {
-			return reply, err
-		}
-		phase("save_segments")
-	}
-
 	// Stop-and-copy baseline: pause admission everywhere and wait for in-flight queries.
 	// Whatever happens next, every paused node is resumed.
 	var paused []*ManagedNode
@@ -543,8 +526,8 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 		phase("pause")
 	}
 
-	// 1. PREPARE -- data readiness: destinations pull segments and the PQ codes they lack from
-	// current owners.
+	// 1. PREPARE -- data readiness: destinations pull the posting lists and the PQ codes they lack
+	// from current owners.
 	var moved, pqCodes, pqBytes atomic.Int64
 	if err := forEach(destNodes, func(n *ManagedNode) error {
 		var st protocol.StageReply

@@ -73,8 +73,7 @@ type Agent struct {
 	selector   query.Selector
 	limiter    *transfer.TokenBucket
 	bulk       *transfer.Server
-	yield      *graphYield  // the graph's transfers wait while data moves here (U16)
-	saving     atomic.Int32 // SavePartitions calls in flight
+	yield      *graphYield // the graph's transfers wait while data moves here (U16)
 	reg        *metrics.Registry
 	// The local data node, twice. Queries (NAVIGATE, and FILTER/RERANK through peer) use local;
 	// everything else -- serving peers' pulls, installing what arrives, loads, evictions, INFO --
@@ -195,9 +194,13 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 		return a.yield.Wait(ctx)
 	}
 	// The graph a new entry pulls from here comes from the data node's memory, where queries
-	// search it: no file of it is kept for peers (U16).
+	// search it, and so do the posting lists of a partition that moves to another node: no file
+	// of either is kept for peers (U16).
 	a.bulk.Graph = func(ctx context.Context, version uint32, off int64, n int) ([]byte, int64, uint64, error) {
 		return a.localBulk.GraphGet(ctx, version, off, n)
+	}
+	a.bulk.Segment = func(ctx context.Context, p int, v uint32, off int64, n int) ([]byte, int64, uint64, error) {
+		return a.localBulk.SegmentGet(ctx, p, v, off, n)
 	}
 	return a, nil
 }

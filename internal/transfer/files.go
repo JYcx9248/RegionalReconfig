@@ -39,17 +39,19 @@ type pullDone struct {
 }
 
 // Server serves files under Root, PQ codes and raw vectors read through PQ and Raw
-// (records.go), and the navigation graph read through Graph (graph.go), to pulling peers. All
-// connections share one token bucket: it caps this node's outgoing background bandwidth, and
-// within it data transfers (segments, PQ codes) go before background ones (the graph, and raw
-// vectors pulled through the agents at RawPriority).
+// (records.go), and the navigation graph and partitions' posting lists read from memory through
+// Graph and Segment (graph.go), to pulling peers. All connections share one token bucket: it
+// caps this node's outgoing background bandwidth, and within it data transfers (posting lists,
+// PQ codes) go before background ones (the graph, and raw vectors pulled through the agents at
+// RawPriority).
 type Server struct {
 	Root       string
-	PQ         PQSource     // nil = PULL_PQ is refused
-	Raw        RawSource    // nil = PULL_RAW is refused
-	Graph      GraphSource  // nil = PULL_GRAPH is refused
-	Limiter    *TokenBucket // nil = unlimited
-	ChunkBytes int          // default chunk size (Koala: StateMigrationChunkSize, 1 MiB)
+	PQ         PQSource      // nil = PULL_PQ is refused
+	Raw        RawSource     // nil = PULL_RAW is refused
+	Graph      GraphSource   // nil = PULL_GRAPH is refused
+	Segment    SegmentSource // nil = PULL_SEGMENT is refused
+	Limiter    *TokenBucket  // nil = unlimited
+	ChunkBytes int           // default chunk size (Koala: StateMigrationChunkSize, 1 MiB)
 	// Yield, if set, is called before each chunk of the navigation graph, or of a background file,
 	// is read, and holds the transfer back until it returns (the agent's strict yield to data,
 	// U16); an error ends the transfer.
@@ -93,6 +95,8 @@ func (s *Server) serveConn(c net.Conn) {
 			err = s.sendRaw(bw, f.Body)
 		case typePullGraph:
 			err = s.sendGraph(bw, f.Body)
+		case typePullSegment:
+			err = s.sendSegment(bw, f.Body)
 		default:
 			return
 		}

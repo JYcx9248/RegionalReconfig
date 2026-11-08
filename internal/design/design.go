@@ -251,9 +251,8 @@ var Open = map[string]Question{
 			"holder of its vector, the node that stores it (u16 node ID, segment version 3), so " +
 			"each key (list, vector) has one current holder: the list's owner if it holds the " +
 			"vector, else the node the posting names. Only the owner's copy of a list is valid: " +
-			"a partition moves as its owner saves it from memory, holders included " +
-			"(SAVE_PARTITION), and the next owner makes the postings of the vectors it holds " +
-			"name itself. A RERANK that meets a vector not there fetches it from the holder that " +
+			"a partition moves from its owner's memory, holders included (SEGMENT_GET, U16), " +
+			"and the next owner makes the postings of the vectors it holds name itself. A RERANK that meets a vector not there fetches it from the holder that " +
 			"a posting in one of the query's lists on that node records, data node to data node " +
 			"(RAW_GET, one hop: a holder has the vector; data nodes know each other by node ID, " +
 			"SET_NODES), and makes that one posting name itself -- other lists naming the vector " +
@@ -350,8 +349,8 @@ var Open = map[string]Question{
 			"deleted vector's code goes with its last version and never becomes a cached one -- " +
 			"a deleted vector is no cache. A staging that fails is undone before the lease is " +
 			"given up; a commit that fails before the flip drops the staged versions. A " +
-			"partition at a later version moves with its current lists: its owner writes them as " +
-			"a segment file for the move (SAVE_PARTITION). Major epochs " +
+			"partition at a later version moves with its current lists, from its owner's memory as " +
+			"any partition does (SEGMENT_GET, U16). Major epochs " +
 			"(internal/update/major.go) split and merge posting lists as a batch with its own " +
 			"lease, decided on PQ codes: a split is a balanced 2-means of a list's members, each " +
 			"child's head the member closest to its mean, both children in the parent's " +
@@ -444,7 +443,7 @@ var Open = map[string]Question{
 			"that any existing entry can do meanwhile. Decided for now (2026-10-21; final once " +
 			"the experiments show what it costs): the graph yields strictly to posting lists, PQ " +
 			"codes and raw vectors, paced or not, at both ends of its transfer -- it moves no byte " +
-			"while its source or its destination moves segments or PQ codes through its agent, or " +
+			"while its source or its destination moves posting lists or PQ codes through its agent, or " +
 			"raw vectors through its data node (RAW_TRAFFIC, polled every 100 ms) -- so it delays " +
 			"neither the flip nor a query's fetch. In the worst case, queries fetching without " +
 			"pause, a new node becomes an entry only once the fetching subsides (accepted for now: " +
@@ -459,12 +458,25 @@ var Open = map[string]Question{
 			"new entry's data node builds its graph from them as they arrive -- so neither end " +
 			"writes a file or holds a second copy (on CloudLab's SATA SSDs, the 7 GB file each new " +
 			"entry wrote went to the disks its fetches needed). After major epochs (U14) the graph " +
-			"moves at the epoch's version, the patches merged in it",
+			"moves at the epoch's version, the patches merged in it. Decided (2026-11-07): a " +
+			"partition's posting lists take the same path, since queries use them only in memory " +
+			"too -- the owner's data node reads any range of a resident segment in the segment " +
+			"format (without its checksum; every posting with its current holder, SEGMENT_GET), the " +
+			"agents relay the chunks at the data class, and the next owner's data node builds the " +
+			"segment from them as they arrive (SEGMENT_PUT) and loads it once its PQ codes are in " +
+			"(SEGMENT_INSTALL): no segment file at either end. Before, the owners wrote the moved " +
+			"partitions as files first (23-24 s for Amazon 300M's 11.9 GB at 4 -> 8, before the " +
+			"first byte moved), and each new node wrote its share to its disk and read it back " +
+			"twice (the PQ listing, the load). The initial deployment and a full rebuild's next " +
+			"generation, built outside, still load segment files, as the graph's bootstrap loads " +
+			"the index's file",
 		"internal/controller/reconfig.go (graphSources, StageGraph, promoteEntries), " +
-			"internal/agent/control.go (handleStageGraph), internal/agent/yield.go (graphYield), " +
-			"internal/transfer/graph.go (PULL_GRAPH), internal/transfer/tokenbucket.go (classes), " +
-			"engine/src/graph_image.cpp (GraphImage, GraphLoader), engine/src/node_engine.cpp " +
-			"(ReadGraph, PutGraph, InstallGraph)"},
+			"internal/agent/control.go (handleStageGraph, fetchSegments), internal/agent/yield.go " +
+			"(graphYield), internal/transfer/graph.go (PULL_GRAPH, PULL_SEGMENT), " +
+			"internal/transfer/tokenbucket.go (classes), engine/src/graph_image.cpp (GraphImage, " +
+			"GraphLoader), engine/src/partition.cpp (ReadSegmentImage, SegmentLoader), " +
+			"engine/src/node_engine.cpp (ReadGraph, PutGraph, InstallGraph, ReadSegment, " +
+			"PutSegment, InstallSegment)"},
 	"U17": {"U17", "Where the client-facing availability list lives",
 		"today the entry set is a field of the epoch table, so \"this node finished loading its " +
 			"graph\" -- a local event that has nothing to do with who owns what -- costs an epoch " +

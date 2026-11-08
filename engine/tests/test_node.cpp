@@ -132,6 +132,52 @@ void TestPartitionFiles() {
     threw = true;
   }
   CHECK(threw);
+
+  // The image a partition moves as: the file's bytes without the checksum, read in any pieces --
+  // holders included, of whatever posting the piece's bytes cover -- and built back as it arrives,
+  // a byte at a time if need be.
+  const std::vector<uint8_t> file1 = ReadFile(JoinPath(dir, partfiles::SegmentName(1)));
+  s1.holders = {3, 4, 5, 6, 7};
+  s1.Save(JoinPath(dir, "with-holders.seg"));
+  const std::vector<uint8_t> want = ReadFile(JoinPath(dir, "with-holders.seg"));
+  const uint64_t size1 = SegmentImageSize(s1);
+  CHECK(size1 + 4 == want.size() && size1 + 4 == file1.size());
+  auto holders1 = [&](size_t first, size_t k, uint16_t* h) {
+    CHECK(first + k <= s1.ids.size());
+    std::copy(s1.holders.begin() + first, s1.holders.begin() + first + k, h);
+  };
+  for (size_t piece : {size_t{1}, size_t{3}, size_t{7}, size_t{size1}}) {
+    std::vector<uint8_t> image(size1);
+    for (uint64_t off = 0; off < size1; off += piece)
+      ReadSegmentImage(s1, off, std::min<uint64_t>(piece, size1 - off), image.data() + off, holders1);
+    CHECK(std::equal(image.begin(), image.end(), want.begin()));
+    SegmentLoader l(1, 4, 3);
+    for (uint64_t off = 0; off < size1; off += piece) {
+      CHECK(!l.complete());
+      l.Append(image.data() + off, std::min<uint64_t>(piece, size1 - off));
+    }
+    const ListSegment& got = l.segment();
+    CHECK(l.complete() && l.received() == size1 && got.partition == 1 && got.list_ids == s1.list_ids &&
+          got.offsets == s1.offsets && got.ids == s1.ids && got.locs == s1.locs && got.holders == s1.holders);
+    CHECK(Throws([&] { l.Append(image.data(), 1); }));  // past the end
+  }
+  CHECK(Throws([&] { ReadSegmentImage(s1, size1 - 2, 3, nullptr, holders1); }));
+  std::vector<uint8_t> image1(size1);
+  ReadSegmentImage(s1, 0, size1, image1.data(), holders1);
+  auto refused = [&](uint32_t partition, uint64_t max_lists, uint32_t max_len, std::vector<uint8_t> bytes) {
+    SegmentLoader l(partition, max_lists, max_len);
+    return Throws([&] { l.Append(bytes.data(), bytes.size()); });
+  };
+  CHECK(!refused(1, 4, 3, image1));
+  CHECK(refused(0, 4, 3, image1));  // another partition's
+  CHECK(refused(1, 1, 3, image1));  // more lists than there are
+  CHECK(refused(1, 4, 2, image1));  // a list longer than a request may gather
+  std::vector<uint8_t> unsorted = image1;
+  std::swap_ranges(unsorted.begin() + 16, unsorted.begin() + 20, unsorted.begin() + 20);  // lists 2, 0
+  CHECK(refused(1, 4, 3, unsorted));
+  std::vector<uint8_t> magic = image1;
+  magic[0] ^= 1;
+  CHECK(refused(1, 4, 3, magic));
 }
 
 // A small index shared by the engine and wire tests.
@@ -227,6 +273,34 @@ void LinkPeers(NodeEngine* node, uint16_t self, std::map<uint16_t, NodeEngine*> 
     if (it == by_addr.end()) throw std::runtime_error("unknown peer " + peer);
     it->second->RawGet(locs, n, out);
   });
+}
+
+// A partition's move as the agents relay it: SEGMENT_GET's chunks from the owner's memory, each
+// SEGMENT_PUT into the next owner's as it comes -- chunks of an odd size, so that some split a
+// holder. The next owner then holds the segment received, not resident (InstallSegment loads
+// it). Returns the image's size.
+uint64_t MoveSegment(NodeEngine* from, NodeEngine* to, uint32_t p, uint32_t version = 0, size_t chunk = 4093) {
+  std::vector<uint8_t> bytes;
+  uint64_t off = 0, size = 0, stamp = 0, first = 0;
+  do {
+    size = from->ReadSegment(p, version, off, chunk, &bytes, &stamp);
+    if (off == 0) first = stamp;
+    CHECK(stamp == first && !bytes.empty());
+    CHECK(to->PutSegment(p, version, off, bytes.data(), bytes.size()) == off + bytes.size());
+    off += bytes.size();
+  } while (off < size);
+  return size;
+}
+
+// The segment a node serves of version `version` of partition p, as the next owner builds it.
+ListSegment ServedSegment(NodeEngine* from, uint32_t p, uint32_t version) {
+  std::vector<uint8_t> bytes;
+  uint64_t stamp = 0;
+  from->ReadSegment(p, version, 0, SIZE_MAX, &bytes, &stamp);
+  SegmentLoader l(p, UINT32_MAX, UINT32_MAX);
+  l.Append(bytes.data(), bytes.size());
+  CHECK(l.complete());
+  return std::move(l.segment());
 }
 
 // For each of `ids`, the first list of partition `part` that names it (deduplicated): the lists
@@ -561,7 +635,7 @@ void TestStageVersions() {
   o.max_pages = man.raw.num_pages + 4;
   o.max_list_len = man.max_list_len + 16;
   auto node = NodeEngine::Open(o);
-  node->SetNodes(1, {});  // SavePartition records this node as the holder of what it holds
+  node->SetNodes(1, {});  // ReadSegment names this node as the holder of what it holds
   node->LoadGraph(JoinPath(f.index, files::kGraph));
   for (uint32_t p = 0; p < f.num_parts; ++p)
     node->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
@@ -652,12 +726,13 @@ void TestStageVersions() {
   const std::vector<uint32_t> after = search(&top1);  // the newest versions
   CHECK(top1 == id && !has(after, del) && after != before);
 
-  // Saved and loaded elsewhere as version 1, the partition answers the same.
+  // Version 1 as a next owner gets it, from this node's memory: the batch's lists, every posting
+  // naming this node, which holds every vector.
   const uint32_t p0 = changed[0];
-  const std::string saved = JoinPath(TempDir(), "saved.seg");
-  node->SavePartition(p0, 1, saved);
-  const ListSegment back = ListSegment::Load(saved);
+  const ListSegment back = ServedSegment(node.get(), p0, 1);
   CHECK(back.partition == p0 && std::find(back.ids.begin(), back.ids.end(), del) == back.ids.end());
+  CHECK(std::all_of(back.holders.begin(), back.holders.end(), [](uint16_t h) { return h == 1; }));
+  CHECK(Throws([&] { ServedSegment(node.get(), p0, 2); }));
 
   // A node without room for a list that long refuses the segment at load, before it changes
   // anything (here: one list grown past the build's longest, on a node at the build's limit).
@@ -679,6 +754,17 @@ void TestStageVersions() {
     refused = std::string(e.what()).find("--max-list-len") != std::string::npos;
   }
   CHECK(refused && small->ResidentVersions().empty() && small->pq_stats().resident == 0);
+  // So does one receiving it from its owner, at the offsets, before a posting comes; and what it
+  // had received is given up.
+  std::vector<uint8_t> image(SegmentImageSize(longer));
+  ReadSegmentImage(longer, 0, image.size(), image.data(), [](size_t, size_t k, uint16_t* h) { std::fill(h, h + k, 1); });
+  refused = false;
+  try {
+    small->PutSegment(p0, 1, 0, image.data(), image.size());
+  } catch (const std::exception& e) {
+    refused = std::string(e.what()).find("--max-list-len") != std::string::npos;
+  }
+  CHECK(refused && Throws([&] { small->InstallSegment(p0, 1); }));
 
   // Reclaim, in the controller's order. The deleted vector is marked first: version 0 still
   // names it, so its code stays for the old epoch's queries. Then version 0 of the changed
@@ -862,8 +948,9 @@ void TestPQStore() {
   CHECK(st.resident == 0 && st.cached == 0 && st.deleted == 0);
 }
 
-// Moving partitions between two NodeEngines the way an agent does: PQMissing on the
-// destination, PQGet on the source, PQPut, then LoadPartition(kPresent).
+// Moving partitions between two NodeEngines the way an agent does: the lists from the source's
+// memory (MoveSegment), PQMissing on the destination, PQGet on the source, PQPut, then
+// InstallSegment.
 void TestPQMigration() {
   Fixture& f = GetFixture();
   auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
@@ -893,41 +980,59 @@ void TestPQMigration() {
 
   auto dst = OpenNode(f, {}, false);
   LinkPeers(dst.get(), 2, {{1, src.get()}});
+  src->SetNodes(1, {});  // the source names itself as the holder of the vectors it holds
   bool threw = false;
-  try {  // raw vectors missing, and no holder to fetch them from
+  try {  // a segment file that records no holder: raw vectors missing, and nowhere to fetch them
     dst->LoadPartition(1, seg(1), PQSource::kPresent);
   } catch (const RawMissingError&) {
     threw = true;
   }
   CHECK(threw && dst->ResidentPartitions().empty() && dst->pq_stats().resident == 0);
+  // From the source's memory: received, not resident. Without its PQ codes it does not load,
+  // and stays received for another try; a segment not received cannot be listed.
+  for (uint32_t p : {1u, 2u})
+    CHECK(MoveSegment(src.get(), dst.get(), p) == SegmentImageSize(ListSegment::Load(seg(p))));
   threw = false;
   try {
-    dst->LoadPartition(1, seg(1), PQSource::kPresent, 0, 1);
+    dst->InstallSegment(1, 0);
   } catch (const PQMissingError&) {
     threw = true;
   }
   CHECK(threw && dst->ResidentPartitions().empty() && dst->pq_stats().resident == 0 &&
         dst->raw_stats(true).pending == 0);
+  CHECK(Throws([&] { dst->PQMissing({{{0, 0}}}); }) && Throws([&] { dst->PQMissing({{{1, 1}}}); }));
 
   // Two sources: the needs are split so that no code is fetched twice.
-  const auto miss = dst->PQMissing({{seg(1)}, {seg(2)}});
+  const auto miss = dst->PQMissing({{{1, 0}}, {{2, 0}}});
   CHECK(miss.size() == 2 && miss[0] == d1 && miss[0].size() + miss[1].size() == d12.size());
   for (const auto& ids : miss) {
     const PQPutResult r = move_codes(src.get(), dst.get(), ids);
     CHECK(r.installed == ids.size() && r.skipped == 0);
   }
   CHECK(dst->pq_stats().staged == d12.size());
-  dst->LoadPartition(1, seg(1), PQSource::kPresent, 0, 1);
-  dst->LoadPartition(2, seg(2), PQSource::kPresent, 0, 1);
+  dst->InstallSegment(1, 0);
+  dst->InstallSegment(2, 0);
+  CHECK(Throws([&] { dst->InstallSegment(1, 0); }));  // installed: no longer received
   st = dst->pq_stats();
   CHECK(st.resident == d12.size() && st.live == d12.size() && st.staged == 0 &&
         st.received == d12.size() && st.from_index == 0);
+  // The lists as the build made them, every posting naming the source: none of the vectors is
+  // here yet.
+  for (uint32_t p : {1u, 2u}) {
+    const ListSegment s = ListSegment::Load(seg(p));
+    for (size_t i = 0; i < s.list_ids.size(); ++i) {
+      const ListPostings lp = dst->GetList(s.list_ids[i], 0);
+      CHECK(lp.ids == std::vector<uint32_t>(s.ids.begin() + s.offsets[i], s.ids.begin() + s.offsets[i + 1]));
+      CHECK(std::all_of(lp.holders.begin(), lp.holders.end(), [](uint16_t h) { return h == 1; }));
+    }
+  }
 
   // Another partition later: only the codes the node lacks are listed.
-  const auto miss0 = dst->PQMissing({{seg(0)}});
+  MoveSegment(src.get(), dst.get(), 0);
+  const auto miss0 = dst->PQMissing({{{0, 0}}});
   CHECK(miss0[0].size() == d012.size() - d12.size());
   move_codes(src.get(), dst.get(), miss0[0]);
-  dst->LoadPartition(0, seg(0), PQSource::kPresent, 0, 1);
+  dst->InstallSegment(0, 0);
   CHECK(dst->pq_stats().resident == d012.size());
 
   // Same PQ top-n as the source for every query (codes are addressed by slot on both nodes,
@@ -954,17 +1059,20 @@ void TestPQMigration() {
   st = dst->pq_stats();
   CHECK(st.resident == d012.size() && st.live == d12.size() &&
         st.cached == d012.size() - d12.size());
-  // Bringing partition 0 back needs no transfer at all.
-  CHECK(dst->PQMissing({{seg(0)}})[0].empty());
-  dst->LoadPartition(0, seg(0), PQSource::kPresent, 0, 1);
+  // Bringing partition 0 back moves its lists and no PQ code.
+  MoveSegment(src.get(), dst.get(), 0);
+  CHECK(dst->PQMissing({{{0, 0}}})[0].empty());
+  dst->InstallSegment(0, 0);
   st = dst->pq_stats();
   CHECK(st.live == d012.size() && st.cached == 0 && st.staged == 0 && st.received == d012.size());
   CHECK(dst->EvictPartition(0));
 
   // Aborted staging: the codes installed for it are freed, the cached codes it protected go
-  // back to the cache.
+  // back to the cache, and the eviction that rolls it back drops the segment received.
   auto full = OpenNode(f, {0, 1, 2, 3}, false);
-  const auto miss3 = dst->PQMissing({{seg(3)}});
+  full->SetNodes(3, {});
+  MoveSegment(full.get(), dst.get(), 3);
+  const auto miss3 = dst->PQMissing({{{3, 0}}});
   CHECK(!miss3[0].empty());
   const auto d3 = distinct({3});
   size_t claimed = 0;  // cached codes (named only by partition 0) that partition 3 also names
@@ -977,6 +1085,7 @@ void TestPQMigration() {
   CHECK(dst->PQReleaseStaged() == miss3[0].size());
   st = dst->pq_stats();
   CHECK(st.resident == d012.size() && st.staged == 0 && st.cached == d012.size() - d12.size());
+  CHECK(!dst->EvictPartition(3) && Throws([&] { dst->PQMissing({{{3, 0}}}); }));
 
   // A node whose budget is smaller than a partition's vectors cannot load it.
   NodeOptions o;
@@ -996,8 +1105,8 @@ void TestPQMigration() {
   CHECK(threw && small->ResidentPartitions().empty() && small->pq_stats().resident == 0);
 }
 
-// Queries race evictions, agent-style stagings (PQMissing, PQGet on another node, PQPut,
-// LoadPartition) and releases on a node whose PQ budget forces cached codes out and slots to be
+// Queries race evictions, agent-style stagings (the lists from another node's memory, PQMissing,
+// PQGet on that node, PQPut, InstallSegment) and releases on a node whose PQ budget forces cached codes out and slots to be
 // reused. Every Filter that succeeds must equal the answer of a node holding everything;
 // afterwards exactly the codes of the resident partitions are live.
 // Bootstrap's PQ codes in one pass (PQFromIndex): the codes the segments name that the node
@@ -1208,6 +1317,7 @@ void TestPQEvictUnderLoad() {
   o.pq_capacity = half.size() + 200;  // about two of the four partitions fit
   auto node = NodeEngine::Open(o);
   LinkPeers(node.get(), 2, {{1, oracle.get()}});
+  oracle->SetNodes(1, {});  // the source of the stagings below
   PartitionManifest man = PartitionManifest::Load(f.parts);
   std::vector<std::vector<uint32_t>> qlists(f.nq);
   for (uint32_t qi = 0; qi < f.nq; ++qi) {
@@ -1263,14 +1373,15 @@ void TestPQEvictUnderLoad() {
       if (action < 4) {
         node->EvictPartition(p);
       } else if (action < 8) {  // agent-style staging, codes installed in reverse order
-        const auto miss = node->PQMissing({{seg(p)}});
+        MoveSegment(oracle.get(), node.get(), p);
+        const auto miss = node->PQMissing({{{p, 0}}});
         std::vector<uint32_t> ids(miss[0].rbegin(), miss[0].rend());
         std::vector<uint8_t> codes(ids.size() * m);
         oracle->PQGet(ids.data(), ids.size(), codes.data());
         const size_t h = ids.size() / 2;
         node->PQPut(ids.data(), h, codes.data());
         node->PQPut(ids.data() + h, ids.size() - h, codes.data() + h * m);
-        node->LoadPartition(p, seg(p), PQSource::kPresent, 0, 1);
+        node->InstallSegment(p, 0);
         stagings++;
       } else if (action < 9) {
         node->LoadPartition(p, seg(p), PQSource::kIndex);
@@ -1502,22 +1613,21 @@ void TestRawStore() {
   RawStoreSnapshot(true);
 }
 
-// Stages partitions on `to` the way an agent does after a migration: `from` writes each as a
-// segment file (every posting records its current holder), `to` gets the PQ codes it lacks
-// from `from` and loads the files.
+// Stages partitions on `to` the way an agent does after a migration: each comes from `from`'s
+// memory (every posting with its current holder), `to` gets the PQ codes it lacks from `from`
+// and installs them.
 void StageFrom(const Fixture& f, NodeEngine* to, NodeEngine* from, const std::vector<uint32_t>& parts) {
   (void)f;
-  static int seq = 0;
-  std::vector<std::string> paths;
+  std::vector<NodeEngine::SegmentKey> keys;
   for (uint32_t p : parts) {
-    paths.push_back(JoinPath(TempDir(), "handoff-" + std::to_string(++seq) + ".seg"));
-    from->SavePartition(p, 0, paths.back());
+    MoveSegment(from, to, p);
+    keys.emplace_back(p, 0);
   }
-  const auto miss = to->PQMissing({paths});
+  const auto miss = to->PQMissing({keys});
   std::vector<uint8_t> codes(miss[0].size() * from->pq_stats().m);
   from->PQGet(miss[0].data(), miss[0].size(), codes.data());
   to->PQPut(miss[0].data(), miss[0].size(), codes.data());
-  for (size_t i = 0; i < parts.size(); ++i) to->LoadPartition(parts[i], paths[i], PQSource::kPresent);
+  for (uint32_t p : parts) to->InstallSegment(p, 0);
 }
 
 // Filters at `at` over the query's lists of `parts`, re-ranks the top 200 at `at` and at `ref`,
@@ -2166,24 +2276,50 @@ void TestWire() {
   r = Call(fd, rtier::kLoadPartition, load0(0, seg0), 6);
   CHECK(r.status == rtier::kOk && e->pq_stats().live == ids0.size());
 
-  // The hand-off: this node is node 1 (SET_NODES) and writes partition 0 as a segment that
-  // records, for every posting, the node holding its vector -- itself (SAVE_PARTITION).
+  // The hand-off: this node is node 1 (SET_NODES) and serves partition 0 from memory as a
+  // segment image, in chunks (SEGMENT_GET), every posting naming the node holding its vector --
+  // itself.
   r = Call(fd, rtier::kSetNodes, set_nodes(1, {}), 58);
   CHECK(r.status == rtier::kOk);
-  const std::string saved0 = JoinPath(TempDir(), "wire-part0.seg");
-  rtier::BodyWriter save;
-  save.Put<uint32_t>(0);
-  save.Put<uint32_t>(0);
-  save.PutBytes(saved0.data(), saved0.size());
-  r = Call(fd, rtier::kSavePartition, save, 57);
-  const ListSegment s0 = ListSegment::Load(saved0);
-  CHECK(r.status == rtier::kOk && s0.holders.size() == s0.ids.size() &&
+  std::vector<uint8_t> image0;
+  uint64_t size0 = 0, stamp0 = 0;
+  for (uint64_t id = 100; size0 == 0 || image0.size() < size0; ++id) {
+    rtier::BodyWriter get;
+    get.Put<uint32_t>(0);  // partition
+    get.Put<uint32_t>(0);  // version
+    get.Put<uint64_t>(image0.size());
+    get.Put<uint32_t>(4093);
+    r = Call(fd, rtier::kSegmentGet, get, id);
+    CHECK(r.status == rtier::kOk && r.body.size() > 16);
+    if (r.status != rtier::kOk || r.body.size() <= 16) break;
+    rtier::BodyReader gr(r.body.data(), r.body.size());
+    const uint64_t size = gr.Get<uint64_t>(), stamp = gr.Get<uint64_t>();
+    CHECK(size0 == 0 || (size == size0 && stamp == stamp0));
+    size0 = size;
+    stamp0 = stamp;
+    const size_t k = gr.remaining();
+    const uint8_t* b = gr.Bytes(k);
+    image0.insert(image0.end(), b, b + k);
+  }
+  const ListSegment file0 = ListSegment::Load(seg0);
+  SegmentLoader l0(0, UINT32_MAX, UINT32_MAX);
+  l0.Append(image0.data(), image0.size());
+  const ListSegment& s0 = l0.segment();
+  CHECK(l0.complete() && image0.size() == size0 && s0.list_ids == file0.list_ids && s0.offsets == file0.offsets &&
+        s0.ids == file0.ids && s0.locs == file0.locs &&
         std::all_of(s0.holders.begin(), s0.holders.end(), [](uint16_t h) { return h == 1; }));
+  rtier::BodyWriter get9;  // a version that is not here
+  get9.Put<uint32_t>(0);
+  get9.Put<uint32_t>(9);
+  get9.Put<uint64_t>(0);
+  get9.Put<uint32_t>(4093);
+  CHECK(Call(fd, rtier::kSegmentGet, get9, 57).status == rtier::kNotResident);
 
   // A node without the codes or vectors (and without the index's pages): the build's segment,
-  // which records no holder, is refused (the vectors could not be fetched); the saved one
-  // reports the codes absent; PQ_MISSING lists them and PQ_PUT installs them (as a peer would
-  // send them); then the load succeeds.
+  // which records no holder, is refused (the vectors could not be fetched). The one received
+  // from node 1 (SEGMENT_PUT, in two pieces) reports the codes absent at SEGMENT_INSTALL;
+  // PQ_MISSING lists them and PQ_PUT installs them (as a peer would send them); then the
+  // install succeeds.
   const std::string peer1 = "127.0.0.1:" + std::to_string(port);
   auto fresh = OpenNode(f, {}, false, f.index_nopages);
   rtier::NodeServer server2(fresh.get());
@@ -2194,13 +2330,34 @@ void TestWire() {
   CHECK(r.status == rtier::kOk);
   r = Call(fd2, rtier::kLoadPartition, load0(0, seg0), 59);
   CHECK(r.status == rtier::kRawAbsent);
-  r = Call(fd2, rtier::kLoadPartition, load0(0, saved0), 60);
+  auto put0 = [&](uint64_t off, size_t n) {
+    rtier::BodyWriter w;
+    w.Put<uint32_t>(0);  // partition
+    w.Put<uint32_t>(0);  // version
+    w.Put<uint64_t>(off);
+    w.PutBytes(image0.data() + off, n);
+    return w;
+  };
+  const size_t piece = image0.size() / 2 + 1;
+  r = Call(fd2, rtier::kSegmentPut, put0(0, piece), 60);
+  CHECK(r.status == rtier::kOk && r.body.size() == 8);
+  rtier::BodyWriter install0;
+  install0.Put<uint32_t>(0);
+  install0.Put<uint32_t>(0);
+  CHECK(Call(fd2, rtier::kSegmentInstall, install0, 65).status != rtier::kOk);  // not whole yet
+  CHECK(Call(fd2, rtier::kSegmentPut, put0(piece + 1, 8), 66).status != rtier::kOk);  // not the next byte
+  r = Call(fd2, rtier::kSegmentPut, put0(piece, image0.size() - piece), 67);
+  CHECK(r.status == rtier::kOk && r.body.size() == 8);
+  uint64_t in0 = 0;
+  std::memcpy(&in0, r.body.data(), 8);
+  CHECK(in0 == image0.size());
+  r = Call(fd2, rtier::kSegmentInstall, install0, 68);
   CHECK(r.status == rtier::kPQAbsent);
   rtier::BodyWriter miss;
-  miss.Put<uint32_t>(1);
-  miss.Put<uint32_t>(1);
-  miss.Put<uint32_t>(static_cast<uint32_t>(saved0.size()));
-  miss.PutBytes(saved0.data(), saved0.size());
+  miss.Put<uint32_t>(1);  // groups
+  miss.Put<uint32_t>(1);  // segments in the group
+  miss.Put<uint32_t>(0);  // partition
+  miss.Put<uint32_t>(0);  // version
   // The listings stream (wire.h): here in frames of about 100 entries, each entry once.
   server2.SetStreamBatch(100);
   const auto mframes = CallStream(fd2, rtier::kPQMissing, miss, 61);
@@ -2240,7 +2397,7 @@ void TestWire() {
   r = Call(fd2, rtier::kPQGet, get, 63);
   CHECK(r.status == rtier::kOk && r.body.size() == 4 + codes.size());
   CHECK(std::memcmp(r.body.data() + 4, codes.data(), codes.size()) == 0);
-  r = Call(fd2, rtier::kLoadPartition, load0(0, saved0), 64);
+  r = Call(fd2, rtier::kSegmentInstall, install0, 64);
   CHECK(r.status == rtier::kOk);
   st = fresh->pq_stats();
   CHECK(st.live == ids0.size() && st.staged == 0 && st.received == ids0.size());
@@ -2894,13 +3051,12 @@ void TestListEdits() {
   // A later owner gets partition 0 at version 1 and learns the new lists from its segment.
   auto z = OpenNode(f, {}, false);
   LinkPeers(z.get(), 3, {{1, x.get()}});
-  const std::string seg = JoinPath(TempDir(), "p0v1.seg");
-  x->SavePartition(0, 1, seg);
-  const auto miss = z->PQMissing({{seg}});
+  MoveSegment(x.get(), z.get(), 0, 1);
+  const auto miss = z->PQMissing({{{0, 1}}});
   std::vector<uint8_t> mc(miss[0].size() * m);
   x->PQGet(miss[0].data(), miss[0].size(), mc.data());
   z->PQPut(miss[0].data(), miss[0].size(), mc.data());
-  z->LoadPartition(0, seg, PQSource::kPresent, 1);
+  z->InstallSegment(0, 1);
   for (uint32_t qi = 0; qi < 5; ++qi) CHECK(filter(*z, qi, {nl, nl + 1}, {1, 1}) == filter(*x, qi, {nl, nl + 1}, {1, 1}));
   for (uint16_t h : z->GetList(nl, 1).holders) CHECK(h == 1);  // z holds none of them
 

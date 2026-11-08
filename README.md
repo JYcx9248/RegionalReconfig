@@ -63,7 +63,7 @@ needs it (`Protocol: lazy`, the default): the point of being lazy is that querie
 small working set of what moved, and the rest never has to. Every posting records the holder of
 its vector, the node that stores it (segment version 3), so each (list, vector) has one current
 holder: the list's owner if it has the vector, else the node its posting names. Only the owner's
-copy of a list counts: a partition moves as its owner saves it, holders included. From the flip
+copy of a list counts: a partition moves from its owner's memory, holders included. From the flip
 on, a RERANK that meets a vector not there fetches it from the holder that one of the query's
 lists on that node records -- one hop, data node to data node -- waits for that fetch only,
 holding no engine worker meanwhile, nor a connection slot of the aggregator's that FILTERs use
@@ -130,9 +130,18 @@ the source entry's memory to the new entry's and never through a disk, since que
 only in memory: the source's data node reads any range of its loaded graph in hnswlib's index
 format (`GRAPH_GET`), the agents relay the chunks, and the new entry's data node builds its
 graph from them as they arrive (`GRAPH_PUT`, then `GRAPH_INSTALL`), so neither end writes a file
-or holds a second copy (`engine/include/fusion/graph_image.h`). The pull runs at
+or holds a second copy (`engine/include/fusion/graph_image.h`). A partition's posting lists move
+the same way, since queries use them only in memory too (2026-11-07): the owner's data node reads
+any range of a resident segment in the segment format, every posting with its current holder
+(`SEGMENT_GET`), the agents relay the chunks at the data class, and the next owner's data node
+builds the segment as they arrive (`SEGMENT_PUT`), lists the PQ codes it lacks from it
+(`PQ_MISSING`) and loads it once they are in (`SEGMENT_INSTALL`) -- no segment file at either end
+(`engine/include/fusion/partition.h`). Before, the old owners first wrote the moved partitions as
+files (23-24 s for Amazon 300M's 4 → 8, 11.9 GB), and each new node wrote its share to its disk
+and read it back twice. Only a bootstrap and a full rebuild's next generation load segment files.
+The graph's pull runs at
 background priority (`GraphPriority: background`, the default): the graph moves only while
-neither its source nor its destination moves data -- segments or PQ codes through the agent,
+neither its source nor its destination moves data -- posting lists or PQ codes through the agent,
 raw vectors through the data node (`RAW_TRAFFIC`, polled every 100 ms) -- paced or not, so it
 delays neither the flip nor a query's fetch. In the worst case, queries fetching without pause,
 a new node becomes an entry only once the fetching subsides; only navigation waits for it,
@@ -194,8 +203,9 @@ placement current in the epoch store.
 - A query runs under the epoch its entry had when the query arrived, not when it was sent. A query
   that waits in a client's queue across the flip runs under the new epoch.
 - The flip is not the trigger, the moment the controller receives the request. Before the flip
-  come, in turn, working out the placement, pre-connecting, saving the segments, the lists and PQ
-  codes, and an eager protocol's raw vectors: the reply's `phases` tile the time from the trigger.
+  come, in turn, working out the placement, pre-connecting, the lists and PQ codes, and an eager
+  protocol's raw vectors: the reply's `phases` tile the time from the trigger (runs before
+  2026-11-07 also have `save_segments`, the old owners writing the moved lists as files).
   Every protocol stages the same lists and PQ codes, so they part at the flip.
 - Nor is it the end of the reconfiguration. After it come the grace period, the reclaim, the entry
   flips (later epochs that only make new nodes entries as their graphs load), lazy's fetches and
@@ -234,8 +244,8 @@ nodes carry it out:
    cached codes are kept because they may be needed again, and a deleted vector never is.
 
 A failed staging is undone before the lease is given up, and a commit that fails before the flip
-drops what was staged. A partition at a later version moves with its current lists: its owner
-writes them as a segment file when it moves. With `lazy`, a vector inserted into a partition
+drops what was staged. A partition at a later version moves with its current lists, from its
+owner's memory like any partition. With `lazy`, a vector inserted into a partition
 stays with the owner that added it when the partition moves on (the postings name that node as
 its holder), and a scale-in that removes the node drains it first.
 

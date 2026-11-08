@@ -36,6 +36,7 @@
 // from its holder.
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,44 @@ struct ListSegment {
 
   void Save(const std::string& path) const;
   static ListSegment Load(const std::string& path);
+};
+
+// A partition's lists move from one node's memory to another's as the segment format's bytes
+// without the checksum (the image), never through a file: the owner serves any range of a
+// resident segment's image from memory (SEGMENT_GET) and the next owner builds the segment from
+// the bytes as they arrive (SEGMENT_PUT), so neither end holds a second copy -- the path of the
+// navigation graph's bytes (fusion/graph_image.h), and checked by the transfer the same way. The
+// image is version 3: every posting has a holder in it.
+uint64_t SegmentImageSize(const ListSegment& s);  // with a holder for each of s.ids
+// holders(first, count, out): the holders of postings [first, first + count), read as the bytes
+// are (a resident segment's change: a fetch makes a posting name the node that fetched).
+using HolderReader = std::function<void(size_t first, size_t count, uint16_t* out)>;
+// Bytes [off, off + n) of s's image (off + n at most its size).
+void ReadSegmentImage(const ListSegment& s, uint64_t off, size_t n, uint8_t* out, const HolderReader& holders);
+
+// A segment built from its image's bytes, in order as they arrive, straight into its arrays.
+// Malformed bytes throw, with the segment unusable: a header of another partition or format, a
+// list longer than max_list_len, more than max_lists lists, offsets out of order, list IDs not
+// ascending, bytes past the end.
+class SegmentLoader {
+ public:
+  SegmentLoader(uint32_t partition, uint64_t max_lists, uint32_t max_list_len);
+  void Append(const uint8_t* p, size_t n);
+  uint64_t received() const { return received_; }
+  bool complete() const { return section_ == kDone; }
+  ListSegment& segment() { return s_; }  // the whole segment once complete
+
+ private:
+  enum Section { kHeader, kListIds, kOffsets, kIds, kLocs, kHolders, kDone };
+  void Next();  // the section being filled is in: check it and go on to the next non-empty one
+  uint64_t max_lists_;
+  uint32_t max_list_len_;
+  ListSegment s_;
+  uint32_t header_[4] = {0, 0, 0, 0};
+  int section_ = kHeader;
+  uint8_t* dst_;
+  size_t left_;  // bytes of the current section still to come
+  uint64_t received_ = 0;
 };
 
 // Splits `lists` by `list_part` and writes the manifest, list_part.bin and one segment per

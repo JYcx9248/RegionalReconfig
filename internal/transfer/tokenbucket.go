@@ -31,7 +31,7 @@ import (
 type Class int
 
 const (
-	// Data is what a node needs before it can own partitions: segment files and PQ codes.
+	// Data is what a node needs before it can own partitions: posting lists and PQ codes.
 	Data Class = iota
 	// Background is the navigation graph, needed only for the entry role, and, through the
 	// agents, the raw vectors a baseline streams in after the flip or a drain takes over.

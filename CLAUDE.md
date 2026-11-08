@@ -110,11 +110,17 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   of each candidate at one owner that reported it, top-k merge. Equal to the single-node answer.
 - **Reconfiguration** (`copyThenFlip`, protocol `lazy` by default): pre-connect (aggregators to
   the data nodes, entries to the aggregators: `StageAggregator`) →
-  new nodes pull segments and the PQ codes they lack (the graph last, for now strictly: it
-  moves only while neither end moves segments, PQ codes or raw vectors, `graphYield`; sources
-  round-robin over entries; from the source entry's memory into the new entry's, never through a
-  disk: `GRAPH_GET`, relayed by the agents, `GRAPH_PUT`, `GRAPH_INSTALL`) → flip (CAS + install) → grace (drain the old epoch) →
-  reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
+  new nodes pull the moved posting lists and the PQ codes they lack (the graph last, for now
+  strictly: it moves only while neither end moves posting lists, PQ codes or raw vectors,
+  `graphYield`; sources round-robin over entries) → flip (CAS + install) → grace (drain the old
+  epoch) → reclaim (old owners drop moved posting lists; PQ codes and raw vectors stay cached).
+  Lists and graph go from the source's memory into the new node's, never through a disk, the
+  agents relaying the chunks: the graph `GRAPH_GET` → `GRAPH_PUT` → `GRAPH_INSTALL`; a
+  partition `SEGMENT_GET` (every posting with its current holder) → `SEGMENT_PUT` →
+  `PQ_MISSING` over the received segments → `SEGMENT_INSTALL` (since 2026-11-07: before, the
+  old owners first wrote the moved partitions as files, `save_segments`, 23-24 s on Amazon
+  300M, and the new nodes loaded them from their disks). Only a bootstrap and a rebuild's next
+  generation load segment files.
   Alongside grace and reclaim, `promoteEntries` flips every `EntryFlipInterval` to make
   entries of the new nodes whose graph has loaded, each connected to every aggregator first;
   the rescale waits for it. Raw vectors do
@@ -122,7 +128,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   `lazy-stream` also streams the rest in after the flip (`StageRaw`; the rescale waits for it),
   `copy-then-flip` and `stop-and-copy` stream them before the flip (eager). A rescale to a plan
   (`rtier-client rescale -plan`) carries out any target placement. The token bucket paces only
-  what goes through the agents -- segments and PQ codes (data class) and the graph (background);
+  what goes through the agents -- posting lists and PQ codes (data class) and the graph (background);
   raw vectors move data node to data node (`RAW_GET`, `RAW_PULL`), unpaced, unless
   `RawPath: agent` (then at `RawPriority`, U8).
 - **Listings stream** (`PQ_MISSING`, `RAW_MISSING`, `RAW_HELD_BY`; `engine/node/stream.h`): the

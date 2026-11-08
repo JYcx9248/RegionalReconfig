@@ -41,14 +41,30 @@
 //                   version)
 //   LOAD_PARTITION  u32 partition, u32 version, u8 pq_source, -> -
 //                   path
-//                   loads (or replaces) that version of the partition; its other versions stay
+//                   loads (or replaces) that version of the partition from a segment file; its
+//                   other versions stay (a partition that moves between nodes comes from its
+//                   owner's memory instead, SEGMENT_GET to SEGMENT_PUT)
 //                   pq_source 0: every PQ code must already be on the node (PQ_PUT); raw
 //                                vectors not here are fetched, when a query needs them, from
-//                                the holder each posting records (a segment saved at a
-//                                hand-off records one for every posting)
+//                                the holder each posting records
 //                             1: bootstrap: copy the missing codes and raw vectors from the index
 //                             2: a generation's partition after a full rebuild (U14): copy the
 //                                missing codes from the generation's index; raw vectors as 0
+//   SEGMENT_GET     u32 partition, u32 version, u64 offset,   -> u64 size, u64 stamp, u8 bytes[]
+//                   u32 n
+//                   (bytes [offset, offset + n) -- fewer at the end -- of that resident version
+//                   as a segment image, fusion/partition.h, read from memory, every posting with
+//                   its current holder (this node by its ID for the vectors it holds): the
+//                   source of a partition's move. size: the image's; stamp differs for each
+//                   segment loaded. NOT_RESIDENT if that version is not here)
+//   SEGMENT_PUT     u32 partition, u32 version, u64 offset,   -> u64 received
+//                   u8 bytes[]
+//                   (the next bytes of that version's image, built in memory as they arrive into
+//                   a received segment, which is not resident yet; offset 0 starts it again --
+//                   with no bytes, only drops it)
+//   SEGMENT_INSTALL u32 partition, u32 version                -> -
+//                   (the received segment, whole, loaded as LOAD_PARTITION with pq_source 0
+//                   would; on failure it stays received)
 //   SWITCH_GENERATION u32 generation, str index_dir,         -> -
 //                   str partitions_dir
 //                   (full rebuild, U14: the node, holding no partition, moves to that generation
@@ -56,11 +72,12 @@
 //   RAW_BITMAP      -                                         -> u64 locations, u64 words[]
 //                   (the raw vectors the node holds, one bit per location)
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
-//                                                                version is evicted)
-//   PQ_MISSING      u32 groups, per group: u32 paths,         -> streamed, each frame: u32 runs,
-//                   str path[paths] (segment files)              (u32 group, u32 n, u32 ids[n])[runs]
-//                   (every missing code once, under the first group that needs it; the codes
-//                   already here are protected for the staging)
+//                                                                version is evicted, and the
+//                                                                received ones are dropped)
+//   PQ_MISSING      u32 groups, per group: u32 n,             -> streamed, each frame: u32 runs,
+//                   (u32 partition, u32 version)[n]              (u32 group, u32 n, u32 ids[n])[runs]
+//                   (of received segments, SEGMENT_PUT: every missing code once, under the first
+//                   group that needs it; the codes already here are protected for the staging)
 //   PQ_FROM_INDEX   u32 n, str path[n] (segment files)        -> u64 installed
 //                   (bootstrap: the codes they name that are not here, read from the index's
 //                   pq_codes.bin in one pass in its order and staged as PQ_PUT's; the ones
@@ -104,9 +121,9 @@
 //
 // A streamed reply comes as frames of the same request ID, every one but the last flagged more,
 // each with at most about kStreamBatch entries: the node sends a frame when it is full, when its
-// first entry has waited kStreamLingerMs (a slow listing -- a large segment read from disk --
-// still feeds the requester, which pulls what a frame names as it arrives), and the last one
-// when the listing is done. An error frame ends the stream.
+// first entry has waited kStreamLingerMs (a slow listing still feeds the requester, which pulls
+// what a frame names as it arrives), and the last one when the listing is done. An error frame
+// ends the stream.
 //
 //   SET_NODES       u16 self, u16 pad, u32 n,                 -> -
 //                   (u16 id, u16 pad, str addr)[n]
@@ -171,7 +188,6 @@
 //                                                                are deleted, and the codes a
 //                                                                version still names are freed
 //                                                                with their last reference)
-//   SAVE_PARTITION  u32 partition, u32 version, path          -> - (that version as a segment file)
 #pragma once
 
 #include <cstdint>
@@ -222,7 +238,8 @@ enum Op : uint8_t {
   kStageVersions = 0x30,
   kDropVersion = 0x31,
   kForget = 0x32,
-  kSavePartition = 0x33,
+  // 0x33: SAVE_PARTITION, retired (a moved partition goes from memory to memory, SEGMENT_GET);
+  // not reused
   kSetNodes = 0x34,
   kRawHeldBy = 0x35,
   kListGet = 0x36,
@@ -241,6 +258,9 @@ enum Op : uint8_t {
   kGraphPut = 0x42,
   kGraphInstall = 0x43,
   kPQSave = 0x44,
+  kSegmentGet = 0x45,
+  kSegmentPut = 0x46,
+  kSegmentInstall = 0x47,
 };
 
 enum Status : uint16_t {

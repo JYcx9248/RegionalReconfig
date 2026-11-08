@@ -128,7 +128,6 @@ const char* OpName(uint8_t op) {
     case kStageVersions: return "stage_versions";
     case kDropVersion: return "drop_version";
     case kForget: return "forget";
-    case kSavePartition: return "save_partition";
     case kSetNodes: return "set_nodes";
     case kRawHeldBy: return "raw_held_by";
     case kListGet: return "list_get";
@@ -145,6 +144,9 @@ const char* OpName(uint8_t op) {
     case kGraphPut: return "graph_put";
     case kGraphInstall: return "graph_install";
     case kPQSave: return "pq_save";
+    case kSegmentGet: return "segment_get";
+    case kSegmentPut: return "segment_put";
+    case kSegmentInstall: return "segment_install";
     default: return nullptr;
   }
 }
@@ -179,15 +181,18 @@ std::string TakeStr(BodyReader* r) {
   return std::string(reinterpret_cast<const char*>(p), n);
 }
 
-// PQ_MISSING / RAW_MISSING: u32 groups, per group u32 paths, str path[paths]; nothing after.
-std::vector<std::vector<std::string>> TakeGroups(BodyReader* r) {
+// PQ_MISSING: u32 groups, per group u32 n, (u32 partition, u32 version)[n]; nothing after.
+std::vector<std::vector<fusion::NodeEngine::SegmentKey>> TakeGroups(BodyReader* r) {
   const uint32_t ngroups = r->Get<uint32_t>();
   Require(ngroups <= 1024, "too many groups");
-  std::vector<std::vector<std::string>> groups(ngroups);
+  std::vector<std::vector<fusion::NodeEngine::SegmentKey>> groups(ngroups);
   for (auto& g : groups) {
-    const uint32_t npaths = r->Get<uint32_t>();
-    Require(npaths <= r->remaining() / 4, "bad path count");
-    for (uint32_t i = 0; i < npaths; ++i) g.push_back(TakeStr(r));
+    const uint32_t n = r->Get<uint32_t>();
+    Require(n <= r->remaining() / 8, "bad segment count");
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t p = r->Get<uint32_t>();
+      g.emplace_back(p, r->Get<uint32_t>());
+    }
   }
   Require(r->remaining() == 0, "trailing bytes after the groups");
   return groups;
@@ -572,6 +577,36 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         const uint64_t size = r.Get<uint64_t>();
         Require(r.remaining() == 0, "trailing bytes in GRAPH_INSTALL");
         e.InstallGraph(v, size);
+        break;
+      }
+      case kSegmentGet: {
+        const uint32_t p = r.Get<uint32_t>();
+        const uint32_t v = r.Get<uint32_t>();
+        const uint64_t off = r.Get<uint64_t>();
+        const uint32_t n = r.Get<uint32_t>();
+        Require(r.remaining() == 0, "trailing bytes in SEGMENT_GET");
+        Require(n <= kMaxFrameBytes / 2, "SEGMENT_GET: chunk too large");
+        std::vector<uint8_t> bytes;
+        uint64_t stamp = 0;
+        const uint64_t size = e.ReadSegment(p, v, off, n, &bytes, &stamp);
+        w.Put<uint64_t>(size);
+        w.Put<uint64_t>(stamp);
+        w.PutBytes(bytes.data(), bytes.size());
+        break;
+      }
+      case kSegmentPut: {
+        const uint32_t p = r.Get<uint32_t>();
+        const uint32_t v = r.Get<uint32_t>();
+        const uint64_t off = r.Get<uint64_t>();
+        const size_t n = r.remaining();
+        w.Put<uint64_t>(e.PutSegment(p, v, off, r.Bytes(n), n));
+        break;
+      }
+      case kSegmentInstall: {
+        const uint32_t p = r.Get<uint32_t>();
+        const uint32_t v = r.Get<uint32_t>();
+        Require(r.remaining() == 0, "trailing bytes in SEGMENT_INSTALL");
+        e.InstallSegment(p, v);
         break;
       }
       case kLoadPartition: {
@@ -997,12 +1032,6 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         Require(static_cast<uint64_t>(n) * 4 == r.remaining(), "FORGET: IDs do not match");
         const auto ids = TakeArray<uint32_t>(&r, n);
         w.Put<uint64_t>(e.ForgetVectors(ids.data(), n, (flags & 1) != 0));
-        break;
-      }
-      case kSavePartition: {
-        const uint32_t p = r.Get<uint32_t>();
-        const uint32_t v = r.Get<uint32_t>();
-        e.SavePartition(p, v, r.Rest());
         break;
       }
       case kSearchLocal: {

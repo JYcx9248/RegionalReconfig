@@ -325,20 +325,41 @@ class NodeEngine {
   // never a result), searched with width ef.
   virtual void SplitCodes(const uint8_t* codes, uint32_t n, uint8_t* side, uint32_t heads[2]) const = 0;
   virtual void NearestHeads(const uint8_t* codes, uint32_t n, uint32_t ef, uint32_t* lists) const = 0;
-  // Loads version `version` of partition p's posting lists, replacing that version if it is
-  // resident; the partition's other versions stay. Every vector they name must end up with a PQ
-  // code on this node (see PQSource); the partition's postings then hold references on those
-  // codes.
+  // Loads version `version` of partition p's posting lists from a segment file, replacing that
+  // version if it is resident; the partition's other versions stay. Every vector they name must
+  // end up with a PQ code on this node (see PQSource); the partition's postings then hold
+  // references on those codes.
   // Raw vectors: every key (list, vector) has one current holder. With kIndex the node copies
   // them all and holds them. With kPresent, a vector not on the node is fetched, when a query
-  // needs it, from the holder its posting records (partition.h; a segment written at a hand-off
-  // records one for every posting). fallback_holder stands in for postings that record none (a
-  // version-2 segment); a vector missing here with no holder at all is a RawMissingError.
+  // needs it, from the holder its posting records (partition.h). fallback_holder stands in for
+  // postings that record none (a version-2 segment, or one rtier_segment wrote); a vector
+  // missing here with no holder at all is a RawMissingError.
   virtual void LoadPartition(uint32_t partition, const std::string& segment_path, PQSource pq,
                              uint32_t version = 0, uint16_t fallback_holder = kNoHolder) = 0;
+  // A partition moving between data nodes, from memory to memory as the graph does (the segment
+  // image, partition.h). The owner: bytes [off, off + n) of the image of its resident version
+  // `version` of partition p, fewer at the end, every posting with its current holder -- this
+  // node (SetNodes) for the vectors it holds, the recorded one for the others; returns the
+  // image's size, and *stamp, which differs for each segment loaded or built, so that a
+  // transfer in chunks can tell its bytes all come from one. NotResidentError if that version
+  // is not here.
+  virtual uint64_t ReadSegment(uint32_t partition, uint32_t version, uint64_t off, size_t n,
+                               std::vector<uint8_t>* out, uint64_t* stamp) const = 0;
+  // The next owner: the next bytes of that version's image, built into a received segment as
+  // they arrive; off 0 starts it again (with n = 0, only drops it). Returns the bytes in. A
+  // received segment is not resident: PQMissing lists the codes it needs, InstallSegment loads
+  // it, EvictPartition drops it.
+  virtual uint64_t PutSegment(uint32_t partition, uint32_t version, uint64_t off, const uint8_t* p,
+                              size_t n) = 0;
+  // Loads the received segment of version `version` of partition p, whole, as LoadPartition
+  // with kPresent would (every PQ code it needs must be here); the received copy becomes the
+  // resident one. On failure (PQMissingError: a code gone since it was listed) it stays
+  // received, for another try.
+  virtual void InstallSegment(uint32_t partition, uint32_t version) = 0;
   // Evicts every version of the partition; returns false if none was resident. Queries already
   // holding the partition finish on the old copy; its PQ references are dropped when the last
-  // one lets go of it. Its codes stay on the node (cached) for a later reconfiguration.
+  // one lets go of it. Its codes stay on the node (cached) for a later reconfiguration. The
+  // segments of it received and not installed are dropped too (a staging rolled back).
   virtual bool EvictPartition(uint32_t partition) = 0;
   // Partitions with at least one resident version, ascending.
   virtual std::vector<uint32_t> ResidentPartitions() const = 0;
@@ -379,30 +400,27 @@ class NodeEngine {
   // still names are freed with their last reference, never cached; without it, only the
   // unreferenced copies go. Returns how many were freed now.
   virtual size_t ForgetVectors(const uint32_t* ids, size_t n, bool deleted) = 0;
-  // Writes a resident version of a partition as a segment file (the format of the partition
-  // directory's), so that a node the partition moves to can load that version. Every posting
-  // records its current holder: this node (SetNodes) for the vectors it holds, the recorded one
-  // for the others.
-  virtual void SavePartition(uint32_t partition, uint32_t version, const std::string& path) const = 0;
   // The cluster's node IDs: this node's (0: unchanged) and other data nodes' addresses, where
   // it fetches the vectors that postings say they hold. Merged into what it knew.
   virtual void SetNodes(uint16_t self, const std::vector<std::pair<uint16_t, std::string>>& peers) = 0;
 
-  // PQ codes (node-level store). For each group of segment files (one group per source a
-  // staging pulls from): the vector IDs they name that have no code on this node and are not
-  // listed for an earlier group. Asking once for all sources makes every missing code come
-  // exactly once, even when several sources could send it. The codes the node already has
-  // (live or cached) are protected until the partitions load or PQReleaseStaged, so that making
-  // room for the missing ones never drops them. PQMissingStream hands the IDs to sink a segment
-  // at a time, as it finds them (sorted within a call, each ID in one call only): the server
-  // streams them, and the requester pulls the first while the rest are listed. PQMissing
-  // collects them, sorted per group.
-  virtual void PQMissingStream(const std::vector<std::vector<std::string>>& groups,
+  // PQ codes (node-level store). For each group of received segments (PutSegment; one group per
+  // source a staging pulls from), named by (partition, version): the vector IDs they name that
+  // have no code on this node and are not listed for an earlier group. Asking once for all
+  // sources makes every missing code come exactly once, even when several sources could send
+  // it. The codes the node already has (live or cached) are protected until the partitions load
+  // or PQReleaseStaged, so that making room for the missing ones never drops them.
+  // PQMissingStream hands the IDs to sink a segment at a time, as it finds them (sorted within a
+  // call, each ID in one call only): the server streams them, and the requester pulls the first
+  // while the rest are listed. PQMissing collects them, sorted per group. NotResidentError for a
+  // segment not received whole.
+  using SegmentKey = std::pair<uint32_t, uint32_t>;  // (partition, version)
+  virtual void PQMissingStream(const std::vector<std::vector<SegmentKey>>& groups,
                                const std::function<void(size_t group, const uint32_t* ids, size_t n)>& sink) = 0;
-  std::vector<std::vector<uint32_t>> PQMissing(const std::vector<std::vector<std::string>>& groups);
+  std::vector<std::vector<uint32_t>> PQMissing(const std::vector<std::vector<SegmentKey>>& groups);
   // Codes of ids (m bytes each) for a peer; PQMissingError if one is not held.
   virtual void PQGet(const uint32_t* ids, size_t n, uint8_t* out) = 0;
-  // Installs codes received from a peer (staged until LoadPartition names them).
+  // Installs codes received from a peer (staged until a partition's load names them).
   virtual PQPutResult PQPut(const uint32_t* ids, size_t n, const uint8_t* codes) = 0;
   // Bootstrap: installs the codes the segments at these paths name that this node lacks, from
   // the index's pq_codes.bin, staged as PQPut's (the ones here already are protected), so that

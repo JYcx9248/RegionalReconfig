@@ -302,8 +302,8 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 		out.Phases, out.RawSeconds)
 	// The phases tile the time from the trigger, so the flip's compare-and-swap falls after the
 	// stages before it and within the flip phase.
-	staged := out.Phases["plan"] + out.Phases["stage_aggregator"] + out.Phases["save_segments"] +
-		out.Phases["pause"] + out.Phases["stage_data"] + out.Phases["stage_raw"]
+	staged := out.Phases["plan"] + out.Phases["stage_aggregator"] + out.Phases["pause"] +
+		out.Phases["stage_data"] + out.Phases["stage_raw"]
 	if _, ok := out.Phases["plan"]; !ok || out.FlipSeconds < staged-1e-3 || out.FlipSeconds > staged+out.Phases["flip"]+1e-3 {
 		t.Errorf("%s: flip at %.6f s after the trigger, its stages end at %.6f s, the flip phase takes %.6f s (phases %v)",
 			what, out.FlipSeconds, staged, out.Phases["flip"], out.Phases)
@@ -478,6 +478,22 @@ func TestScaleOutFromOneNode(t *testing.T) {
 	if raw := info.Raw; raw.FromIndex != 0 || raw.Streamed != 0 || raw.Fetched == 0 || raw.Present != raw.Fetched ||
 		raw.Present > info.PQ.Resident {
 		t.Errorf("new node's raw vectors %+v: want only those queries needed, fetched from the first node", raw)
+	}
+	// The lists moved from the first node's memory into the new node's, through no file: the new
+	// node's partition directory is empty, and the first node's holds the bootstrap's files of
+	// the partitions it still owns.
+	for id, dir := range cl.dirs {
+		files, err := os.ReadDir(filepath.Join(dir, "partitions"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := len(tbl.Placement.PartitionsOf(id))
+		if id == added {
+			want = 0
+		}
+		if len(files) != want {
+			t.Errorf("node %d keeps %d files in its partition directory, want %d", id, len(files), want)
+		}
 	}
 	t.Logf("1 -> 2 under load: %d queries, %d retries (%v), max latency %v, per epoch %v",
 		st.total, st.retries, st.retryWhy, st.maxLatency, st.epochs)

@@ -243,8 +243,9 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 			changed++
 		}
 	}
-	if changed == 0 || out.Phases["save_segments"] == 0 {
-		t.Fatalf("scale-out moved %v at versions %v (phases %v): want partitions the batch changed, saved for the move",
+	// Their version 1 exists only in the old owners' memory: it moves from there (SEGMENT_GET).
+	if changed == 0 {
+		t.Fatalf("scale-out moved %v at versions %v (phases %v): want partitions the batch changed",
 			out.Moved, cur.Versions, out.Phases)
 	}
 	t.Logf("scale-out: epoch %d -> %d, moved %v, phases %v", out.FromEpoch, out.ToEpoch, out.Moved, out.Phases)

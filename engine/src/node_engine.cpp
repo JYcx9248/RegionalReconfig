@@ -95,6 +95,7 @@ struct ResidentSegment {
   // acquire carry that: a thread that reads kSelfHolder finds the vector.
   std::unique_ptr<std::atomic<uint16_t>[]> holders;
   uint32_t version = 0;                           // of the partition (see NodeEngine)
+  uint64_t stamp = 0;                             // unique to this segment (ReadSegment)
   mutable const ResidentSegment* next = nullptr;  // Reclaimer queue
 
   uint16_t Holder(size_t j) const { return holders[j].load(std::memory_order_acquire); }
@@ -708,19 +709,105 @@ class NodeEngineImpl : public NodeEngine {
                      uint16_t fallback_holder) override {
     const uint32_t num_parts = Man()->num_partitions;
     FUSION_CHECK(p < num_parts, "partition %u out of range (%u partitions)", p, num_parts);
-    auto rs = std::make_unique<ResidentSegment>();
-    rs->seg = LoadSegment(seg_path);
-    FUSION_CHECK(rs->seg.partition == p, "%s holds partition %u, not %u", seg_path.c_str(),
-                 rs->seg.partition, p);
+    ListSegment seg = LoadSegment(seg_path);
+    FUSION_CHECK(seg.partition == p, "%s holds partition %u, not %u", seg_path.c_str(), seg.partition, p);
+    Install(p, version, &seg, seg_path, pq, fallback_holder);
+  }
+
+  uint64_t ReadSegment(uint32_t p, uint32_t version, uint64_t off, size_t n, std::vector<uint8_t>* out,
+                       uint64_t* stamp) const override {
+    std::shared_ptr<const ResidentSegment> rs;  // pinned: an eviction meanwhile fails the next chunk
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
+      rs = SegmentLocked(p, &version);
+    }
+    if (!rs) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
+    const uint64_t size = SegmentImageSize(rs->seg);
+    FUSION_CHECK(off <= size, "SEGMENT_GET at byte %llu of a %llu-byte segment", static_cast<unsigned long long>(off),
+                 static_cast<unsigned long long>(size));
+    out->resize(static_cast<size_t>(std::min<uint64_t>(n, size - off)));
+    // Every posting with its current holder: this node, by its ID, for the vectors it holds. A
+    // holder that changes between two chunks is still one: no node drops a vector it has held.
+    const uint16_t me = self_id_.load();
+    ReadSegmentImage(rs->seg, off, out->size(), out->data(), [&](size_t first, size_t count, uint16_t* hs) {
+      for (size_t i = 0; i < count; ++i) {
+        const uint16_t h = rs->Holder(first + i);
+        FUSION_CHECK(h != kSelfHolder || me != kNoHolder,
+                     "partition %u: this node holds vectors of it but does not know its own node ID (SetNodes)", p);
+        hs[i] = h == kSelfHolder ? me : h;
+      }
+    });
+    *stamp = rs->stamp;
+    return size;
+  }
+
+  uint64_t PutSegment(uint32_t p, uint32_t version, uint64_t off, const uint8_t* bytes, size_t n) override {
+    const uint32_t num_parts = Man()->num_partitions;
+    FUSION_CHECK(p < num_parts, "partition %u out of range (%u partitions)", p, num_parts);
+    const SegmentKey key(p, version);
+    // Under the lock throughout: one chunk's copy, while other partitions' wait.
+    std::lock_guard<std::mutex> l(recv_mu_);
+    auto it = received_.find(key);
+    if (off == 0) {
+      if (it != received_.end()) received_.erase(it);
+      if (n == 0) return 0;
+      it = received_.emplace(key, std::make_shared<SegmentLoader>(p, Lists()->capacity, max_list_len_)).first;
+    }
+    FUSION_CHECK(it != received_.end() && it->second->received() == off,
+                 "SEGMENT_PUT at byte %llu of partition %u's version %u, which has %llu bytes in",
+                 static_cast<unsigned long long>(off), p, version,
+                 static_cast<unsigned long long>(it != received_.end() ? it->second->received() : 0));
+    try {
+      it->second->Append(bytes, n);
+      if (it->second->complete()) CheckLists(it->second->segment(), StrFormat("partition %u from its owner", p));
+    } catch (...) {
+      received_.erase(it);  // a segment that went wrong half way is given up, with its memory
+      throw;
+    }
+    return it->second->received();
+  }
+
+  void InstallSegment(uint32_t p, uint32_t version) override {
+    const SegmentKey key(p, version);
+    std::shared_ptr<SegmentLoader> rec;
+    {
+      std::lock_guard<std::mutex> l(recv_mu_);
+      auto it = received_.find(key);
+      FUSION_CHECK(it != received_.end() && it->second->complete(),
+                   "SEGMENT_INSTALL of partition %u's version %u: %s", p, version,
+                   it == received_.end() ? "not received" : "not received whole");
+      rec = std::move(it->second);  // out of reach of a PQ listing or a put meanwhile
+      received_.erase(it);
+    }
+    try {
+      Install(p, version, &rec->segment(), StrFormat("partition %u from its owner", p), PQSource::kPresent,
+              kNoHolder);
+    } catch (...) {
+      // Received still, for another try, unless a transfer of it began again -- or Install had
+      // taken it (a segment has offsets until moved from) and failed after: the generation changed.
+      if (!rec->segment().offsets.empty()) {
+        std::lock_guard<std::mutex> l(recv_mu_);
+        received_.emplace(key, std::move(rec));
+      }
+      throw;
+    }
+  }
+
+  // Loads *seg as version `version` of partition p (see LoadPartition); what names it in errors.
+  // *seg is taken only once nothing can fail: until then a refusal leaves it whole.
+  void Install(uint32_t p, uint32_t version, ListSegment* seg, const std::string& what, PQSource pq,
+               uint16_t fallback_holder) {
     // A version that update batches made can hold lists longer than the build's (U14): refuse
     // it here, before the flip, rather than fail the queries that gather it.
-    for (size_t li = 0; li + 1 < rs->seg.offsets.size(); ++li)
-      FUSION_CHECK(rs->seg.offsets[li + 1] - rs->seg.offsets[li] <= max_list_len_,
+    for (size_t li = 0; li + 1 < seg->offsets.size(); ++li)
+      FUSION_CHECK(seg->offsets[li + 1] - seg->offsets[li] <= max_list_len_,
                    "%s: list %u holds %llu postings, more than the %u a request may gather (--max-list-len)",
-                   seg_path.c_str(), rs->seg.list_ids[li],
-                   static_cast<unsigned long long>(rs->seg.offsets[li + 1] - rs->seg.offsets[li]), max_list_len_);
-    const std::vector<uint32_t>& ids = rs->seg.ids;
-    const std::vector<uint32_t>& locs = rs->seg.locs;
+                   what.c_str(), seg->list_ids[li],
+                   static_cast<unsigned long long>(seg->offsets[li + 1] - seg->offsets[li]), max_list_len_);
+    auto rs = std::make_unique<ResidentSegment>();
+    const std::vector<uint32_t>& ids = seg->ids;
+    const std::vector<uint32_t>& locs = seg->locs;
     rs->holders.reset(new std::atomic<uint16_t>[ids.size()]);
     if (pq == PQSource::kIndex) {
       FillFromIndex(ids);
@@ -738,7 +825,7 @@ class NodeEngineImpl : public NodeEngine {
       size_t unknown = 0;
       uint32_t first = 0;
       for (size_t j = 0; j < ids.size(); ++j) {
-        uint16_t h = rs->seg.holders.empty() ? kNoHolder : rs->seg.holders[j];
+        uint16_t h = seg->holders.empty() ? kNoHolder : seg->holders[j];
         if (h == kNoHolder) h = fallback_holder;
         if (!std::binary_search(absent.begin(), absent.end(), locs[j])) {
           h = kSelfHolder;
@@ -752,15 +839,17 @@ class NodeEngineImpl : public NodeEngine {
                                         "this node and record no other holder (first: location %u)",
                                         p, unknown, first));
     }
-    std::vector<uint16_t>().swap(rs->seg.holders);
     rs->slots.resize(ids.size());
     // PQMissingError: nothing changed. The locations are recorded with the codes.
     store_->Ref(ids.data(), ids.size(), rs->slots.data(), locs.data());
+    rs->seg = std::move(*seg);
+    std::vector<uint16_t>().swap(rs->seg.holders);  // in rs->holders now
     // The references are dropped (by the reclaimer) once the last holder -- the table below,
     // or a query that pinned the segment -- lets go of it.
     rs->version = version;
+    rs->stamp = seg_stamp_.fetch_add(1) + 1;
     Reclaimer* reclaimer = reclaimer_.get();
-    std::shared_ptr<const ResidentSegment> seg(
+    std::shared_ptr<const ResidentSegment> shared(
         rs.release(), [reclaimer](const ResidentSegment* r) { reclaimer->Push(r); });
     std::shared_ptr<const ResidentSegment> old;
     {
@@ -771,9 +860,9 @@ class NodeEngineImpl : public NodeEngine {
                              [&](const auto& r) { return r->version >= version; });
       if (it != vs.end() && (*it)->version == version) {
         old = std::move(*it);
-        *it = std::move(seg);
+        *it = std::move(shared);
       } else {
-        vs.insert(it, std::move(seg));
+        vs.insert(it, std::move(shared));
       }
     }
     resident_version_.fetch_add(1);
@@ -785,6 +874,10 @@ class NodeEngineImpl : public NodeEngine {
       std::lock_guard<std::mutex> l(seg_mu_);
       FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
       old.swap(segs_[p]);
+    }
+    {
+      std::lock_guard<std::mutex> l(recv_mu_);
+      received_.erase(received_.lower_bound(SegmentKey(p, 0)), received_.lower_bound(SegmentKey(p + 1, 0)));
     }
     const bool was = !old.empty();
     // Unless a request still holds the partition, its references are dropped (its codes are
@@ -972,6 +1065,7 @@ class NodeEngineImpl : public NodeEngine {
       rs->holders.reset(new std::atomic<uint16_t>[holders.size()]);
       for (size_t j = 0; j < holders.size(); ++j) rs->SetHolder(j, holders[j]);
       rs->version = vs.next;
+      rs->stamp = seg_stamp_.fetch_add(1) + 1;
       rs->slots.resize(seg.ids.size());
       // PQMissingError: this segment holds no reference yet; the ones built before drop theirs.
       store_->Ref(seg.ids.data(), seg.ids.size(), rs->slots.data(), seg.locs.data());
@@ -1050,28 +1144,6 @@ class NodeEngineImpl : public NodeEngine {
     return store_->Forget(ids, n, deleted);
   }
 
-  void SavePartition(uint32_t p, uint32_t version, const std::string& path) const override {
-    std::shared_ptr<const ResidentSegment> seg;
-    {
-      std::lock_guard<std::mutex> l(seg_mu_);
-      FUSION_CHECK(p < segs_.size(), "partition %u out of range", p);
-      seg = SegmentLocked(p, &version);
-    }
-    if (!seg) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
-    // The next owner gets every key's current holder: this node, by its ID, for the vectors it
-    // holds; the recorded holder for the others.
-    const uint16_t me = self_id_.load();
-    ListSegment out = seg->seg;
-    out.holders.resize(out.ids.size());
-    for (size_t j = 0; j < out.ids.size(); ++j) {
-      const uint16_t h = seg->Holder(j);
-      FUSION_CHECK(h != kSelfHolder || me != kNoHolder,
-                   "partition %u: this node holds vectors of it but does not know its own node ID (SetNodes)", p);
-      out.holders[j] = h == kSelfHolder ? me : h;
-    }
-    out.Save(path);
-  }
-
   void SetNodes(uint16_t self, const std::vector<std::pair<uint16_t, std::string>>& peers) override {
     FUSION_CHECK(self != kSelfHolder, "node ID %u is reserved", self);
     if (self != kNoHolder) {
@@ -1087,17 +1159,33 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // ---------------------------------------------------------------- PQ codes
-  void PQMissingStream(const std::vector<std::vector<std::string>>& groups,
+  void PQMissingStream(const std::vector<std::vector<SegmentKey>>& groups,
                        const std::function<void(size_t, const uint32_t*, size_t)>& sink) override {
+    std::vector<std::vector<std::shared_ptr<SegmentLoader>>> segs(groups.size());
+    {
+      std::lock_guard<std::mutex> l(recv_mu_);
+      for (size_t g = 0; g < groups.size(); ++g)
+        for (const SegmentKey& k : groups[g]) {
+          auto it = received_.find(k);
+          if (it == received_.end() || !it->second->complete())
+            throw NotResidentError(
+                StrFormat("partition %u's version %u has not been received whole", k.first, k.second));
+          segs[g].push_back(it->second);
+        }
+    }
     Seen listed;  // for this group or an earlier one
-    for (size_t g = 0; g < groups.size(); ++g)
-      for (const std::string& path : groups[g]) {
-        const ListSegment s = LoadSegment(path);
-        std::vector<uint32_t> fresh = store_->Reserve(s.ids.data(), s.ids.size());
-        fresh.erase(std::remove_if(fresh.begin(), fresh.end(), [&](uint32_t id) { return !listed.Add(id); }),
-                    fresh.end());
-        if (!fresh.empty()) sink(g, fresh.data(), fresh.size());
-      }
+    for (size_t g = 0; g < segs.size(); ++g)
+      for (const auto& rec : segs[g]) ListMissing(rec->segment().ids, g, &listed, sink);
+  }
+
+  // Of ids, the codes not on this node and not listed yet, to sink as group g (PQMissingStream);
+  // the ones here are protected for the staging.
+  void ListMissing(const std::vector<uint32_t>& ids, size_t g, Seen* listed,
+                   const std::function<void(size_t, const uint32_t*, size_t)>& sink) {
+    std::vector<uint32_t> fresh = store_->Reserve(ids.data(), ids.size());
+    fresh.erase(std::remove_if(fresh.begin(), fresh.end(), [&](uint32_t id) { return !listed->Add(id); }),
+                fresh.end());
+    if (!fresh.empty()) sink(g, fresh.data(), fresh.size());
   }
 
   void PQGet(const uint32_t* ids, size_t n, uint8_t* out) override { store_->Get(ids, n, out); }
@@ -1117,12 +1205,13 @@ class NodeEngineImpl : public NodeEngine {
     }
     // A bit per code to read, so that the pass goes in the file's order without sorting them.
     // Inserted vectors (U14) are not in the file: their codes must be here already.
-    Seen want;
+    Seen want, listed;
     uint64_t wanted = 0;
-    PQMissingStream(std::vector<std::vector<std::string>>(1, segments), [&](size_t, const uint32_t* ids, size_t k) {
-      for (size_t i = 0; i < k; ++i)
-        if (ids[i] < n && want.Add(ids[i])) ++wanted;
-    });
+    for (const std::string& path : segments)
+      ListMissing(LoadSegment(path).ids, 0, &listed, [&](size_t, const uint32_t* ids, size_t k) {
+        for (size_t i = 0; i < k; ++i)
+          if (ids[i] < n && want.Add(ids[i])) ++wanted;
+      });
     PQPutResult r;
     if (wanted == 0) return r;  // all here (a snapshot's codes): the file is not even opened
     const std::shared_ptr<ReadOnlyFile> file = PQFile(n);
@@ -1752,17 +1841,22 @@ class NodeEngineImpl : public NodeEngine {
   // Loads a segment file and checks that its lists belong to its partition.
   ListSegment LoadSegment(const std::string& path) const {
     ListSegment s = ListSegment::Load(path);
+    CheckLists(s, path);
+    return s;
+  }
+
+  // Checks that s's lists belong to its partition (what names s in errors).
+  void CheckLists(const ListSegment& s, const std::string& what) const {
     const auto man = Man();
     const ListMap* lm = Lists();
-    FUSION_CHECK(s.partition < man->num_partitions, "%s: partition %u out of range", path.c_str(),
+    FUSION_CHECK(s.partition < man->num_partitions, "%s: partition %u out of range", what.c_str(),
                  s.partition);
     for (uint32_t c : s.list_ids)
       FUSION_CHECK(c < lm->capacity && (c >= man->num_lists || man->list_part[c] == s.partition),
-                   "%s: list %u does not belong to partition %u", path.c_str(), c, s.partition);
+                   "%s: list %u does not belong to partition %u", what.c_str(), c, s.partition);
     // A list a major epoch created (U14) is learned from the segment that holds it.
     for (uint32_t c : s.list_ids)
       if (c >= man->num_lists) RegisterList(c, s.partition);
-    return s;
   }
 
   // Bootstrap (and a generation's partitions after a full rebuild): installs the codes of `ids`
@@ -2534,6 +2628,10 @@ class NodeEngineImpl : public NodeEngine {
   mutable std::mutex seg_mu_;
   // Per partition, its resident versions, ascending (guarded by seg_mu_).
   std::vector<std::vector<std::shared_ptr<const ResidentSegment>>> segs_;
+  std::atomic<uint64_t> seg_stamp_{0};  // the last load's stamp
+  // Segments coming from their owners (PutSegment), until InstallSegment loads them.
+  std::mutex recv_mu_;
+  std::map<SegmentKey, std::shared_ptr<SegmentLoader>> received_;
 
   // Partition p at *version, or at its newest version if version is null; null if not
   // resident. seg_mu_ must be held.
@@ -2612,7 +2710,7 @@ RawRefs Sorted(uint16_t holder, std::vector<std::pair<uint32_t, uint32_t>> refs)
 
 }  // namespace
 
-std::vector<std::vector<uint32_t>> NodeEngine::PQMissing(const std::vector<std::vector<std::string>>& groups) {
+std::vector<std::vector<uint32_t>> NodeEngine::PQMissing(const std::vector<std::vector<SegmentKey>>& groups) {
   std::vector<std::vector<uint32_t>> out(groups.size());
   PQMissingStream(groups, [&](size_t g, const uint32_t* ids, size_t n) { out[g].insert(out[g].end(), ids, ids + n); });
   for (auto& ids : out) std::sort(ids.begin(), ids.end());

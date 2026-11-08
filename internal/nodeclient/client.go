@@ -48,7 +48,6 @@ const (
 	opStageVersions  uint8 = 0x30
 	opDropVersion    uint8 = 0x31
 	opForget         uint8 = 0x32
-	opSavePartition  uint8 = 0x33
 	opSetNodes       uint8 = 0x34
 	opRawHeldBy      uint8 = 0x35
 	opListGet        uint8 = 0x36
@@ -65,6 +64,9 @@ const (
 	opGraphPut       uint8 = 0x42
 	opGraphInstall   uint8 = 0x43
 	opPQSave         uint8 = 0x44
+	opSegmentGet     uint8 = 0x45
+	opSegmentPut     uint8 = 0x46
+	opSegmentInstall uint8 = 0x47
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -538,14 +540,67 @@ func (c *Client) GraphInstall(ctx context.Context, version uint32, size int64) e
 	return err
 }
 
+// SegmentGet reads bytes [off, off+n) of the image of version v of partition p -- fewer at its
+// end -- from the node's memory, every posting with its current holder: the source of a
+// partition's move (SEGMENT_GET). It also returns the image's size, and a stamp that differs for
+// each segment the node loads.
+func (c *Client) SegmentGet(ctx context.Context, p int, v uint32, off int64, n int) (data []byte, size int64, stamp uint64, err error) {
+	var w frame.Writer
+	w.U32(uint32(p))
+	w.U32(v)
+	w.U64(uint64(off))
+	w.U32(uint32(n))
+	b, err := c.do(ctx, opSegmentGet, 0, w.B)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	r := frame.NewReader(b)
+	size, stamp = int64(r.U64()), r.U64()
+	data = r.Rest()
+	if r.Err != nil {
+		return nil, 0, 0, r.Err
+	}
+	return data, size, stamp, nil
+}
+
+// SegmentPut hands the node the next bytes of the image of version v of partition p, which it
+// builds in memory as they come into a received segment, not resident yet (SEGMENT_PUT); off 0
+// starts it again, and with no bytes only drops it. It returns the bytes the node has.
+func (c *Client) SegmentPut(ctx context.Context, p int, v uint32, off int64, data []byte) (int64, error) {
+	var w frame.Writer
+	w.U32(uint32(p))
+	w.U32(v)
+	w.U64(uint64(off))
+	w.Bytes(data)
+	b, err := c.do(ctx, opSegmentPut, 0, w.B)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	got := int64(r.U64())
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, fmt.Errorf("SEGMENT_PUT: %d trailing bytes", r.Remaining())
+	}
+	return got, r.Err
+}
+
+// SegmentInstall loads the received segment of version v of partition p, as LoadPartition with
+// LoadPeer would (SEGMENT_INSTALL); on failure it stays received.
+func (c *Client) SegmentInstall(ctx context.Context, p int, v uint32) error {
+	var w frame.Writer
+	w.U32(uint32(p))
+	w.U32(v)
+	_, err := c.do(ctx, opSegmentInstall, 0, w.B)
+	return err
+}
+
 // LoadMode is where LoadPartition takes what the node lacks.
 type LoadMode uint8
 
 const (
 	// LoadPeer: the PQ codes must have been installed with PQPut (or the load fails with
 	// StatusPQAbsent), and a raw vector the node lacks is fetched, when a query needs it, from
-	// the holder its posting records (a segment saved at a hand-off records one for every
-	// posting; StatusRawAbsent if one is missing with no holder recorded).
+	// the holder its posting records (StatusRawAbsent if one is missing with no holder recorded).
 	LoadPeer LoadMode = 0
 	// LoadIndex (bootstrap): the PQ codes and raw vectors the node lacks are copied from the
 	// index.
@@ -556,7 +611,7 @@ const (
 	LoadGeneration LoadMode = 2
 )
 
-// LoadPartition makes the node load version v of partition p from the segment at path,
+// LoadPartition makes the node load version v of partition p from the segment file at path,
 // replacing that version if it is resident (the partition's other versions stay).
 func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string, mode LoadMode) error {
 	var w frame.Writer
@@ -686,20 +741,26 @@ func (c *Client) PQFromIndex(ctx context.Context, paths []string) (uint64, error
 	return n, r.Err
 }
 
-// PQMissing lists, for each group of segment files (paths on the node's host), the vector IDs
+// Segment names a version of a partition's lists.
+type Segment struct {
+	Partition int
+	Version   uint32
+}
+
+// PQMissing lists, for each group of segments the node received (SegmentPut), the vector IDs
 // they name whose PQ code the node lacks: every missing code once, under the first group
 // (source) that needs it. The node streams them as it finds them, and fn gets each batch as it
 // arrives, so that the codes can be pulled while the rest are listed. The codes the node
 // already has are protected until the partitions load (or PQRelease), so making room for the
 // missing ones never drops them.
-func (c *Client) PQMissing(ctx context.Context, groups [][]string, fn func(group int, ids []uint32) error) error {
+func (c *Client) PQMissing(ctx context.Context, groups [][]Segment, fn func(group int, ids []uint32) error) error {
 	var w frame.Writer
 	w.U32(uint32(len(groups)))
 	for _, g := range groups {
 		w.U32(uint32(len(g)))
-		for _, p := range g {
-			w.U32(uint32(len(p)))
-			w.Str(p)
+		for _, s := range g {
+			w.U32(uint32(s.Partition))
+			w.U32(s.Version)
 		}
 	}
 	return c.stream(ctx, opPQMissing, w.B, func(b []byte) error {
@@ -1185,17 +1246,6 @@ func (c *Client) ForgetVectors(ctx context.Context, ids []uint32, deleted bool) 
 	r := frame.NewReader(b)
 	n := r.U64()
 	return n, r.Err
-}
-
-// SavePartition writes version v of partition p as a segment file at path (on the node's
-// host), so that a node the partition moves to can load that version.
-func (c *Client) SavePartition(ctx context.Context, p int, v uint32, path string) error {
-	var w frame.Writer
-	w.U32(uint32(p))
-	w.U32(v)
-	w.Bytes([]byte(path))
-	_, err := c.do(ctx, opSavePartition, 0, w.B)
-	return err
 }
 
 // RawPull has the node fetch the vectors at locs that it lacks from the sources of their lists

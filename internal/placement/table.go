@@ -215,7 +215,7 @@ func MakePlan(ch Changes) Plan {
 
 // History records who has owned each partition (Koala's BucketOwnerHistory), in two senses:
 //
-//	Owners  nodes that may still hold a copy of the partition's segment files; a node drops
+//	Owners  nodes that may still hold a copy of the partition's posting lists; a node drops
 //	        out when it has reclaimed (evicted) its copy.
 //	Ever    nodes that have owned the partition at any point, never forgotten. With a static
 //	        dataset such a node still holds the PQ codes of the partition's vectors (they are
