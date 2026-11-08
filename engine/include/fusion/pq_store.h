@@ -7,7 +7,8 @@
 // sized to the node's budget (`capacity` codes: the HBM budget); an ID -> slot map finds them.
 //
 // Every code is in one of three states:
-//   live    named by at least one posting of a resident partition (one reference per posting);
+//   live    named by at least one resident segment (a partition's version): one reference per
+//           segment that names the vector, however many of its postings do (Ref);
 //   staged  protected for a staging in progress: installed by Put, or already here and claimed
 //           by Reserve, and not yet named by a loaded partition;
 //   cached  no longer named by a resident partition (its partition moved away, or a version
@@ -30,7 +31,11 @@
 // NodeEngine::LoadPartition adds a segment's references before the segment becomes visible to
 // queries; they are dropped once the last query holding the segment lets go of it (after
 // EvictPartition). A slot never moves while its code is here, so queries read codes by slot
-// without taking the store's lock (the slots of a segment are resolved once, when it loads).
+// without taking the store's lock (the slots of a segment are resolved once, when it loads), and
+// they find a referenced code's slot and location without it too (Locate, SlotOf): a load, a
+// reclaim or a peer's PQ_GET never holds a query back. The lock guards the references and the
+// slots' states; a load holds it once, over the segment's distinct vectors in ID order, and does
+// the per-posting work outside it, so that several partitions load at once.
 //
 // The store is also where the node looks up a vector's raw-vector location (fusion/layout.h,
 // RawLayout): the segments carry it next to every posting, and Ref records it with the code.
@@ -39,6 +44,7 @@
 // partition that names the vector loads.
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -112,19 +118,26 @@ class PQStore {
   size_t Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigin origin);
   // Copies the codes of ids[0..n) into out (n x m bytes). Throws PQMissingError if one is absent.
   void Get(const uint32_t* ids, size_t n, uint8_t* out);
-  // Adds one reference per entry of ids[0..n) (the codes become live) and writes each entry's
-  // slot to slots_out (may be null). locs (may be null): each entry's raw-vector location,
-  // recorded with the code. Throws PQMissingError if a code is absent, and std::runtime_error
-  // if a location contradicts the one recorded before; either way nothing changes.
+  // Adds a reference to the code of each of ids[0..n) -- ascending, without duplicates: the
+  // distinct vectors of one segment, which references each once -- making it live, and writes
+  // its slot to slots_out (may be null). locs (may be null): each one's raw-vector location,
+  // recorded with the code. Throws PQMissingError if a code is absent, std::runtime_error if a
+  // location contradicts the one recorded before, std::invalid_argument for IDs out of order or
+  // out of range; in every case nothing changes.
   void Ref(const uint32_t* ids, size_t n, uint32_t* slots_out, const uint32_t* locs = nullptr);
+  // The slot of id's code, without the lock: only for a code the caller holds a reference to
+  // (it cannot move then); kNoSlot if none is here.
+  uint32_t SlotOf(uint32_t id) const;
   // Writes the raw-vector location of ids[0..n) to locs_out: kNoLoc where it is not known (no
   // code here, or no loaded partition has named the vector since its code arrived). Returns how
-  // many are not known.
+  // many are not known. Without the lock: exact for codes a resident segment references (a
+  // query's candidates), whose slot and location cannot change.
   size_t Locate(const uint32_t* ids, size_t n, uint32_t* locs_out) const;
-  // Drops one reference per entry; a code with no reference left becomes cached (or stays
-  // staged if a staging protects it). Never frees anything and never throws (it runs from
-  // the segment reclaimer); inconsistencies are logged.
-  void Unref(const uint32_t* ids, size_t n) noexcept;
+  // Drops the references a segment took (the slots Ref gave it, any order); a code with no
+  // reference left becomes cached (or stays staged if a staging protects it). Never frees but a
+  // deleted vector's code (Forget), never throws (it runs from the segment reclaimer);
+  // inconsistencies are logged.
+  void Unref(const uint32_t* slots, size_t n) noexcept;
   // Ends a staging that did not load (rollback): frees staged codes no partition ever named
   // and returns the claimed ones to the cache. Returns how many codes were freed.
   size_t ReleaseStaged();
@@ -157,6 +170,12 @@ class PQStore {
   void FreeLocked(uint32_t slot);
   void EvictLocked(uint64_t count);  // drops `count` cached codes; caller checked they exist
 
+  // Their entries are written under the lock and read without it by Locate and SlotOf.
+  uint32_t SlotLocked(uint32_t id) const { return slot_of_[id].load(std::memory_order_relaxed); }
+  void SetSlot(uint32_t id, uint32_t s) { slot_of_[id].store(s, std::memory_order_relaxed); }
+  uint32_t LocLocked(uint32_t s) const { return loc_[s].load(std::memory_order_relaxed); }
+  void SetLoc(uint32_t s, uint32_t loc) { loc_[s].store(loc, std::memory_order_relaxed); }
+
   const uint64_t n_;
   const uint32_t m_;
   const uint64_t capacity_;
@@ -164,13 +183,13 @@ class PQStore {
   mutable std::mutex mu_;
   // Per vector ID; kNoSlot = no code here. Sized by the whole dataset, not by what this node
   // holds (4 GB at a billion vectors) -- the accounting cost of overlapping posting lists, and
-  // the one per-node structure here that scaling out does not shrink. Staging path only; a
-  // sorted (id, slot) array with a merge would replace it below ~50% residency. See
-  // engine/README.md, "Known limits of the PQ path".
-  std::vector<uint32_t> slot_of_;
+  // the one per-node structure here that scaling out does not shrink. A sorted (id, slot) array
+  // with a merge would replace it below ~50% residency. See engine/README.md, "Known limits of
+  // the PQ path".
+  std::unique_ptr<std::atomic<uint32_t>[]> slot_of_;
   std::vector<uint32_t> id_of_;    // per slot; kNoSlot = free
-  std::vector<uint32_t> refs_;     // per slot
-  std::vector<uint32_t> loc_;      // per slot: raw-vector location of its vector, or kNoLoc
+  std::vector<uint32_t> refs_;     // per slot: the resident segments that name it
+  std::unique_ptr<std::atomic<uint32_t>[]> loc_;  // per slot: raw-vector location of its vector, or kNoLoc
   std::vector<uint8_t> flags_;     // per slot: kProtected | kEverReferenced | kDeleted
   std::vector<uint32_t> free_;     // freed slots, reused first
   uint64_t next_ = 0;              // slots [0, next_) have been handed out at least once

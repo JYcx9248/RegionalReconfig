@@ -136,7 +136,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   when its first entry has waited 100 ms, or as the last; the agent pulls what a frame names as
   it arrives, several requests in flight per source (`pullMissingPQ`, `rawPuller`).
 - **PQ codes** are stored per node, once per vector, with a cache of codes of partitions that
-  moved away (`engine/include/fusion/pq_store.h`); placement `even-reversible-graph` (the
+  moved away (`engine/include/fusion/pq_store.h`). A resident partition references each code
+  once; a load takes its distinct vectors' references under the store's lock and does the
+  per-posting work outside it, 8 partitions at once (`loadStreams`), and RERANK's lookups take
+  no lock (2026-11-07). Placement `even-reversible-graph` (the
   default) returns partitions to former owners so a scale-in moves no PQ code. The runners give
   every node a budget (`--pq-capacity`) of the fullest node's codes at the smallest cluster size,
   plus 10% (`"PQCapacity": "auto"`, `rtier-client pq-share`; a run with a rebuild gets the
@@ -368,6 +371,10 @@ Next:
      `Ref`). The 4to8to4 scale-in starts only after the load: its scale-out ends at 504 s.
    - The 1,152 queries with ground truth answered in all four 4 → 8 runs have the same recall
      (0.80) in each.
+   - **Fixed since (2026-11-07, not yet rerun):** a partition moves from memory to memory, so
+     no `save_segments`; a load no longer sorts the postings and references each code once per
+     partition (3.4 s instead of 27 at this scale on a laptop), 8 load at once; RERANK's
+     `Locate` takes no lock, so the reclaim stalls no query.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

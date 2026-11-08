@@ -361,9 +361,21 @@ func (a *Agent) pullRawViaNode(ctx context.Context, locs, lists []uint32, batch,
 	return st, nil
 }
 
-// stagePQAndLoad brings the PQ codes the fetched partitions need, then loads the partitions:
-// from a peer, the segments the data node received.
+// loadStreams is how many partitions a staging loads at once. A load is a few passes over the
+// partition's postings on one of the data node's cores, bound by memory latency (Amazon 300M: 37M
+// postings over 7M vectors a partition), so loads in parallel add up; the data node's PQ store
+// takes its lock once per load, over the partition's distinct vectors.
+const loadStreams = 8
+
+// stagePQAndLoad brings the PQ codes the fetched partitions need, then loads the partitions,
+// loadStreams at once: from a peer, the segments the data node received.
 func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, reply *protocol.StageReply) error {
+	type load struct {
+		p    int
+		v    uint32
+		mode nodeclient.LoadMode
+	}
+	var files []load // a bootstrap's, or a full rebuild's: segment files
 	var pending []protocol.Source
 	for _, src := range sources {
 		if src.Kind != "peer" {
@@ -393,13 +405,16 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 				}
 			}
 			for i, p := range src.Partitions {
-				if err := a.loadPartition(ctx, p, src.VersionOf(i), mode); err != nil {
-					return err
-				}
+				files = append(files, load{p, src.VersionOf(i), mode})
 			}
 			continue
 		}
 		pending = append(pending, src)
+	}
+	if err := parallelLimit(ctx, len(files), loadStreams, func(ctx context.Context, k int) error {
+		return a.loadPartition(ctx, files[k].p, files[k].v, files[k].mode)
+	}); err != nil {
+		return err
 	}
 	// A code that looked present when listed can be gone by the time its partition loads (it
 	// was held only by an evicted partition that a query still used). The load then reports
@@ -408,21 +423,32 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 		if err := a.pullMissingPQ(ctx, pending, reply); err != nil {
 			return err
 		}
+		type job struct{ src, i int }
+		var jobs []job
+		for s, src := range pending {
+			for i := range src.Partitions {
+				jobs = append(jobs, job{s, i})
+			}
+		}
+		absent := make([]bool, len(jobs))
+		if err := parallelLimit(ctx, len(jobs), loadStreams, func(ctx context.Context, k int) error {
+			src := pending[jobs[k].src]
+			err := a.installPartition(ctx, src.Partitions[jobs[k].i], src.VersionOf(jobs[k].i))
+			if err != nil && nodeclient.IsPQAbsent(err) && round < maxPQRounds {
+				absent[k] = true
+				return nil
+			}
+			return err
+		}); err != nil {
+			return err
+		}
 		var retry []protocol.Source
-		for _, src := range pending {
+		for s, src := range pending {
 			var again []int
 			var againV []uint32
-			for i, p := range src.Partitions {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				err := a.installPartition(ctx, p, src.VersionOf(i))
-				if err != nil && nodeclient.IsPQAbsent(err) && round < maxPQRounds {
-					again, againV = append(again, p), append(againV, src.VersionOf(i))
-					continue
-				}
-				if err != nil {
-					return err
+			for k, j := range jobs {
+				if j.src == s && absent[k] {
+					again, againV = append(again, src.Partitions[j.i]), append(againV, src.VersionOf(j.i))
 				}
 			}
 			if len(again) > 0 {
@@ -514,7 +540,7 @@ func (a *Agent) pullMissingPQ(ctx context.Context, sources []protocol.Source, re
 
 // loadPartition loads the segment file of version v of partition p as that version.
 func (a *Agent) loadPartition(ctx context.Context, p int, v uint32, mode nodeclient.LoadMode) error {
-	if err := a.localBulk.LoadPartition(ctx, p, v, a.segmentPath(p, v), mode); err != nil {
+	if err := a.localLoad.LoadPartition(ctx, p, v, a.segmentPath(p, v), mode); err != nil {
 		return fmt.Errorf("load partition %d at version %d: %w", p, v, err)
 	}
 	a.mu.Lock()
@@ -526,7 +552,7 @@ func (a *Agent) loadPartition(ctx context.Context, p int, v uint32, mode nodecli
 // installPartition loads the segment of version v of partition p the data node received from
 // its owner.
 func (a *Agent) installPartition(ctx context.Context, p int, v uint32) error {
-	if err := a.localBulk.SegmentInstall(ctx, p, v); err != nil {
+	if err := a.localLoad.SegmentInstall(ctx, p, v); err != nil {
 		return fmt.Errorf("install partition %d at version %d: %w", p, v, err)
 	}
 	a.mu.Lock()
@@ -544,18 +570,35 @@ func (a *Agent) segmentPath(p int, v uint32) string {
 // parallel runs fn(ctx, 0..n-1) concurrently and returns the first error; the context passed
 // to fn is cancelled as soon as one call fails.
 func parallel(ctx context.Context, n int, fn func(ctx context.Context, i int) error) error {
-	ctx, cancel := context.WithCancel(ctx)
+	return parallelLimit(ctx, n, n, fn)
+}
+
+// parallelLimit is parallel with at most limit calls running at once; once one fails, or ctx
+// ends, no more start.
+func parallelLimit(ctx context.Context, n, limit int, fn func(ctx context.Context, i int) error) error {
+	inner, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
 		wg    sync.WaitGroup
 		mu    sync.Mutex
 		first error
 	)
-	for i := 0; i < n; i++ {
+	sem := make(chan struct{}, max(limit, 1))
+	started := 0
+	for ; started < n; started++ {
+		select {
+		case sem <- struct{}{}:
+		case <-inner.Done():
+		}
+		if inner.Err() != nil {
+			break
+		}
+		i := started
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			if err := fn(ctx, i); err != nil {
+			defer func() { <-sem }()
+			if err := fn(inner, i); err != nil {
 				mu.Lock()
 				if first == nil {
 					first = err
@@ -563,9 +606,12 @@ func parallel(ctx context.Context, n int, fn func(ctx context.Context, i int) er
 				}
 				mu.Unlock()
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
+	if first == nil && started < n {
+		first = ctx.Err() // ended before every call started
+	}
 	return first
 }
 

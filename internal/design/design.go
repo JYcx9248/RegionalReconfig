@@ -49,7 +49,13 @@ var Open = map[string]Question{
 			"internal/agent/control.go); codes of partitions that move away stay on the old node " +
 			"as a cache (valid because vectors are immutable; a deleted vector's code goes with " +
 			"its last version, U14) and are dropped only to make room for a later staging, which " +
-			"protects the codes it needs. As the design stands nothing is ever dropped: a " +
+			"protects the codes it needs. A resident partition references each code once, however " +
+			"many of its postings name the vector (2026-11-07): a load takes the references of its " +
+			"distinct vectors under the store's lock, in ID order, and resolves every posting's " +
+			"slot outside it, so that partitions load in parallel; queries look slots and " +
+			"locations up without the lock, so neither a load nor a reclaim holds one back (Amazon " +
+			"300M: a load a partition at a time took 26 s, and a reclaim stopped the answers for " +
+			"75 s). As the design stands nothing is ever dropped: a " +
 			"scale-out only takes partitions away from a node and a reversible scale-in only " +
 			"returns what it took (U3), so a node's resident set stays what it held at the " +
 			"initial cluster size, which fits its budget or the deployment would not have " +

@@ -23,7 +23,12 @@ send exactly those over the rate-limited bulk channel (`PULL_PQ`); they are inst
 only once it holds every posting list and PQ code of its partitions and can filter at once.
 Vectors are immutable (an update deletes and inserts under a new ID, U14), so the old owner keeps
 the codes of partitions that moved away as a cache; they are dropped only when a later staging
-needs the room, and a staging protects the codes it needs. `rtier_node --pq-capacity N` sets a
+needs the room, and a staging protects the codes it needs. A resident partition references each
+vector's code once, however many of its postings name the vector: a load finds its distinct
+vectors with a bit per ID, takes their references under the PQ store's lock and does the
+per-posting work outside it, and the agent loads 8 partitions at once (2026-11-07; one at a time,
+a partition of Amazon 300M took 26 s). Queries find codes' slots and locations without the lock,
+so neither a load nor a reclaim holds one back. `rtier_node --pq-capacity N` sets a
 node's budget (its HBM, in codes); the runners size it from the partitions
 (`"PQCapacity": "auto"`, the default: the most distinct vectors one node's partitions name
 at the smallest cluster size, plus `"PQHeadroom"`, 10%; `bin/rtier-client pq-share`

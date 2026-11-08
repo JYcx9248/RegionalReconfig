@@ -850,11 +850,24 @@ void TestPQStore() {
   CHECK(threw && s.Stats().resident == 3 && s.Missing(one.data(), 1).size() == 1);
   s.SetMirror(nullptr);
 
-  // One reference per posting makes codes live; Get copies codes out.
-  const std::vector<uint32_t> postings = {3, 7, 7};
-  std::vector<uint32_t> slots(3);
-  s.Ref(postings.data(), postings.size(), slots.data());
-  CHECK(slots[1] == slots[2] && slots[0] != slots[1]);
+  // A segment references each vector it names once, with its location: two segments, both
+  // naming 7, make 3 and 7 live. IDs out of order, or repeated, are refused with nothing changed.
+  const std::vector<uint32_t> seg_a = {3, 7}, seg_b = {7}, locs_a = {30, 70}, locs_b = {70};
+  const std::vector<uint32_t> repeated = {3, 3}, unordered = {7, 3};
+  CHECK(Throws([&] { s.Ref(repeated.data(), 2, nullptr); }) && Throws([&] { s.Ref(unordered.data(), 2, nullptr); }));
+  CHECK(s.Stats().live == 0);
+  std::vector<uint32_t> slots_a(2), slots_b(1);
+  s.Ref(seg_a.data(), seg_a.size(), slots_a.data(), locs_a.data());
+  const std::vector<uint32_t> wrong_loc = {71};
+  CHECK(Throws([&] { s.Ref(seg_b.data(), 1, slots_b.data(), wrong_loc.data()); }) && s.Stats().live == 2);
+  s.Ref(seg_b.data(), seg_b.size(), slots_b.data(), locs_b.data());
+  CHECK(slots_b[0] == slots_a[1] && slots_a[0] != slots_a[1]);
+  CHECK(s.SlotOf(3) == slots_a[0] && s.SlotOf(7) == slots_a[1] && s.SlotOf(50) == PQStore::kNoSlot &&
+        s.SlotOf(1000) == PQStore::kNoSlot);
+  std::vector<uint32_t> where(3);
+  const std::vector<uint32_t> asked = {7, 3, 9};  // 9 is here, named by no segment yet
+  CHECK(s.Locate(asked.data(), 3, where.data()) == 1 && where[0] == 70 && where[1] == 30 &&
+        where[2] == PQStore::kNoLoc);
   st = s.Stats();
   CHECK(st.live == 2 && st.staged == 1 && st.cached == 0);
   std::vector<uint8_t> out(4);
@@ -881,10 +894,10 @@ void TestPQStore() {
   CHECK(threw);
 
   // A partition moving away leaves its codes cached, not freed (static dataset).
-  s.Unref(postings.data(), 2);  // 3, and one of 7's two references
+  s.Unref(slots_a.data(), slots_a.size());  // 3, and one of 7's two references
   st = s.Stats();
   CHECK(st.live == 1 && st.cached == 1 && st.resident == 2);
-  s.Unref(postings.data() + 2, 1);
+  s.Unref(slots_b.data(), slots_b.size());
   st = s.Stats();
   CHECK(st.live == 0 && st.cached == 2 && st.resident == 2 && st.freed == 1);
   const std::vector<uint32_t> both = {3, 7};
@@ -928,19 +941,20 @@ void TestPQStore() {
   // still named is marked and goes with its last reference, or when the staging protecting it
   // ends. Without the deleted flag only unreferenced copies go.
   const std::vector<uint32_t> ten_eleven = {10, 11};
-  s.Ref(ten_eleven.data(), 2, nullptr);  // 10 and 11 live; 12 and 13 staged, never named
+  std::vector<uint32_t> te_slots(2);
+  s.Ref(ten_eleven.data(), 2, te_slots.data());  // 10 and 11 live; 12 and 13 staged, never named
   const std::vector<uint32_t> unused = {kept, 10, 12};
   CHECK(s.Forget(unused.data(), unused.size(), false) == 1);  // the cached one only
   st = s.Stats();
   CHECK(st.deleted == 0 && st.resident == 4 && st.cached == 0);
   CHECK(s.Forget(ten_eleven.data(), 2, true) == 0);
   CHECK(s.Stats().deleted == 2 && s.Stats().live == 2);
-  s.Unref(ten_eleven.data(), 1);  // 10's last reference: freed, not cached
+  s.Unref(te_slots.data(), 1);  // 10's last reference: freed, not cached
   st = s.Stats();
   CHECK(st.deleted == 1 && st.cached == 0 && st.live == 1 && st.resident == 3);
   const std::vector<uint32_t> eleven = {11};
   CHECK(s.Reserve(eleven.data(), 1).empty());  // a staging claims 11 ...
-  s.Unref(eleven.data(), 1);                    // ... so it stays, staged, past its last reference
+  s.Unref(te_slots.data() + 1, 1);              // ... so it stays, staged, past its last reference
   st = s.Stats();
   CHECK(st.staged == 3 && st.deleted == 1 && st.resident == 3);
   CHECK(s.ReleaseStaged() == 3);  // 12 and 13 never named, and 11 deleted: none is cached
@@ -1165,11 +1179,12 @@ void TestPQSnapshot() {
   const std::string dir = TempDir(), path = dir + "/pq.codes";
   const uint32_t crc = 0x5eed;
   PQStore s(100, 4, 8);
-  const std::vector<uint32_t> named = {42, 3, 7}, staged = {99, 0}, gone = {7};
+  const std::vector<uint32_t> named = {3, 7, 42}, staged = {99, 0};
   CHECK(s.Put(named.data(), named.size(), codes_of(named).data(), PQOrigin::kIndex) == 3);
-  s.Ref(named.data(), named.size(), nullptr);
+  std::vector<uint32_t> named_slots(3);
+  s.Ref(named.data(), named.size(), named_slots.data());
   CHECK(s.ReleaseStaged() == 0);
-  s.Unref(gone.data(), gone.size());
+  s.Unref(named_slots.data() + 1, 1);  // 7
   CHECK(s.Put(staged.data(), staged.size(), codes_of(staged).data(), PQOrigin::kReceived) == 2);
   PQStats st = s.Stats();
   CHECK(st.live == 2 && st.cached == 1 && st.staged == 2);

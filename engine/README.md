@@ -84,12 +84,25 @@ Behavior changes to the original engine, both for deterministic results across n
 
 PQ codes are node-level (`include/fusion/pq_store.h`, `src/pq_store.cpp`; the decided part of
 U1): a data node holds one code per vector named by its resident posting lists, in slots of a
-buffer sized to its budget (`--pq-capacity`, the HBM budget). Postings hold references, so a
-code shared by several resident lists or partitions is stored once. A code is live while a
-resident posting names it, staged while a staging needs it, and cached after its partitions
-moved away: vectors are immutable, so it stays valid and is kept until a later `PQ_PUT` needs
-the room (then cached codes are dropped in slot order; live and staged ones never are). A
-deleted vector's code is freed with its last version instead (`Forget`, U14).
+buffer sized to its budget (`--pq-capacity`, the HBM budget). A resident segment (a partition's
+version) holds one reference per vector it names, however many of its postings do, so a code
+shared by several resident lists or partitions is stored once. A code is live while a resident
+segment names it, staged while a staging needs it, and cached after its partitions moved away:
+vectors are immutable, so it stays valid and is kept until a later `PQ_PUT` needs the room (then
+cached codes are dropped in slot order; live and staged ones never are). A deleted vector's code
+is freed with its last version instead (`Forget`, U14).
+A load (`LOAD_PARTITION`, `SEGMENT_INSTALL`, and the versions `StageVersions` builds) never sorts
+the postings: it finds the segment's distinct vectors with a bit per vector ID and sorts only
+the first posting of each, takes their references under the store's lock in ID order
+(`PQStore::Ref`, whose slots then come mostly in order too), and resolves each posting's slot
+(`PQStore::SlotOf`) and holder (the raw store's presence bits and a view of the fetch cache,
+`HeldView`) outside it. The reclaimer gives the references back by the slots the segment kept
+(`ref_slots`), and RERANK finds its candidates' locations without the lock (`Locate`). At
+Amazon 300M's scale (37M postings over 7M vectors a partition, 49M codes on the node), on a
+laptop: a load 3.4 s instead of 27 -- 20 of which went to sorting the postings' locations and
+binary-searching each posting's among them, 5.7 to a reference per posting under the lock --
+four loads at once 5.6 s, a reclaim 0.3 s instead of 1.9, and a query's `Locate` never waits
+(at most 1.6 ms while they ran). The agent loads 8 partitions at once (`loadStreams`).
 Codes arrive through `PQ_MISSING` / `PQ_PUT` (a peer's `PQ_GET`) or, when bootstrapping, from
 the index's `pq_codes.bin` -- which a node opens only when it first reads a code from it -- or
 from a warmup snapshot of the node's own codes, installed at its start (`--pq-file`: the file
@@ -161,8 +174,9 @@ Known limits of the PQ path:
   That is the one place the engine breaks the rule that no per-node structure should be sized by
   the dataset, and it exists only because posting lists overlap (a vector lands in r ≈ 7.3 of
   them), so a node that owns several partitions has to answer "do I already hold this code, and
-  in which slot". It is touched only on the staging path (the `PQ_MISSING` set difference and
-  `PQ_PUT`), never by a query, so it costs DRAM and not latency. The replacement is a
+  in which slot". The staging path uses it (the `PQ_MISSING` set difference, `PQ_PUT`, the
+  loads), and RERANK reads it without the lock to find each candidate's location (`Locate`).
+  The replacement is a
   vector-ID-sorted `(id, slot)` array: binary search for a single lookup and a merge for the set
   difference, which is what `PQ_MISSING` computes anyway. It costs 8 B per resident vector, so it
   wins below 50% residency -- at the ~40% a billion-vector eight-node cluster would see it saves
@@ -174,6 +188,10 @@ Known limits of the PQ path:
   almost uniformly over the ID space and every page gets touched.
 - Released segments drop their references on a background reclaimer thread, not on the query
   that let go of them last.
+- A load, and a PQ listing, mark the vectors they meet in a bitmap of the whole ID space while
+  they run (37.5 MB at 300M vectors, 125 MB at a billion; `loadStreams` loads at once), and a
+  resident segment keeps the slots of its distinct vectors (4 B each, about a fifth of its
+  postings' IDs at Amazon 300M).
 - `PQ_MISSING` protects the codes it counts as present, so the load that follows finds them;
   `PQ_ABSENT` would only mean a bug, and the agent then lists and pulls again (up to three
   rounds).

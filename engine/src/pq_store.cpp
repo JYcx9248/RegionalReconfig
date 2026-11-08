@@ -59,10 +59,12 @@ PQStore::PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity)
                static_cast<unsigned long long>(capacity),
                static_cast<unsigned long long>(num_vectors));
   codes_.reset(new uint8_t[capacity * m]);
-  slot_of_.assign(n_, kNoSlot);
+  slot_of_.reset(new std::atomic<uint32_t>[n_]);
+  for (uint64_t i = 0; i < n_; ++i) slot_of_[i].store(kNoSlot, std::memory_order_relaxed);
   id_of_.assign(capacity_, kNoSlot);
   refs_.assign(capacity_, 0);
-  loc_.assign(capacity_, kNoLoc);
+  loc_.reset(new std::atomic<uint32_t>[capacity_]);
+  for (uint64_t s = 0; s < capacity_; ++s) loc_[s].store(kNoLoc, std::memory_order_relaxed);
   flags_.assign(capacity_, 0);
   free_.reserve(capacity_);  // never grows past this: freeing cannot allocate
   st_.m = m;
@@ -84,29 +86,36 @@ void PQStore::Count(Category c, int64_t delta) {
   v = static_cast<uint64_t>(static_cast<int64_t>(v) + delta);
 }
 
-std::vector<uint32_t> PQStore::Missing(const uint32_t* ids, size_t n) const {
+// ids[0..n) ascending, without duplicates: sorted only if they are not (a segment's distinct
+// vectors come sorted).
+static std::vector<uint32_t> SortedUnique(const uint32_t* ids, size_t n) {
   std::vector<uint32_t> v(ids, ids + n);
-  std::sort(v.begin(), v.end());
-  v.erase(std::unique(v.begin(), v.end()), v.end());
+  if (std::adjacent_find(v.begin(), v.end(), [](uint32_t a, uint32_t b) { return a >= b; }) != v.end()) {
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+  }
+  return v;
+}
+
+std::vector<uint32_t> PQStore::Missing(const uint32_t* ids, size_t n) const {
+  std::vector<uint32_t> v = SortedUnique(ids, n);
   if (!v.empty() && v.back() >= n_)
     throw std::invalid_argument(StrFormat("vector ID %u out of range", v.back()));
   std::lock_guard<std::mutex> l(mu_);
-  v.erase(std::remove_if(v.begin(), v.end(), [&](uint32_t id) { return slot_of_[id] != kNoSlot; }),
+  v.erase(std::remove_if(v.begin(), v.end(), [&](uint32_t id) { return SlotLocked(id) != kNoSlot; }),
           v.end());
   return v;
 }
 
 std::vector<uint32_t> PQStore::Reserve(const uint32_t* ids, size_t n) {
-  std::vector<uint32_t> v(ids, ids + n);
-  std::sort(v.begin(), v.end());
-  v.erase(std::unique(v.begin(), v.end()), v.end());
+  std::vector<uint32_t> v = SortedUnique(ids, n);
   if (!v.empty() && v.back() >= n_)
     throw std::invalid_argument(StrFormat("vector ID %u out of range", v.back()));
   std::vector<uint32_t> missing;
   missing.reserve(v.size());
   std::lock_guard<std::mutex> l(mu_);
   for (uint32_t id : v) {
-    const uint32_t s = slot_of_[id];
+    const uint32_t s = SlotLocked(id);
     if (s == kNoSlot) {
       missing.push_back(id);
       continue;
@@ -135,7 +144,7 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
   // Pass 1: find the new IDs (also deduplicates within the batch) without changing anything
   // visible; undone if the batch is rejected.
   auto undo_pending = [&] {
-    for (size_t i : fresh) slot_of_[ids[i]] = kNoSlot;
+    for (size_t i : fresh) SetSlot(ids[i], kNoSlot);
   };
   for (size_t i = 0; i < n; ++i) {
     const uint32_t id = ids[i];
@@ -143,8 +152,8 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
       undo_pending();
       throw std::invalid_argument(StrFormat("vector ID %u out of range", id));
     }
-    if (slot_of_[id] == kNoSlot) {
-      slot_of_[id] = kPending;
+    if (SlotLocked(id) == kNoSlot) {
+      SetSlot(id, kPending);
       fresh.push_back(i);
     }
   }
@@ -171,10 +180,10 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
       s = static_cast<uint32_t>(next_++);
     }
     const uint32_t id = ids[fresh[k]];
-    slot_of_[id] = s;
+    SetLoc(s, kNoLoc);       // known once a partition that names it loads (Ref)
+    SetSlot(id, s);
     id_of_[s] = id;
     refs_[s] = 0;
-    loc_[s] = kNoLoc;        // known once a partition that names it loads (Ref)
     flags_[s] = kProtected;  // staged until a partition that names it loads
     std::memcpy(codes_.get() + static_cast<uint64_t>(s) * m_, codes + fresh[k] * m_, m_);
     slots[k] = s;
@@ -186,7 +195,7 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
       mirror_(sorted.data(), static_cast<uint32_t>(sorted.size()));
     } catch (...) {
       for (uint32_t s : slots) {
-        slot_of_[id_of_[s]] = kNoSlot;
+        SetSlot(id_of_[s], kNoSlot);
         id_of_[s] = kNoSlot;
         flags_[s] = 0;
         free_.push_back(s);
@@ -210,7 +219,7 @@ void PQStore::Get(const uint32_t* ids, size_t n, uint8_t* out) {
   for (size_t i = 0; i < n; ++i) {
     const uint32_t id = ids[i];
     if (id >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", id));
-    const uint32_t s = slot_of_[id];
+    const uint32_t s = SlotLocked(id);
     if (s == kNoSlot) throw PQMissingError(StrFormat("no PQ code for vector %u on this node", id));
     std::memcpy(out + i * m_, codes_.get() + static_cast<uint64_t>(s) * m_, m_);
   }
@@ -218,31 +227,37 @@ void PQStore::Get(const uint32_t* ids, size_t n, uint8_t* out) {
 }
 
 void PQStore::Ref(const uint32_t* ids, size_t n, uint32_t* slots_out, const uint32_t* locs) {
+  for (size_t i = 0; i < n; ++i) {
+    if (ids[i] >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", ids[i]));
+    if (i > 0 && ids[i] <= ids[i - 1])
+      throw std::invalid_argument("PQ references: vector IDs must be ascending, without duplicates");
+  }
+  // In ID order, the slots of a segment's vectors follow the order their codes were installed
+  // in (a staging's Puts come sorted), so both passes walk the arrays rather than jump.
   std::lock_guard<std::mutex> l(mu_);
   size_t missing = 0;
   uint32_t first = 0;
   for (size_t i = 0; i < n; ++i) {
     const uint32_t id = ids[i];
-    if (id >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", id));
-    const uint32_t s = slot_of_[id];
+    const uint32_t s = SlotLocked(id);
     if (s == kNoSlot) {
       if (missing++ == 0) first = id;
       continue;
     }
     // A vector's location is a property of the dataset: two segments naming it must agree.
-    if (locs && loc_[s] != kNoLoc && loc_[s] != locs[i])
+    if (locs && LocLocked(s) != kNoLoc && LocLocked(s) != locs[i])
       throw std::runtime_error(StrFormat("vector %u: a segment gives raw-vector location %u, "
-                                         "another gave %u", id, locs[i], loc_[s]));
+                                         "another gave %u", id, locs[i], LocLocked(s)));
   }
   if (missing)
-    throw PQMissingError(StrFormat("%zu postings name vectors whose PQ code is not on this node "
+    throw PQMissingError(StrFormat("%zu vectors a segment names have no PQ code on this node "
                                    "(first: vector %u)", missing, first));
   for (size_t i = 0; i < n; ++i) {
-    const uint32_t s = slot_of_[ids[i]];
+    const uint32_t s = SlotLocked(ids[i]);
     const Category before = CategoryOf(s);
     ++refs_[s];
     flags_[s] = static_cast<uint8_t>((flags_[s] & ~kProtected) | kEverReferenced);
-    if (locs) loc_[s] = locs[i];
+    if (locs) SetLoc(s, locs[i]);
     if (before != kLive) {
       Count(before, -1);
       Count(kLive, +1);
@@ -251,25 +266,28 @@ void PQStore::Ref(const uint32_t* ids, size_t n, uint32_t* slots_out, const uint
   }
 }
 
+uint32_t PQStore::SlotOf(uint32_t id) const {
+  if (id >= n_) return kNoSlot;
+  const uint32_t s = SlotLocked(id);
+  return s < capacity_ ? s : kNoSlot;  // kPending: a Put of it in progress
+}
+
 size_t PQStore::Locate(const uint32_t* ids, size_t n, uint32_t* locs_out) const {
-  std::lock_guard<std::mutex> l(mu_);
   size_t unknown = 0;
   for (size_t i = 0; i < n; ++i) {
-    const uint32_t id = ids[i];
-    const uint32_t s = id < n_ ? slot_of_[id] : kNoSlot;
-    locs_out[i] = s < capacity_ ? loc_[s] : kNoLoc;  // kPending never shows outside Put
+    const uint32_t s = SlotOf(ids[i]);
+    locs_out[i] = s != kNoSlot ? LocLocked(s) : kNoLoc;
     if (locs_out[i] == kNoLoc) ++unknown;
   }
   return unknown;
 }
 
-void PQStore::Unref(const uint32_t* ids, size_t n) noexcept {
+void PQStore::Unref(const uint32_t* slots, size_t n) noexcept {
   std::lock_guard<std::mutex> l(mu_);
   size_t bad = 0;
   for (size_t i = 0; i < n; ++i) {
-    const uint32_t id = ids[i];
-    const uint32_t s = id < n_ ? slot_of_[id] : kNoSlot;
-    if (s >= capacity_ || refs_[s] == 0) {
+    const uint32_t s = slots[i];
+    if (s >= capacity_ || id_of_[s] == kNoSlot || refs_[s] == 0) {
       ++bad;
       continue;
     }
@@ -314,7 +332,7 @@ size_t PQStore::Forget(const uint32_t* ids, size_t n, bool deleted) {
   size_t freed = 0;
   for (size_t i = 0; i < n; ++i) {
     if (ids[i] >= n_) continue;
-    const uint32_t s = slot_of_[ids[i]];
+    const uint32_t s = SlotLocked(ids[i]);
     if (s == kNoSlot) continue;
     if (CategoryOf(s) == kCached) {
       FreeLocked(s);
@@ -345,10 +363,10 @@ void PQStore::EvictLocked(uint64_t count) {
 void PQStore::FreeLocked(uint32_t s) {
   Count(CategoryOf(s), -1);
   if (flags_[s] & kDeleted) --st_.deleted;
-  slot_of_[id_of_[s]] = kNoSlot;
+  SetSlot(id_of_[s], kNoSlot);
   id_of_[s] = kNoSlot;
   refs_[s] = 0;
-  loc_[s] = kNoLoc;
+  SetLoc(s, kNoLoc);
   flags_[s] = 0;
   free_.push_back(s);
   --st_.resident;
@@ -365,7 +383,7 @@ uint64_t PQStore::Save(const std::string& path, uint32_t codebook_crc) const {
   std::vector<uint32_t> ids;
   ids.reserve(st_.resident);
   for (uint64_t id = 0; id < n_; ++id)
-    if (slot_of_[id] != kNoSlot) ids.push_back(static_cast<uint32_t>(id));
+    if (SlotLocked(static_cast<uint32_t>(id)) != kNoSlot) ids.push_back(static_cast<uint32_t>(id));
   std::string tmp = path + ".tmp.XXXXXX";
   const int fd = ::mkstemp(&tmp[0]);
   FUSION_CHECK(fd >= 0, "cannot create %s: %s", tmp.c_str(), std::strerror(errno));
@@ -384,7 +402,7 @@ uint64_t PQStore::Save(const std::string& path, uint32_t codebook_crc) const {
       const size_t k = std::min<size_t>(kSnapChunk, ids.size() - i);
       buf.resize(k * m_);
       for (size_t j = 0; j < k; ++j)
-        std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(slot_of_[ids[i + j]]) * m_, m_);
+        std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(SlotLocked(ids[i + j])) * m_, m_);
       WriteAll(fd, buf.data(), buf.size(), tmp);
     }
     FUSION_CHECK(::fsync(fd) == 0, "fsync %s: %s", tmp.c_str(), std::strerror(errno));

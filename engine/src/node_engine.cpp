@@ -88,6 +88,9 @@ constexpr uint16_t kSelfHolder = 0xFFFF;
 struct ResidentSegment {
   ListSegment seg;                                // seg.holders moves into `holders` at load
   std::vector<uint32_t> slots;                    // parallel to seg.ids
+  // The PQ codes it references, one per distinct vector its postings name, by slot (in its
+  // vectors' ID order): what the reclaimer gives back (PQStore::Unref).
+  std::vector<uint32_t> ref_slots;
   // Per posting, the node holding its raw vector (kSelfHolder, a peer's ID, or kNoHolder). The
   // key (list, vector) has one holder at a time: a fetch through the posting makes it this node.
   // The only part of a shared segment that changes, hence atomic. A posting is made to say
@@ -158,7 +161,7 @@ class Reclaimer {
       uint64_t n = 0;
       while (list != nullptr) {
         const ResidentSegment* next = list->next;
-        store_->Unref(list->seg.ids.data(), list->seg.ids.size());
+        store_->Unref(list->ref_slots.data(), list->ref_slots.size());
         delete list;
         list = next;
         ++n;
@@ -808,26 +811,36 @@ class NodeEngineImpl : public NodeEngine {
     auto rs = std::make_unique<ResidentSegment>();
     const std::vector<uint32_t>& ids = seg->ids;
     const std::vector<uint32_t>& locs = seg->locs;
+    const uint64_t nlocs = raw_->layout().locations();
+    for (size_t j = 0; j < locs.size(); ++j)
+      FUSION_CHECK(locs[j] < nlocs, "%s: raw-vector location %u out of range (%llu locations)", what.c_str(),
+                   locs[j], static_cast<unsigned long long>(nlocs));
+    // Per distinct vector: the PQ code (one reference each) and, at a bootstrap, the raw vector.
+    // Per posting, below: its holder and its code's slot. All in passes over the postings,
+    // without sorting them (Amazon 300M: 37M postings over 7M vectors a partition; sorting their
+    // locations and searching each posting's among them took 20 of a load's 26 s), and with the
+    // PQ store's lock held only for the references.
+    const Distinct d = DistinctVectors(*seg, what);
     rs->holders.reset(new std::atomic<uint16_t>[ids.size()]);
     if (pq == PQSource::kIndex) {
-      FillFromIndex(ids);
-      FillRawFromIndex(locs);
+      FillFromIndex(d.ids);
+      FillRawFromIndex(d.locs);
       for (size_t j = 0; j < ids.size(); ++j) rs->SetHolder(j, kSelfHolder);
     } else {
       // A generation's partitions after a full rebuild (U14): the codes the node lacks come from
       // the generation's pq_codes.bin (one codebook: the same codes), the raw vectors from the
       // holders the postings record, as after a migration.
-      if (pq == PQSource::kGenIndex) FillFromIndex(ids);
+      if (pq == PQSource::kGenIndex) FillFromIndex(d.ids);
       // Each key's holder: this node if the vector is here, else the one the posting records.
       // A missing vector with no holder could never be fetched: refused before anything changes.
-      const std::vector<uint32_t> absent = RawAbsent(locs.data(), locs.size());
+      const HeldView held = Held();
       const uint16_t me = self_id_.load();
       size_t unknown = 0;
       uint32_t first = 0;
       for (size_t j = 0; j < ids.size(); ++j) {
         uint16_t h = seg->holders.empty() ? kNoHolder : seg->holders[j];
         if (h == kNoHolder) h = fallback_holder;
-        if (!std::binary_search(absent.begin(), absent.end(), locs[j])) {
+        if (held.Has(locs[j])) {
           h = kSelfHolder;
         } else if (h == kNoHolder || h == me) {
           if (unknown++ == 0) first = locs[j];
@@ -839,9 +852,8 @@ class NodeEngineImpl : public NodeEngine {
                                         "this node and record no other holder (first: location %u)",
                                         p, unknown, first));
     }
-    rs->slots.resize(ids.size());
     // PQMissingError: nothing changed. The locations are recorded with the codes.
-    store_->Ref(ids.data(), ids.size(), rs->slots.data(), locs.data());
+    TakeReferences(*seg, d, rs.get());
     rs->seg = std::move(*seg);
     std::vector<uint16_t>().swap(rs->seg.holders);  // in rs->holders now
     // The references are dropped (by the reclaimer) once the last holder -- the table below,
@@ -1066,9 +1078,9 @@ class NodeEngineImpl : public NodeEngine {
       for (size_t j = 0; j < holders.size(); ++j) rs->SetHolder(j, holders[j]);
       rs->version = vs.next;
       rs->stamp = seg_stamp_.fetch_add(1) + 1;
-      rs->slots.resize(seg.ids.size());
       // PQMissingError: this segment holds no reference yet; the ones built before drop theirs.
-      store_->Ref(seg.ids.data(), seg.ids.size(), rs->slots.data(), seg.locs.data());
+      TakeReferences(seg, DistinctVectors(seg, StrFormat("partition %u's version %u", vs.partition, vs.next)),
+                     rs.get());
       built[i].reset(rs.release(), [reclaimer](const ResidentSegment* r) { reclaimer->Push(r); });
     }
     // Every version could be built: the lists the batch creates belong to their partitions now.
@@ -1178,11 +1190,12 @@ class NodeEngineImpl : public NodeEngine {
       for (const auto& rec : segs[g]) ListMissing(rec->segment().ids, g, &listed, sink);
   }
 
-  // Of ids, the codes not on this node and not listed yet, to sink as group g (PQMissingStream);
-  // the ones here are protected for the staging.
+  // Of the vectors a segment's postings name (ids), the codes not on this node and not listed
+  // yet, to sink as group g (PQMissingStream); the ones here are protected for the staging.
   void ListMissing(const std::vector<uint32_t>& ids, size_t g, Seen* listed,
                    const std::function<void(size_t, const uint32_t*, size_t)>& sink) {
-    std::vector<uint32_t> fresh = store_->Reserve(ids.data(), ids.size());
+    const std::vector<uint32_t> distinct = DistinctIds(ids, "a segment to list the PQ codes of");
+    std::vector<uint32_t> fresh = store_->Reserve(distinct.data(), distinct.size());
     fresh.erase(std::remove_if(fresh.begin(), fresh.end(), [&](uint32_t id) { return !listed->Add(id); }),
                 fresh.end());
     if (!fresh.empty()) sink(g, fresh.data(), fresh.size());
@@ -1253,17 +1266,16 @@ class NodeEngineImpl : public NodeEngine {
       }
     }
     // Each vector once, from the first posting, in the partitions' order, that records a holder.
-    // A posting that says the vector is here: a query fetched it since RawAbsent looked.
+    // A posting that says the vector is here: a query fetched it since the view was made.
     Seen done;                     // given out, or here
     std::vector<uint32_t> unheld;  // postings that record no holder
     std::vector<RawRef> chunk;
+    const HeldView held = Held();
     for (const auto& s : segs) {
-      const std::vector<uint32_t> absent = RawAbsent(s->seg.locs.data(), s->seg.locs.size());
-      if (absent.empty()) continue;
       for (size_t i = 0; i < s->seg.list_ids.size(); ++i)
         for (uint64_t j = s->seg.offsets[i]; j < s->seg.offsets[i + 1]; ++j) {
           const uint32_t loc = s->seg.locs[j];
-          if (done.Has(loc) || !std::binary_search(absent.begin(), absent.end(), loc)) continue;
+          if (done.Has(loc) || held.Has(loc)) continue;
           const uint16_t h = s->Holder(j);
           if (h != kSelfHolder && !Fetchable(h)) {
             unheld.push_back(loc);
@@ -1298,17 +1310,14 @@ class NodeEngineImpl : public NodeEngine {
     uint64_t repointed = 0;
     Seen listed;
     std::vector<RawRef> chunk;
+    const HeldView held = Held();
     for (const auto& s : segs) {
       std::vector<size_t> named;
       for (size_t j = 0; j < s->seg.ids.size(); ++j)
         if (s->Holder(j) == holder) named.push_back(j);
-      if (named.empty()) continue;
-      std::vector<uint32_t> locs(named.size());
-      for (size_t k = 0; k < named.size(); ++k) locs[k] = s->seg.locs[named[k]];
-      const std::vector<uint32_t> absent = RawAbsent(locs.data(), locs.size());
       for (size_t j : named) {
         const uint32_t loc = s->seg.locs[j];
-        if (!std::binary_search(absent.begin(), absent.end(), loc)) {
+        if (held.Has(loc)) {
           s->SetHolder(j, kSelfHolder);  // the vector is here: the key's holder is this node
           ++repointed;
           continue;
@@ -1838,6 +1847,85 @@ class NodeEngineImpl : public NodeEngine {
     ~PinScope() { w.held.clear(); }
   };
 
+  // The distinct vectors a segment's postings name, ascending, each with its raw-vector location
+  // (its first posting's: PQStore::Ref checks it against the one recorded). A bit per vector ID
+  // marks the vectors met in one pass over the postings, and only the first posting of each,
+  // (ID, location) in one word, is sorted: a fifth of the postings at Amazon 300M.
+  struct Distinct {
+    std::vector<uint32_t> ids, locs;
+  };
+  Distinct DistinctVectors(const ListSegment& s, const std::string& what) const {
+    std::vector<uint64_t> seen((ids_ + 63) / 64, 0);
+    std::vector<uint64_t> first;
+    for (size_t j = 0; j < s.ids.size(); ++j) {
+      const uint32_t id = s.ids[j];
+      FUSION_CHECK(id < ids_, "%s: vector ID %u out of range (%llu IDs)", what.c_str(), id,
+                   static_cast<unsigned long long>(ids_));
+      uint64_t& w = seen[id >> 6];
+      const uint64_t bit = uint64_t{1} << (id & 63);
+      if (w & bit) continue;
+      w |= bit;
+      first.push_back(uint64_t{id} << 32 | s.locs[j]);
+    }
+    std::sort(first.begin(), first.end());
+    Distinct d;
+    d.ids.resize(first.size());
+    d.locs.resize(first.size());
+    for (size_t k = 0; k < first.size(); ++k) {
+      d.ids[k] = static_cast<uint32_t>(first[k] >> 32);
+      d.locs[k] = static_cast<uint32_t>(first[k]);
+    }
+    return d;
+  }
+
+  // The distinct vector IDs of ids, ascending (a bit per ID, then the bits in order).
+  std::vector<uint32_t> DistinctIds(const std::vector<uint32_t>& ids, const std::string& what) const {
+    std::vector<uint64_t> seen((ids_ + 63) / 64, 0);
+    size_t n = 0;
+    for (uint32_t id : ids) {
+      FUSION_CHECK(id < ids_, "%s: vector ID %u out of range (%llu IDs)", what.c_str(), id,
+                   static_cast<unsigned long long>(ids_));
+      const uint64_t bit = uint64_t{1} << (id & 63);
+      n += (seen[id >> 6] & bit) == 0;
+      seen[id >> 6] |= bit;
+    }
+    std::vector<uint32_t> out;
+    out.reserve(n);
+    for (size_t w = 0; w < seen.size(); ++w)
+      for (uint64_t b = seen[w]; b; b &= b - 1) out.push_back(static_cast<uint32_t>(w * 64 + __builtin_ctzll(b)));
+    return out;
+  }
+
+  // Takes rs's PQ references -- one per distinct vector of seg (d), recording their locations --
+  // and resolves every posting's slot, which the references keep in place, without the store's
+  // lock. PQMissingError, or a location that contradicts the recorded one: nothing changed.
+  void TakeReferences(const ListSegment& seg, const Distinct& d, ResidentSegment* rs) {
+    rs->ref_slots.resize(d.ids.size());
+    store_->Ref(d.ids.data(), d.ids.size(), rs->ref_slots.data(), d.locs.data());
+    rs->slots.resize(seg.ids.size());
+    for (size_t j = 0; j < seg.ids.size(); ++j) rs->slots[j] = store_->SlotOf(seg.ids[j]);
+  }
+
+  // The raw vectors on this node -- on the SSD or in the fetch cache -- for a pass over many
+  // postings, without taking cache_mu_ for each: the SSD's presence bits as they are, the cache's
+  // locations as they were when the view was made. A vector that leaves the cache is on the SSD
+  // by then; one fetched since counts as absent, as it would have a moment earlier.
+  class HeldView {
+   public:
+    HeldView(const RawStore* raw, Seen cached) : raw_(raw), cached_(std::move(cached)) {}
+    bool Has(uint32_t loc) const { return raw_->Present(loc) || cached_.Has(loc); }
+
+   private:
+    const RawStore* raw_;
+    Seen cached_;
+  };
+  HeldView Held() const {
+    Seen cached;
+    std::lock_guard<std::mutex> l(cache_mu_);
+    for (const auto& kv : cache_) cached.Add(kv.first);
+    return HeldView(raw_.get(), std::move(cached));
+  }
+
   // Loads a segment file and checks that its lists belong to its partition.
   ListSegment LoadSegment(const std::string& path) const {
     ListSegment s = ListSegment::Load(path);
@@ -1859,10 +1947,10 @@ class NodeEngineImpl : public NodeEngine {
       if (c >= man->num_lists) RegisterList(c, s.partition);
   }
 
-  // Bootstrap (and a generation's partitions after a full rebuild): installs the codes of `ids`
-  // this node lacks from the index's pq_codes.bin (the ones it has are protected meanwhile, so
-  // making room never drops them). The file holds the index's vectors only: an inserted
-  // vector's code must be here already.
+  // Bootstrap (and a generation's partitions after a full rebuild): installs the codes of `all`
+  // (a segment's distinct vectors, ascending) this node lacks from the index's pq_codes.bin (the
+  // ones it has are protected meanwhile, so making room never drops them). The file holds the
+  // index's vectors only: an inserted vector's code must be here already.
   void FillFromIndex(const std::vector<uint32_t>& all) {
     uint64_t n = 0;  // the vectors the index's file holds
     {
@@ -1888,8 +1976,8 @@ class NodeEngineImpl : public NodeEngine {
     store_->Put(miss.data(), miss.size(), buf.data(), PQOrigin::kIndex);
   }
 
-  // Bootstrap: copies the raw vectors at `locs` this node lacks from the index's page file, one
-  // page read for all the vectors a page holds.
+  // Bootstrap: copies the raw vectors at `locs` (a segment's distinct vectors') this node lacks
+  // from the index's page file, one page read for all the vectors a page holds.
   void FillRawFromIndex(const std::vector<uint32_t>& locs) {
     const std::vector<uint32_t> miss = raw_->Missing(locs.data(), locs.size());
     if (miss.empty()) return;

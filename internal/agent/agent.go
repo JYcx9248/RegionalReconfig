@@ -82,6 +82,10 @@ type Agent struct {
 	// open-loop overload while the data node answered each request in under a millisecond).
 	local     *nodeclient.Client
 	localBulk *nodeclient.Client
+	// Loads of partitions (LOAD_PARTITION, SEGMENT_INSTALL), loadStreams at once: each holds its
+	// connection for seconds, and has one of its own, so that serving peers and INFO never wait
+	// behind a staging's loads.
+	localLoad *nodeclient.Client
 
 	beforeInstall func(epoch uint64) // test hooks (Options)
 	beforeGraph   func() error
@@ -227,6 +231,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer a.local.Close()
 	a.localBulk = nodeclient.New(a.cfg.NodeAddr, a.cfg.NodeConns)
 	defer a.localBulk.Close()
+	a.localLoad = nodeclient.New(a.cfg.NodeAddr, loadStreams)
+	defer a.localLoad.Close()
 	info, err := a.waitForNode(ctx)
 	if err != nil {
 		return err
