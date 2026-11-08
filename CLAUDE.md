@@ -327,6 +327,37 @@ Next:
      - the new entries come online only after the load, 314-328 s after the trigger: the graph
        yields to data strictly (U16), and data moves the whole run.
    - Every answer is the same in all six runs.
+   - **Held to 570 s** (`4to8-worst-long`, lazy, two runs; `lazy-keepup.svg`): the 360 s runs'
+     drain was capped by the load generator's 64 in flight per entry, with 4 entries online.
+     - The backlog clears under the load at 395-415 s.
+     - Then lazy answers 1100 q/s at 13.6-13.8 ms (p99 30-31 ms), as 8 nodes with every raw
+       vector local do, while still fetching 13-20 MB/s.
+     - By the load's end it has fetched 31.4 GB, 73% of the copy. Without locality lazy's total
+       approaches the copy's; it moves it while serving.
+     - `keepup-all.svg` (`--lazy-series 4to8-worst-long`) sets it against the baselines' 360 s runs.
+       By 570 s copy-then-flip on one budget has moved as much (30.9-32.5 GB) and still not
+       flipped.
+     - The answers match the 360 s runs'.
+
+   Amazon 300M 4 → 8 (2026-11-07, `results/cloudlab-gpu/amazon-4to8`; figures `--series
+   amazon-4to8` in `results/cloudlab-gpu-figures/amazon-4to8`, `lazy-stall.svg` the new one):
+   - **Capacity:** C4 564, C8 872 q/s (1.55x). The reads are skewed: the busiest node takes 1.67
+     times an even share on 4 nodes and 2.19 on 8 (Wikipedia 1.37, 1.70). A query re-ranks 200
+     candidates in 173 page reads. The runs: load 350 → 700 q/s at 60 s, 4 → 8 at 90 s, 360 s.
+   - **Neither protocol flips during the load.** Lazy's stage_data takes 291-306 s, with or
+     without load: lists and PQ codes (24.5 GB) arrive in about 100 s, then each new node loads
+     its 8 partitions one at a time, about 25 s each (`PQStore::Ref`: a reference per posting,
+     about 37M a partition, under the store's mutex). Lazy flips 317-320 s after the trigger.
+     Copy-then-flip streams 151 GB after the same staging and flips 1661-1768 s after it.
+   - **After lazy's flip the answers stop for about 75 s**, the reclaim: the old owners' `Unref`
+     of whole partitions holds the PQ store's mutex, which every RERANK takes (`Locate`). Queries
+     that wait over 30 s fail at the client: 153 and 190 per run, 654 in 4to8to4; none under
+     copy-then-flip. The staging's `PQ_GET`s on the same mutex halve the answers for ~20 s too.
+   - **A run's deployment on the snapshot takes 9.5 min:** the PQ pass about 4 (the codes are in
+     the snapshot since, `results/pq-snapshot-2026-11-07`), the 16 partition loads 4.5 (the same
+     `Ref`). The 4to8to4 scale-in starts only after the load: its scale-out ends at 504 s.
+   - The 1,152 queries with ground truth answered in all four 4 → 8 runs have the same recall
+     (0.80) in each.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

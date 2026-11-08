@@ -328,7 +328,7 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
     panels.append(("mean latency of the answered queries" + (" (log scale)" if log_latency else ""), "ms", 210,
                    [(slot, [(w["t"] + width / 2, w["mean_us"] / 1000.0 if w["mean_us"] else None) for w in win])
                     for _, slot, win, _, _ in lines]))
-    tops, yy = [], TOP + 24
+    tops, yy = [], (TOP if title else 10) + 24  # no title: a paper figure, its caption carries it
     for _, _, ph, _ in panels:
         tops.append(yy)
         yy += ph + 44
@@ -372,8 +372,9 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
 </style>""" % (colours(0, "#fcfcfb", "#0b0b0b", "#52514e", "#e1e0d9", "#c3c2b7"),
                colours(1, "#1a1a19", "#ffffff", "#c3c2b7", "#2c2c2a", "#383835")))
     svg.append('<rect class="bg" x="0" y="0" width="%d" height="%d"/>' % (W, h))
-    svg.append('<text class="title" x="%d" y="22">%s</text>' % (LEFT, esc(title)))
-    svg.append('<text class="sub" x="%d" y="40">%s</text>' % (LEFT, esc(subtitle)))
+    if title:
+        svg.append('<text class="title" x="%d" y="22">%s</text>' % (LEFT, esc(title)))
+        svg.append('<text class="sub" x="%d" y="40">%s</text>' % (LEFT, esc(subtitle)))
 
     # Each reconfiguration's trigger, as a dashed line through every panel: one neutral line where
     # the lines' runs trigger together (within a window), one in a line's colour where only its
@@ -582,7 +583,8 @@ def main():
     ap.add_argument("--until", choices=("load", "answer"), default="load",
                     help="the time axis' end: where the load stopped (default) or the last answer")
     ap.add_argument("--out", help="output path without extension (default: latency-mean next to the runs)")
-    ap.add_argument("--title", default="Mean latency over time")
+    ap.add_argument("--title", default="Mean latency over time",
+                    help="the title; \"\" for none, and no subtitle either (a paper figure, whose caption carries them)")
     ap.add_argument("--log-latency", action="store_true", help="latency panel on a log scale")
     ap.add_argument("--slo-ms", type=float, default=200.0,
                     help="open loop: count the queries answered later than this (default 200 ms)")
