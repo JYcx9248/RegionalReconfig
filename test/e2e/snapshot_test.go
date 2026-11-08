@@ -14,14 +14,17 @@ import (
 
 // TestBootstrapFromSnapshot: an experiment's warmup snapshot (scripts/run_local.py, "Type":
 // "warmup"). The initial nodes bootstrap from the index, each saves the presence bits of its raw
-// vectors (RAW_SAVE), and the cluster stops. A new cluster's initial nodes start on copies of
-// those raw files (--raw-reuse) and on the index without its page file, so that a single vector
-// copied from the index would fail the deployment: they deploy the same placement, copy no
-// vector, and answer exactly; a scale-out then runs as it does from bootstrapped nodes.
+// vectors (RAW_SAVE) and its PQ codes (PQ_SAVE), and the cluster stops. A new cluster's initial
+// nodes start on copies of those raw files (--raw-reuse), on the saved codes where they are, as
+// the runners leave them (--pq-file), and on the index without its page file and PQ codes, so
+// that a single vector or code read from the index would fail the deployment: they deploy the
+// same placement, copy nothing, and answer exactly; a scale-out then runs as it does from
+// bootstrapped nodes.
 func TestBootstrapFromSnapshot(t *testing.T) {
 	f := getFixture(t)
 	dir := t.TempDir()
 	raw := func(run string, i int) string { return filepath.Join(dir, run, fmt.Sprintf("n%d", i), "raw.pages") }
+	pq := filepath.Join(dir, "warmup", "n%d", "pq.codes")
 	const initial = 2
 	warm := newCluster(t, f, "lazy", initial)
 	for i := 1; i <= initial; i++ {
@@ -34,19 +37,23 @@ func TestBootstrapFromSnapshot(t *testing.T) {
 		t.Fatalf("initial deployment: %v (%s)", err, warm.ctl.LastError())
 	}
 	want := warm.ctl.Status().Table.Placement
-	saved := make([]uint64, initial)
+	saved, savedPQ := make([]uint64, initial), make([]uint64, initial)
 	for i, a := range warm.agents {
 		c := nodeclient.New(a.Info().NodeAddr, 1)
 		n, err := c.RawSave(warm.ctx)
+		codes, perr := c.PQSave(warm.ctx, fmt.Sprintf(pq, i+1))
 		info, ierr := c.InfoSettled(warm.ctx)
 		c.Close()
-		if err != nil || ierr != nil {
-			t.Fatalf("n%d: RAW_SAVE %v, INFO %v", i+1, err, ierr)
+		if err != nil || perr != nil || ierr != nil {
+			t.Fatalf("n%d: RAW_SAVE %v, PQ_SAVE %v, INFO %v", i+1, err, perr, ierr)
 		}
 		if n == 0 || n != info.Raw.Present || n != info.Raw.FromIndex {
 			t.Fatalf("n%d saved %d raw vectors, holds %+v: want every vector it copied", i+1, n, info.Raw)
 		}
-		saved[i] = n
+		if codes == 0 || codes != info.PQ.Resident || codes != info.PQ.FromIndex {
+			t.Fatalf("n%d saved %d PQ codes, holds %+v: want every code it copied", i+1, codes, info.PQ)
+		}
+		saved[i], savedPQ[i] = n, codes
 	}
 	warm.close()
 	warm.stops = nil // stopped: its cleanup has nothing left to stop
@@ -67,9 +74,10 @@ func TestBootstrapFromSnapshot(t *testing.T) {
 		}
 	}
 	cl := newCluster(t, f, "lazy", initial)
-	cl.initialIndex = f.indexNoPages
+	cl.initialIndex = f.indexNoBootstrap
 	for i := 1; i <= initial; i++ {
-		cl.addNode(fmt.Sprintf("n%d", i), query.TwoPhase{}, "--raw-file", raw("run", i), "--raw-reuse")
+		cl.addNode(fmt.Sprintf("n%d", i), query.TwoPhase{}, "--raw-file", raw("run", i), "--raw-reuse",
+			"--pq-file", fmt.Sprintf(pq, i))
 	}
 	cl.addNode("n3", query.TwoPhase{}) // a spare: starts empty, joins at the scale-out
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
@@ -88,8 +96,8 @@ func TestBootstrapFromSnapshot(t *testing.T) {
 		if r := info.Raw; r.Restored != saved[i] || r.Present != r.Restored || r.FromIndex != 0 {
 			t.Errorf("n%d's raw vectors %+v: want the %d saved, none copied from the index", i+1, r, saved[i])
 		}
-		if pq := info.PQ; pq.FromIndex == 0 || pq.FromIndex != pq.Resident {
-			t.Errorf("n%d's PQ codes %+v: want every one from the index", i+1, pq)
+		if c := info.PQ; c.Restored != savedPQ[i] || c.Resident != c.Restored || c.FromIndex != 0 {
+			t.Errorf("n%d's PQ codes %+v: want the %d saved, none read from the index", i+1, c, savedPQ[i])
 		}
 	}
 	checkResidency(t, cl)

@@ -74,12 +74,15 @@ class NoGraphError : public std::runtime_error {
 
 struct NodeOptions {
   std::string index_dir;       // index built by fusion_build (codebook, graph; codes and pages
-                               // are read only to bootstrap partitions)
+                               // are read only to bootstrap partitions, when first needed)
   std::string partitions_dir;  // written by rtier_segment (manifest, list_part.bin, segments)
   std::string layout;          // "" = the manifest's (the page layout its locations refer to)
   std::string raw_file;        // this node's raw vectors; "" = an anonymous temporary file
   bool raw_reuse = false;      // open raw_file as it is, with the presence bits RawSave wrote
                                // next to it (a warmup snapshot's copy), instead of empty
+  std::string pq_file;         // PQ codes PQSave wrote (a warmup snapshot's), installed at
+                               // startup: the bootstrap then reads none from pq_codes.bin; ""
+                               // = none
   FilterDevice device = FilterDevice::kCpu;
   int num_workers = 2;
   uint32_t max_nprobe = 256;   // largest m per request
@@ -178,7 +181,8 @@ enum class PQSource {
   kPresent,
   // Bootstrap (the initial deployment, --load): PQ codes and raw vectors are copied from the
   // index's pq_codes.bin and vectors_<layout>.bin -- those the node lacks: none of the codes
-  // after PQFromIndex, none of the vectors a snapshot restored (raw_reuse).
+  // after PQFromIndex or that a snapshot restored (pq_file), none of the vectors a snapshot
+  // restored (raw_reuse). Each file is opened when a code or vector is first read from it.
   kIndex,
   // A generation's partitions after a full rebuild (U14): the codes the node lacks are copied
   // from the generation's pq_codes.bin (one codebook: the same codes), and raw vectors come from
@@ -454,6 +458,9 @@ class NodeEngine {
   // (RawStore::SaveBitmap; one fetched and still in memory is not among them), for a node
   // started later with raw_reuse on a copy of both: a warmup snapshot. Returns how many there are.
   virtual uint64_t RawSave() = 0;
+  // Saves every PQ code this node holds to path, durably (PQStore::Save), for a node started
+  // later with it as pq_file: the rest of a warmup snapshot. Returns how many.
+  virtual uint64_t PQSave(const std::string& path) = 0;
   // A snapshot that waits for nothing, or (settle) one taken once the vectors fetched before
   // the call are on the SSD: with no query fetching, cached is then 0.
   virtual RawStats raw_stats(bool settle) const = 0;

@@ -102,7 +102,7 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.indexNoPages, f.parts, logf)
+	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.indexNoBootstrap, f.parts, logf)
 	if err != nil {
 		t.Fatal(err)
 	}

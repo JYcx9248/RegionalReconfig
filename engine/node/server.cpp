@@ -144,6 +144,7 @@ const char* OpName(uint8_t op) {
     case kGraphGet: return "graph_get";
     case kGraphPut: return "graph_put";
     case kGraphInstall: return "graph_install";
+    case kPQSave: return "pq_save";
     default: return nullptr;
   }
 }
@@ -761,6 +762,12 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         Require(r.remaining() == 0, "trailing bytes in RAW_SAVE");
         w.Put<uint64_t>(e.RawSave());
         break;
+      case kPQSave: {
+        const std::string path = TakeStr(&r);
+        Require(r.remaining() == 0, "trailing bytes in PQ_SAVE");
+        w.Put<uint64_t>(e.PQSave(path));
+        break;
+      }
       case kRawPull: {
         const uint32_t n = r.Get<uint32_t>();
         Require(n <= kMaxRawBatch && static_cast<uint64_t>(n) * e.vec_bytes() <= kMaxFrameBytes / 2,
@@ -1077,11 +1084,11 @@ std::string NodeServer::InfoJson(bool settle) const {
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
   s += fusion::StrFormat(
       "],\"pq\":{\"m\":%u,\"capacity\":%llu,\"resident\":%llu,\"live\":%llu,\"staged\":%llu,"
-      "\"cached\":%llu,\"received\":%llu,\"from_index\":%llu,\"skipped\":%llu,\"evicted\":%llu,"
-      "\"freed\":%llu,\"served\":%llu,\"deleted\":%llu}",
+      "\"cached\":%llu,\"received\":%llu,\"from_index\":%llu,\"restored\":%llu,\"skipped\":%llu,"
+      "\"evicted\":%llu,\"freed\":%llu,\"served\":%llu,\"deleted\":%llu}",
       pq.m, u(pq.capacity), u(pq.resident), u(pq.live), u(pq.staged), u(pq.cached),
-      u(pq.received), u(pq.from_index), u(pq.skipped), u(pq.evicted), u(pq.freed), u(pq.served),
-      u(pq.deleted));
+      u(pq.received), u(pq.from_index), u(pq.restored), u(pq.skipped), u(pq.evicted), u(pq.freed),
+      u(pq.served), u(pq.deleted));
   const fusion::RawStats raw = e.raw_stats(settle);
   s += fusion::StrFormat(
       ",\"raw\":{\"vec_bytes\":%u,\"locations\":%llu,\"present\":%llu,\"cached\":%llu,"

@@ -159,6 +159,17 @@ void SyncAndDropFromPageCache(const std::string& path) {
   FUSION_CHECK(synced, "cannot sync %s: %s", path.c_str(), std::strerror(err));
 }
 
+void RenameDurably(const std::string& tmp, const std::string& path) {
+  FUSION_CHECK(std::rename(tmp.c_str(), path.c_str()) == 0, "rename %s: %s", tmp.c_str(), std::strerror(errno));
+  const size_t slash = path.rfind('/');
+  const std::string dir = slash == std::string::npos ? "." : slash == 0 ? "/" : path.substr(0, slash);
+  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {  // the rename itself, where the file system takes a directory sync
+    ::fsync(dfd);
+    ::close(dfd);
+  }
+}
+
 std::vector<uint8_t> ReadFile(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
   FUSION_CHECK(f != nullptr, "cannot open %s: %s", path.c_str(), std::strerror(errno));

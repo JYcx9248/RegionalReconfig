@@ -48,7 +48,8 @@ location, and finds a candidate's location through its PQ store. The same vector
 two lists names the same offset, so dedup is free, and the transfer unit is a single vector (list
 tails share pages). Only the initial deployment reads the index's page file, and not even it on a
 warmup snapshot (below); the end-to-end tests run every node that joins later on a copy of the
-index without it. Old owners keep the vectors of
+index without it, and without its PQ codes, which it gets from its peers too. Old owners keep the
+vectors of
 partitions that moved away, like PQ codes. Raw vectors need no versions under updates: vectors are
 immutable, and IDs and locations are only appended. Decided for now: raw vectors are kept in full
 -- no disk budget, no eviction, and deleted vectors' pages stay -- since disk is cheap, and the
@@ -308,7 +309,7 @@ epoch, a full rebuild and rescales.
 |---|---|
 | `cmd/rtier-controller` | control plane: registration, placement, epochs, reconfiguration, metrics sink |
 | `cmd/rtier-agent` | per-node agent next to `rtier_node`: staging, epochs, entry + aggregator roles |
-| `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline / `pq-share` (each initial node's PQ codes, offline) / `save-raw` (a node's warmup snapshot) |
+| `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline / `pq-share` (each initial node's PQ codes, offline) / `save-raw`, `save-pq` (a node's warmup snapshot: its raw vectors, its PQ codes) |
 | `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time) with a rate schedule, or closed-loop users; follows the entry list (U17) |
 | `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14), routing inserts with its own router (`-router`, or `-index` to start one), and runs major epochs (`-split-len`, `-merge-len`; `-split`, `-merge`) |
 | `cmd/rtier-overhead` | cost of fan-out: emulates N owners on one data node holding every partition and reports what the two-phase query adds over N = 1 (owners per query, duplicate PQ scoring, extra page reads, per-call and merge time); `-compare` sets two-phase against local re-ranking (recall with `-gt`), `-owners` shows how queries spread over owners |
@@ -375,13 +376,16 @@ cache and swappiness 1.
 The initial deployment copies each initial node's share of the raw vectors from the index's page
 file: minutes at scale (371 s for Wikipedia's two nodes on the lab server). A warmup run does it
 once. `"Type": "warmup"` deploys the initial nodes, has each save the presence bits of its raw
-vectors next to its raw file (`rtier-client save-raw`), stops, and moves every node's raw file
-and bits into a snapshot under `"SnapshotDir"` (default `WorkDir/snapshots`; a rename, so that a
-file system without reflinks, such as ext4, holds them once), with no load. A later
-run of the same index, partitions, placement and number of initial nodes copies the snapshot into
-its initial nodes' directories (`cp --reflink=auto --sparse=always`, at once on XFS or btrfs) and
-starts them with `rtier_node --raw-reuse`: their bootstrap copies no raw vector. Once deployed, it
-checks that each got the partitions its snapshot was made for. A run without a matching snapshot
+vectors next to its raw file (`rtier-client save-raw`) and its PQ codes (`rtier-client save-pq`,
+`pq.codes`), stops, and moves every node's raw file, bits and codes into a snapshot under
+`"SnapshotDir"` (default `WorkDir/snapshots`; a rename, so that a file system without reflinks,
+such as ext4, holds them once), with no load. A later run of the same index, partitions,
+placement and number of initial nodes copies the raw files into its initial nodes' directories
+(`cp --reflink=auto --sparse=always`, at once on XFS or btrfs) and starts them with `rtier_node
+--raw-reuse --pq-file`, the codes read in the snapshot (a node only reads them, at its start):
+their bootstrap copies no raw vector and reads no PQ code from the index, and a cluster run
+copies neither the page file nor `pq_codes.bin` to their hosts. Once deployed, it checks that
+each got the partitions its snapshot was made for. A run without a matching snapshot
 bootstraps from the index and says why, or, with `"RequireSnapshot": true`, stops before anything
 starts. A snapshot is named by a digest of content alone -- the index's `meta.txt`; the partitions'
 manifest, list → partition map and segments (each by its size and CRC); the placement; the number
@@ -393,10 +397,11 @@ files must be copied, not rebuilt: the same data built twice is not the same ind
 The backend plays no part, so a warmup on the CPU backend serves GPU runs. The stage records name
 files by absolute path, so prepared data moves as is when it sits at the same paths on the other
 machine. The nodes start one at a time, each after the previous one
-registered, so `n1`, `n2`, ... get IDs 1, 2, ... and the same partitions every time. The PQ codes
-come from `pq_codes.bin` either way, read once in file order for all of a node's partitions
-(`PQ_FROM_INDEX`). `configs/experiment.wiki-c1024-warmup-{1,2,4}.json` are the warmups of the
-Wikipedia runs.
+registered, so `n1`, `n2`, ... get IDs 1, 2, ... and the same partitions every time. Without a
+snapshot, and on one made before 2026-11-07, which has no PQ codes, a node reads its codes from
+`pq_codes.bin`, once in file order for all of its partitions (`PQ_FROM_INDEX`); `rtier_node` opens
+the file only then, so the nodes that join later need no copy of it.
+`configs/experiment.wiki-c1024-warmup-{1,2,4}.json` are the warmups of the Wikipedia runs.
 
 `configs/experiment.example.json` is the same run on BigANN (edit the paths). With
 `"Emulation": {"Netns": true}` (root), each node runs in its own network namespace with its

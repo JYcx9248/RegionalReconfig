@@ -62,7 +62,7 @@ class PQCapacityError : public std::runtime_error {
 };
 
 // Where installed codes came from (statistics only).
-enum class PQOrigin { kReceived, kIndex };
+enum class PQOrigin { kReceived, kIndex, kSnapshot };
 
 struct PQStats {
   uint32_t m = 0;          // bytes per code
@@ -73,6 +73,7 @@ struct PQStats {
   uint64_t cached = 0;     // kept after their partitions moved away
   uint64_t received = 0;   // cumulative: codes installed from peers (PQ_PUT)
   uint64_t from_index = 0; // cumulative: codes installed from the index files
+  uint64_t restored = 0;   // cumulative: codes installed from a warmup snapshot (Restore)
   uint64_t skipped = 0;    // cumulative: codes offered that were already held
   uint64_t evicted = 0;    // cumulative: cached codes dropped to make room
   uint64_t freed = 0;      // cumulative: codes dropped (evicted, released after a staging, deleted)
@@ -134,6 +135,18 @@ class PQStore {
   // unreferenced ones go (codes known to be unused, e.g. of inserts whose batch did not flip).
   // Returns how many were freed now.
   size_t Forget(const uint32_t* ids, size_t n, bool deleted);
+
+  // A warmup snapshot of the codes (rtier_node --pq-file): every code held, in ID order, written
+  // durably to path with codebook_crc, the CRC-32 of the codebook's centroids, so that codes of
+  // another codebook are refused. Returns how many. Holds the store's lock while it writes: a
+  // warmup saves an idle node.
+  uint64_t Save(const std::string& path, uint32_t codebook_crc) const;
+  // Installs the codes of a file Save wrote into this store, empty, as Put installs them
+  // (staged until a partition that names them loads), and drops the file from the page cache:
+  // a node that starts on a snapshot reads its own codes instead of a pass over the index's
+  // pq_codes.bin. Refuses, before installing any, a file of another codebook or code size, a
+  // damaged or truncated one, and more codes than the capacity. Returns how many.
+  uint64_t Restore(const std::string& path, uint32_t codebook_crc);
 
   PQStats Stats() const;
 

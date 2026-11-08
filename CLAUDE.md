@@ -36,10 +36,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   `scripts/compare_runs.py` (README, "Mean latency over time"); measure without `-race`.
   `RTIER_E2E_BACKEND=gpu` (with a CUDA build in `RTIER_ENGINE_BIN`) runs the cluster's nodes on
   the GPU backend against the CPU oracle. Nodes that join after the initial
-  deployment run on a copy of the index without its page file (`indexNoPages`): they can only
-  get raw vectors from peers (so do the initial nodes of `TestBootstrapFromSnapshot`, which
-  start on their saved raw vectors). Every node runs with `--stream-batch 100`, so each staging
-  and drain streams in many frames.
+  deployment run on a copy of the index without its page file and PQ codes
+  (`indexNoBootstrap`): they can only get raw vectors and PQ codes from peers (so do the initial
+  nodes of `TestBootstrapFromSnapshot`, which start on their saved raw vectors and PQ codes).
+  Every node runs with `--stream-batch 100`, so each staging and drain streams in many frames.
 - Configuration as in Koala: one system configuration, `config.yaml` at the repository root
   (the controller's and the agents' keys; `bin/rtier-controller -defaults` prints them all),
   which every process reads at startup, and one JSON file per experiment
@@ -60,7 +60,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | Path | What |
 |---|---|
 | `cmd/rtier-controller`, `cmd/rtier-agent` | control plane; per-node agent next to `rtier_node` |
-| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline) / a node's raw-vector snapshot (`save-raw`); open-loop or closed-loop load |
+| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline) / a node's warmup snapshot: raw vectors (`save-raw`) and PQ codes (`save-pq`); open-loop or closed-loop load |
 | `cmd/rtier-updater` | the update controller's command: one batch of inserts and deletes, or a major epoch (U14) |
 | `cmd/rtier-overhead` | fan-out cost analysis: one data node emulates N owners (`-owners`, `-compare`) |
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
@@ -156,18 +156,21 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   file, and not on a warmup snapshot (below).
 - **Warmup snapshots** (`"Type": "warmup"`, `run_local.py`): a run that only deploys the
   initial nodes and moves each one's raw vectors -- its raw file and presence bits (`RAW_SAVE`,
-  `rtier-client save-raw`) -- into `"SnapshotDir"`, on the node's machine (a rename: one copy on
-  disk, even on ext4). A later run of
-  the same index, partitions, placement and initial node count restores them (`cp
-  --reflink=auto --sparse=always`) and starts those nodes with `rtier_node --raw-reuse`: their
-  bootstrap copies no raw vector, `run_cluster.py` copies no page file to their hosts, and the
-  run checks that each got its snapshot's partitions. A snapshot is keyed by content (the
+  `rtier-client save-raw`) -- and its PQ codes (`PQ_SAVE`, `rtier-client save-pq`, `pq.codes`)
+  into `"SnapshotDir"`, on the node's machine (a rename: one copy on disk, even on ext4). A
+  later run of the same index, partitions, placement and initial node count restores the raw
+  files (`cp --reflink=auto --sparse=always`) and starts those nodes with `rtier_node
+  --raw-reuse --pq-file <snapshot>/n<i>/pq.codes`, the codes read where they are, at the node's
+  start: their bootstrap copies no raw vector and reads no PQ code (the agent skips
+  `PQ_FROM_INDEX`), `run_cluster.py` copies neither the page file nor `pq_codes.bin` to their
+  hosts, and the run checks that each got its snapshot's partitions. A snapshot is keyed by content (the
   index's `meta.txt`, the partitions' manifest, list map and segment sizes and CRCs, placement,
   initial node count), never by path or mtime: one made on the lab server serves AWS hosts that
   have the same files (copied, not rebuilt) and its `snapshot.json` and `n<i>/` under the same
-  `"SnapshotDir"`; `"RequireSnapshot": true` stops a run whose initial nodes lack it. PQ codes
-  still come from `pq_codes.bin`, all of a node's in one pass (`PQ_FROM_INDEX`). Nodes start one
-  at a time, each after the previous one registered, so IDs, and with them the initial
+  `"SnapshotDir"`; `"RequireSnapshot": true` stops a run whose initial nodes lack it. A
+  snapshot made before 2026-11-07 has no PQ codes: its nodes read theirs from `pq_codes.bin`,
+  all of a node's in one pass (`PQ_FROM_INDEX`); `rtier_node` opens that file only to read from
+  it, so a node that joins later, its codes from peers, needs none. Nodes start one at a time, each after the previous one registered, so IDs, and with them the initial
   placement, follow the order. Stage records name files by absolute path: prepared data moves as
   is at the same paths.
 - **Updates (U14)**: the update controller (`internal/update`, `rtier-updater`) takes the
@@ -207,10 +210,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   (`scripts/evict_cache.py`).
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
   controller and the load generator; it checks every host, copies with rsync, to the same
-  paths, the binaries, `config.yaml` and what the host's nodes open (the index's meta, codebook
-  and PQ codes and the partitions' manifest; where an initial node runs, also the page file
-  (unless the host's initial nodes start on a warmup snapshot), the graph and the segments; a
-  next generation's meta, codebook, PQ codes, graph and manifest), checks with `ldd` that the
+  paths, the binaries, `config.yaml` and what the host's nodes open (the index's meta and
+  codebook and the partitions' manifest; where an initial node runs, also the graph, the
+  segments, and the PQ codes and the page file unless the host's initial nodes start on a
+  warmup snapshot of them; a next generation's meta, codebook, PQ codes, graph and manifest),
+  checks with `ldd` that the
   binaries find their shared libraries there, and starts the nodes in order
   over SSH, each after the previous one registered. A remote process stops when its SSH session
   closes. `"NodeResources"` (except `"ReadIOPSPerNode"`) and `"Emulation"` are for one machine
@@ -389,9 +393,8 @@ Next:
      against queries during a scale-out; staged versions left by an expired lease;
    - scale limits for billion-vector datasets, the target: single-frame graph patches (the
      listings `PQ_MISSING`, `RAW_MISSING`, `RAW_HELD_BY` stream since 2026-10-21), what
-     `run_cluster.py` still copies whole (every segment, and the page file where there is no
-     warmup snapshot, to each initial node's host; the PQ codes to every host: `rtier_node`
-     opens them at startup), per-node
+     `run_cluster.py` still copies whole (every segment to each initial node's host, and the
+     page file and the PQ codes where there is no warmup snapshot), per-node
      structures sized by the dataset (`slot_of_`, the presence bitmap);
    - elsewhere: chunk storage (U12, last), the host copy of the PQ codes (U15), the number of
      partitions (U2), the PQ compression level.

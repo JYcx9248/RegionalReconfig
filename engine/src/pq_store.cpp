@@ -1,6 +1,11 @@
 #include "fusion/pq_store.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 
 namespace fusion {
@@ -10,6 +15,40 @@ constexpr uint32_t kPending = 0xFFFFFFFEu;
 constexpr uint8_t kProtected = 1;       // a staging in progress needs this code
 constexpr uint8_t kEverReferenced = 2;  // a loaded partition has named this code
 constexpr uint8_t kDeleted = 4;         // the vector is deleted (U14): freed with its last reference
+
+// A snapshot of the codes as Save writes it (little endian): the magic, u32 version, u32 m, u32
+// the codebook's CRC-32, u32 reserved, u64 the ID space it was saved with, u64 n, the n IDs
+// ascending (u32), then their codes in that order (n x m bytes). No checksum over the codes: a
+// pass over gigabytes would cost much of what the snapshot saves. The size, every ID and the
+// codebook are checked; rsync checks a copy.
+constexpr char kSnapMagic[8] = {'R', 'T', 'P', 'Q', 'S', 'N', 'A', 'P'};
+constexpr uint32_t kSnapVersion = 1;
+constexpr uint64_t kSnapHeader = 8 + 4 * 4 + 8 + 8;
+constexpr uint64_t kSnapChunk = uint64_t{1} << 20;  // codes a write or a read
+
+void WriteAll(int fd, const void* data, size_t n, const std::string& path) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  while (n > 0) {
+    const ssize_t r = ::write(fd, p, n);
+    if (r < 0 && errno == EINTR) continue;
+    FUSION_CHECK(r > 0, "write %s: %s", path.c_str(), r == 0 ? "no progress" : std::strerror(errno));
+    p += r;
+    n -= static_cast<size_t>(r);
+  }
+}
+
+void ReadAllAt(int fd, void* data, size_t n, uint64_t off, const std::string& path) {
+  auto* p = static_cast<uint8_t*>(data);
+  while (n > 0) {
+    const ssize_t r = ::pread(fd, p, n, static_cast<off_t>(off));
+    if (r < 0 && errno == EINTR) continue;
+    FUSION_CHECK(r > 0, "read %s at %llu: %s", path.c_str(), static_cast<unsigned long long>(off),
+                 r == 0 ? "unexpected end of file" : std::strerror(errno));
+    p += r;
+    off += static_cast<uint64_t>(r);
+    n -= static_cast<size_t>(r);
+  }
+}
 }  // namespace
 
 PQStore::PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity)
@@ -157,7 +196,11 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
   }
   st_.resident += fresh.size();
   st_.staged += fresh.size();
-  (origin == PQOrigin::kIndex ? st_.from_index : st_.received) += fresh.size();
+  switch (origin) {
+    case PQOrigin::kIndex: st_.from_index += fresh.size(); break;
+    case PQOrigin::kSnapshot: st_.restored += fresh.size(); break;
+    case PQOrigin::kReceived: st_.received += fresh.size(); break;
+  }
   st_.skipped += n - fresh.size();
   return fresh.size();
 }
@@ -315,6 +358,98 @@ void PQStore::FreeLocked(uint32_t s) {
 PQStats PQStore::Stats() const {
   std::lock_guard<std::mutex> l(mu_);
   return st_;
+}
+
+uint64_t PQStore::Save(const std::string& path, uint32_t codebook_crc) const {
+  std::lock_guard<std::mutex> l(mu_);
+  std::vector<uint32_t> ids;
+  ids.reserve(st_.resident);
+  for (uint64_t id = 0; id < n_; ++id)
+    if (slot_of_[id] != kNoSlot) ids.push_back(static_cast<uint32_t>(id));
+  std::string tmp = path + ".tmp.XXXXXX";
+  const int fd = ::mkstemp(&tmp[0]);
+  FUSION_CHECK(fd >= 0, "cannot create %s: %s", tmp.c_str(), std::strerror(errno));
+  try {
+    ::fchmod(fd, 0644);
+    uint8_t hdr[kSnapHeader];
+    const uint32_t h32[4] = {kSnapVersion, m_, codebook_crc, 0};
+    const uint64_t h64[2] = {n_, ids.size()};
+    std::memcpy(hdr, kSnapMagic, 8);
+    std::memcpy(hdr + 8, h32, sizeof(h32));
+    std::memcpy(hdr + 24, h64, sizeof(h64));
+    WriteAll(fd, hdr, sizeof(hdr), tmp);
+    WriteAll(fd, ids.data(), ids.size() * sizeof(uint32_t), tmp);
+    std::vector<uint8_t> buf;
+    for (size_t i = 0; i < ids.size(); i += kSnapChunk) {
+      const size_t k = std::min<size_t>(kSnapChunk, ids.size() - i);
+      buf.resize(k * m_);
+      for (size_t j = 0; j < k; ++j)
+        std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(slot_of_[ids[i + j]]) * m_, m_);
+      WriteAll(fd, buf.data(), buf.size(), tmp);
+    }
+    FUSION_CHECK(::fsync(fd) == 0, "fsync %s: %s", tmp.c_str(), std::strerror(errno));
+    DropFromPageCache(fd, 0, kSnapHeader + ids.size() * (sizeof(uint32_t) + uint64_t{m_}));
+  } catch (...) {
+    ::close(fd);
+    ::unlink(tmp.c_str());
+    throw;
+  }
+  ::close(fd);
+  RenameDurably(tmp, path);
+  return ids.size();
+}
+
+uint64_t PQStore::Restore(const std::string& path, uint32_t codebook_crc) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  FUSION_CHECK(fd >= 0, "cannot open %s: %s", path.c_str(), std::strerror(errno));
+  struct Closer {
+    int fd;
+    ~Closer() { ::close(fd); }
+  } closer{fd};
+  struct stat sb {};
+  FUSION_CHECK(::fstat(fd, &sb) == 0, "stat %s: %s", path.c_str(), std::strerror(errno));
+  const uint64_t size = static_cast<uint64_t>(sb.st_size);
+  FUSION_CHECK(size >= kSnapHeader, "%s is no PQ snapshot: %llu bytes", path.c_str(),
+               static_cast<unsigned long long>(size));
+  uint8_t hdr[kSnapHeader];
+  ReadAllAt(fd, hdr, sizeof(hdr), 0, path);
+  uint32_t h32[4];
+  uint64_t h64[2];
+  std::memcpy(h32, hdr + 8, sizeof(h32));
+  std::memcpy(h64, hdr + 24, sizeof(h64));
+  FUSION_CHECK(std::memcmp(hdr, kSnapMagic, 8) == 0 && h32[0] == kSnapVersion,
+               "%s is no PQ snapshot (PQ_SAVE writes them)", path.c_str());
+  FUSION_CHECK(h32[1] == m_, "%s holds %u-byte PQ codes, this index %u-byte ones", path.c_str(), h32[1], m_);
+  FUSION_CHECK(h32[2] == codebook_crc, "%s holds PQ codes of another codebook than this index's", path.c_str());
+  const uint64_t n = h64[1];
+  FUSION_CHECK(n <= size && size == kSnapHeader + n * (sizeof(uint32_t) + uint64_t{m_}),
+               "%s is damaged: %llu bytes for %llu PQ codes", path.c_str(), static_cast<unsigned long long>(size),
+               static_cast<unsigned long long>(n));
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    FUSION_CHECK(st_.resident == 0, "a PQ snapshot is restored into an empty store, not one with %llu codes",
+                 static_cast<unsigned long long>(st_.resident));
+  }
+  if (n > capacity_)
+    throw PQCapacityError(StrFormat("%s holds %llu PQ codes, more than this node's capacity of %llu (--pq-capacity)",
+                                    path.c_str(), static_cast<unsigned long long>(n),
+                                    static_cast<unsigned long long>(capacity_)));
+  std::vector<uint32_t> ids(n);
+  ReadAllAt(fd, ids.data(), n * sizeof(uint32_t), kSnapHeader, path);
+  DropFromPageCache(fd, kSnapHeader, n * sizeof(uint32_t));
+  for (uint64_t i = 0; i < n; ++i)
+    FUSION_CHECK(ids[i] < n_ && (i == 0 || ids[i] > ids[i - 1]), "%s is damaged: vector ID %u at position %llu",
+                 path.c_str(), ids[i], static_cast<unsigned long long>(i));
+  uint64_t installed = 0;
+  std::vector<uint8_t> buf;
+  for (uint64_t i = 0; i < n; i += kSnapChunk) {
+    const uint64_t k = std::min(kSnapChunk, n - i), off = kSnapHeader + n * sizeof(uint32_t) + i * m_;
+    buf.resize(k * m_);
+    ReadAllAt(fd, buf.data(), buf.size(), off, path);
+    DropFromPageCache(fd, off, buf.size());
+    installed += Put(ids.data() + i, k, buf.data(), PQOrigin::kSnapshot);
+  }
+  return installed;
 }
 
 }  // namespace fusion

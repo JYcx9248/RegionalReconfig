@@ -98,6 +98,9 @@
 //                   (the raw file is synced and the presence bits of the vectors on the SSD
 //                   are written next to it, <raw-file>.present: a warmup snapshot of this
 //                   node, which rtier_node --raw-reuse opens with a copy of the file)
+//   PQ_SAVE         str path (on the node's host)             -> u64 codes
+//                   (every PQ code the node holds, written to path: the rest of a warmup
+//                   snapshot, which rtier_node --pq-file installs at startup)
 //
 // A streamed reply comes as frames of the same request ID, every one but the last flagged more,
 // each with at most about kStreamBatch entries: the node sends a frame when it is full, when its
@@ -237,6 +240,7 @@ enum Op : uint8_t {
   kGraphGet = 0x41,
   kGraphPut = 0x42,
   kGraphInstall = 0x43,
+  kPQSave = 0x44,
 };
 
 enum Status : uint16_t {

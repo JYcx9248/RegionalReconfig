@@ -107,5 +107,8 @@ void WriteVector(FILE* f, const std::vector<T>& v, const std::string& path) {
 void DropFromPageCache(int fd, uint64_t off, uint64_t len);
 // Syncs a file just written, then drops it from the page cache.
 void SyncAndDropFromPageCache(const std::string& path);
+// Renames tmp, written and synced, over path, then syncs the directory: path is then the whole
+// new file or the old one, after a crash too.
+void RenameDurably(const std::string& tmp, const std::string& path);
 
 }  // namespace fusion

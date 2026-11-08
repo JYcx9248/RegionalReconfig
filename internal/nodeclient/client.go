@@ -64,6 +64,7 @@ const (
 	opGraphGet       uint8 = 0x41
 	opGraphPut       uint8 = 0x42
 	opGraphInstall   uint8 = 0x43
+	opPQSave         uint8 = 0x44
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -138,7 +139,7 @@ type OpStats struct {
 // PQStats describe the node's PQ code store (engine/include/fusion/pq_store.h): one code per
 // vector. Live codes are named by resident partitions, staged ones are held for a staging in
 // progress, cached ones stayed after their partitions moved away (dropped only to make room).
-// Received, FromIndex, Skipped, Evicted, Freed and Served are cumulative.
+// Received, FromIndex, Restored, Skipped, Evicted, Freed and Served are cumulative.
 type PQStats struct {
 	M         int    `json:"m"`
 	Capacity  uint64 `json:"capacity"`
@@ -148,6 +149,7 @@ type PQStats struct {
 	Cached    uint64 `json:"cached"`
 	Received  uint64 `json:"received"`
 	FromIndex uint64 `json:"from_index"`
+	Restored  uint64 `json:"restored"` // installed at startup from a warmup snapshot (--pq-file)
 	Skipped   uint64 `json:"skipped"`
 	Evicted   uint64 `json:"evicted"`
 	Freed     uint64 `json:"freed"`
@@ -624,6 +626,25 @@ func (c *Client) RawSave(ctx context.Context) (uint64, error) {
 	n := r.U64()
 	if r.Err == nil && r.Remaining() != 0 {
 		return 0, fmt.Errorf("RAW_SAVE: %d trailing bytes", r.Remaining())
+	}
+	return n, r.Err
+}
+
+// PQSave has the node save every PQ code it holds to path (on the node's host), for a node
+// started later with that file (rtier_node --pq-file): the rest of an experiment's warmup
+// snapshot. It returns how many codes it saved.
+func (c *Client) PQSave(ctx context.Context, path string) (uint64, error) {
+	var w frame.Writer
+	w.U32(uint32(len(path)))
+	w.Str(path)
+	b, err := c.do(ctx, opPQSave, 0, w.B)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	n := r.U64()
+	if r.Err == nil && r.Remaining() != 0 {
+		return 0, fmt.Errorf("PQ_SAVE: %d trailing bytes", r.Remaining())
 	}
 	return n, r.Err
 }

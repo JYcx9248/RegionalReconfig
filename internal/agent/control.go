@@ -354,13 +354,22 @@ func (a *Agent) stagePQAndLoad(ctx context.Context, sources []protocol.Source, r
 				mode = nodeclient.LoadGeneration
 			} else {
 				// The PQ codes of them all first, in one pass over the index's file: a node's codes
-				// are scattered over the whole of it, and the loads read them code by code.
-				paths := make([]string, len(src.Partitions))
-				for i, p := range src.Partitions {
-					paths[i] = a.segmentPath(p, src.VersionOf(i))
+				// are scattered over the whole of it, and the loads read them code by code. Not on a
+				// node that started on a warmup snapshot's codes (rtier_node --pq-file): it has
+				// them, and the pass would only list the segments to find that out; a load reads
+				// from the file only a code the snapshot lacks.
+				info, err := a.localBulk.Info(ctx)
+				if err != nil {
+					return fmt.Errorf("INFO before the PQ codes: %w", err)
 				}
-				if _, err := a.localBulk.PQFromIndex(ctx, paths); err != nil {
-					return fmt.Errorf("PQ codes from the index: %w", err)
+				if info.PQ.Restored == 0 {
+					paths := make([]string, len(src.Partitions))
+					for i, p := range src.Partitions {
+						paths[i] = a.segmentPath(p, src.VersionOf(i))
+					}
+					if _, err := a.localBulk.PQFromIndex(ctx, paths); err != nil {
+						return fmt.Errorf("PQ codes from the index: %w", err)
+					}
 				}
 			}
 			for i, p := range src.Partitions {

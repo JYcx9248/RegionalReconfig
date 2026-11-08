@@ -39,6 +39,9 @@ static void Usage() {
   --raw-reuse            open --raw-file as it is, with the presence bits RAW_SAVE wrote next to
                          it (PATH.present), instead of empty: a copy of a warmup snapshot, whose
                          vectors the bootstrap then does not copy from the index
+  --pq-file PATH         install the PQ codes PQ_SAVE wrote to PATH at startup (the rest of a
+                         warmup snapshot): the bootstrap then reads none from the index's
+                         pq_codes.bin, which a node opens only to read a code from it
   --layout L             bucket | id (default: the layout the partitions were written for)
   --io B                 auto | uring | aio | pread (default auto)
   --io-depth D           (default 64)
@@ -92,6 +95,7 @@ int main(int argc, char** argv) {
     o.layout = a.Str("layout", "");
     o.raw_file = a.Str("raw-file", "");
     o.raw_reuse = a.Flag("raw-reuse");
+    o.pq_file = a.Str("pq-file", "");
     const std::string backend = a.Str("backend", "cpu");
     FUSION_CHECK(backend == "cpu" || backend == "gpu", "unknown backend %s", backend.c_str());
     o.device = backend == "gpu" ? FilterDevice::kGpu : FilterDevice::kCpu;

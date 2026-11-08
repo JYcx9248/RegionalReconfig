@@ -126,14 +126,7 @@ void WriteDurably(const std::string& path, const std::vector<uint8_t>& data) {
     throw;
   }
   ::close(fd);
-  FUSION_CHECK(std::rename(tmp.c_str(), path.c_str()) == 0, "rename %s: %s", tmp.c_str(), std::strerror(errno));
-  const size_t slash = path.rfind('/');
-  const std::string dir = slash == std::string::npos ? "." : slash == 0 ? "/" : path.substr(0, slash);
-  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (dfd >= 0) {  // the rename itself, where the file system takes a directory sync
-    ::fsync(dfd);
-    ::close(dfd);
-  }
+  RenameDurably(tmp, path);
 }
 
 // Visits the entries of order (indices into locs, sorted by location) in runs of consecutive

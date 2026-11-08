@@ -25,6 +25,7 @@
 //	rtier-client search-local -node ADDR -queries Q.u8bin [...]   # single-node baseline
 //	rtier-client pq-share -partitions DIR -nodes K [-placement P] | -plan FILE
 //	rtier-client save-raw -node ADDR
+//	rtier-client save-pq -node ADDR -file PATH
 //
 // pq-share needs no controller: it reads the partitions and prints, for each data node of the
 // first epoch the placement policy gives K nodes (as the controller deploys them: IDs 1..K), or
@@ -33,7 +34,8 @@
 //
 // save-raw talks to a data node, not the controller: it syncs the node's raw vectors and saves
 // their presence bits next to its raw file, for a warmup snapshot (scripts/run_local.py, "Type":
-// "warmup") that later nodes start from (rtier_node --raw-reuse).
+// "warmup") that later nodes start from (rtier_node --raw-reuse). save-pq saves the node's PQ
+// codes to PATH on the node's host, the rest of that snapshot (rtier_node --pq-file).
 package main
 
 import (
@@ -62,7 +64,7 @@ import (
 func main() {
 	api := flag.String("api", "127.0.0.1:7101", "controller API address")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ... | save-raw -node ADDR")
+		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ... | save-raw -node ADDR | save-pq -node ADDR -file PATH")
 	}
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -157,6 +159,23 @@ func main() {
 			log.Fatalf("save-raw %s: %v", *node, err)
 		}
 		printJSON(map[string]uint64{"present": n})
+	case "save-pq":
+		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		node := fs.String("node", "", "data node address")
+		file := fs.String("file", "", "where the node writes its codes, on its host")
+		fs.Parse(args)
+		if *node == "" || *file == "" {
+			log.Fatal("usage: save-pq -node ADDR -file PATH")
+		}
+		c := nodeclient.New(*node, 1)
+		defer c.Close()
+		sctx, cancel := context.WithTimeout(ctx, time.Hour) // gigabytes of codes, synced
+		defer cancel()
+		n, err := c.PQSave(sctx, *file)
+		if err != nil {
+			log.Fatalf("save-pq %s: %v", *node, err)
+		}
+		printJSON(map[string]uint64{"codes": n})
 	case "pq-share":
 		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 		parts := fs.String("partitions", "", "rtier_segment's output")

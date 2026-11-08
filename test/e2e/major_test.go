@@ -81,7 +81,7 @@ func TestMajorEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.indexNoPages, f.parts, logf)
+	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.indexNoBootstrap, f.parts, logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestMajorEpoch(t *testing.T) {
 	router := nodeclient.New(raddr, 2)
 	defer router.Close()
 	u := &update.Updater{Controller: cl.ctl, Manifest: m, Alloc: alloc, Router: router,
-		GraphPath: filepath.Join(f.indexNoPages, "graph.hnsw"), PatchDir: t.TempDir()}
+		GraphPath: filepath.Join(f.indexNoBootstrap, "graph.hnsw"), PatchDir: t.TempDir()}
 	defer u.Close()
 	oracleVersions := make([]uint32, numPartitions)
 

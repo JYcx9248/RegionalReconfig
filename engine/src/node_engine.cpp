@@ -258,9 +258,12 @@ class NodeEngineImpl : public NodeEngine {
 
     // PQ codes: node-level store, filled as partitions arrive (fusion/pq_store.h). The index's
     // pq_codes.bin is only read to bootstrap (PQSource::kIndex) and, after a full rebuild, for
-    // the codes a generation's partitions need (PQSource::kGenIndex).
+    // the codes a generation's partitions need (PQSource::kGenIndex), and opened when a code is
+    // first read from it (PQFile): a node that starts on a warmup snapshot's codes (pq_file), or
+    // joins later with its codes from peers, needs no copy of the file.
     PQCodebook cb = PQCodebook::Load(path(files::kPQCodebook));
-    pq_file_ = OpenPQFile(path(files::kPQCodes), n_, cb.m());
+    pq_path_ = path(files::kPQCodes);
+    codebook_crc_ = Crc32(cb.centroids(), static_cast<size_t>(cb.m()) * kPQKsub * cb.dsub() * sizeof(float));
     const uint64_t cap = o.pq_capacity ? o.pq_capacity : ids_;
     FUSION_CHECK(cap <= ids_, "PQ capacity %llu exceeds the %llu vector IDs",
                  static_cast<unsigned long long>(cap), static_cast<unsigned long long>(ids_));
@@ -284,6 +287,11 @@ class NodeEngineImpl : public NodeEngine {
     store_->SetMirror([fb, host_codes](const uint32_t* slots, uint32_t n) {
       fb->StoreCodes(slots, n, host_codes);
     });
+    if (!o.pq_file.empty()) {  // with the mirror set, so that the filter gets them too
+      Timer t;
+      const uint64_t k = store_->Restore(o.pq_file, codebook_crc_);
+      Log("PQ codes: %llu from %s in %.1f s", static_cast<unsigned long long>(k), o.pq_file.c_str(), t.Sec());
+    }
 
     // Raw vectors: node-level too, a sparse copy of the page file filled as partitions arrive
     // (fusion/raw_store.h). The index's page file is only read to bootstrap.
@@ -479,6 +487,7 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   uint64_t RawSave() override { return raw_->SaveBitmap(); }
+  uint64_t PQSave(const std::string& path) override { return store_->Save(path, codebook_crc_); }
 
   std::vector<uint64_t> RawBitmap() const override {
     std::lock_guard<std::mutex> l(cache_mu_);  // the writer moves a vector to the SSD under it
@@ -1101,11 +1110,9 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   PQPutResult PQFromIndex(const std::vector<std::string>& segments) override {
-    std::shared_ptr<ReadOnlyFile> file;
-    uint64_t n = 0;  // the vectors the file holds: read with it (see FillFromIndex)
+    uint64_t n = 0;  // the vectors the index's file holds
     {
       std::lock_guard<std::mutex> l(gen_mu_);
-      file = pq_file_;
       n = n_.load();
     }
     // A bit per code to read, so that the pass goes in the file's order without sorting them.
@@ -1117,6 +1124,8 @@ class NodeEngineImpl : public NodeEngine {
         if (ids[i] < n && want.Add(ids[i])) ++wanted;
     });
     PQPutResult r;
+    if (wanted == 0) return r;  // all here (a snapshot's codes): the file is not even opened
+    const std::shared_ptr<ReadOnlyFile> file = PQFile(n);
     const uint32_t m = store_->m();
     const uint64_t per_read = std::max<uint64_t>(opts_.pq_read_bytes / m, 1);
     std::vector<uint32_t> ids;
@@ -1761,11 +1770,9 @@ class NodeEngineImpl : public NodeEngine {
   // making room never drops them). The file holds the index's vectors only: an inserted
   // vector's code must be here already.
   void FillFromIndex(const std::vector<uint32_t>& all) {
-    std::shared_ptr<ReadOnlyFile> file;
-    uint64_t n = 0;  // the vectors the file holds: read with it, a generation switch replaces both
+    uint64_t n = 0;  // the vectors the index's file holds
     {
       std::lock_guard<std::mutex> l(gen_mu_);
-      file = pq_file_;
       n = n_.load();
     }
     std::vector<uint32_t> ids;
@@ -1774,6 +1781,7 @@ class NodeEngineImpl : public NodeEngine {
       if (id < n) ids.push_back(id);
     const std::vector<uint32_t> miss = store_->Reserve(ids.data(), ids.size());
     if (miss.empty()) return;
+    const std::shared_ptr<ReadOnlyFile> file = PQFile(n);
     const uint32_t m = store_->m();
     std::vector<uint8_t> buf(miss.size() * m);
     for (size_t i = 0; i < miss.size();) {  // one read per run of consecutive IDs
@@ -1968,6 +1976,16 @@ class NodeEngineImpl : public NodeEngine {
     a.ef = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_ef", "128")));
     return a;
   }
+  // The index's pq_codes.bin (a generation's, after a full rebuild), opened at the first read
+  // from it. n: the vectors the caller read the IDs against; a generation switch replaces the
+  // file and the count together.
+  std::shared_ptr<ReadOnlyFile> PQFile(uint64_t n) {
+    std::lock_guard<std::mutex> l(gen_mu_);
+    FUSION_CHECK(n == n_.load(), "the index switched generations during a bootstrap");
+    if (!pq_file_) pq_file_ = OpenPQFile(pq_path_, n, store_->m());
+    return pq_file_;
+  }
+
   // An index's pq_codes.bin, checked against its vector count and the codebook.
   static std::shared_ptr<ReadOnlyFile> OpenPQFile(const std::string& path, uint64_t n, uint32_t m) {
     auto f = std::make_shared<ReadOnlyFile>();
@@ -2507,7 +2525,9 @@ class NodeEngineImpl : public NodeEngine {
   std::unique_ptr<GraphLoader> loader_;  // a graph being received (PutGraph)
   std::atomic<const ListMap*> lists_{nullptr};
   std::vector<std::unique_ptr<ListMap>> list_maps_;  // under gen_mu_: every map published
-  std::shared_ptr<ReadOnlyFile> pq_file_;            // under gen_mu_
+  std::shared_ptr<ReadOnlyFile> pq_file_;            // under gen_mu_; null until PQFile opens it
+  std::string pq_path_;                              // the index's pq_codes.bin
+  uint32_t codebook_crc_ = 0;  // of the codebook's centroids: a PQ snapshot of another is refused
   std::unique_ptr<FilterBackend> filter_;
   std::unique_ptr<PQStore> store_;
   std::unique_ptr<Reclaimer> reclaimer_;

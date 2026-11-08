@@ -10,15 +10,15 @@ load (run_local.py is the single-machine case):
   2. build the index, the ground truth and the partitions on this machine, the root
      (run_local.py's stages)
   3. rewrite config.yaml (run_local.py's), then copy it and what the nodes open to every host,
-     at this machine's paths (Koala's syncRepo): rtier_node and rtier-agent; the index's meta,
-     PQ codebook and PQ codes, and the
-     partitions' manifest; where a node of the initial deployment runs, also the index's page
-     file (not where every such node starts on a warmup snapshot), its graph and the segments,
-     which only the initial deployment reads -- the nodes that join later get them from their
-     peers; of each rebuild's next generation, its meta, codebook, PQ codes, graph and
-     manifest. The rest of an index is the build's own (postings, centroids, layout maps). A
-     host that sees a directory at its path already (this machine, a shared file system) gets
-     no copy of it. Before that, each initial node's warmup snapshot is restored on its host.
+     at this machine's paths (Koala's syncRepo): rtier_node and rtier-agent; the index's meta
+     and PQ codebook, and the partitions' manifest; where a node of the initial deployment runs,
+     also the index's graph and the segments, and its PQ codes and page file, unless every such
+     node there starts on a warmup snapshot of its codes and of its raw vectors -- only the
+     initial deployment reads these, and the nodes that join later get them from their peers;
+     of each rebuild's next generation, its meta, codebook, PQ codes, graph and manifest. The
+     rest of an index is the build's own (postings, centroids, layout maps). A host that sees a
+     directory at its path already (this machine, a shared file system) gets no copy of it.
+     Before that, each initial node's warmup snapshot is restored on its host.
   4. start the controller here, then each node in order over SSH -- its rtier_node, then its
      agent -- and wait for the agent's registration before the next: nodes n1, n2, ... get IDs
      1, 2, ..., and the first InitialNodes form the deployment (Koala starts its workers in
@@ -358,25 +358,29 @@ def check_gpus(hosts: list, visible: dict, tables: dict, ebin: str) -> None:
 
 # ------------------------------------------------------------------- 3. copies
 
-# What every node opens, wherever it runs: rtier_node checks the PQ codes at startup, though only
-# the bootstrap reads them.
-NODE_INDEX = ("meta.txt", "pq_codebook.bin", "pq_codes.bin")
+# What every node opens, wherever it runs. The PQ codes (pq_codes.bin) only a bootstrap reads,
+# and rtier_node opens them only then.
+NODE_INDEX = ("meta.txt", "pq_codebook.bin")
 NODE_PARTS = ("manifest.txt", "list_part.bin")
 
 
-def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool, pages: bool = True) -> list:
-    """(directory, its files) for the nodes of one host. Every node opens the index's meta, PQ
-    codebook and PQ codes and the partitions' manifest. A node of the initial deployment also
-    reads the page file (its bootstrap; pages: unless every such node of the host starts on a
-    warmup snapshot), its segments and the graph (staged from the build output): all the
-    segments go, since the initial placement is the controller's. A node that
-    joins later gets these from its peers. Of each rebuild's next generation (gens: index and
+def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool, pages: bool = True,
+               pq: bool = True) -> list:
+    """(directory, its files) for the nodes of one host. Every node opens the index's meta and PQ
+    codebook and the partitions' manifest. A node of the initial deployment also reads the PQ
+    codes and the page file (its bootstrap; pq, pages: unless every such node of the host starts
+    on a warmup snapshot of its codes, of its raw vectors), its segments and the graph (staged
+    from the build output): all the segments go, since the initial placement is the
+    controller's. A node that joins later gets these from its peers. Of each rebuild's next
+    generation (gens: index and
     partition directories), the meta, codebook, PQ codes, graph and manifest: every node in the
     cluster at the rebuild switches to it, and its segments, with their holders, come from the
     controller. The rest of an index (postings, centroids, heads, layout maps) is the build's
     own. graph: rtier_node --graph index, every node loading the graph at startup."""
     man = rl.read_kv(os.path.join(parts, "manifest.txt"))
     idx, seg = list(NODE_INDEX), list(NODE_PARTS)
+    if bootstrap and pq:
+        idx.append("pq_codes.bin")
     if bootstrap or graph:
         idx.append("graph.hnsw")
     if bootstrap and pages:
@@ -384,24 +388,26 @@ def node_files(index: str, parts: str, gens: list, bootstrap: bool, graph: bool,
     if bootstrap:
         seg += [f"part-{p:05d}.seg" for p in range(int(man["num_partitions"]))]
     out = [(index, idx), (parts, seg)]
-    for gi, gp in gens:
-        out += [(gi, list(NODE_INDEX) + ["graph.hnsw"]), (gp, list(NODE_PARTS))]
+    for gi, gp in gens:  # a node opens a generation's PQ codes when it switches to it
+        out += [(gi, list(NODE_INDEX) + ["pq_codes.bin", "graph.hnsw"]), (gp, list(NODE_PARTS))]
     return out
 
 
 def sync(hosts: list, initial: int, files: list, index: str, parts: str, gens: list, graph: bool,
-         out_dir: str, restored: list) -> None:
+         out_dir: str, restored: list, with_pq: list) -> None:
     """Step 3: the copies, at the same paths, to every host in parallel: files (the binaries,
     config.yaml) and what its nodes open (node_files; restored: the initial nodes that start on a
-    warmup snapshot, which read no page file). A directory a host already sees at that path --
+    warmup snapshot, which read no page file; with_pq: those of them that start on its PQ codes
+    too, which read none from the index). A directory a host already sees at that path --
     this machine itself, under any name, or a file system it shares -- is left alone: a marker
     file put in it here shows there (Koala's syncRepo skips the local machine by its addresses).
     rsync copies what changed only, so a host keeps the index from one run to the next."""
     bootstrap = set(hosts[:initial])
     pages = {hosts[i - 1] for i in range(1, initial + 1) if i not in restored}
+    pq = {hosts[i - 1] for i in range(1, initial + 1) if i not in with_pq}
     distinct = list(dict.fromkeys(hosts))
     plans = {h: [(os.path.dirname(f), [os.path.basename(f)]) for f in files] +
-             node_files(index, parts, gens, h in bootstrap, graph, h in pages) for h in distinct}
+             node_files(index, parts, gens, h in bootstrap, graph, h in pages, h in pq) for h in distinct}
     srcs = list(dict.fromkeys(d for plan in plans.values() for d, _ in plan))
     marker = f".rtier-same-{os.urandom(8).hex()}"
     marked = []
@@ -559,7 +565,7 @@ def main(cfg_path: str, out_dir: str) -> None:
     key = rl.snapshot_key(cfg, index, parts)
     snap = rl.snapshot_path(cfg, key)
     host_of = {i: hosts[i - 1] for i in range(1, initial + 1)}
-    restored, manifest = ([], None) if warmup else rl.start_on_snapshot(
+    restored, with_pq, manifest = ([], [], None) if warmup else rl.start_on_snapshot(
         snap, key, host_of, work, required=bool(cfg.get("RequireSnapshot")))
     ctl_addr = cfg.get("ControllerAddr", f"{root}:7100")
     api_addr = cfg.get("APIAddr", f"{root}:7101")
@@ -569,7 +575,8 @@ def main(cfg_path: str, out_dir: str) -> None:
     values.update(ControllerBulkAddr=f"{root}:0", SampleInterval=cfg.get("SampleInterval", "1s"))
     rl.write_system_config(cfg, values, out_dir)
     bins = [os.path.join(gbin, "rtier-agent"), os.path.join(ebin, "rtier_node")]
-    sync(hosts, initial, bins + [rl.experiment_config.SYSTEM_CONFIG], index, parts, gens, graph, out_dir, restored)
+    sync(hosts, initial, bins + [rl.experiment_config.SYSTEM_CONFIG], index, parts, gens, graph, out_dir, restored,
+         with_pq)
     check_libraries(hosts, bins)
 
     procs = Procs(out_dir)
@@ -582,9 +589,8 @@ def main(cfg_path: str, out_dir: str) -> None:
         for i, h in enumerate(hosts, 1):
             name, node_dir = f"n{i}", os.path.join(work, f"n{i}")
             # Listening everywhere, known by the host's address: the one the others reach.
-            reuse = ["--raw-reuse"] if i in restored else []
             ready = procs.start(f"node-{name}", rl.node_command(cfg, ebin, index, parts, "0.0.0.0:0", node_dir,
-                                                                node_args + reuse),
+                                                                node_args + rl.snapshot_args(i, restored, with_pq, snap)),
                                 prefix=rl.gpu_env(visible, i), wait_line="READY tcp=", host=h)
             addrs[i] = f"{h.addr}:{ready.split('=')[1]}"
             procs.start(f"agent-{name}", rl.agent_command(gbin, name, "0.0.0.0", addrs[i], node_dir, advertise=h.addr),

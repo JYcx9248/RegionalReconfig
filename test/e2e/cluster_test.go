@@ -48,13 +48,15 @@ const (
 
 type fixture struct {
 	bin, dir, index, parts string
-	// indexNoPages is the index without its page file (vectors_*.bin). Nodes that join after
-	// the initial deployment run on it: they can only get raw vectors from their peers, which
-	// is what shows that nothing but the bootstrap reads the index's pages (no global replica).
-	indexNoPages string
-	queries      *vecio.Vectors
-	oracle       [][]nodeclient.Candidate // single-node exhaustive answers
-	partIDs      [][]uint32               // per partition: vector IDs its lists name
+	// indexNoBootstrap is the index without the two files only a bootstrap reads: its page file
+	// (vectors_*.bin) and its PQ codes (pq_codes.bin). Nodes that join after the initial
+	// deployment run on it: they can only get raw vectors and PQ codes from their peers, which
+	// is what shows that nothing but the bootstrap reads either (no global replica, and no copy
+	// of the codes on a host whose nodes do not bootstrap from the index).
+	indexNoBootstrap string
+	queries          *vecio.Vectors
+	oracle           [][]nodeclient.Candidate // single-node exhaustive answers
+	partIDs          [][]uint32               // per partition: vector IDs its lists name
 }
 
 // idsOf is the set of vector IDs named by the lists of the given partitions: the PQ codes a
@@ -180,8 +182,8 @@ func buildFixture(bin string) (*fixture, error) {
 	if f.partIDs, err = partitionIDs(filepath.Join(f.index, "postings.bin"), assign, numPartitions); err != nil {
 		return nil, err
 	}
-	f.indexNoPages = filepath.Join(dir, "index-nopages")
-	if err := os.MkdirAll(f.indexNoPages, 0o755); err != nil {
+	f.indexNoBootstrap = filepath.Join(dir, "index-nobootstrap")
+	if err := os.MkdirAll(f.indexNoBootstrap, 0o755); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(f.index)
@@ -189,10 +191,10 @@ func buildFixture(bin string) (*fixture, error) {
 		return nil, err
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "vectors_") {
+		if strings.HasPrefix(e.Name(), "vectors_") || e.Name() == "pq_codes.bin" {
 			continue
 		}
-		if err := os.Symlink(filepath.Join(f.index, e.Name()), filepath.Join(f.indexNoPages, e.Name())); err != nil {
+		if err := os.Symlink(filepath.Join(f.index, e.Name()), filepath.Join(f.indexNoBootstrap, e.Name())); err != nil {
 			return nil, err
 		}
 	}
@@ -225,7 +227,7 @@ func startNode(f *fixture, extra ...string) (string, func() error, error) {
 	return startNodeOn(f, f.index, extra...)
 }
 
-// startNodeOn is startNode on another index directory (f.indexNoPages).
+// startNodeOn is startNode on another index directory (f.indexNoBootstrap).
 func startNodeOn(f *fixture, index string, extra ...string) (string, func() error, error) {
 	return startNodeWith(f, index, f.parts, extra...)
 }
@@ -324,7 +326,7 @@ type cluster struct {
 	// agentCfg, when set, adjusts each agent's configuration before it starts.
 	agentCfg func(name string, c *config.Agent)
 	// initialIndex, when set, is the index the initial nodes run on instead of f.index
-	// (f.indexNoPages: nodes started on a snapshot of their raw vectors).
+	// (f.indexNoBootstrap: nodes started on a warmup snapshot of their raw vectors and PQ codes).
 	initialIndex string
 }
 
@@ -396,14 +398,14 @@ func (cl *cluster) addNode(name string, strategy query.Strategy, nodeArgs ...str
 }
 
 // addNodeWith is addNode with the agent's test options. The nodes of the initial deployment
-// bootstrap from the index; the others join later and run without the index's page file.
+// bootstrap from the index; the others join later and run without its page file and PQ codes.
 func (cl *cluster) addNodeWith(name string, opts agent.Options, nodeArgs ...string) *agent.Agent {
 	index := cl.f.index
 	if cl.initialIndex != "" {
 		index = cl.initialIndex
 	}
 	if len(cl.agents) >= cl.initial {
-		index = cl.f.indexNoPages
+		index = cl.f.indexNoBootstrap
 	}
 	// RTIER_E2E_BACKEND=gpu runs the cluster's data nodes on the GPU filter backend; the
 	// single-node oracle stays on the CPU, so every answer also checks GPU against CPU.

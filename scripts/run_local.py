@@ -40,8 +40,9 @@ the partitions are made again when the index or the assignment changes, and a gr
 of other vectors, queries or stride stops the run too.
 
 "Type": "warmup" makes a warmup run: the initial deployment (no spare node), then each initial
-node saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw),
-everything stops, and each node's raw file and bits are moved into a snapshot -- under
+node saves the presence bits of its raw vectors next to its raw file (rtier-client save-raw)
+and its PQ codes (rtier-client save-pq, pq.codes), everything stops, and each node's raw file,
+bits and codes are moved into a snapshot -- under
 SnapshotDir (default WorkDir/snapshots), named by the number of initial nodes and a digest of
 what the vectors are made of -- with its manifest, snapshot.json, written last; no load, no
 reconfiguration. The digest is of content alone (the index's meta.txt; the partitions' manifest,
@@ -49,13 +50,15 @@ list -> partition map and segments; the placement; the number of initial nodes),
 fits wherever the same files are: made on one machine, it serves the runs of another, given the
 same index and partition files (copied, not rebuilt: two builds of the same data differ) and the
 same SnapshotDir, under which each initial node n<i>'s machine has snapshot.json and n<i>/. A
-later run copies the snapshot into each initial node's directory (cp --reflink=auto
+later run copies the raw files into each initial node's directory (cp --reflink=auto
 --sparse=always: at once on XFS or btrfs, a copy of the node's share elsewhere) and starts its
-rtier_node with --raw-reuse, so that its bootstrap copies no raw vector from the index; once
-deployed, it checks that every such node got the partitions its snapshot was made for. A run
-without one bootstraps from the index and says why (what the closest snapshot there differs
-in); with "RequireSnapshot": true it stops instead, before anything starts. The PQ codes come
-from the index either way: all of a node's in one pass over pq_codes.bin. The backend does not
+rtier_node with --raw-reuse and --pq-file on the snapshot's codes, where they are (a node only
+reads them, at its start), so that its bootstrap copies no raw vector and reads no PQ code from
+the index; once deployed, it checks that every such node got the partitions its snapshot was
+made for. A run without one bootstraps from the index and says why (what the closest snapshot
+there differs in); with "RequireSnapshot": true it stops instead, before anything starts. A
+snapshot made before the codes were saved with it (2026-11-07) has none: its nodes read their
+codes from the index, all of a node's in one pass over pq_codes.bin. The backend does not
 matter to a snapshot: a warmup on the CPU backend serves GPU runs.
 
 The stage records (an index's build flags and base file, a ground truth's vectors, queries and
@@ -941,6 +944,9 @@ def gpu_env(visible: dict, i: int) -> list:
 # ------------------------------------------------------------------- warmup snapshots
 
 SNAPSHOT_FILES = ("raw.pages", "raw.pages.present")  # a node's raw vectors and their presence bits
+# A node's PQ codes (rtier_node --pq-file), read where they are: not in an older snapshot, whose
+# nodes then read their codes from the index.
+SNAPSHOT_PQ = "pq.codes"
 
 
 class Local:
@@ -999,14 +1005,16 @@ def by_machine(host_of: dict) -> dict:
 
 def find_snapshot(snap: str, key: dict, host_of: dict) -> tuple:
     """The nodes (of host_of: node number -> machine) that can start on the snapshot at snap --
-    their machine has its manifest, made of key, and their files --, the manifest, and the
-    machines that have that manifest."""
-    found, manifest, matched = [], None, set()
+    their machine has its manifest, made of key, and their raw files --, those of them whose PQ
+    codes are there too, the manifest, and the machines that have that manifest."""
+    found, with_pq, manifest, matched = [], [], None, set()
     for h, nodes in by_machine(host_of).items():
         q = shlex.quote
         out = h.run(f"cat {q(os.path.join(snap, 'snapshot.json'))} 2>/dev/null; echo; " +
                     "; ".join(f"[ -f {q(os.path.join(snap, f'n{i}', f))} ] || echo missing=n{i}"
-                              for i in nodes for f in SNAPSHOT_FILES) + "; true",
+                              for i in nodes for f in SNAPSHOT_FILES) + "; " +
+                    "; ".join(f"[ -f {q(os.path.join(snap, f'n{i}', SNAPSHOT_PQ))} ] || echo nopq=n{i}"
+                              for i in nodes) + "; true",
                     f"{h.dest}: looking for the snapshot")
         first, _, rest = out.partition("\n")
         try:
@@ -1014,11 +1022,14 @@ def find_snapshot(snap: str, key: dict, host_of: dict) -> tuple:
         except ValueError:
             continue
         missing = {line.split("=", 1)[1] for line in rest.splitlines() if line.startswith("missing=")}
+        nopq = {line.split("=", 1)[1] for line in rest.splitlines() if line.startswith("nopq=")}
         if m.get("key") == key:
             manifest = m
             matched.add(h)
-            found += [i for i in nodes if f"n{i}" not in missing and f"n{i}" in m.get("nodes", {})]
-    return found, manifest, matched
+            here = [i for i in nodes if f"n{i}" not in missing and f"n{i}" in m.get("nodes", {})]
+            found += here
+            with_pq += [i for i in here if f"n{i}" not in nopq]
+    return found, with_pq, manifest, matched
 
 
 def snapshot_mismatch(h, snap: str, key: dict) -> str:
@@ -1043,8 +1054,9 @@ def snapshot_mismatch(h, snap: str, key: dict) -> str:
 
 
 def restore_snapshot(snap: str, nodes: list, host_of: dict, work: str) -> None:
-    """Copies the files of the snapshot's nodes into their directories (WORK_DIR/n<i>), for
-    rtier_node --raw-reuse: copies, as a run changes them (fetches, drains, inserts). cp
+    """Copies the raw files of the snapshot's nodes into their directories (WORK_DIR/n<i>), for
+    rtier_node --raw-reuse: copies, as a run changes them (fetches, drains, inserts); a node's PQ
+    codes it only reads, at its start, so it reads them in the snapshot (--pq-file). cp
     --reflink=auto shares the blocks where the file system can (XFS, btrfs), and elsewhere copies
     the sparse file whole -- through the page cache, so the copies are synced and dropped from
     it: every restored node starts with its vectors on the disk alone, nothing to write back and
@@ -1064,9 +1076,10 @@ def restore_snapshot(snap: str, nodes: list, host_of: dict, work: str) -> None:
 def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, snap: str, key: dict,
                   procs, out_dir: str) -> None:
     """The warmup run, once the initial deployment is ready (st: its status): each node saves the
-    presence bits of its raw vectors (rtier-client save-raw), everything stops, and each node's
-    raw file and bits are moved into the snapshot on its machine, synced, with the manifest
-    written there last: it marks a complete snapshot. addrs: node number -> data node address."""
+    presence bits of its raw vectors (rtier-client save-raw) and its PQ codes (save-pq, into its
+    directory on its machine), everything stops, and each node's raw file, bits and codes are
+    moved into the snapshot on its machine, synced, with the manifest written there last: it
+    marks a complete snapshot. addrs: node number -> data node address."""
     gbin = paths_of(cfg)[2]
     ids = {n["name"]: n["id"] for n in st.get("nodes") or []}
     owners = st["table"]["placement"]["owners"]
@@ -1078,8 +1091,13 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
         r = subprocess.run([f"{gbin}/rtier-client", "save-raw", "-node", addr], capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"n{i}: save-raw failed: {r.stderr.strip()}")
+        pq = subprocess.run([f"{gbin}/rtier-client", "save-pq", "-node", addr, "-file",
+                             os.path.join(work, f"n{i}", SNAPSHOT_PQ)], capture_output=True, text=True)
+        if pq.returncode != 0:
+            raise RuntimeError(f"n{i}: save-pq failed: {pq.stderr.strip()}")
         manifest["nodes"][f"n{i}"] = {"partitions": [p for p, o in enumerate(owners) if o == ids.get(f"n{i}")],
-                                      "vectors": json.loads(r.stdout)["present"]}
+                                      "vectors": json.loads(r.stdout)["present"],
+                                      "pq_codes": json.loads(pq.stdout)["codes"]}
     procs.stop()  # nothing runs while the files are moved
     started = time.monotonic()
     q = shlex.quote
@@ -1094,8 +1112,9 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
             # Moved, not copied: the run is over and needs its own files no more, and where the
             # file system has no reflinks (ext4) a copy takes the snapshot's size a second time. On
             # one file system it is a rename; across two, mv copies (holes kept) and deletes.
-            script += [f"mv {q(os.path.join(src, f))} {q(os.path.join(d, f))}" for f in SNAPSHOT_FILES]
-            script.append("sync " + " ".join(q(os.path.join(d, f)) for f in SNAPSHOT_FILES) + f" {q(d)}")
+            files = SNAPSHOT_FILES + (SNAPSHOT_PQ,)
+            script += [f"mv {q(os.path.join(src, f))} {q(os.path.join(d, f))}" for f in files]
+            script.append("sync " + " ".join(q(os.path.join(d, f)) for f in files) + f" {q(d)}")
             script.append(f"echo n{i}=$(du -s -B1 {q(d)} | cut -f1)")
         out = h.run("; ".join(script), f"{h.dest}: saving the snapshot", timeout=24 * 3600)
         return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
@@ -1116,7 +1135,8 @@ def take_snapshot(cfg: dict, st: dict, addrs: dict, host_of: dict, work: str, sn
         list(ex.map(write_manifest, machines))
     json.dump(manifest, open(os.path.join(out_dir, "snapshot.json"), "w"), indent=2)
     log(f"snapshot of {len(addrs)} nodes in {snap}, saved in {time.monotonic() - started:.0f} s: " +
-        ", ".join(f"{k} {v['vectors']} vectors ({v['bytes'] / 2**30:.2f} GiB)" for k, v in manifest["nodes"].items()))
+        ", ".join(f"{k} {v['vectors']} vectors and {v['pq_codes']} PQ codes ({v['bytes'] / 2**30:.2f} GiB)"
+                  for k, v in manifest["nodes"].items()))
     log(f"to start on it elsewhere, give the machine of each initial node n<i>, at this path, {path} and "
         f"{snap}/n<i>/ -- with the same index and partition files (copied, not rebuilt) and the same "
         "SnapshotDir; rsync -aSz keeps raw.pages sparse and its holes off the wire (without -z, rsync "
@@ -1138,11 +1158,12 @@ def check_restored(st: dict, manifest: dict, restored: list, snap: str) -> None:
 
 def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, required: bool) -> tuple:
     """Before the nodes start: those of host_of (node number -> machine) that can start on the
-    warmup snapshot get its files (restore_snapshot); returns them and the manifest. The others
-    bootstrap from the index's page file -- unless required ("RequireSnapshot"): then a node that
-    cannot start on the snapshot stops the run before anything is copied or started (on a cluster
-    its machine would get the whole page file first)."""
-    found, manifest, matched = find_snapshot(snap, key, host_of)
+    warmup snapshot get its raw files (restore_snapshot); returns them, those of them whose PQ
+    codes the snapshot has (snapshot_args), and the manifest. The others bootstrap from the
+    index's page file -- unless required ("RequireSnapshot"): then a node that cannot start on the
+    snapshot stops the run before anything is copied or started (on a cluster its machine would
+    get the whole page file first)."""
+    found, with_pq, manifest, matched = find_snapshot(snap, key, host_of)
     rest = sorted(set(host_of) - set(found))
     if rest:
         why = []
@@ -1160,9 +1181,19 @@ def start_on_snapshot(snap: str, key: dict, host_of: dict, work: str, required: 
     if found:
         started = time.monotonic()
         restore_snapshot(snap, found, host_of, work)
+        nopq = [f"n{i}" for i in found if i not in with_pq]
         log(", ".join(f"n{i}" for i in found) + f": start on the warmup snapshot {snap} (restored in "
-            f"{time.monotonic() - started:.0f} s)")
-    return found, manifest
+            f"{time.monotonic() - started:.0f} s); " +
+            (f"PQ codes from the index for {', '.join(nopq)}: the snapshot has none of theirs (made before "
+             "PQ codes were saved with it, 2026-11-07)" if nopq else "PQ codes from the snapshot"))
+    return found, with_pq, manifest
+
+
+def snapshot_args(i: int, restored: list, with_pq: list, snap: str) -> list:
+    """rtier_node's flags for node i on the warmup snapshot at snap: its raw file restored
+    (--raw-reuse), its PQ codes read in the snapshot (--pq-file)."""
+    return ((["--raw-reuse"] if i in restored else []) +
+            (["--pq-file", os.path.join(snap, f"n{i}", SNAPSHOT_PQ)] if i in with_pq else []))
 
 
 def connect(api_addr: str, procs, timeout: float = 30) -> Controller:
@@ -1463,8 +1494,8 @@ def main(cfg_path: str, out_dir: str) -> None:
     snap = snapshot_path(cfg, key)
     machine = Local()
     here = {i: machine for i in range(1, initial + 1)}  # one machine: one manifest
-    restored, manifest = ([], None) if warmup else start_on_snapshot(snap, key, here, work,
-                                                                     required=bool(cfg.get("RequireSnapshot")))
+    restored, with_pq, manifest = ([], [], None) if warmup else start_on_snapshot(
+        snap, key, here, work, required=bool(cfg.get("RequireSnapshot")))
 
     procs = Procs(out_dir)
     results = []
@@ -1496,9 +1527,8 @@ def main(cfg_path: str, out_dir: str) -> None:
             # The agent forwards this run's stats log from its start: none of an earlier run's.
             if os.path.exists(os.path.join(node_dir, "stats.jsonl")):
                 os.remove(os.path.join(node_dir, "stats.jsonl"))
-            reuse = ["--raw-reuse"] if i in restored else []
             ready = procs.start(f"node-{name}", node_command(cfg, ebin, index, parts, f"{host}:0", node_dir,
-                                                             node_args + reuse),
+                                                             node_args + snapshot_args(i, restored, with_pq, snap)),
                                 prefix=prefix + gpu_env(visible, i), wait_line="READY tcp=")
             addrs[i] = f"{host}:{ready.split('=')[1]}"
             if sampler:

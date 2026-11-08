@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <map>
@@ -1038,6 +1039,152 @@ void TestPQFromIndex() {
   const PQPutResult r1 = g->PQFromIndex({seg(1)});
   CHECK(r1.installed > 0 && g->pq_stats().staged == r1.installed);
   CHECK(g->PQReleaseStaged() == r1.installed && g->pq_stats().resident == 0);
+}
+
+// A snapshot of the PQ codes (PQStore::Save, Restore): every code held -- live, staged or
+// cached -- in ID order, installed again into an empty store as staged codes, through the
+// mirror. Refused before anything is installed: a file of another codebook or code size, more
+// codes than the capacity, a vector outside the ID space, a store that holds codes already, a
+// truncated or damaged file, and no snapshot at all.
+void TestPQSnapshot() {
+  auto codes_of = [](const std::vector<uint32_t>& ids) {
+    std::vector<uint8_t> c;
+    for (uint32_t id : ids)
+      for (uint32_t j = 0; j < 4; ++j) c.push_back(static_cast<uint8_t>(id * 7 + j));
+    return c;
+  };
+  const std::string dir = TempDir(), path = dir + "/pq.codes";
+  const uint32_t crc = 0x5eed;
+  PQStore s(100, 4, 8);
+  const std::vector<uint32_t> named = {42, 3, 7}, staged = {99, 0}, gone = {7};
+  CHECK(s.Put(named.data(), named.size(), codes_of(named).data(), PQOrigin::kIndex) == 3);
+  s.Ref(named.data(), named.size(), nullptr);
+  CHECK(s.ReleaseStaged() == 0);
+  s.Unref(gone.data(), gone.size());
+  CHECK(s.Put(staged.data(), staged.size(), codes_of(staged).data(), PQOrigin::kReceived) == 2);
+  PQStats st = s.Stats();
+  CHECK(st.live == 2 && st.cached == 1 && st.staged == 2);
+  CHECK(s.Save(path, crc) == 5 && s.Save(path, crc) == 5);  // the second replaces the first
+  const std::vector<uint8_t> file = ReadFile(path);
+  CHECK(file.size() == 40 + 5 * (4 + 4));
+  bool tmp_left = false;
+  for (const auto& e : std::filesystem::directory_iterator(dir))
+    tmp_left |= e.path().filename().string() != "pq.codes";
+  CHECK(!tmp_left);
+
+  const std::vector<uint32_t> want = {0, 3, 7, 42, 99};
+  PQStore t(100, 4, 8);
+  std::vector<uint32_t> mirrored;
+  t.SetMirror([&](const uint32_t* slots, uint32_t n) { mirrored.insert(mirrored.end(), slots, slots + n); });
+  CHECK(t.Restore(path, crc) == 5 && mirrored.size() == 5);
+  st = t.Stats();
+  CHECK(st.resident == 5 && st.staged == 5 && st.restored == 5 && st.from_index == 0 && st.received == 0);
+  std::vector<uint8_t> got(want.size() * 4);
+  t.Get(want.data(), want.size(), got.data());
+  CHECK(got == codes_of(want));
+  // A partition that names them makes them live, as after Put.
+  t.Ref(want.data(), want.size(), nullptr);
+  CHECK(t.Stats().live == 5);
+
+  auto refused = [&](uint64_t ids, uint32_t m, uint64_t cap, const std::string& p, uint32_t c) {
+    PQStore u(ids, m, cap);
+    const bool threw = Throws([&] { u.Restore(p, c); });
+    return threw && u.Stats().resident == 0;
+  };
+  CHECK(refused(100, 4, 8, path, crc + 1));                // another codebook
+  CHECK(refused(100, 2, 8, path, crc));                    // another code size
+  CHECK(refused(50, 4, 8, path, crc));                     // vector 99 outside the ID space
+  CHECK(refused(100, 4, 8, dir + "/none.codes", crc));     // no file
+  CHECK(Throws([&] { t.Restore(path, crc); }));            // a store with codes
+  bool capacity = false;
+  try {
+    PQStore u(100, 4, 4);
+    u.Restore(path, crc);
+  } catch (const PQCapacityError&) {
+    capacity = true;
+  }
+  CHECK(capacity);
+  const std::string bad = dir + "/bad.codes";
+  WriteFile(bad, file.data(), file.size() - 1);            // truncated
+  CHECK(refused(100, 4, 8, bad, crc));
+  std::vector<uint8_t> swapped = file;                     // IDs out of order
+  std::swap_ranges(swapped.begin() + 40, swapped.begin() + 44, swapped.begin() + 44);
+  WriteFile(bad, swapped.data(), swapped.size());
+  CHECK(refused(100, 4, 8, bad, crc));
+  std::vector<uint8_t> other = file;                       // no snapshot
+  other[0] = 'X';
+  WriteFile(bad, other.data(), other.size());
+  CHECK(refused(100, 4, 8, bad, crc));
+
+  // An empty store saves an empty snapshot.
+  PQStore none(100, 4, 8), none2(100, 4, 8);
+  CHECK(none.Save(bad, crc) == 0 && none2.Restore(bad, crc) == 0 && none2.Stats().resident == 0);
+}
+
+// A node started on a snapshot's PQ codes (NodeOptions::pq_file, PQSave) installs them at
+// startup and never opens the index's pq_codes.bin -- here an index without one: a node opens
+// it only when a bootstrap reads a code from it. Its PQFromIndex finds every code here, its
+// partitions load with the codes of a node bootstrapped from the index, and it answers as that
+// node does. More codes than its budget stop its start.
+void TestNodePQSnapshot() {
+  Fixture& f = GetFixture();
+  auto seg = [&](uint32_t p) { return JoinPath(f.parts, partfiles::SegmentName(p)); };
+  std::vector<std::string> segs;
+  std::vector<uint32_t> all;
+  for (uint32_t p = 0; p < f.num_parts; ++p) {
+    segs.push_back(seg(p));
+    const ListSegment s = ListSegment::Load(segs.back());
+    all.insert(all.end(), s.ids.begin(), s.ids.end());
+  }
+  std::sort(all.begin(), all.end());
+  all.erase(std::unique(all.begin(), all.end()), all.end());
+  auto ref = OpenNode(f, {0, 1, 2, 3}, true);
+  const std::string path = JoinPath(TempDir(), "pq.codes");
+  CHECK(ref->PQSave(path) == all.size());
+
+  // The index without its PQ codes.
+  const std::string bare = TempDir();
+  for (const auto& e : std::filesystem::directory_iterator(f.index))
+    if (e.path().filename() != files::kPQCodes)
+      CHECK(::symlink(e.path().c_str(), JoinPath(bare, e.path().filename().string()).c_str()) == 0);
+  NodeOptions o = ref->options();
+  o.index_dir = bare;
+  {
+    auto plain = NodeEngine::Open(o);  // starts: the file is opened at the first read
+    CHECK(Throws([&] { plain->PQFromIndex(segs); }));
+  }
+  o.pq_file = path;
+  NodeOptions small = o;
+  small.pq_capacity = all.size() - 1;
+  CHECK(Throws([&] { NodeEngine::Open(small); }));
+  auto e = NodeEngine::Open(o);
+  PQStats st = e->pq_stats();
+  CHECK(st.restored == all.size() && st.resident == all.size() && st.staged == all.size() && st.from_index == 0);
+  CHECK(e->PQFromIndex(segs).installed == 0);
+  for (uint32_t p = 0; p < f.num_parts; ++p) e->LoadPartition(p, seg(p), PQSource::kIndex);
+  e->LoadGraph(JoinPath(bare, files::kGraph));
+  st = e->pq_stats();
+  CHECK(st.live == all.size() && st.staged == 0 && st.from_index == 0);
+  std::vector<uint8_t> a(all.size() * st.m), b(all.size() * st.m);
+  e->PQGet(all.data(), all.size(), a.data());
+  ref->PQGet(all.data(), all.size(), b.data());
+  CHECK(a == b);
+  bool same = true;
+  for (uint32_t qi = 0; qi < f.nq; ++qi) {
+    SearchParams sp;
+    sp.k = 10;
+    sp.nprobe = 16;
+    sp.rerank = 400;
+    sp.rr.heuristic = false;
+    std::vector<uint32_t> ia(10), ib(10);
+    std::vector<float> da(10), db(10);
+    QueryStats qa, qb;
+    const float* q = &f.queries[qi * f.dim];
+    const uint32_t na = e->SearchLocal(0, q, sp, ia.data(), da.data(), &qa);
+    const uint32_t nb = ref->SearchLocal(0, q, sp, ib.data(), db.data(), &qb);
+    same = same && na == nb && na > 0 && ia == ib && da == db;
+  }
+  CHECK(same);
 }
 
 void TestPQEvictUnderLoad() {
@@ -2273,8 +2420,22 @@ void TestWire() {
         FileExists(RawStore::BitmapPath(bo.raw_file)));
   r = Call(fd, rtier::kRawSave, empty, 93);
   CHECK(r.status == rtier::kInternal);
+  // PQ_SAVE writes the codes where the request says; a directory that is not there fails.
+  auto pq_save = [&](const std::string& p, uint64_t id) {
+    rtier::BodyWriter ps;
+    ps.Put<uint32_t>(static_cast<uint32_t>(p.size()));
+    ps.PutBytes(p.data(), p.size());
+    return Call(fd3, rtier::kPQSave, ps, id);
+  };
+  const std::string pq_path = JoinPath(TempDir(), "pq.codes");
+  r = pq_save(pq_path, 95);
+  rtier::BodyReader saved(r.body.data(), r.body.size());
+  CHECK(r.status == rtier::kOk && r.body.size() == 8 && saved.Get<uint64_t>() == ids0.size() && FileExists(pq_path));
+  CHECK(pq_save(JoinPath(TempDir(), "none/pq.codes"), 96).status == rtier::kInternal);
   r = Call(fd3, rtier::kInfo, empty, 94);
   CHECK(std::string(r.body.begin(), r.body.end()).find("\"restored\":0}") != std::string::npos);
+  CHECK(std::string(r.body.begin(), r.body.end()).find("\"from_index\":" + std::to_string(ids0.size()) +
+                                                      ",\"restored\":0,") != std::string::npos);
   ::close(fd3);
   server3.Stop();
   serve3.join();
@@ -3004,6 +3165,8 @@ int main() {
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},
       {"pq_from_index", TestPQFromIndex},
+      {"pq_snapshot", TestPQSnapshot},
+      {"node_pq_snapshot", TestNodePQSnapshot},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"read_budget", TestReadBudget},
