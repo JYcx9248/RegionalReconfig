@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5: 4 -> 8 at 90 s under lazy. Set the rates from the two capacities, as the lab's 2 -> 4 did: Rate about 0.6 x C4 (4to8-calibrate-4), RateSteps 60:about 0.8 x C8 (4to8-calibrate-8), the same in every protocol's file.",
+  "Comment": "CloudLab c240g5: 4 -> 8 at 90 s under lazy. Set the rates from the two capacities, as the lab's 2 -> 4 did: Rate about 0.6 x C4 (4to8-calibrate-4), RateSteps 60:about 0.8 x C8 (4to8-calibrate-8), the same in every protocol's file. Here 390 and 780 q/s, from C4 595 and C8 985 (2026-11-04), as the runs since 4to8-v2 had.",
   "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
   "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
@@ -45,8 +45,8 @@
     "Arrivals": "poisson",
     "NProbe": 64,
     "N": 200,
-    "Rate": "SET_ME",
-    "RateSteps": "60:SET_ME",
+    "Rate": "390",
+    "RateSteps": "60:780",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
     "WarmupSeconds": 30

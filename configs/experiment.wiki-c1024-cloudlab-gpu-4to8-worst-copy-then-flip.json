@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5, U11's worst case: the queries are 1M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. Ground truth for every 300th of the first 600K (fusion_gt --index: the base file is gone). Set the rates from the two worst-case capacities: Rate about 0.6 x C4 (4to8-worst-calibrate-4), RateSteps 60:about 0.8 x C8 (4to8-worst-calibrate-8), the same in every protocol's file. Otherwise experiment.wiki-c1024-cloudlab-gpu-4to8-copy-then-flip.json: 4 -> 8 at 90 s under copy-then-flip.",
+  "Comment": "CloudLab c240g5, U11's worst case: the queries are 1M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. Ground truth for every 300th of the first 600K (fusion_gt --index: the base file is gone). Set the rates from the two worst-case capacities: Rate about 0.6 x C4 (4to8-worst-calibrate-4), RateSteps 60:about 0.8 x C8 (4to8-worst-calibrate-8), the same in every protocol's file. Otherwise experiment.wiki-c1024-cloudlab-gpu-4to8-copy-then-flip.json: 4 -> 8 at 90 s under copy-then-flip. Here 550 and 1100 q/s, from C4 742 and C8 1466 (2026-11-05), as the runs since 4to8-worst had.",
   "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
   "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
@@ -46,8 +46,8 @@
     "Arrivals": "poisson",
     "NProbe": 64,
     "N": 200,
-    "Rate": "SET_ME",
-    "RateSteps": "60:SET_ME",
+    "Rate": "550",
+    "RateSteps": "60:1100",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
     "WarmupSeconds": 30

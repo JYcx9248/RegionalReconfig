@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5: 4 -> 8 at 90 s, back to 4 at 300 s, under lazy. Rates as in 4to8 (Rate about 0.6 x C4, then about 0.8 x C8 at 60 s), and from 280 s back to the first rate, below C4, before the scale-in.",
+  "Comment": "CloudLab c240g5: 4 -> 8 at 90 s, back to 4 at 300 s, under lazy. Rates as in 4to8 (Rate about 0.6 x C4, then about 0.8 x C8 at 60 s), and from 280 s back to the first rate, below C4, before the scale-in. Here 390, 780 and 390 q/s, as the 4to8-v2 run had (C4 595, C8 985).",
   "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
   "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
@@ -45,8 +45,8 @@
     "Arrivals": "poisson",
     "NProbe": 64,
     "N": 200,
-    "Rate": "SET_ME",
-    "RateSteps": "60:SET_ME,280:SET_ME",
+    "Rate": "390",
+    "RateSteps": "60:780,280:390",
     "RetryForSeconds": 30,
     "DurationSeconds": 480,
     "WarmupSeconds": 30
