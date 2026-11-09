@@ -462,6 +462,9 @@ var Open = map[string]Question{
 			"entries came only after the load (282-297 s after the trigger), and 4 -> 8 -> 4's " +
 			"scale-in waited for them. Since the graph moves from memory to memory (below), it " +
 			"shares only the network with the fetches, which their disks and read budgets bound. " +
+			"In the rerun (amazon-4to8-v4) each graph starts as its node's staging ends and moves " +
+			"its 3.3 GB in 22-25 s, the new entries come online 59-71 s after the trigger, and " +
+			"4 -> 8 -> 4's scale-in runs under the load. " +
 			"Pairs with U6's warmup selector, which moves aggregation to the new node before its " +
 			"graph arrives. Decided (2026-11-04): the graph moves from the source entry's memory " +
 			"to the new entry's and never through a disk, since queries search it only in " +

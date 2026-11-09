@@ -428,6 +428,38 @@ Next:
      509 s, after the load (it takes 59 s, its flip at 43 s).
    - No query fails in any run. The 1,152 queries with ground truth answered in all twelve 4 → 8
      runs (v1, v2, v3) have the same recall, and so do 4to8to4's in v1 and v3 (the same rates).
+
+   The rerun with the graph yielding to the staging only (2026-11-08, U16,
+   `results/cloudlab-gpu/amazon-4to8-v4`, 3a27d05: lazy in rep2 and copy-then-flip in rep1, one
+   run each, and 4to8to4; figures `--series amazon-4to8-v4 --calibrations amazon-4to8 --before
+   amazon-4to8-v3`, `lazy-entries.svg` and `4to8to4-before-after.svg` the new ones):
+   - **The new entries come online 59-71 s after the trigger** (282-297 s), 13-25 s after the
+     flip. Each graph starts as its node's staging ends and moves its 3.3 GB in 22-25 s. Lazy's
+     rescale ends at 71 s (295-297 s); its staging and flip are as before (flip at 46 s).
+   - **The cluster answers at the same rate:** the backlog peaks at 10.3K and clears at 227 s
+     (223-226 s), and 192K queries are answered from the trigger to the load's end, as in v2 and v3.
+   - **The backlog waits elsewhere** (`lazy-entries.svg`). The load generator sends each query, as
+     it arrives, to the next entry (round-robin), at most 64 in flight at each; the rest queue at
+     that entry. The new entries start with empty queues and answer their share at once (351 q/s
+     together), while the initial ones work through theirs at 502 q/s together (849-855 before).
+     Of the queries sent from 149 s until the backlogs cleared, 47% are answered within 200 ms
+     (17-18%), but the slowest 1% wait 29 s or more (17-19 s). From the trigger on, 37% of the
+     queries miss 200 ms (45-46%), and the mean latency is 5.0 s (4.6-4.8 s).
+   - **4to8to4's whole cycle runs under the load.** The scale-out ends at 154 s (509 s). The
+     scale-in starts at 300 s and takes 47 s, its flip at 32.5 s:
+     - the lists come back from memory in 17-20 s;
+     - a PQ listing takes 5 s and finds every code cached;
+     - the 8 loads take about 6 s;
+     - then a 14.7 s drain pulls nothing: every vector the leaving nodes fetched is still on its
+       old holder.
+     During its staging the mean latency is 20.1 ms (17.9 ms on 8 nodes without it). After its
+     flip, on 4 nodes with every raw vector local, it is 11.4 ms, p99 22 ms, against 14.3 ms and
+     32 ms on 8 nodes still fetching. One query, refused by a leaving entry, is answered on its
+     retry (U17).
+   - Copy-then-flip flips 1691 s after the trigger (1636-1718 s). Its graphs now arrive during
+     its stream, 58-70 s after the trigger, so its 4 entries come with the flip.
+   - No query fails. The 1,152 queries with ground truth answered in all fourteen 4 → 8 runs
+     (v1-v4) have the same recall, and so do the 1,224 of 4to8to4 in v1, v3 and v4.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).
@@ -454,7 +486,8 @@ Next:
    generator of our own (U11: real queries that do not repeat, and the worst case). Decided on
    2026-11-08: the graph yields to the staging's posting lists and PQ codes, not to raw vectors,
    with no rate of its own (U16: on Amazon 300M, lazy's fetches, even at 5-7 MB/s, held the new
-   entries until the load ended, and 4to8to4's scale-in after them). Still open:
+   entries until the load ended, and 4to8to4's scale-in after them; in the rerun the entries come
+   59-71 s after the trigger, and the scale-in runs under the load). Still open:
    - on the protocol: placement by per-tier bytes (U3);
    - on updates (U14, to be discussed later): the update interface (a log, LSNs, visibility;
      batch size and period are set aside); a batch over budget (scale out first?); writes

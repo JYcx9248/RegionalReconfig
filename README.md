@@ -159,7 +159,9 @@ byte through either data node, polled every 100 ms -- and on Amazon 300M the que
 after the load, 282-297 s after the trigger, and 4 -> 8 -> 4's scale-in waited for them. The
 graph moves from memory to memory, so it shares only the network with the fetches, which their
 disks and read budgets bound, and takes what the bucket's background class gets: all of it,
-unless `TransferRateBytesPerSec` paces the agents. `"data"` shares the source's bucket equally,
+unless `TransferRateBytesPerSec` paces the agents. In the rerun (`results/cloudlab-gpu/amazon-4to8-v4`)
+each graph starts as its node's staging ends and moves its 3.3 GB in 22-25 s, the new entries
+come online 59-71 s after the trigger, and 4 -> 8 -> 4's scale-in runs under the load, at 300 s. `"data"` shares the source's bucket equally,
 as a baseline. A new node
 becomes an entry as soon as its graph has loaded, not when the slowest one has: while graphs
 are arriving, the controller flips every `EntryFlipInterval` (1 s by default) to add all the
@@ -182,7 +184,14 @@ together share one read. A refusal carries the entry's epoch, so one under the l
 reads nothing and is retried after a pause. The list stays in the epoch table, for now: a new
 node owns its partitions and aggregates from the data flip on, and only the entry role waits for
 its graph, so a list kept elsewhere would change when the rescale counts as done (once every new
-node is an entry), not when a node starts working.
+node is an entry), not when a node starts working. The client sends each query, as it arrives, to
+the next entry of its list (round-robin), at most 64 in flight at each (`-conns`); the rest wait
+in that entry's queue, in arrival order. So a backlog stays with the entries it queued at: a new
+entry starts with an empty queue and answers its share of the arrivals at once, while the
+initial entries work through theirs. On Amazon 300M (`results/cloudlab-gpu/amazon-4to8-v4`,
+`lazy-entries.svg`) that changes the order in which the backlog is answered, not how fast: it
+clears at the same time, 47% of the queries sent meanwhile are answered within 200 ms instead of
+17-18%, and the slowest 1% wait 29 s or more instead of 17-19 s.
 
 **Aggregator (decided part of U6):** the entry navigates first, then works out which nodes own
 the probed lists, and only then picks the aggregator among them (`Selector: owner`, the

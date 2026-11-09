@@ -4,20 +4,25 @@
 compare_runs.py writes them. The titles take the dataset, the reconfigurations and the load from
 the runs' experiment.json.
 
-    python3 scripts/analysis/cloudlab_gpu_figures.py [--runs results/cloudlab-gpu] [--out results/cloudlab-gpu-figures]
+    python3 scripts/analysis/cloudlab_gpu_figures.py [--runs results/cloudlab-gpu] [--out results/cloudlab-gpu-figures/SERIES]
         [--series 4to8] [--calibrations 4to8] [--before SERIES] [--fetch-bound-mb 2048] [--drained] [--lazy-series SERIES]
 
 The runs directory is what came back from the control node (the runbook's section 8); the
-figures go to a directory of their own, so that copying the runs again leaves them alone. A
+figures go to a directory of their own, so that copying the runs again leaves them alone: by
+default one per series, results/cloudlab-gpu-figures/SERIES, so that no series' figures are
+taken for another's (the first Wikipedia runs', 4to8, before the fixes of 2026-11-04). A
 series is a directory of the runs with rep1/ and rep2/ (lazy, copy-then-flip) and 4to8to4/, as
-run_one.sh wrote them; the calibrations (calibrate-4, calibrate-8) can come from another series,
-as for a rerun after a change. --fetch-bound-mb is the fetch cache's bound the runs had (64 before
+run_one.sh wrote them; a protocol may have run in one repetition only, not the same one for each
+(amazon-4to8-v4: rep1/copy-then-flip and rep2/lazy), and the figures then take the repetitions
+that ran. The calibrations (calibrate-4, calibrate-8) can come from another series, as for a
+rerun after a change. --fetch-bound-mb is the fetch cache's bound the runs had (64 before
 2026-11-04, 2048 since). Every number a figure's notes cite is computed from the runs. Writes,
 into --out:
 
   4to8.svg, 4to8-rep1.svg, 4to8-rep2.svg, 4to8to4.svg
-                    compare_runs.py: lazy against copy-then-flip (both repetitions pooled, then
-                    each one), and 4 -> 8 -> 4 under lazy; a .csv and a .json beside each
+                    compare_runs.py: lazy against copy-then-flip (the repetitions pooled, then
+                    each one that ran both), and 4 -> 8 -> 4 under lazy; a .csv and a .json beside
+                    each
   4to8-stream-first.svg
                     with rep1/ and rep2/ copy-then-flip-stream-first: lazy, copy-then-flip, and
                     copy-then-flip whose stream the queries yield to (--peer-reads-first)
@@ -36,13 +41,21 @@ into --out:
                     copies, its stream's against its queries', on one budget and the stream first
 
   lazy-before-after.svg
-                    with --before: lazy in that series against lazy in this one (both repetitions
+                    with --before: lazy in that series against lazy in this one (the repetitions
                     pooled), for a change that only lazy's path sees
+  4to8to4-before-after.svg
+                    with --before, when both series' 4to8to4 runs have the same load and
+                    reconfigurations: 4 -> 8 -> 4 in that series against this one
   lazy-staging.svg  with --before: lazy's rescale step by step in that series and in this one
-                    (repetition 1 of each): the answers, each new node's lists, PQ codes and
-                    partition loads up to the flip and its graph up to its entry, the initial
-                    nodes' saving of the moved partitions as files and their reclaim
-  lazy-keepup.svg   lazy through the whole load, both repetitions: answered against offered, the
+                    (the first repetition of each that ran lazy): the answers, each new node's
+                    lists, PQ codes and partition loads up to the flip and its graph up to its
+                    entry, the initial nodes' saving of the moved partitions as files and their
+                    reclaim
+  lazy-entries.svg  with --before, when this series' new entries come online while lazy's backlog
+                    drains: each group of entries' answers (the initial ones', the new ones'),
+                    the backlog in both series, and the latency of the queries sent from the
+                    first new entry until the backlog cleared, as a distribution
+  lazy-keepup.svg   lazy through the whole load, every repetition: answered against offered, the
                     backlog, the latency against 8 warm nodes', and the raw vectors fetched against
                     what copy-then-flip copies (calibrate-8)
   keepup-all.svg    lazy and copy-then-flip's two baselines until every query is answered, as
@@ -117,6 +130,61 @@ def field(rec, path):
 def load_start(run):
     p = os.path.join(run, "clock.json")
     return load_json(p)["load_start"] if os.path.exists(p) else None
+
+
+def reps(runs, runset, protocol, need="latency.csv"):
+    """The repetitions of a protocol that the series ran (rep1/, rep2/, those with need), in order."""
+    rs = [os.path.join(runs, runset, r, protocol) for r in ("rep1", "rep2")]
+    return [r for r in rs if os.path.exists(os.path.join(r, need))]
+
+
+def lead_run(runs, runset):
+    """The run whose experiment.json states the series' trigger and load (every protocol's file has
+    the same): its first lazy run, else its first copy-then-flip run."""
+    rs = reps(runs, runset, "lazy", "experiment.json") + reps(runs, runset, "copy-then-flip", "experiment.json")
+    return rs[0] if rs else os.path.join(runs, runset, "rep1", "lazy")
+
+
+def rep_name(run):
+    """"repetition 2" for .../rep2/lazy."""
+    r = os.path.basename(os.path.dirname(run))
+    return "repetition " + r[3:] if r.startswith("rep") else r
+
+
+def runs_count(n):
+    return "%d run%s" % (n, "" if n == 1 else "s")
+
+
+def same_schedule(a, b):
+    """Whether two runs had the same load and reconfigurations (experiment.json), so that their
+    timelines compare window by window."""
+    try:
+        ea, eb = (load_json(os.path.join(r, "experiment.json")) for r in (a, b))
+    except OSError:
+        return False
+    return all(os.path.exists(os.path.join(r, "latency.csv")) for r in (a, b)) and \
+        ea.get("Load") == eb.get("Load") and ea.get("Reconfigurations") == eb.get("Reconfigurations")
+
+
+def metrics_series(run, types):
+    """The agents' metrics (metrics.jsonl) of the given types on the load's clock: {(node, type):
+    [(t, value)]}. The controller stamps each report as it arrives ("ts", its wall clock), and its
+    own reconfig.start at the first trigger, whose time on the load's clock reconfigurations.json
+    has: the offset between the two clocks."""
+    import datetime
+
+    def wall(s):
+        day, _, frac = s.rstrip("Z").partition(".")
+        return (datetime.datetime.fromisoformat(day).replace(tzinfo=datetime.timezone.utc).timestamp()
+                + float("0." + (frac or "0")))
+    recs = jsonl(os.path.join(run, "metrics.jsonl"))
+    start = next(r for r in recs if r["type"] == "reconfig.start")
+    base = wall(start["ts"]) - events(run)[0]
+    out = {}
+    for r in recs:
+        if r["type"] in types:
+            out.setdefault((r["node"].split(":")[0], r["type"]), []).append((wall(r["ts"]) - base, r["value"]))
+    return out
 
 
 def series(recs, path, t0):
@@ -379,18 +447,21 @@ def schedule(run, protocol=False):
 
 
 def setting(runs, runset):
-    """The 4 -> 8 runs' trigger and load as the titles state them, from the series' first lazy run
-    (every protocol's file has the same)."""
-    return schedule(os.path.join(runs, runset, "rep1", "lazy"))
+    """The 4 -> 8 runs' trigger and load as the titles state them, from the series' lead run."""
+    return schedule(lead_run(runs, runset))
 
 
 def compare_specs(runs, runset, before=None):
-    """compare_runs.py figures: (name, title, run dirs under --runs, labels, slots)."""
+    """compare_runs.py figures: (name, title, run dirs under --runs, labels, slots[, more of its
+    options]). The pooled figures take the repetitions that ran."""
     tag = "" if runset == "4to8" else " [%s]" % runset
     head = setting(runs, runset)
-    specs = [
-        ("4to8", head + " (2 runs per protocol)" + tag,
-         ["%s/rep%d/%s" % (runset, r, p) for p in ("lazy", "copy-then-flip") for r in (1, 2)], None, None),
+    rel = lambda rs: [os.path.relpath(r, runs) for r in rs]  # noqa: E731
+    lazy, ctf = rel(reps(runs, runset, "lazy")), rel(reps(runs, runset, "copy-then-flip"))
+    per = ("%s per protocol" % runs_count(len(lazy)) if len(lazy) == len(ctf)
+           else "lazy %s, copy-then-flip %s" % (runs_count(len(lazy)), runs_count(len(ctf))))
+    specs = [("4to8", head + " (%s)" % per + tag, lazy + ctf, None, None)] if lazy and ctf else []
+    specs += [
         ("4to8-rep1", head + " (repetition 1)" + tag,
          ["%s/rep1/lazy" % runset, "%s/rep1/copy-then-flip" % runset], None, None),
         ("4to8-rep2", head + " (repetition 2)" + tag,
@@ -407,17 +478,27 @@ def compare_specs(runs, runset, before=None):
         # Both lines are lazy: lazy's own colour for this series, a validated neighbour of it (the
         # palette's third slot) for the one before -- not copy-then-flip's orange. The labels stay
         # short enough for the legend (about 16 characters); the title names the two series.
-        specs.append(("lazy-before-after", head + ": lazy before (%s) and after (%s), 2 runs each" % (before, runset),
-                      ["%s/rep%d/lazy" % (s_, r) for s_ in (before, runset) for r in (1, 2)],
-                      ",".join(["lazy (before)"] * 2 + ["lazy (after)"] * 2),  # no comma inside a label: the separator
-                      "%d,%d" % (HOT_A, LAZY)))
+        old = rel(reps(runs, before, "lazy"))
+        if old and lazy:
+            counts = ("%s each" % runs_count(len(old)) if len(old) == len(lazy)
+                      else "%s and %s" % (runs_count(len(old)), runs_count(len(lazy))))
+            specs.append(("lazy-before-after", head + ": lazy before (%s) and after (%s), %s" % (before, runset, counts),
+                          old + lazy,
+                          ",".join(["lazy (before)"] * len(old) + ["lazy (after)"] * len(lazy)),  # no comma in a label
+                          "%d,%d" % (HOT_A, LAZY)))
+        a, b = os.path.join(runs, before, "4to8to4"), os.path.join(runs, runset, "4to8to4")
+        if same_schedule(a, b):  # a scale-in that the change moved, say
+            # on a log scale: the scale-in's milliseconds beside the backlog's seconds
+            specs.append(("4to8to4-before-after", schedule(b, protocol=True) + ": before (%s) and after (%s)"
+                          % (before, runset), rel([a, b]), "lazy (before),lazy (after)", "%d,%d" % (HOT_A, LAZY),
+                          ["--log-latency"]))
     return specs
 
 
 def timelines(runs, out, specs, until="load"):
     """compare_runs.py's timelines. until "answer": past the load's end until every query is
     answered, the backlogs drained, as NAME-drained.svg beside the ones cut at the load's end."""
-    for name, title, dirs, labels, slots in specs:
+    for name, title, dirs, labels, slots, *more in specs:
         paths = [os.path.join(runs, d) for d in dirs]
         if not all(os.path.exists(os.path.join(p, "latency.csv")) for p in paths):
             print("skipped", name, "(runs missing)")
@@ -429,7 +510,7 @@ def timelines(runs, out, specs, until="load"):
             cmd += ["--labels", labels]
         if slots:
             cmd += ["--slots", slots]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(cmd + (more[0] if more else []), check=True, stdout=subprocess.DEVNULL)
         print("wrote", os.path.join(out, name + ".svg"))
 
 
@@ -441,7 +522,7 @@ def capacity(runs, out, runset, calibrations):
     if len(cals) < 2:
         print("skipped capacity.svg (calibrations missing)")
         return
-    exp = os.path.join(runs, runset, "rep1", "lazy", "experiment.json")
+    exp = os.path.join(lead_run(runs, runset), "experiment.json")
     if not os.path.exists(exp):
         print("skipped capacity.svg (no %s)" % exp)
         return
@@ -536,11 +617,12 @@ def read_shares(run):
 
 
 def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=None):
-    rel = "%s/rep1/lazy" % runset
-    run = os.path.join(runs, rel)
-    if not os.path.exists(os.path.join(run, "stats-n5.jsonl")):
+    rs = reps(runs, runset, "lazy", "stats-n5.jsonl")
+    if not rs:
         print("skipped lazy-fetch.svg (run missing)")
         return
+    run = rs[0]
+    rel = os.path.relpath(run, runs)
     t0 = load_start(run)
     trig, flip, entries, _ = events(run)
     new = ["n5", "n6", "n7", "n8"]
@@ -750,7 +832,7 @@ def lazy_stall(runs, out, runset, step=5.0):
     p3.line(rr_old, "c%d" % HOT_A)
     p3.line(rr_new, "c%d" % HOT_B)
     time_axis(svg, p3, ys[2] + 100, lo, hi)
-    svg.legend(W - RIGHT + 16, ys[0] + 10, [("lazy", "c%d" % LAZY, "line"), ("(%d runs)" % len(per), "", "none"),
+    svg.legend(W - RIGHT + 16, ys[0] + 10, [("lazy", "c%d" % LAZY, "line"), ("(%s)" % runs_count(len(per)), "", "none"),
                                             ("offered", "cu sched", "line")])
     svg.legend(W - RIGHT + 16, ys[1] + 10, [("PQ codes", "c%d" % HOT_A, "line"), ("installed", "", "none"),
                                             ("partitions", "c%d" % HOT_B, "line"), ("loaded", "", "none")])
@@ -793,7 +875,7 @@ def counter_rises(st, op, key, t0, lo, hi):
 def staging_bars(run):
     """A lazy rescale's steps from its nodes' counters (1 s samples), in seconds since the trigger:
     per new node its phases [(phase, start, end)], its partition loads (each one's end, the busy
-    time per load) and its graph (from the first chunk to the install); the initial nodes' phases
+    time per load) and its graph (from the bulk of its chunks to the install); the initial nodes' phases
     (the moved partitions saved as files, before 2026-11-07, and the reclaim); the flip, each new
     entry, the load's end."""
     t0 = load_start(run)
@@ -821,14 +903,25 @@ def staging_bars(run):
         if starts and ends:
             bars.append(("loads", starts[0][0], ends[-1][1]))
         last = st[-1]["ops"].get(op, {})
+        # how many loads started together: 1 when they went one at a time
+        counts = [r["ops"][op]["count"] for r in st if op in r.get("ops", {}) and lo <= r["t"] - t0 <= hi]
+        at_once = max((b - a for a, b in zip(counts, counts[1:])), default=0)
         gp, gi = rose("graph_put"), rose("graph_install")
+        # The graph starts where the bulk of its chunks does: its first chunk or few can leave as
+        # the rescale starts, before the yield sees the staging, and then wait with the rest (n5 and
+        # n6 in amazon-4to8-v3 and v4, 1-5 chunks of about 3,100).
+        puts = [(r["t"] - t0 - trig, r["ops"]["graph_put"]["count"]) for r in st
+                if "graph_put" in r.get("ops", {}) and lo <= r["t"] - t0 <= hi]
+        first_n = puts[0][1] if puts else 0
+        total = puts[-1][1] - first_n if puts else 0
+        bulk = next((ta for (ta, _), (_, vb) in zip(puts, puts[1:]) if total and vb - first_n >= 0.02 * total), None)
         # The graph ends at its install; the run's last sample can come before the last entry's
         # (the runner stops when the rescale returns), and its entry flip then marks the end.
         entry = next((e["seconds"] for e in reply.get("entry_flips", []) if int(n[1:]) in e["nodes"]), None)
         done = gi[0][1] if gi else entry
-        nodes[n] = dict(bars=bars, ends=[b for _, b in ends], op=op, loads=last.get("count", 0),
+        nodes[n] = dict(bars=bars, ends=[b for _, b in ends], op=op, loads=last.get("count", 0), at_once=at_once,
                         per_load=last.get("busy_us", 0) / 1e6 / max(last.get("count", 0), 1),
-                        graph=(gp[0][0], done) if gp and done is not None else None)
+                        graph=(bulk if bulk is not None else gp[0][0], done) if gp and done is not None else None)
     old = [("lists", pre, saved)] if ph.get("save_segments") else []
     reclaim = flip - trig + ph.get("drain", 0.0)
     old.append(("reclaim", reclaim, reclaim + ph.get("reclaim", 0.0)))
@@ -838,17 +931,18 @@ def staging_bars(run):
 
 
 def lazy_staging(runs, out, runset, before, step=5.0):
-    """With --before: where lazy's rescale spends its time, in that series and in this one
-    (repetition 1 of each), on one axis of seconds since the trigger. Per series, the answers,
-    then per new node its posting lists, PQ codes and partition loads up to the flip, and its
-    graph up to its entry; the initial nodes' saving of the moved partitions as files (before
-    2026-11-07) and their reclaim after the flip. For a change to the staging: on 2026-11-07,
-    lists from memory, partitions loaded 8 at once with a PQ reference per partition and vector."""
+    """With --before: where lazy's rescale spends its time, in that series and in this one (the
+    first repetition of each that ran lazy), on one axis of seconds since the trigger. Per series,
+    the answers, then per new node its posting lists, PQ codes and partition loads up to the flip,
+    and its graph up to its entry; the initial nodes' saving of the moved partitions as files
+    (before 2026-11-07) and their reclaim after the flip. For a change to the staging (2026-11-07:
+    lists from memory, partitions loaded 8 at once with a PQ reference per partition and vector)
+    or to when the graph moves (2026-11-08, U16: after the staging, not after the fetches)."""
     if not before:
         return None
     sets = [("before", before), ("after", runset)]
-    paths = [os.path.join(runs, s, "rep1", "lazy") for _, s in sets]
-    if not all(os.path.exists(os.path.join(r, "stats-n5.jsonl")) for r in paths):
+    paths = [(reps(runs, s, "lazy", "stats-n5.jsonl") or [None])[0] for _, s in sets]
+    if None in paths:
         print("skipped lazy-staging.svg (runs missing)")
         return None
     data, lo_ = [], -10.0
@@ -892,8 +986,9 @@ def lazy_staging(runs, out, runset, before, step=5.0):
     y = 84
     p = None
     for b in data:
-        p = Panel(svg, left, y + 20, pw, tp_h, (lo, hi), "%s: %s%s, repetition 1 · answered queries per second, per %g s"
-                  % (b["name"], b["series"], revision(b["run"], " (commit ", ")"), step), "q/s", ymax=ymax)
+        p = Panel(svg, left, y + 20, pw, tp_h, (lo, hi), "%s: %s%s, %s · answered queries per second, per %g s"
+                  % (b["name"], b["series"], revision(b["run"], " (commit ", ")"), rep_name(b["run"]), step), "q/s",
+                  ymax=ymax)
         p.line([(t, v) for t, v in b["sched"] if lo <= t <= hi], "ref")
         p.line([(t, v) for t, v in b["answered"] if lo <= t <= hi], "neu")
         gy = y + 20 + tp_h + 22  # the rows
@@ -919,12 +1014,12 @@ def lazy_staging(runs, out, runset, before, step=5.0):
                 if ph_ == "loads":
                     tip += "; %d loads (%s), %.1f s each" % (node["loads"], node["op"].upper(), node["per_load"])
                 bar(p.x(a), p.x(z), ry, lane, cls[ph_], tip)
-                if ph_ == "loads":  # each load's end, as a cut in the bar
+                if ph_ == "loads" and node["at_once"] <= 1:  # each load's end, as a cut in the bar
                     for e in node["ends"][:-1]:
                         svg.add('<line class="dot" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (p.x(e), ry, p.x(e), ry + lane))
             if node["graph"]:
                 a, z = node["graph"]
-                bar(p.x(a), p.x(z), ry + lane + gap, 5, "fctx", "%s: the graph, first chunk %.1f s, installed %.1f s "
+                bar(p.x(a), p.x(z), ry + lane + gap, 5, "fctx", "%s: the graph, moving from %.1f s, installed %.1f s "
                     "after the trigger" % (n, a, z))
             if n in b["entries"]:
                 e = b["entries"][n]
@@ -945,44 +1040,229 @@ def lazy_staging(runs, out, runset, before, step=5.0):
         return [f(a, z) for nd in b["nodes"].values() for ph_, a, z in nd["bars"] if ph_ == name]
     old, new = data
     rng = lambda vals, f="%.0f": span_of(vals, f) if vals else "–"  # noqa: E731
-    text = ("Before (%s): lazy flips %.0f s after the trigger. The initial nodes first save the moved partitions "
-            "as files (%.0f s); the new nodes copy them, then list and fetch their PQ codes until %s s, then load "
-            "their partitions one at a time, %s s each, until %s s. After the flip the initial nodes' reclaim takes "
-            "%.0f s, and %d queries fail. "
-            % (old["series"], old["flip"], old["phases"].get("save_segments", 0.0), rng(phase(old, "PQ codes", lambda a, z: z)),
-               rng([nd["per_load"] for nd in old["nodes"].values()]), rng(phase(old, "loads", lambda a, z: z)),
-               old["phases"].get("reclaim", 0.0), old["failed"]))
-    text += ("After (%s): the lists come from the initial nodes' memory by %s s, the PQ codes by %s s; the %d "
-             "partitions of each new node load at once in %s s (%s s of work each), and lazy flips %.0f s after the "
-             "trigger. The reclaim takes %.1f s; %d queries fail. "
-             % (new["series"], rng(phase(new, "lists", lambda a, z: z)), rng(phase(new, "PQ codes", lambda a, z: z)),
-                max(nd["loads"] for nd in new["nodes"].values()), rng(phase(new, "loads", lambda a, z: z - a)),
-                rng([nd["per_load"] for nd in new["nodes"].values()], "%.1f"), new["flip"],
-                new["phases"].get("reclaim", 0.0), new["failed"]))
-    ent = list(new["entries"].values())
-    if ent:
-        text += ("The graph moves only while no data moves at either end of its transfer (U16), and the queries' "
-                 "fetches go on %s: the new entries come online %s s after the trigger%s, where the rescale ends."
-                 % ("until the load ends, %.0f s after the trigger" % new["end"] if min(ent) > new["end"] else "after the flip",
-                    rng(ent), "" if min(ent) <= new["end"] else ", after the load"))
+
+    def describe(b, name):  # one series' steps, from its counters: the same words for any change
+        lists_by = rng(phase(b, "lists", lambda a, z: z))
+        save = b["phases"].get("save_segments", 0.0)
+        lists = ("the initial nodes first save the moved partitions as files (%.0f s) and the new nodes copy them "
+                 "by %s s" % (save, lists_by) if save else "the lists come from the initial nodes' memory by %s s"
+                 % lists_by)
+        together = max(nd["at_once"] for nd in b["nodes"].values())
+        reclaim = b["phases"].get("reclaim", 0.0)
+        return ("%s (%s): %s, the PQ codes in %s s (by %s s), and the partitions load %s, %s s of work each, by "
+                "%s s; lazy flips %.0f s after the trigger. The reclaim takes %s s, and %d queries fail. "
+                % (name, b["series"], lists, rng(phase(b, "PQ codes", lambda a, z: z - a)),
+                   rng(phase(b, "PQ codes", lambda a, z: z)), "one at a time" if together <= 1 else "%d at once" % together,
+                   rng([nd["per_load"] for nd in b["nodes"].values()], "%.1f"), rng(phase(b, "loads", lambda a, z: z)),
+                   b["flip"], ("%.1f" if reclaim < 10 else "%.0f") % reclaim, b["failed"])
+                + graph_text(b))
+
+    def graph_text(b):  # when each graph moved, against its node's own staging; the entries
+        g = [(nd["graph"], max(z for _, _, z in nd["bars"])) for nd in b["nodes"].values() if nd["graph"] and nd["bars"]]
+        ent = list(b["entries"].values())
+        if not g or not ent:
+            return ""
+        return ("Its graphs start %s s after their node's staging ends and move in %s s each; the new entries come "
+                "online %s s after the trigger%s, and the rescale ends with the last. "
+                % (rng([max(a - staged, 0.0) for (a, _), staged in g]), rng([z - a for (a, z), _ in g]), rng(ent),
+                   ", after the load" if min(ent) > b["end"] else ""))
+    text = describe(old, "Before") + describe(new, "After")
     notes = textwrap.wrap(text, 112)
     yb = base + 56
     for i, s in enumerate(notes):
         svg.text(LEFT, yb + 15 * i, s, "note")
     return svg.save(out, "lazy-staging.svg", yb + 15 * len(notes) + 6,
-                    "Lazy's rescale step by step, before and after the 2026-11-07 staging changes",
+                    "Lazy's rescale step by step: %s against %s" % (before, runset),
                     schedule(paths[1]))
 
 
+LOADGEN_CONNS = 64  # rtier-loadgen -conns, its default: the runners do not set it
+
+
+def lazy_entries(runs, out, runset, before, step=5.0):
+    """With --before, when this series' new entries come online while lazy's backlog drains (since
+    2026-11-08 the graph no longer waits for the queries' fetches, U16): where the backlog waits.
+    The load generator sends each query, when it arrives, to the next entry of its list (round-
+    robin), at most LOADGEN_CONNS in flight at an entry, the others queued at that entry in arrival
+    order. A new entry starts with an empty queue, and answers its share of the arrivals as they
+    come, while the initial entries' queues hold the backlog. Per 5 s: each group of entries'
+    answers (their agents' counts) and the backlog, in both series; then the latency of the queries
+    sent from the first new entry until the backlogs cleared, as a distribution."""
+    if not before:
+        return None
+    import bisect
+    after, olds = reps(runs, runset, "lazy", "metrics.jsonl"), reps(runs, before, "lazy", "metrics.jsonl")
+    if not after or not olds:
+        print("skipped lazy-entries.svg (runs missing)")
+        return None
+
+    def facts(run):
+        rows = read_latency(os.path.join(run, "latency.csv"))
+        sent = sorted(r["t"] for r in rows)
+        ans = sorted(answered_at(r) for r in rows if r["status"] == "ok")
+        trig, flip, _, rc = events(run)
+        end = load_end(run) or 360.0
+        backlog = [(t, bisect.bisect_left(sent, t) - bisect.bisect_left(ans, t)) for t in (trig + i for i in range(int(end - trig) + 1))]
+        peak = max(backlog, key=lambda p: p[1])
+        cleared = next((t for t, b in backlog if t > peak[0] and b <= 100), None)
+        entries = {"n%d" % n: trig + e["seconds"] for e in rc["reply"].get("entry_flips", []) for n in e["nodes"]}
+        tail = sorted(r["us"] / 1e6 for r in rows if r["status"] == "ok" and r["t"] >= trig)
+        return dict(run=run, rows=rows, sent=sent, ans=ans, trig=trig, flip=flip, end=end, rc=rc, backlog=backlog,
+                    peak=peak, cleared=cleared, entries=entries,
+                    miss=sum(1 for r in rows if r["t"] >= trig and (r["status"] != "ok" or r["us"] > 200e3))
+                    / max(sum(1 for r in rows if r["t"] >= trig), 1),
+                    mean=sum(tail) / len(tail) if tail else None)
+    a, olds = facts(after[0]), [facts(r) for r in olds]
+    if not a["entries"] or a["cleared"] is None or min(a["entries"].values()) >= a["cleared"]:
+        print("skipped lazy-entries.svg (no new entry of %s comes online while its backlog drains)" % runset)
+        return None
+    if any(o["cleared"] is None for o in olds):
+        print("skipped lazy-entries.svg (a backlog of %s does not clear during the load)" % before)
+        return None
+    exp = load_json(os.path.join(a["run"], "experiment.json"))
+    initial = ["n%d" % i for i in range(1, int(exp.get("InitialNodes", 4)) + 1)]
+    added = ["n%d" % n for n in a["rc"]["reply"].get("added", [])]
+    load = exp["Load"]
+    steps_ = sorted((float(t), float(r)) for t, r in (x.split(":") for x in str(load.get("RateSteps", "")).split(",") if x))
+    offered_at = lambda t: next((r for s, r in reversed(steps_) if s <= t), float(load["Rate"]))  # noqa: E731
+    first, last = min(a["entries"].values()), max(a["entries"].values())
+    w0, w1 = first, max([a["cleared"]] + [o["cleared"] for o in olds])  # the queries the figure's last panel takes
+    lo, hi = a["trig"] - 10.0, min(a["end"], w1 + 30.0)
+    bins = [lo + step * i for i in range(int((hi - lo) / step))]
+
+    def group(f, names_):  # q/s the entries of names_ answered, per bin: each one's mean rate in it, summed
+        m = metrics_series(f["run"], ("entry.latency.per_sec",))
+        out_ = []
+        for t in bins:
+            tot = 0.0
+            for n in names_:
+                v = [x for tt, x in m.get((n, "entry.latency.per_sec"), []) if t <= tt < t + step]
+                tot += sum(v) / len(v) if v else 0.0
+            out_.append((t + step / 2, tot))
+        return out_
+    a_init, a_new = group(a, initial), group(a, added)
+    o_init = [group(o, initial) for o in olds]
+
+    def window_lat(f):  # the latency (s) of the queries sent in [w0, w1), sorted
+        return sorted(r["us"] / 1e6 for r in f["rows"] if r["status"] == "ok" and w0 <= r["t"] < w1)
+    lat = {"after": [window_lat(a)], "before": [window_lat(o) for o in olds]}
+    within = lambda xs, s: bisect.bisect_right(xs, s) / len(xs) if xs else 0.0  # noqa: E731
+    pct = lambda xs, q: xs[min(int(q * len(xs)), len(xs) - 1)] if xs else float("nan")  # noqa: E731
+
+    def mean_in(pts, t0_, t1_):
+        v = [x for t, x in pts if t0_ <= t - step / 2 and t + step / 2 <= t1_]
+        return sum(v) / len(v) if v else float("nan")
+
+    svg = Svg()
+    pw = W - LEFT - RIGHT
+    ymax = max(max(v for _, v in s) for s in [a_init, a_new] + o_init + [[(0, offered_at(lo)), (0, offered_at(hi))]])
+    pa = Panel(svg, LEFT, 84, pw, 150, (lo, hi), "answered queries per second at each group of entries (their agents' "
+               "counts), per %g s" % step, "q/s", ymax=ymax * 1.15)
+    pb = Panel(svg, LEFT, 294, pw, 110, (lo, hi), "backlog: queries sent, not answered yet", "queries",
+               ymax=max(p[1] for f in [a] + olds for p in f["backlog"] if lo <= p[0] <= hi))
+    sched = [(lo, offered_at(lo))]
+    for s, r in steps_:
+        if lo < s < hi:
+            sched += [(s, sched[-1][1]), (s, r)]
+    sched.append((hi, offered_at(hi)))
+    pa.line(sched, "cu sched")
+    pa.line([(t, v) for t, v in [(last, offered_at(last) / 2), (hi, offered_at(hi) / 2)]], "ref")
+    svg.text(pa.x(hi) - 4, pa.y(offered_at(hi) / 2) + 14, "half the offered rate", "note", "end")
+    for o in o_init:
+        pa.line(o, "ctx")
+    pa.line(a_init, "c%d" % LAZY)
+    pa.line(a_new, "c%d dash" % LAZY)
+    for o in olds:
+        pb.line([p for p in o["backlog"] if lo <= p[0] <= hi], "ctx")
+    pb.line([p for p in a["backlog"] if lo <= p[0] <= hi], "c%d" % LAZY)
+    for p in (pa, pb):
+        p.vline(a["trig"], "trigger" if p is pa else None, "end")
+        p.vline(a["flip"], "flip" if p is pa else None, "end")
+        for i, t in enumerate(sorted(a["entries"].values())):
+            p.vline(t, "new entries online (after)" if p is pa and i == 0 else None)
+        p.vline(a["cleared"], "backlog cleared" if p is pa else None, row=1)
+    time_axis(svg, pb, pb.y0 + pb.ph, lo, hi)
+    # the panels' titles name the entries, the figure's title the two series
+    svg.legend(W - RIGHT + 16, pa.y0 + 10, [("initial (after)", "c%d" % LAZY, "line"), ("new (after)", "c%d dash" % LAZY, "line"),
+                                            ("initial (before)", "ctx", "line"), ("offered", "cu sched", "line")])
+    svg.legend(W - RIGHT + 16, pb.y0 + 10, [("after", "c%d" % LAZY, "line"), ("before", "ctx", "line")])
+
+    def describe(t):
+        k = min(int(round((t - lo) / step)), len(bins) - 1)
+        lines = ["%.0f–%.0f s" % (t, t + step),
+                 "after: initial entries %.0f q/s, new entries %.0f q/s; backlog %s"
+                 % (a_init[k][1], a_new[k][1], fmt_k(value_at(a["backlog"], t + step)))]
+        for o, oi in zip(olds, o_init):
+            lines.append("before (%s): initial entries %.0f q/s; backlog %s"
+                         % (rep_name(o["run"]), oi[k][1], fmt_k(value_at(o["backlog"], t + step))))
+        return lines
+    hover(svg, [pa, pb], lo, bins[-1] + step, step, describe)
+
+    # the distribution: share answered within a time, on a log axis from 10 ms to 100 s
+    yc = pb.y0 + pb.ph + 92
+    # ymax under 1: the ticks then end at 100% (ticks_to clears its argument by 5%)
+    pc = Panel(svg, LEFT, yc, pw, 150, (-2.0, 2.0), "queries sent from %.0f s (the first new entry) to %.0f s (both "
+               "backlogs cleared): share answered within a latency" % (w0, w1), "",
+               ymax=0.95, yfmt=lambda v: "%.0f%%" % (100 * v))
+    for d, label in zip(range(-2, 3), ("10 ms", "100 ms", "1 s", "10 s", "100 s")):
+        svg.add('<line class="grid" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % (pc.x(d), yc, pc.x(d), yc + pc.ph))
+        svg.text(pc.x(d), yc + pc.ph + 16, label, anchor="middle")
+    svg.text(pc.x0 + pc.pw / 2, yc + pc.ph + 32, "latency, from the query's arrival (log scale)", anchor="middle")
+    pc.vline(math.log10(0.2), "200 ms")
+    grid = [-2.0 + 0.02 * i for i in range(201)]
+    for xs in lat["before"]:
+        pc.line([(g, within(xs, 10 ** g)) for g in grid], "ctx")
+    pc.line([(g, within(lat["after"][0], 10 ** g)) for g in grid], "c%d" % LAZY)
+    for i in range(40):  # a readout per tenth of a decade
+        g0, g1 = -2.0 + 0.1 * i, -2.0 + 0.1 * (i + 1)
+        tip = ["within %s" % (("%.0f ms" % (1000 * 10 ** g1)) if g1 < 0 else "%.1f s" % 10 ** g1),
+               "after: %.0f%%" % (100 * within(lat["after"][0], 10 ** g1))]
+        tip += ["before (%s): %.0f%%" % (rep_name(o["run"]), 100 * within(xs, 10 ** g1)) for o, xs in zip(olds, lat["before"])]
+        svg.add('<g class="hit"><title>%s</title><rect x="%.1f" y="%.1f" width="%.1f" height="%.1f"/></g>'
+                % (esc("\n".join(tip)), pc.x(g0), yc, pc.x(g1) - pc.x(g0), pc.ph))
+    svg.legend(W - RIGHT + 16, yc + 10, [("after", "c%d" % LAZY, "line"), ("before", "ctx", "line")])
+
+    rng = lambda vals, f="%.0f": span_of(vals, f)  # noqa: E731
+    o_ent = [t - o["trig"] for o in olds for t in o["entries"].values()]
+    before_txt = ("Before (%s), the new entries came online %s s after the trigger, %s: the backlog drained through the "
+                  "%d initial entries' queues, in arrival order. "
+                  % (before, rng(o_ent), "after the backlog had cleared (at %s s)" % rng([o["cleared"] for o in olds])
+                     if min(o_ent) + olds[0]["trig"] >= max(o["cleared"] for o in olds) else "while it drained",
+                     len(initial)))
+    share = [within(xs, 0.2) for xs in lat["before"]]
+    text = ("The load generator sends each query, as it arrives, to the next entry of its list (round-robin), at most %d in "
+            "flight at an entry; the others wait in that entry's queue, in arrival order. " % LOADGEN_CONNS + before_txt +
+            "After (%s), they come online %s s after the trigger, at %s s, while %s queries wait. A new entry starts with an "
+            "empty queue and answers its share of the arrivals as they come: the %d new entries %.0f q/s together, half "
+            "the offered rate, while the initial entries answer their queues at %.0f q/s together, against %s before, so "
+            "the queries in them wait longer. Of the queries sent from %.0f s until both backlogs cleared, %.0f%% are "
+            "answered within 200 ms, against %s%% before; the slowest 1%% wait %.0f s and more, against %s s. The backlog "
+            "clears at %.0f s, against %s s: the cluster answers as many queries, in another order. From the trigger on, "
+            "%.0f%% of the queries miss 200 ms (%s%% before), and their mean latency is %.1f s (%s s)."
+            % (runset, rng([t - a["trig"] for t in a["entries"].values()]), rng([first, last]),
+               fmt_k(value_at(a["backlog"], first)), len(added), mean_in(a_new, last, a["cleared"]),
+               mean_in(a_init, last, a["cleared"]), rng([mean_in(oi, last, a["cleared"]) for oi in o_init]),
+               w0, 100 * within(lat["after"][0], 0.2), rng([100 * s for s in share]),
+               pct(lat["after"][0], 0.99), rng([pct(xs, 0.99) for xs in lat["before"]]),
+               a["cleared"], rng([o["cleared"] for o in olds]), 100 * a["miss"], rng([100 * o["miss"] for o in olds]),
+               a["mean"], rng([o["mean"] for o in olds], "%.1f")))
+    notes = textwrap.wrap(text, 112)
+    yb = yc + pc.ph + 62
+    for i, s in enumerate(notes):
+        svg.text(LEFT, yb + 15 * i, s, "note")
+    return svg.save(out, "lazy-entries.svg", yb + 15 * len(notes) + 6,
+                    "Lazy's backlog once the new entries serve: %s against %s" % (before, runset),
+                    "%s; lazy, %s against %s" % (schedule(a["run"]), os.path.basename(os.path.dirname(a["run"])),
+                                                 ", ".join(os.path.basename(os.path.dirname(o["run"])) for o in olds)))
+
+
 def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
-    rels = ("%s/rep1/lazy" % runset, "%s/rep1/copy-then-flip" % runset)
-    runs_ = [(r, os.path.join(runs, r)) for r in rels if os.path.exists(os.path.join(runs, r, "stats-n1.jsonl"))]
-    if len(runs_) < len(rels):
+    picked = [reps(runs, runset, p, "stats-n1.jsonl") for p in ("lazy", "copy-then-flip")]
+    if not all(picked):
         print("skipped node-reads.svg (runs missing)")
         return
-    sf = "%s/rep1/copy-then-flip-stream-first" % runset
-    if os.path.exists(os.path.join(runs, sf, "stats-n1.jsonl")):
-        runs_.append((sf, os.path.join(runs, sf)))
+    sf = reps(runs, runset, "copy-then-flip-stream-first", "stats-n1.jsonl")
+    runs_ = [(os.path.relpath(rs[0], runs), rs[0]) for rs in picked + ([sf] if sf else [])]
     names = {"copy-then-flip-stream-first": "copy-then-flip, stream first"}
     nodes = ["n%d" % i for i in range(1, 9)]
     svg = Svg()
@@ -1087,8 +1367,7 @@ def revision(run, before="", after=""):
 
 def copy_runs(runs, runset, protocol):
     """rep1/ and rep2/ of a protocol in the series, those with stats."""
-    rs = [os.path.join(runs, runset, r, protocol) for r in ("rep1", "rep2")]
-    return [r for r in rs if os.path.exists(os.path.join(r, "stats-n1.jsonl"))]
+    return reps(runs, runset, protocol, "stats-n1.jsonl")
 
 
 def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=None):
@@ -1136,9 +1415,9 @@ def ctf_stream(runs, out, runset, calibrations, lo=0.0, hi=None):
             p.line([(t, v) for t, v in pts if lo <= t <= hi], cls)
         time_axis(svg, p, cy + ph, lo, hi, label="seconds since the trigger" if i // cols == 1 else "", count=5)
         panels.append(p)
-    items = [("one budget", "c%d" % CTF, "line"), ("(%d runs)" % len(loaded), "", "none")]
+    items = [("one budget", "c%d" % CTF, "line"), ("(%s)" % runs_count(len(loaded)), "", "none")]
     if first:
-        items += [("stream first", "c%d" % SF, "line"), ("(%d runs)" % len(first), "", "none")]
+        items += [("stream first", "c%d" % SF, "line"), ("(%s)" % runs_count(len(first)), "", "none")]
     svg.legend(W - RIGHT + 16, 94, items + [("no load", "neu dash", "line"), ("(calibrate-8)", "", "none")])
     yb = 84 + 2 * (ph + gy) - 10
     calm_raw = load_json(os.path.join(calm, "reconfigurations.json"))[0]["reply"]["phases"]["stage_raw"]
@@ -1266,11 +1545,10 @@ def ctf_budget(runs, out, runset, step=5.0):
 
 
 def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
-    """Lazy through the whole load, both repetitions: whether it holds the offered rate while its
+    """Lazy through the whole load, every repetition: whether it holds the offered rate while its
     new nodes still fetch, against what copy-then-flip copies (calibrate-8's scale-out) and what
     8 nodes with every raw vector local answer in (calibrate-8's ladder)."""
-    rs = [os.path.join(runs, runset, r, "lazy") for r in ("rep1", "rep2")]
-    rs = [r for r in rs if os.path.exists(os.path.join(r, "stats-n5.jsonl"))]
+    rs = reps(runs, runset, "lazy", "stats-n5.jsonl")
     if rs and all(events(r)[1] >= (load_end(r) or 360.0) for r in rs):
         print("skipped lazy-keepup.svg (lazy flips after the load's end: lazy-stall.svg)")
         return None
@@ -1354,7 +1632,7 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
         p3.line(q["mean"], "c%d" % LAZY)
         p4.line(q["gb"], "c%d" % LAZY)
     time_axis(svg, p4, ys[3] + 140, lo, hi)
-    svg.legend(W - RIGHT + 16, ys[0] + 10, [("lazy", "c%d" % LAZY, "line"), ("(%d runs)" % len(per), "", "none"),
+    svg.legend(W - RIGHT + 16, ys[0] + 10, [("lazy", "c%d" % LAZY, "line"), ("(%s)" % runs_count(len(per)), "", "none"),
                                             ("offered", "cu sched", "line")])
     rng = lambda key, f="%.0f": span_of([q[key] for q in per if q[key] is not None], f)  # noqa: E731
     exp = load_json(os.path.join(rs[0], "experiment.json"))
@@ -1388,7 +1666,8 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
         svg.text(LEFT, yb + 15 * i, s, "note")
     return svg.save(out, "lazy-keepup.svg", yb + 15 * len(notes) + 6,
                     "Lazy through the whole load: the offered rate held while its new nodes still fetch",
-                    "both repetitions; the backlog, latency and fetched data of each")
+                    "%s; the backlog, latency and fetched data of each"
+                    % ("both repetitions" if len(per) == 2 else ", ".join(rep_name(q["run"]) for q in per)))
 
 
 def keepup_all(runs, out, runset, lazy_set):
@@ -1417,7 +1696,7 @@ def keepup_all(runs, out, runset, lazy_set):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--runs", default="results/cloudlab-gpu")
-    ap.add_argument("--out", default="results/cloudlab-gpu-figures")
+    ap.add_argument("--out", help="where the figures go (default: results/cloudlab-gpu-figures/SERIES)")
     ap.add_argument("--series", default="4to8", help="the runs to draw: a directory under --runs (default 4to8)")
     ap.add_argument("--calibrations", default="4to8",
                     help="the directory under --runs with calibrate-4 and calibrate-8 (default 4to8)")
@@ -1429,6 +1708,7 @@ def main():
     ap.add_argument("--drained", action="store_true",
                     help="also draw each timeline until every query is answered, the backlogs drained (NAME-drained.svg)")
     args = ap.parse_args()
+    args.out = args.out or os.path.join("results/cloudlab-gpu-figures", args.series)
     os.makedirs(args.out, exist_ok=True)
     specs = compare_specs(args.runs, args.series, args.before)
     timelines(args.runs, args.out, specs)
@@ -1438,12 +1718,13 @@ def main():
             lazy_fetch(args.runs, args.out, args.series, args.calibrations, args.fetch_bound_mb),
             lazy_stall(args.runs, args.out, args.series),
             lazy_staging(args.runs, args.out, args.series, args.before),
+            lazy_entries(args.runs, args.out, args.series, args.before),
             node_reads(args.runs, args.out, args.series),
             ctf_stream(args.runs, args.out, args.series, args.calibrations),
             ctf_budget(args.runs, args.out, args.series),
             lazy_keepup(args.runs, args.out, args.series, args.calibrations),
             keepup_all(args.runs, args.out, args.series, args.lazy_series or args.series)]
-    made += [os.path.join(args.out, n + suffix + ".svg") for n, _, _, _, _ in specs
+    made += [os.path.join(args.out, spec[0] + suffix + ".svg") for spec in specs
              for suffix in ("", "-drained") if suffix == "" or args.drained]
     if shutil.which("rsvg-convert"):
         for path in made:
