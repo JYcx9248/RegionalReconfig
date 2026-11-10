@@ -221,7 +221,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   the cgroup io controller is not delegated; `run_one.sh` evicts only the run's own files
   (`scripts/evict_cache.py`).
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
-  controller and the load generator; it checks every host, copies with rsync, to the same
+  controller and the load generator; it checks every host and leaves it clean (no earlier
+  node directory; where sudo asks no password, an empty page cache, swappiness 1 and Ubuntu's
+  weekly `fstrim.timer` stopped: a TRIM held a SATA SSD for 8.6 min of a run on 2026-11-09),
+  copies with rsync, to the same
   paths, the binaries, `config.yaml` and what the host's nodes open (the index's meta and
   codebook and the partitions' manifest; where an initial node runs, also the graph, the
   segments, and the PQ codes and the page file unless the host's initial nodes start on a
@@ -243,7 +246,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   for the GPU it finds, and node0 builds before its driver is loaded. The `amazon-300m-*`
   experiments run 4 → 8 there on 300M of the Amazon corpus's 560M documents
   (`scripts/data/subset_base.py`; at 2 nodes the PQ codes would exceed a P100), on a 4-node
-  snapshot made on the control node (`amazon-300m-warmup-4`). The `*-aliyun-gpu-*`
+  snapshot made on the control node (`amazon-300m-warmup-4`). Their `4to8-worst-*` files are
+  U11's worst case there: 2M of the base's vectors as queries, drawn on the lab server, which
+  has the index's layout map (`scripts/data/sample_queries.py`), with ground truth for every
+  500th of the first 1M (`fusion_gt --base`). The `*-aliyun-gpu-*`
   experiments are the 2 → 4 runs on Alibaba
   Cloud (one A10 instance per data node at 192.168.1.11 on, user root, a 1 TB ESSD each); their
   control node is a CPU instance of the same Xeon, which builds the CUDA backend with
@@ -345,7 +351,7 @@ Next:
    - Every answer is the same in all six runs.
    - **Held to 570 s** (`4to8-worst-long`, lazy, two runs; `lazy-keepup.svg`): the 360 s runs'
      drain was capped by the load generator's 64 in flight per entry, with 4 entries online.
-     - The backlog clears under the load at 395-415 s.
+     - The backlog clears under the load at 394-412 s.
      - Then lazy answers 1100 q/s at 13.6-13.8 ms (p99 30-31 ms), as 8 nodes with every raw
        vector local do, while still fetching 13-20 MB/s.
      - By the load's end it has fetched 31.4 GB, 73% of the copy. Without locality lazy's total
@@ -430,21 +436,24 @@ Next:
      runs (v1, v2, v3) have the same recall, and so do 4to8to4's in v1 and v3 (the same rates).
 
    The rerun with the graph yielding to the staging only (2026-11-08, U16,
-   `results/cloudlab-gpu/amazon-4to8-v4`, 3a27d05: lazy in rep2 and copy-then-flip in rep1, one
-   run each, and 4to8to4; figures `--series amazon-4to8-v4 --calibrations amazon-4to8 --before
-   amazon-4to8-v3`, `lazy-entries.svg` and `4to8to4-before-after.svg` the new ones):
+   `results/cloudlab-gpu/amazon-4to8-v4`, 3a27d05: two runs of each protocol and 4to8to4;
+   figures `--series amazon-4to8-v4 --calibrations amazon-4to8 --before amazon-4to8-v3`,
+   `lazy-entries.svg` and `4to8to4-before-after.svg` the new ones):
    - **The new entries come online 59-71 s after the trigger** (282-297 s), 13-25 s after the
-     flip. Each graph starts as its node's staging ends and moves its 3.3 GB in 22-25 s. Lazy's
-     rescale ends at 71 s (295-297 s); its staging and flip are as before (flip at 46 s).
-   - **The cluster answers at the same rate:** the backlog peaks at 10.3K and clears at 227 s
-     (223-226 s), and 192K queries are answered from the trigger to the load's end, as in v2 and v3.
-   - **The backlog waits elsewhere** (`lazy-entries.svg`). The load generator sends each query, as
-     it arrives, to the next entry (round-robin), at most 64 in flight at each; the rest queue at
-     that entry. The new entries start with empty queues and answer their share at once (351 q/s
-     together), while the initial ones work through theirs at 502 q/s together (849-855 before).
-     Of the queries sent from 149 s until the backlogs cleared, 47% are answered within 200 ms
-     (17-18%), but the slowest 1% wait 29 s or more (17-19 s). From the trigger on, 37% of the
-     queries miss 200 ms (45-46%), and the mean latency is 5.0 s (4.6-4.8 s).
+     flip. Each graph starts as its node's staging ends and moves its 3.3 GB in 22-26 s. Lazy's
+     rescale ends at 68-71 s (295-297 s); its staging and flip are as before (flip at 43-46 s).
+   - **The cluster answers at the same rate:** the backlog peaks at 9.8-10.3K and clears at
+     222-227 s (223-226 s), and 192K queries are answered from the trigger to the load's end, as
+     in v2 and v3.
+   - **The backlog waits elsewhere** (`lazy-entries.svg`):
+     - The load generator sends each query, as it arrives, to the next entry (round-robin), at
+       most 64 in flight at each; the rest queue at that entry.
+     - The new entries start with empty queues and answer their share at once (350 q/s
+       together). The initial ones work through theirs at 494-501 q/s together (848 before).
+     - Of the queries sent from 149 s until the backlogs cleared, 47-51% are answered within
+       200 ms (17-18%), but the slowest 1% wait 29-31 s or more (17-19 s).
+     - From the trigger on, 36-37% of the queries miss 200 ms (45-46%), and the mean latency is
+       4.5-5.0 s (4.6-4.8 s).
    - **4to8to4's whole cycle runs under the load.** The scale-out ends at 154 s (509 s). The
      scale-in starts at 300 s and takes 47 s, its flip at 32.5 s:
      - the lists come back from memory in 17-20 s;
@@ -456,10 +465,82 @@ Next:
      flip, on 4 nodes with every raw vector local, it is 11.4 ms, p99 22 ms, against 14.3 ms and
      32 ms on 8 nodes still fetching. One query, refused by a leaving entry, is answered on its
      retry (U17).
-   - Copy-then-flip flips 1691 s after the trigger (1636-1718 s). Its graphs now arrive during
+   - Copy-then-flip flips 1691-1746 s after the trigger (1636-1718 s). Its graphs now arrive during
      its stream, 58-70 s after the trigger, so its 4 entries come with the flip.
-   - No query fails. The 1,152 queries with ground truth answered in all fourteen 4 → 8 runs
+   - No query fails. The 1,152 queries with ground truth answered in all sixteen 4 → 8 runs
      (v1-v4) have the same recall, and so do the 1,224 of 4to8to4 in v1, v3 and v4.
+
+   The Wikipedia runs again on the code of 2026-11-08 (2026-11-09, 9e6ae33, each experiment as
+   in 4to8-v2 and 4to8-worst: `results/cloudlab-gpu/4to8-v3`, `4to8-worst-v2`,
+   `4to8-worst-long-v2`; figures `--series 4to8-v3 --calibrations 4to8 --before 4to8-v2`,
+   `--series 4to8-worst-v2 --calibrations 4to8-worst --before 4to8-worst --drained --lazy-series
+   4to8-worst-long-v2` and `--series 4to8-worst-long-v2 --calibrations 4to8-worst --before
+   4to8-worst-long`):
+   - **Three runs met the hosts' weekly TRIM** (Ubuntu's `fstrim.timer`: Monday 00:00 and up to
+     100 min later, each host at its own time). These were `4to8-v3/rep1/copy-then-flip` (n4's
+     host for 8.6 min from the trigger on) and both `4to8-worst-long-v2` runs (n3's host from
+     251 s; n2's from 196 s and n1's from 553 s).
+     - A TRIM on these SATA SSDs is not queued. Each read took 54-71 µs of the disk's time
+       instead of 14-18, and the node read 13-16K pages/s instead of 39K.
+     - Every query that touched the node waited: 155 q/s instead of 588, and 241-246K queries
+       still queued at the load's end. 9,706 and 107,166 queries were abandoned, and 232 others
+       hit the client's 30 s timeout.
+     - They ran again at 05:53-06:32, after every host's TRIM of the week, each initial node's
+       disk at 15-16 µs a read (the first runs are in `results/cloudlab-gpu-fstrim`).
+       `run_cluster.py` and `run_one.sh` stop the timer since.
+   - **4 → 8, lazy:**
+     - Staging takes 2.3 s (8.4-8.5 s): the lists from memory, then the PQ codes, then the 8
+       loads at once. Lazy flips 2.5 s after the trigger (9.5-9.6 s).
+     - Each graph starts as its node's staging ends and moves its 7 GB in 40-51 s (43-67 s). The
+       new entries come online 42-53 s after the trigger (70-76 s).
+     - The backlog peaks at 7.2-7.4K (8.6-8.9K) and clears at 122-124 s (132 s). From the
+       trigger on, 10.3-10.7% of the queries miss 200 ms (12.8-12.9%), and the mean latency is
+       0.66-0.71 s (1.12-1.17 s).
+     - Then it answers 780 q/s at 13.9-14.0 ms, as 8 warm nodes do.
+   - **4 → 8 → 4:**
+     - The scale-out flips at 2.4 s and ends at 50.6 s (10.1 s, 78.7 s).
+     - The scale-in flips 1.7 s after its trigger and ends at 2.5 s (6.6 s, 7.8 s), with no
+       partition saved as a file.
+     - The queries do not notice the scale-in: 12.8 ms, p99 25 ms in the 40 s after its
+       trigger (22.9 ms, p99 233 ms).
+   - **U11's worst case, lazy:** it flips at 2.4-2.7 s (9.9-10.2 s), and the new entries come
+     online 48-55 s after the trigger (314-328 s, and 516-523 s in the 570 s runs). The data
+     path still sets the pace: the initial nodes' read budgets (n1's readers wait 36 s/s after
+     the flip) and the new nodes' writes, 23-33 MB/s each. So the cluster answers about as
+     before:
+     - in the 360 s runs the backlog peaks at 26K and 36K (34-37K). Repetition 1 clears it at
+       346 s, while repetition 2 still has 10.5K at the load's end (8-12K). 297-308K queries are
+       answered from the trigger to the load's end (296-299K);
+     - held to 570 s, it peaks at 31K and 44K (34-37K) and clears at 374 s and 440 s
+       (394-412 s). Then lazy answers 1,100 q/s at 14.2-14.4 ms, p99 30-31 ms (13.6-13.8 ms,
+       p99 30-31 ms), still fetching 13 MB/s. By the load's end it has fetched 31.5 GB, 73% of the
+       copy, as before. From the trigger on, 47% and 61% of the queries miss 200 ms (62-65%).
+
+     When the new entries come online, the mean latency of the answered queries falls from about
+     21 s to 14-16 s for a while, since their queues start empty (U17).
+   - **The repetitions differ where a new node's fetch cache reaches its bound, and then the whole
+     cluster stops for seconds** (every worst-case lazy run, old code and new; never in the
+     normal 4 → 8 runs or on Amazon):
+     - A new owner of hot partitions fetches 40-67 MB/s in the first 40 s after the flip. Its
+       SATA SSD writes 23-33 MB/s, a little differently in each run, so its 2 GB cache fills at
+       150-250 s.
+     - Past the bound a query installs what it fetched itself (`Cache`). But `RawStore::Put`
+       holds `put_mu_` for a whole call, and the writer installs up to 65,536 vectors (256 MB)
+       a call, 10-12 s of writes. So the query waits for the writer's round, not for its own
+       pages, and the cluster answers nothing for 2-4 s, until the round ends. The cache then
+       refills in 6-9 s.
+     - In `4to8-worst-long-v2/rep2`, n6 wrote 22.7 MB/s (26.6-32.1 in the other runs). Its
+       cache hit the bound every 12 s from 153 s to 249 s, the cluster answered fewer than 100
+       queries in 15 of those seconds, and queries waited 1,871 s in all to install 19,783
+       vectors. In `4to8-worst-v2/rep2` the same happened on n5 (14,445 vectors).
+     - Every second after a flip with fewer than 100 answers, in all eight runs, falls while a
+       new node's cache is at its bound.
+   - **Copy-then-flip is unchanged.** 4 → 8 flips at 503-507 s (497-526 s), and with the stream
+     first at 213-223 s (213-220 s). In the worst case it flips at 621-646 s (614-627 s), and
+     with the stream first at 214-223 s (214-222 s).
+   - No query fails. The queries with ground truth answered in all runs have the same recall in
+     each group: 257,438 in the sixteen 4 → 8 runs (4to8, v2, v3), 272,893 in 4to8to4's three,
+     1,211 in the twelve worst-case runs, and 1,980 in the four 570 s runs.
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).

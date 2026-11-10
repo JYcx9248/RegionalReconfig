@@ -1112,12 +1112,13 @@ def lazy_entries(runs, out, runset, before, step=5.0):
                     miss=sum(1 for r in rows if r["t"] >= trig and (r["status"] != "ok" or r["us"] > 200e3))
                     / max(sum(1 for r in rows if r["t"] >= trig), 1),
                     mean=sum(tail) / len(tail) if tail else None)
-    a, olds = facts(after[0]), [facts(r) for r in olds]
-    if not a["entries"] or a["cleared"] is None or min(a["entries"].values()) >= a["cleared"]:
-        print("skipped lazy-entries.svg (no new entry of %s comes online while its backlog drains)" % runset)
+    afters, olds = [facts(r) for r in after], [facts(r) for r in olds]
+    a = afters[0]  # the experiment, its nodes and its schedule: the same in every run
+    if any(f["cleared"] is None for f in afters + olds):
+        print("skipped lazy-entries.svg (a backlog of %s or %s does not clear during the load)" % (runset, before))
         return None
-    if any(o["cleared"] is None for o in olds):
-        print("skipped lazy-entries.svg (a backlog of %s does not clear during the load)" % before)
+    if any(not f["entries"] or min(f["entries"].values()) >= f["cleared"] for f in afters):
+        print("skipped lazy-entries.svg (no new entry of %s comes online while its backlog drains)" % runset)
         return None
     exp = load_json(os.path.join(a["run"], "experiment.json"))
     initial = ["n%d" % i for i in range(1, int(exp.get("InitialNodes", 4)) + 1)]
@@ -1125,8 +1126,10 @@ def lazy_entries(runs, out, runset, before, step=5.0):
     load = exp["Load"]
     steps_ = sorted((float(t), float(r)) for t, r in (x.split(":") for x in str(load.get("RateSteps", "")).split(",") if x))
     offered_at = lambda t: next((r for s, r in reversed(steps_) if s <= t), float(load["Rate"]))  # noqa: E731
-    first, last = min(a["entries"].values()), max(a["entries"].values())
-    w0, w1 = first, max([a["cleared"]] + [o["cleared"] for o in olds])  # the queries the figure's last panel takes
+    first = min(t for f in afters for t in f["entries"].values())
+    last = max(t for f in afters for t in f["entries"].values())
+    w0, w1 = first, max(f["cleared"] for f in afters + olds)  # the queries the figure's last panel takes
+    r0, r1 = last, min(f["cleared"] for f in afters)  # the entries' rates: every run of this series drains
     lo, hi = a["trig"] - 10.0, min(a["end"], w1 + 30.0)
     bins = [lo + step * i for i in range(int((hi - lo) / step))]
 
@@ -1140,12 +1143,12 @@ def lazy_entries(runs, out, runset, before, step=5.0):
                 tot += sum(v) / len(v) if v else 0.0
             out_.append((t + step / 2, tot))
         return out_
-    a_init, a_new = group(a, initial), group(a, added)
+    a_init, a_new = [group(f, initial) for f in afters], [group(f, added) for f in afters]
     o_init = [group(o, initial) for o in olds]
 
     def window_lat(f):  # the latency (s) of the queries sent in [w0, w1), sorted
         return sorted(r["us"] / 1e6 for r in f["rows"] if r["status"] == "ok" and w0 <= r["t"] < w1)
-    lat = {"after": [window_lat(a)], "before": [window_lat(o) for o in olds]}
+    lat = {"after": [window_lat(f) for f in afters], "before": [window_lat(o) for o in olds]}
     within = lambda xs, s: bisect.bisect_right(xs, s) / len(xs) if xs else 0.0  # noqa: E731
     pct = lambda xs, q: xs[min(int(q * len(xs)), len(xs) - 1)] if xs else float("nan")  # noqa: E731
 
@@ -1155,11 +1158,11 @@ def lazy_entries(runs, out, runset, before, step=5.0):
 
     svg = Svg()
     pw = W - LEFT - RIGHT
-    ymax = max(max(v for _, v in s) for s in [a_init, a_new] + o_init + [[(0, offered_at(lo)), (0, offered_at(hi))]])
+    ymax = max(max(v for _, v in s) for s in a_init + a_new + o_init + [[(0, offered_at(lo)), (0, offered_at(hi))]])
     pa = Panel(svg, LEFT, 84, pw, 150, (lo, hi), "answered queries per second at each group of entries (their agents' "
                "counts), per %g s" % step, "q/s", ymax=ymax * 1.15)
     pb = Panel(svg, LEFT, 294, pw, 110, (lo, hi), "backlog: queries sent, not answered yet", "queries",
-               ymax=max(p[1] for f in [a] + olds for p in f["backlog"] if lo <= p[0] <= hi))
+               ymax=max(p[1] for f in afters + olds for p in f["backlog"] if lo <= p[0] <= hi))
     sched = [(lo, offered_at(lo))]
     for s, r in steps_:
         if lo < s < hi:
@@ -1170,17 +1173,31 @@ def lazy_entries(runs, out, runset, before, step=5.0):
     svg.text(pa.x(hi) - 4, pa.y(offered_at(hi) / 2) + 14, "half the offered rate", "note", "end")
     for o in o_init:
         pa.line(o, "ctx")
-    pa.line(a_init, "c%d" % LAZY)
-    pa.line(a_new, "c%d dash" % LAZY)
+    for ai, an in zip(a_init, a_new):
+        pa.line(ai, "c%d" % LAZY)
+        pa.line(an, "c%d dash" % LAZY)
     for o in olds:
         pb.line([p for p in o["backlog"] if lo <= p[0] <= hi], "ctx")
-    pb.line([p for p in a["backlog"] if lo <= p[0] <= hi], "c%d" % LAZY)
+    for f in afters:
+        pb.line([p for p in f["backlog"] if lo <= p[0] <= hi], "c%d" % LAZY)
+    # The trigger's label right of its line and the flip's left of its own, or one label for both where
+    # lazy flips seconds after the trigger (Wikipedia since 2026-11-08): two would overlap.
+    flips = sorted(set(f["flip"] for f in afters))
+    close = pa.x(flips[-1]) - pa.x(a["trig"]) < 80
+    cleared = sorted(f["cleared"] for f in afters)
     for p in (pa, pb):
-        p.vline(a["trig"], "trigger" if p is pa else None, "end")
-        p.vline(a["flip"], "flip" if p is pa else None, "end")
-        for i, t in enumerate(sorted(a["entries"].values())):
+        p.vline(a["trig"], "trigger" if p is pa and not close else None)
+        for i, t in enumerate(flips):  # right of the last run's flip, or left of the first one's
+            mine = p is pa and i == (len(flips) - 1 if close else 0)
+            p.vline(t, ("trigger, flip" if close else "flip") if mine else None, "start" if close else "end")
+        for i, t in enumerate(sorted(t for f in afters for t in f["entries"].values())):
             p.vline(t, "new entries online (after)" if p is pa and i == 0 else None)
-        p.vline(a["cleared"], "backlog cleared" if p is pa else None, row=1)
+        # right of the last run's line where the figure leaves room for it before the legend, else
+        # left of the first one's: no other run's line crosses the label
+        right = pa.x(hi) - pa.x(cleared[-1]) > 110
+        for i, t in enumerate(cleared):
+            mine = p is pa and i == (len(cleared) - 1 if right else 0)
+            p.vline(t, "backlog cleared" if mine else None, "start" if right else "end", row=1)
     time_axis(svg, pb, pb.y0 + pb.ph, lo, hi)
     # the panels' titles name the entries, the figure's title the two series
     svg.legend(W - RIGHT + 16, pa.y0 + 10, [("initial (after)", "c%d" % LAZY, "line"), ("new (after)", "c%d dash" % LAZY, "line"),
@@ -1189,9 +1206,10 @@ def lazy_entries(runs, out, runset, before, step=5.0):
 
     def describe(t):
         k = min(int(round((t - lo) / step)), len(bins) - 1)
-        lines = ["%.0f–%.0f s" % (t, t + step),
-                 "after: initial entries %.0f q/s, new entries %.0f q/s; backlog %s"
-                 % (a_init[k][1], a_new[k][1], fmt_k(value_at(a["backlog"], t + step)))]
+        lines = ["%.0f–%.0f s" % (t, t + step)]
+        for f, ai, an in zip(afters, a_init, a_new):
+            lines.append("after (%s): initial entries %.0f q/s, new entries %.0f q/s; backlog %s"
+                         % (rep_name(f["run"]), ai[k][1], an[k][1], fmt_k(value_at(f["backlog"], t + step))))
         for o, oi in zip(olds, o_init):
             lines.append("before (%s): initial entries %.0f q/s; backlog %s"
                          % (rep_name(o["run"]), oi[k][1], fmt_k(value_at(o["backlog"], t + step))))
@@ -1212,11 +1230,12 @@ def lazy_entries(runs, out, runset, before, step=5.0):
     grid = [-2.0 + 0.02 * i for i in range(201)]
     for xs in lat["before"]:
         pc.line([(g, within(xs, 10 ** g)) for g in grid], "ctx")
-    pc.line([(g, within(lat["after"][0], 10 ** g)) for g in grid], "c%d" % LAZY)
+    for xs in lat["after"]:
+        pc.line([(g, within(xs, 10 ** g)) for g in grid], "c%d" % LAZY)
     for i in range(40):  # a readout per tenth of a decade
         g0, g1 = -2.0 + 0.1 * i, -2.0 + 0.1 * (i + 1)
-        tip = ["within %s" % (("%.0f ms" % (1000 * 10 ** g1)) if g1 < 0 else "%.1f s" % 10 ** g1),
-               "after: %.0f%%" % (100 * within(lat["after"][0], 10 ** g1))]
+        tip = ["within %s" % (("%.0f ms" % (1000 * 10 ** g1)) if g1 < 0 else "%.1f s" % 10 ** g1)]
+        tip += ["after (%s): %.0f%%" % (rep_name(f["run"]), 100 * within(xs, 10 ** g1)) for f, xs in zip(afters, lat["after"])]
         tip += ["before (%s): %.0f%%" % (rep_name(o["run"]), 100 * within(xs, 10 ** g1)) for o, xs in zip(olds, lat["before"])]
         svg.add('<g class="hit"><title>%s</title><rect x="%.1f" y="%.1f" width="%.1f" height="%.1f"/></g>'
                 % (esc("\n".join(tip)), pc.x(g0), yc, pc.x(g1) - pc.x(g0), pc.ph))
@@ -1232,27 +1251,34 @@ def lazy_entries(runs, out, runset, before, step=5.0):
     share = [within(xs, 0.2) for xs in lat["before"]]
     text = ("The load generator sends each query, as it arrives, to the next entry of its list (round-robin), at most %d in "
             "flight at an entry; the others wait in that entry's queue, in arrival order. " % LOADGEN_CONNS + before_txt +
-            "After (%s), they come online %s s after the trigger, at %s s, while %s queries wait. A new entry starts with an "
-            "empty queue and answers its share of the arrivals as they come: the %d new entries %.0f q/s together, half "
-            "the offered rate, while the initial entries answer their queues at %.0f q/s together, against %s before, so "
-            "the queries in them wait longer. Of the queries sent from %.0f s until both backlogs cleared, %.0f%% are "
-            "answered within 200 ms, against %s%% before; the slowest 1%% wait %.0f s and more, against %s s. The backlog "
-            "clears at %.0f s, against %s s: the cluster answers as many queries, in another order. From the trigger on, "
-            "%.0f%% of the queries miss 200 ms (%s%% before), and their mean latency is %.1f s (%s s)."
-            % (runset, rng([t - a["trig"] for t in a["entries"].values()]), rng([first, last]),
-               fmt_k(value_at(a["backlog"], first)), len(added), mean_in(a_new, last, a["cleared"]),
-               mean_in(a_init, last, a["cleared"]), rng([mean_in(oi, last, a["cleared"]) for oi in o_init]),
-               w0, 100 * within(lat["after"][0], 0.2), rng([100 * s for s in share]),
-               pct(lat["after"][0], 0.99), rng([pct(xs, 0.99) for xs in lat["before"]]),
-               a["cleared"], rng([o["cleared"] for o in olds]), 100 * a["miss"], rng([100 * o["miss"] for o in olds]),
-               a["mean"], rng([o["mean"] for o in olds], "%.1f")))
+            "After (%s), they come online %s s after the trigger, at %s s, while %sK queries wait. A new entry starts with an "
+            "empty queue and answers its share of the arrivals as they come: the %d new entries %s q/s together, half "
+            "the offered rate, while the initial entries answer their queues at %s q/s together, against %s before, so "
+            "the queries in them wait longer. Of the queries sent from %.0f s until both backlogs cleared, %s%% are "
+            "answered within 200 ms, against %s%% before; the slowest 1%% wait %s s and more, against %s s. The backlog "
+            "clears at %s s, against %s s%s. From the trigger on, "
+            "%s%% of the queries miss 200 ms (%s%% before), and their mean latency is %s s (%s s)."
+            % (runset, rng([t - f["trig"] for f in afters for t in f["entries"].values()]), rng([first, last]),
+               rng([value_at(f["backlog"], min(f["entries"].values())) / 1e3 for f in afters], "%.1f"), len(added),
+               rng([mean_in(an, r0, r1) for an in a_new]), rng([mean_in(ai, r0, r1) for ai in a_init]),
+               rng([mean_in(oi, r0, r1) for oi in o_init]),
+               w0, rng([100 * within(xs, 0.2) for xs in lat["after"]]), rng([100 * s for s in share]),
+               rng([pct(xs, 0.99) for xs in lat["after"]]), rng([pct(xs, 0.99) for xs in lat["before"]]),
+               rng(cleared), rng([o["cleared"] for o in olds]),
+               # the same drain, its queries in another order -- not where the runs clear far apart
+               ": the cluster answers as many queries, in another order"
+               if min(cleared) >= min(o["cleared"] for o in olds) - 10 and max(cleared) <= max(o["cleared"] for o in olds) + 10
+               else "",
+               rng([100 * f["miss"] for f in afters]), rng([100 * o["miss"] for o in olds]),
+               rng([f["mean"] for f in afters], "%.1f"), rng([o["mean"] for o in olds], "%.1f")))
     notes = textwrap.wrap(text, 112)
     yb = yc + pc.ph + 62
     for i, s in enumerate(notes):
         svg.text(LEFT, yb + 15 * i, s, "note")
     return svg.save(out, "lazy-entries.svg", yb + 15 * len(notes) + 6,
                     "Lazy's backlog once the new entries serve: %s against %s" % (before, runset),
-                    "%s; lazy, %s against %s" % (schedule(a["run"]), os.path.basename(os.path.dirname(a["run"])),
+                    "%s; lazy, %s against %s" % (schedule(a["run"]),
+                                                 ", ".join(os.path.basename(os.path.dirname(f["run"])) for f in afters),
                                                  ", ".join(os.path.basename(os.path.dirname(o["run"])) for o in olds)))
 
 
@@ -1596,7 +1622,7 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
         fetch_rate = lambda t: (value_at(gb, t + step) - value_at(gb, t)) / step * 1000 if value_at(gb, t) is not None and value_at(gb, t + step) is not None else None
         per.append(dict(run=run, answered=answered, backlog=backlog, mean=mean, gb=gb, trig=trig, flip=flip,
                         entries=entries, cleared=cleared,
-                        steady_qps=len(steady) / (hi - cleared - 20) if cleared else None,
+                        steady_qps=len(steady) / (hi - cleared - 20) if cleared and hi - cleared > 20 else None,
                         steady_mean=sum(lat) / len(lat) if lat else None, steady_p99=lat[int(0.99 * len(lat))] if lat else None,
                         rate_from=fetch_rate(cleared + 20) if cleared else None, rate_to=fetch_rate(hi - step - step),
                         fetched_end=value_at(gb, hi) or gb[-1][1]))
@@ -1604,8 +1630,9 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     pw = W - LEFT - RIGHT
     xr = (lo, hi)
     ys = [84, 300, 470, 670]
+    # room above the 8 nodes' line for its label: a drain can answer close to it at the load's end
     p1 = Panel(svg, LEFT, ys[0], pw, 160, xr, "answered and offered queries per second (per %.0f s)" % step, "q/s",
-               ymax=max(max(v for p in per for _, v in p["answered"]), c8))
+               ymax=max(max(v for p in per for _, v in p["answered"]), 1.1 * c8))
     p2 = Panel(svg, LEFT, ys[1], pw, 110, xr, "backlog: queries sent, not answered yet", "queries",
                ymax=max(v for p in per for _, v in p["backlog"]))
     p3 = Panel(svg, LEFT, ys[2], pw, 140, xr, "mean latency of the answered queries (log scale)", "ms", log=(1, 100000),
@@ -1613,8 +1640,9 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     p4 = Panel(svg, LEFT, ys[3], pw, 140, xr, "raw vectors the new nodes fetched, cumulative", "GB", ymax=copy / 1e9)
     sched = [(lo, rate0 if lo < s1 else rate1), (s1, rate0), (s1, rate1), (hi, rate1)] if lo < s1 else [(lo, rate1), (hi, rate1)]
     p1.line(sched, "cu sched")
-    # below its line: above it, near the panel's top, it would run into the events' labels
-    p1.hline(c8, "8 nodes' capacity, %.0f q/s" % c8, dy=14)
+    # above its line, at the right: the events' labels are at the top left, and a backlog that
+    # drains until the load's end answers just below the line there
+    p1.hline(c8, "8 nodes' capacity, %.0f q/s" % c8)
     if c4:
         p1.hline(c4, "4 nodes' capacity, %.0f q/s" % c4, dy=14)
     p3.hline(warm, "8 nodes with every raw vector local, at %.0f q/s: %.1f ms" % (rate1, warm), dy=14)
@@ -1623,9 +1651,14 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     for p in (p1, p2, p3, p4):
         p.vline(first["trig"], "trigger" if p is p1 else None, "end")
         p.vline(first["flip"], "flip" if p is p1 else None)
-        for i, q in enumerate(per):
-            if q["cleared"]:
-                p.vline(q["cleared"], "backlog cleared" if p is p1 and i == 0 else None)
+        # Labelled in the backlog's panel, whose top is clear once the backlog drains: right of the
+        # last run's line, or left of the first one's where the last is near the right edge (the
+        # legend's side), so that no other run's line crosses the label.
+        cl = sorted(q["cleared"] for q in per if q["cleared"])
+        right = bool(cl) and cl[-1] <= lo + 0.75 * (hi - lo)
+        for i, t in enumerate(cl):
+            mine = p is p2 and i == (len(cl) - 1 if right else 0)
+            p.vline(t, "backlog cleared" if mine else None, "start" if right else "end")
     for q in per:
         p1.line(q["answered"], "c%d" % LAZY)
         p2.line(q["backlog"], "c%d" % LAZY)
@@ -1642,7 +1675,17 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
                else "The Wikipedia queries (the file is shorter than a run: they repeat)" if name == "Wikipedia"
                else "The %s queries" % name,
                rate0, rate1, s1, first["trig"]))
-    if all(q["cleared"] for q in per):
+    done, left = [q for q in per if q["cleared"]], [q for q in per if not q["cleared"]]
+    names = lambda qs: " and ".join(rep_name(q["run"]) for q in qs)  # noqa: E731
+    if done and (left or any(q["steady_mean"] is None for q in done)):
+        # too late for a steady state before the load's end, or not in every repetition
+        text += "Lazy's backlog clears under the load at %s s%s" % (
+            span_of([q["cleared"] for q in done]), " in %s" % names(done) if left else ".")
+        if left:
+            text += "; in %s, %s queries still wait when the load ends." % (
+                names(left), span_of([q["backlog"][-1][1] for q in left]))
+        text += " "
+    elif done:
         still = (", while its new nodes still fetch %s MB/s, and %s MB/s at the load's end" % (rng("rate_from"), rng("rate_to"))
                  if max(q["rate_from"] or 0 for q in per) >= 1 else "; its new nodes have stopped fetching by then")
         # "as warm nodes do" only when it is so (within 15%); else the two numbers
@@ -1674,8 +1717,10 @@ def keepup_all(runs, out, runset, lazy_set):
     """Lazy and copy-then-flip's two baselines until every query is answered, drawn by
     compare_runs.py as the series' other timelines are: offered and answered queries, the backlog
     and the mean latency; the reconfigurations; the data each transferred, per run. Lazy's runs
-    come from lazy_set, a series whose load may go on longer: they come first, so the offered rate
-    drawn is theirs, and the baselines' backlogs fall once their own load stops. Per 5 s windows,
+    come from lazy_set, a series whose load may go on longer: the figure then ends where the
+    baselines' load stops, the last moment the three ran one load (past it a line's backlog
+    balances against its own load). With one load it goes on until every query is answered. Per
+    5 s windows,
     the latency on a log scale (lazy's return to a warm cluster's milliseconds, against minutes),
     and no title or subtitle: a paper figure, whose caption carries them."""
     dirs = (["%s/rep%d/lazy" % (lazy_set, r) for r in (1, 2)] +
@@ -1685,9 +1730,11 @@ def keepup_all(runs, out, runset, lazy_set):
         print("skipped keepup-all.svg (runs missing)")
         return None
     path = os.path.join(out, "keepup-all")
+    ends = sorted({e for e in (load_end(p) for p in paths) if e})
     subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "compare_runs.py")] + paths +
                    ["--labels", ",".join(["lazy"] * 2 + ["copy-then-flip"] * 2 + ["ctf stream-first"] * 2),
-                    "--until", "answer", "--window", "5", "--log-latency", "--title", "", "--out", path],
+                    "--until", "answer" if len(ends) < 2 else "%g" % ends[0],
+                    "--window", "5", "--log-latency", "--title", "", "--out", path],
                    check=True, stdout=subprocess.DEVNULL)
     print("wrote", path + ".svg")
     return path + ".svg"

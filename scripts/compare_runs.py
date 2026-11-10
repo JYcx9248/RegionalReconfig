@@ -33,11 +33,16 @@ that view: what a query sent then waited. The time axis ends where the load stop
 ("DurationSeconds" in the runs' experiment.json; the last query's scheduled time without one),
 so that every line covers the same period: what the cluster answers after it -- a backlog it
 serves only then, as copy-then-flip under overload -- is left out of the figure and the CSV,
-and is in the backlog the figure ends with. --until answer draws on to the last answer. The
+and is in the backlog the figure ends with. --until answer draws on to the last answer, and
+--until SECONDS ends the axis at that time (runs whose loads part later, compared while they ran
+one). The
 means in OUT.json are by the time a query was sent (a query belongs to the period it arrived
 in) and cover every query, the peak window by the figure's windows. With the open-loop load (no "users" in latency.csv) the
 figure has no users panel: it draws the offered rate as a bold dashed line over the answered
-queries per second, and adds the backlog: queries sent and not answered yet. It grows whenever the offered rate exceeds what the cluster answers, and after a
+queries per second, and adds the backlog: queries sent and not answered yet. Lines whose runs ran
+different loads (keepup-all's lazy, held longer than the baselines) each get their own offered
+rate, named by where it stopped; the others in lighter dashes where they leave the first: a line's
+backlog balances against its own load, against 0 once that load has stopped. It grows whenever the offered rate exceeds what the cluster answers, and after a
 scale-out it drains only with the capacity left over -- what a closed loop hides, since its
 users just wait. OUT.json then also has the peak backlog, when it drained, and the queries
 answered later than --slo-ms (failed ones included) among those sent from the first
@@ -75,6 +80,9 @@ W, LEFT, RIGHT, TOP, PLOT_H = 900, 64, 132, 60, 260
 # widest of the usual sans fonts (DejaVu Sans, as rsvg-convert renders it: about 8.1 px a character).
 TITLE_CHARS = 98
 STRIP_ROW, STRIP_GAP = 20, 64  # one strip row per label, below the x axis
+# Another load's offered rate (lines that ran different loads): the offered dashes, lighter. Inline,
+# so that a figure of one load keeps its stylesheet byte for byte.
+ALT_RATE = "stroke-width: 2; opacity: .6"
 
 
 def slots(labels):
@@ -119,6 +127,16 @@ def offered_schedule(d):
     if isinstance(steps, str):
         steps = [x.split(":") for x in steps.split(",") if x]
     return [(0.0, float(load["Rate"]))] + sorted((float(t), float(r)) for t, r in steps)
+
+
+def until_arg(v):
+    """--until: "load", "answer", or seconds since the load started."""
+    if v in ("load", "answer"):
+        return v
+    try:
+        return float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError('want "load", "answer" or seconds, not %r' % v)
 
 
 def rate_at(sched, t):
@@ -311,20 +329,30 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                  flows=None, offered=None, stopped=None):
     """lines: [(label, slot, pooled windows, [reconfigurations of each run], runs)]; users:
     [(t, n)] per window or None; moved: {label: bytes by component, mean over its runs} or {};
-    flows: {label: flow()}; offered: [(t, rate)] per window with the open-loop load, else None
-    (then no backlog panel); stopped: when the load stopped, where the axis ends, or None. One
-    time axis (t_min to span) for every panel."""
+    flows: {label: flow()}; offered: [(name, [(t, rate)] per window)] with the open-loop load, one
+    per load the lines ran, else None (then no backlog panel); stopped: when the load stopped,
+    where the axis ends, or None. One time axis (t_min to span) for every panel."""
     plot_w = W - LEFT - RIGHT
     x = lambda t: LEFT + plot_w * ((t - t_min) / (span - t_min) if span > t_min else 0)
-    panels = []  # (title, unit, height, series [(slot or None, [(t, v)])], dashed legend)
+    panels = []  # (title, unit, height, series [(slot, None or "alt", [(t, v)])], dashed legend)
     if users:
         panels.append(("concurrent users", "users", 70, [(None, users)]))
     # The offered rate goes over the answered ones, on the same axis: the gap between them is how
-    # fast the backlog grows (or drains), which two panels make the reader compare by eye.
+    # fast the backlog grows (or drains), which two panels make the reader compare by eye. A second
+    # load ("alt") is drawn only where it leaves the first, so that it shows where the two part.
+    rate_lines = []
+    for i, (_, pts) in enumerate(offered or []):
+        if i == 0:
+            rate_lines.append((None, pts))
+            continue
+        main = offered[0][1]
+        off = [v != m for (_, v), (_, m) in zip(pts, main)]
+        near = [off[k] or (k > 0 and off[k - 1]) or (k + 1 < len(off) and off[k + 1]) for k in range(len(off))]
+        rate_lines.append(("alt", [(t, v if near[k] else None) for k, (t, v) in enumerate(pts)]))
     panels.append(("offered and answered queries per second" if offered else "answered queries per second", "q/s", 170,
                    [(slot, [(w["t"] + width / 2, w["answered"])
                             for w in flows[label] if w["t"] + width <= span])  # the last window is partial
-                    for label, slot, _, _, _ in lines] + ([(None, offered)] if offered else [])))
+                    for label, slot, _, _, _ in lines] + rate_lines))
     if offered:
         panels.append(("backlog: queries sent, not answered yet", "queries", 120,
                        [(slot, [(w["t"] + width, w["backlog"]) for w in flows[label] if w["t"] + width <= span])
@@ -438,6 +466,20 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         for t, slot in flips:
             svg.append('<line class="flip c%d" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>' % (slot, x(t), y0, x(t), y0 + ph))
         for slot, pts in series:
+            if slot == "alt":  # another load's offered rate, where it leaves the first: a step path per stretch
+                d = []
+                for t, v in pts:
+                    if t < t_min:
+                        continue
+                    if v is None:
+                        if d:
+                            svg.append('<path class="line cu sched" style="%s" d="%s H%.1f"/>' % (ALT_RATE, " ".join(d), x(t)))
+                        d = []
+                        continue
+                    d.append("M%.1f,%.1f" % (x(t), y(v)) if not d else "H%.1f V%.1f" % (x(t), y(v)))
+                if d:
+                    svg.append('<path class="line cu sched" style="%s" d="%s H%.1f"/>' % (ALT_RATE, " ".join(d), x(span)))
+                continue
             cls = ("cu sched" if series[0][0] is not None else "cu") if slot is None else "c%d" % slot
             if slot is None:  # a schedule: steps, not a trend
                 d = []
@@ -483,16 +525,18 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         lx, ly = W - RIGHT + 16, ly0 + 10 + i * 18
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(label)))
-    if offered:
-        lx, ly = W - RIGHT + 16, ly0 + 10 + len(lines) * 18
-        svg.append('<line class="line cu sched" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
-        svg.append('<text class="legend" x="%d" y="%d">offered</text>' % (lx + 22, ly))
+    nrates = len(offered or [])
+    for i, (name, _) in enumerate(offered or []):
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + i) * 18
+        svg.append('<line class="line cu sched"%s x1="%d" y1="%d" x2="%d" y2="%d"/>'
+                   % (' style="%s"' % ALT_RATE if i else "", lx, ly - 4, lx + 16, ly - 4))
+        svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(name)))
     if trig_cls:
-        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + (1 if offered else 0)) * 18
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + nrates) * 18
         svg.append('<line class="line trig cu" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">trigger</text>' % (lx + 22, ly))
     if flips:
-        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + (1 if offered else 0) + (1 if trig_cls else 0)) * 18
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + nrates + (1 if trig_cls else 0)) * 18
         svg.append('<line class="line flip cu" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">flip</text>' % (lx + 22, ly))
 
@@ -570,8 +614,9 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         text = ["%.2f–%.2f s" % (t, t + width)]
         if users and k < len(users) and users[k][1] is not None:
             text.append("users: %d" % users[k][1])
-        if offered and k < len(offered):
-            text.append("offered: %.0f q/s" % offered[k][1])
+        for name, pts in offered or []:
+            if k < len(pts):
+                text.append("%s: %.0f q/s" % (name, pts[k][1]))
         for label, _, win, _, runs in lines:
             w = win[k] if k < len(win) else None
             f = flows[label][k] if k < len(flows[label]) else None
@@ -598,8 +643,9 @@ def main():
     ap.add_argument("--window", type=float, default=0.5, help="window in seconds (default 0.5)")
     ap.add_argument("--latency-at", choices=("answer", "send"), default="answer",
                     help="where a query's latency counts: the window of its answer (default) or of its sending")
-    ap.add_argument("--until", choices=("load", "answer"), default="load",
-                    help="the time axis' end: where the load stopped (default) or the last answer")
+    ap.add_argument("--until", type=until_arg, default="load",
+                    help="the time axis' end: where the load stopped (default), the last answer ('answer'), or "
+                         "seconds since the load started")
     ap.add_argument("--out", help="output path without extension (default: latency-mean next to the runs)")
     ap.add_argument("--title", default="Mean latency over time",
                     help="the title; \"\" for none, and no subtitle either (a paper figure, whose caption carries them)")
@@ -642,10 +688,14 @@ def main():
     last = max(answered_at(r) for _, merged in loaded for r in merged)
     ends = [e for e in (load_end(d) for d in args.runs) if e]
     end = max(ends) if ends else max(merged[-1]["t"] for _, merged in loaded)  # where the load stopped
-    span = last if args.until == "answer" else min(end, last)  # a run cut short ends at its last answer
+    # A run cut short ends at its last answer; --until SECONDS ends every line there.
+    span = last if args.until == "answer" else min(end if args.until == "load" else args.until, last)
     for label, slot, (runs, merged) in zip(labels, chosen, loaded):
         win = windows(merged, args.window, args.latency_at, None if args.until == "answer" else span)
-        flows[label] = flow(merged, args.window, len(win), len(runs))
+        # Cut at a time (--until SECONDS), the queries sent after it are not the figure's: flow
+        # would count them all in its last window. Their answers there came before the cut anyway.
+        flows[label] = flow(merged if isinstance(args.until, str) else [r for r in merged if r["t"] < span],
+                            args.window, len(win), len(runs))
         lines.append((label, slot, win, [rcs for _, rcs in runs], len(runs)))
         s = summarize(label, runs, win, args.window, args.skip)
         if sched and runs[0][1]:
@@ -667,9 +717,27 @@ def main():
     offered = None
     if sched and not users:
         n = max(len(win) for _, _, win, _, _ in lines)
-        # With --until answer a backlog's answers go on after the load stopped: the offered rate is 0 there.
-        offered = [(k * args.window, rate_at(sched, k * args.window) if k * args.window < end else 0.0)
-                   for k in range(n)]
+
+        def rates(s, e):  # per window; with --until answer the answers go on after the load stopped, at 0
+            return [(k * args.window, rate_at(s, k * args.window) if k * args.window < e else 0.0) for k in range(n)]
+        # One offered rate per load the lines ran: its schedule, and where it stopped. A line's backlog
+        # balances against its own load, so lines whose loads differ (keepup-all: lazy held longer
+        # than the baselines) each need theirs: past its load's end a line drains its backlog against 0.
+        loads = []  # [(schedule, end, labels)], the first line's load first
+        for label in labels:  # loads that part only past the axis' end draw as one
+            es = [e for e in (load_end(d) for d in groups[label]) if e]
+            key = (offered_schedule(groups[label][0]) or sched, min(max(es) if es else end, span))
+            hit = next((g for g in loads if (g[0], g[1]) == key), None)
+            if hit:
+                hit[2].append(label)
+            else:
+                loads.append(key + ([label],))
+        if len(loads) == 1:
+            offered = [("offered", rates(sched, end))]
+        else:
+            same = all(s == loads[0][0] for s, _, _ in loads)  # then they differ only in where they stopped
+            offered = [("offered to %s s" % fmt(e) if same else "offered: " + ", ".join(ls), rates(s, e))
+                       for s, e, ls in loads]
     counts = {len(groups[l]) for l in labels}
     subtitle = "per %s ms window: %s" % (fmt(args.window * 1000), "answers and their latency when they came"
                                          if args.latency_at == "answer" else "answers when they came, latency by send time")

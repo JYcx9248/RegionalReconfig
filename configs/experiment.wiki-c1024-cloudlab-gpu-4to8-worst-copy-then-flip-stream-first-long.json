@@ -1,0 +1,83 @@
+{
+  "Comment": "CloudLab c240g5, U11's worst case, copy-then-flip with its stream first (--peer-reads-first) with the load held to 570 s, as 4to8-worst-lazy-long holds lazy's: keepup-all compares the three under one load. With the baselines' load stopping at 360 s, they drained their backlog against no load while lazy still served 1100 q/s. It sends about 594K queries, within the ground truth's first 600K. Otherwise experiment.wiki-c1024-cloudlab-gpu-4to8-worst-copy-then-flip-stream-first.json, with the rates its runs had (C4 742, C8 1466 q/s).",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-worst-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-worst-gt.ibin",
+  "GroundTruthStride": 300,
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000",
+    "--peer-reads-first"
+  ],
+  "NodeResources": {
+    "ReadIOPSPerNode": 40000
+  },
+  "Nodes": 8,
+  "InitialNodes": 4,
+  "Protocol": "copy-then-flip",
+  "TransferRateBytesPerSec": 0,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200,
+    "Rate": "550",
+    "RateSteps": "60:1100",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 570,
+    "WarmupSeconds": 30
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "DataNodes": 8
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.5",
+      "10.10.1.6",
+      "10.10.1.7",
+      "10.10.1.8",
+      "10.10.1.9",
+      "10.10.1.1"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

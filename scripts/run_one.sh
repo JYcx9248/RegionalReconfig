@@ -7,9 +7,10 @@
 # object, other keys overridden: an object merges into the one it overrides ('{"Load": {"Rate":
 # 200}}' changes the rate alone), anything else replaces, null removes; paths in it are relative
 # to the repository. Before the run: the nodes' directories under the work directory are
-# removed (the partitions and the index stay), the page cache is dropped, and with swap on
+# removed (the partitions and the index stay), the page cache is dropped, with swap on
 # vm.swappiness is set to 1 -- at the default 60 the kernel swaps node memory out under
-# page-cache pressure, and a run that swaps in during its load is not comparable. System memory, swap and swap-ins are
+# page-cache pressure, and a run that swaps in during its load is not comparable -- and the
+# weekly fstrim.timer is stopped (a TRIM held a SATA SSD for minutes of a run). System memory, swap and swap-ins are
 # logged every 5 s to OUT_DIR/../mem-<protocol>.log; the last line printed says how many pages
 # were swapped in. The runner's log is OUT_DIR/run_local.log (run_cluster.log); a run that fails prints its end. Dropping the page cache and setting swappiness need root; without it (a shared
 # server) only the run's own files leave the page cache (scripts/evict_cache.py: the work
@@ -18,7 +19,7 @@
 #
 # An experiment with "Hosts" runs on its cluster (scripts/run_cluster.py), which makes the same
 # clean state on every host: it removes the nodes' directories there, and where sudo asks no
-# password (CloudLab) drops the page cache and sets swappiness. This machine, which runs the
+# password (CloudLab) drops the page cache, sets swappiness and stops fstrim.timer. This machine, which runs the
 # controller and the load, is cleaned as above, and its memory is what mem-<protocol>.log logs.
 set -u
 cd "$(dirname "$0")/.."
@@ -52,6 +53,8 @@ if [ "$(id -u)" = 0 ]; then
     sysctl -q -w vm.swappiness=1 && echo "vm.swappiness set to 1"
   fi
   sync; echo 3 > /proc/sys/vm/drop_caches
+  # Ubuntu's weekly fstrim.timer would trim the disks under the run (run_cluster.py, preflight)
+  systemctl stop fstrim.timer fstrim.service 2>/dev/null
 else
   [ -n "$(swapon --noheadings 2>/dev/null)" ] && echo "not root: vm.swappiness stays at $(cat /proc/sys/vm/swappiness)"
   mapfile -t OWN < <(python3 -c "import json,sys; c=json.load(open(sys.argv[1]))

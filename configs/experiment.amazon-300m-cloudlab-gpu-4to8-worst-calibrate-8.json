@@ -1,0 +1,94 @@
+{
+  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the lab server, which has the index's layout map; their ground truth covers every 500th of the first 1M (fusion_gt --base). Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-calibrate-8.json: the 8-node capacity, measured after a scale-out without load (copy-then-flip: about 30 minutes of copy before the ladder). StageTimeout 2h, as there.",
+  "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
+  "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/amazon/vec/corpus-300m.i8bin",
+  "Queries": "/data-ssd/chenxu/amazon/vec/queries-worst-2m.i8bin",
+  "GroundTruth": "/data-ssd/chenxu/amazon/vec/corpus-300m-worst-gt.ibin",
+  "GroundTruthStride": 500,
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/amazon-300m-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--centroid-ratio",
+    "0.01",
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "ReadIOPSPerNode": 40000
+  },
+  "Nodes": 8,
+  "InitialNodes": 4,
+  "Protocol": "copy-then-flip",
+  "StageTimeout": "2h",
+  "TransferRateBytesPerSec": 0,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 128,
+    "N": 200
+  },
+  "Calibrate": {
+    "Rates": [
+      800,
+      1200,
+      1400,
+      1600,
+      1800,
+      2000,
+      2400,
+      2800,
+      3200
+    ],
+    "SecondsPerRate": 30
+  },
+  "RequireSnapshot": true,
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 0,
+      "DataNodes": 8
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.5",
+      "10.10.1.6",
+      "10.10.1.7",
+      "10.10.1.8",
+      "10.10.1.9",
+      "10.10.1.1"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

@@ -287,12 +287,17 @@ def preflight(hosts: list, nodes: int, dirs: list, work: str, ebin: str, cfg: di
         script = "\n".join([
             f"pkill -TERM -f -- {shlex.quote(stale)} && sleep 2; pkill -KILL -f -- {shlex.quote(stale)}",
             # The clean node state scripts/run_one.sh makes on one machine: no node directory an
-            # earlier run left, and where sudo asks no password (CloudLab) an empty page cache and,
+            # earlier run left, and where sudo asks no password (CloudLab) an empty page cache,
             # with swap on, swappiness 1 -- at 60 the kernel swaps node memory out under page-cache
-            # pressure, and a run that swaps in is not comparable.
+            # pressure, and a run that swaps in is not comparable -- and no TRIM of the disks:
+            # Ubuntu's fstrim.timer trims every file system weekly (Monday 00:00 and up to 100 min
+            # later), and on 2026-11-09 it held a c240g5's SSD for 8.6 min of a run, each read
+            # taking 3.5 times as long (a SATA TRIM is not queued: the reads wait behind it).
+            # Stopped, the timer stays so until a reboot; a trim under way stops between chunks.
             *(f"rm -rf {shlex.quote(d)}" for d in node_dirs[h]),
             "if sudo -n true 2>/dev/null; then sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null; "
-            "[ -z \"$(swapon --noheadings 2>/dev/null)\" ] || sudo -n sysctl -q -w vm.swappiness=1; fi",
+            "[ -z \"$(swapon --noheadings 2>/dev/null)\" ] || sudo -n sysctl -q -w vm.swappiness=1; "
+            "sudo -n systemctl stop fstrim.timer fstrim.service 2>/dev/null; fi",
             *(f"mkdir -p {shlex.quote(d)} 2>/dev/null && [ -w {shlex.quote(d)} ] || echo nodir={d}"
               for d in made),
             "command -v rsync >/dev/null 2>&1 && echo rsync=yes",
