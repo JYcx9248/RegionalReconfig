@@ -6,6 +6,15 @@ query stream with no locality at all (internal/design/design.go, U11).
         [--seed 1] [--layout bucket]
     python3 scripts/data/sample_queries.py check --gt GT.ibin --ids QUERIES.fbin.ids [--stride S]
     python3 scripts/data/sample_queries.py join --index DIR --snapshot SNAPDIR --out DIR [--layout bucket]
+    python3 scripts/data/sample_queries.py map --index DIR --partitions DIR [--out DIR] [--layout bucket]
+
+map is for a machine that has the index's page file but not its layout map, such as a cluster's
+control node, which the runbooks give the page file but not the map (1.8 GB at Amazon 300M). Every
+posting in the partitions' segments names its vector's location in the page file (partition.h),
+so together they name every vector's: map writes layout_<layout>.map again from them (into the
+index directory by default), the same file as the index's. It stops when a vector is in no
+posting, when two postings of a vector name different locations, or when two vectors share one.
+It needs numpy, for the billions of postings; the other subcommands only the standard library.
 
 join is for a machine that has the index's layout map but not its page file, such as a
 cluster's control node, which runs on a warmup snapshot. Each node's raw.pages in the snapshot
@@ -28,7 +37,7 @@ check then counts the queries among their own nearest neighbours, as each must b
 to itself is 0. Only a base that holds a vector more than k times leaves one out, and a vector
 held twice can come first with the smaller ID. It exits 1 when fewer than 99% are found.
 
-Standard library only, so that it runs on whichever machine holds the index.
+Standard library only, so that it runs on whichever machine holds the index; map also needs numpy.
 """
 
 import argparse
@@ -175,6 +184,59 @@ def join(args):
           % (out, len(page_of), len(nodes), args.out))
 
 
+def rebuild_map(args):
+    import numpy as np  # 2.4 billion postings at Amazon 300M: no Python loop
+    n = int(read_meta(args.index)["num_vectors"])
+    man = {}
+    with open(os.path.join(args.partitions, "manifest.txt")) as f:
+        for line in f:
+            k, _, v = line.rstrip("\n").partition("=")
+            man[k] = v
+    if man.get("layout") != args.layout:
+        sys.exit("map: the partitions' locations are in layout %r, not %r" % (man.get("layout"), args.layout))
+    page_size, vb, vpp, num_pages = (int(man[k]) for k in ("page_size", "vec_bytes", "vectors_per_page", "num_pages"))
+    unset = np.uint32(0xFFFFFFFF)
+    loc_of = np.full(n, unset, dtype=np.uint32)
+    postings = 0
+    for p in range(int(man["num_partitions"])):
+        path = os.path.join(args.partitions, "part-%05d.seg" % p)
+        with open(path, "rb") as f:  # magic, version, partition, lists; list IDs; offsets; IDs; locations
+            head = f.read(16)
+            if len(head) < 16 or head[:4] != b"RTSG":
+                sys.exit("map: %s is not a segment" % path)
+            version, part, lists = struct.unpack("<3I", head[4:])
+            if version not in (2, 3) or part != p:
+                sys.exit("map: %s: version %d of partition %d" % (path, version, part))
+            f.seek(16 + 4 * lists)
+            m = int(np.fromfile(f, dtype="<u8", count=lists + 1)[-1])
+            ids = np.fromfile(f, dtype="<u4", count=m)
+            locs = np.fromfile(f, dtype="<u4", count=m)
+        if len(locs) != m or (m and (int(ids.max()) >= n or int(locs.max()) >= num_pages * vpp)):
+            sys.exit("map: %s: short, or an ID or a location out of range" % path)
+        had = loc_of[ids]
+        clash = int(((had != unset) & (had != locs)).sum())
+        if clash:
+            sys.exit("map: %s: %d postings name another location for their vector than an earlier one" % (path, clash))
+        loc_of[ids] = locs
+        postings += m
+        print("  %s: %d postings" % (path, m), file=sys.stderr)
+    missing = int((loc_of == unset).sum())
+    if missing:
+        sys.exit("map: %d of the %d vectors are in no posting" % (missing, n))
+    s = np.sort(loc_of)
+    shared = int((s[1:] == s[:-1]).sum())
+    if shared:
+        sys.exit("map: %d locations hold two vectors" % shared)
+    out = os.path.join(args.out or args.index, "layout_%s.map" % args.layout)
+    tmp = out + ".partial"
+    with open(tmp, "wb") as f:  # fusion/layout.h, LayoutMap::Save
+        f.write(struct.pack("<4I2Q", page_size, vb, vpp, 0, n, num_pages))
+        (loc_of // vpp).astype("<u4").tofile(f)
+        (loc_of % vpp).astype("<u2").tofile(f)
+    os.rename(tmp, out)
+    print("%s: every one of the %d vectors' locations, from %d postings in %s" % (out, n, postings, args.partitions))
+
+
 def sample(args):
     meta = read_meta(args.index)
     dtype, dim = meta.get("dtype"), int(meta["dim"])
@@ -258,8 +320,13 @@ def main():
     j.add_argument("--snapshot", required=True, help="the warmup snapshot (n1/raw.pages, n1/raw.pages.present, ...)")
     j.add_argument("--layout", default="bucket")
     j.add_argument("--out", required=True, help="the directory to write vectors_<layout>.bin to, with meta.txt and the map")
+    mp = sub.add_parser("map", help="the layout map again, from the partitions' segments")
+    mp.add_argument("--index", required=True, help="the index directory (meta.txt)")
+    mp.add_argument("--partitions", required=True, help="the partitions (manifest.txt, part-*.seg)")
+    mp.add_argument("--layout", default="bucket")
+    mp.add_argument("--out", help="the directory to write layout_<layout>.map to (default: --index)")
     args = ap.parse_args()
-    {"sample": sample, "check": check, "join": join}[args.cmd](args)
+    {"sample": sample, "check": check, "join": join, "map": rebuild_map}[args.cmd](args)
 
 
 if __name__ == "__main__":

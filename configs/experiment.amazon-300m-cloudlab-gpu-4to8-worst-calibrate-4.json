@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the lab server, which has the index's layout map; their ground truth covers every 500th of the first 1M (fusion_gt --base). Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-calibrate-4.json: the 4-node capacity, the nodes started on the 4-node warmup snapshot. The ladder reaches higher than there: drawn uniformly, the queries spread over the nodes as the data does, where the QAC searches put 1.67 times an even share on the busiest node.",
+  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the control node, from the index's page file and its layout map rebuilt from the partitions (sample_queries.py map); their ground truth covers every 1000th of the first 1M (fusion_gt --index). Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-calibrate-4.json: the 4-node capacity, the nodes started on the 4-node warmup snapshot. The ladder reaches higher than there: drawn uniformly, the queries spread over the nodes as the data does, where the QAC searches put 1.67 times an even share on the busiest node.",
   "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
   "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
   "EngineBin": "engine/build",
@@ -7,7 +7,7 @@
   "Base": "/data-ssd/chenxu/amazon/vec/corpus-300m.i8bin",
   "Queries": "/data-ssd/chenxu/amazon/vec/queries-worst-2m.i8bin",
   "GroundTruth": "/data-ssd/chenxu/amazon/vec/corpus-300m-worst-gt.ibin",
-  "GroundTruthStride": 500,
+  "GroundTruthStride": 1000,
   "SnapshotDir": "/data-ssd/chenxu/warmupdata/amazon-300m-4nodes",
   "Partition": {
     "Generator": "gp",

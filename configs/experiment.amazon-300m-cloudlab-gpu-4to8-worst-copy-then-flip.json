@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the lab server, which has the index's layout map; their ground truth covers every 500th of the first 1M (fusion_gt --base). Set the rates from the two worst-case capacities: Rate about 0.6 x C4 (4to8-worst-calibrate-4), RateSteps 60:about 0.8 x C8 (4to8-worst-calibrate-8), the same in every protocol's file. Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-copy-then-flip.json: 4 -> 8 at 90 s under copy-then-flip. The copy outlasts the load (with the QAC queries it flipped 1636-1768 s after the trigger), and the run keeps what it measured. StageTimeout 2h, as there.",
+  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the control node, from the index's page file and its layout map rebuilt from the partitions (sample_queries.py map); their ground truth covers every 1000th of the first 1M (fusion_gt --index). Set the rates from the two worst-case capacities: Rate about 0.6 x C4 (4to8-worst-calibrate-4), RateSteps 60:about 0.8 x C8 (4to8-worst-calibrate-8), the same in every protocol's file. Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-copy-then-flip.json: 4 -> 8 at 90 s under copy-then-flip. The copy outlasts the load (with the QAC queries it flipped 1636-1768 s after the trigger), and the run keeps what it measured. StageTimeout 2h, as there.",
   "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
   "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
   "EngineBin": "engine/build",
@@ -7,7 +7,7 @@
   "Base": "/data-ssd/chenxu/amazon/vec/corpus-300m.i8bin",
   "Queries": "/data-ssd/chenxu/amazon/vec/queries-worst-2m.i8bin",
   "GroundTruth": "/data-ssd/chenxu/amazon/vec/corpus-300m-worst-gt.ibin",
-  "GroundTruthStride": 500,
+  "GroundTruthStride": 1000,
   "SnapshotDir": "/data-ssd/chenxu/warmupdata/amazon-300m-4nodes",
   "Partition": {
     "Generator": "gp",

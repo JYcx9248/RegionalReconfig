@@ -247,9 +247,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   experiments run 4 → 8 there on 300M of the Amazon corpus's 560M documents
   (`scripts/data/subset_base.py`; at 2 nodes the PQ codes would exceed a P100), on a 4-node
   snapshot made on the control node (`amazon-300m-warmup-4`). Their `4to8-worst-*` files are
-  U11's worst case there: 2M of the base's vectors as queries, drawn on the lab server, which
-  has the index's layout map (`scripts/data/sample_queries.py`), with ground truth for every
-  500th of the first 1M (`fusion_gt --base`). The `*-aliyun-gpu-*`
+  U11's worst case there: 2M of the base's vectors as queries, drawn on the control node from
+  the page file, with the layout map rebuilt from the partitions' segments
+  (`scripts/data/sample_queries.py map`: the control node has no map), and ground truth for every
+  1000th of the first 1M (`fusion_gt --index`). The `*-aliyun-gpu-*`
   experiments are the 2 → 4 runs on Alibaba
   Cloud (one A10 instance per data node at 192.168.1.11 on, user root, a 1 TB ESSD each); their
   control node is a CPU instance of the same Xeon, which builds the CUDA backend with
