@@ -220,6 +220,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   read budget (`"ReadIOPSPerNode"` → `rtier_node --read-iops`, `fusion/read_budget.h`), since
   the cgroup io controller is not delegated; `run_one.sh` evicts only the run's own files
   (`scripts/evict_cache.py`).
+- **No experiment limits reads** since 2026-11-12 (the CloudLab files dropped their 40K budget):
+  a node still counts its device reads (stats `reads`: `charged`, `peer`), and copy-then-flip's
+  stream-first baseline (`--peer-reads-first`) orders them without a rate: at most `--io-depth`
+  reads at the device at once, a peer's let in before the node's own. The runs before used the
+  budget, and stream-first then ordered the budget's queue.
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
   controller and the load generator; it checks every host and leaves it clean (no earlier
   node directory; where sudo asks no password, an empty page cache, swappiness 1 and Ubuntu's

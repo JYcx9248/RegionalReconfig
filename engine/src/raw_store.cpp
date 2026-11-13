@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <optional>
 
 #include "fusion/partition.h"  // Crc32
 #include "fusion/read_budget.h"
@@ -54,10 +55,18 @@ void PreadAll(int fd, uint8_t* p, size_t n, uint64_t off, const std::string& pat
 }
 
 // Reads n bytes only if the page cache holds them all (RWF_NOWAIT fails with EAGAIN instead of
-// reading the device): a read budget charges only the reads that miss.
+// reading the device): a read budget counts only the reads that miss.
 bool PreadCached(int fd, uint8_t* p, size_t n, uint64_t off) {
   iovec iov{p, n};
   return ::preadv2(fd, &iov, 1, static_cast<off_t>(off), RWF_NOWAIT) == static_cast<ssize_t>(n);
+}
+
+// Device reads, admitted to a data node's budget when the store has one (fusion/read_budget.h):
+// their turn, the rate and the count. Held while the reads run.
+std::optional<ReadBudget::Admission> Admit(ReadBudget* b, uint64_t reads, ReadClass c) {
+  std::optional<ReadBudget::Admission> a;
+  if (b && reads) a.emplace(b->Admit(reads, c));
+  return a;
 }
 
 // Device reads one Get keeps in flight: enough for a query's misses at one holder (at most its N
@@ -426,7 +435,7 @@ void RawStore::PutPages(const uint32_t* locs, const uint8_t* vecs, const std::ve
       }
     }
     if (!reads.empty()) {
-      if (budget_) budget_->Charge(reads.size());
+      const auto a = Admit(budget_, reads.size(), ReadClass::kOwn);
       io_->Run(false, reads.data(), read_bufs.data(), static_cast<uint32_t>(reads.size()), path_);
     }
     for (size_t k = 0; k < pages.size(); ++k)
@@ -503,22 +512,24 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
     const size_t end = std::min(runs.size(), w + kReadsInFlight);
     // A page holds several runs where the asked vectors on it are not adjacent, and they come
     // in a row (runs are sorted): once one has started the page's read, the others wait for it
-    // in their own read, neither probed (the page is not in the cache yet) nor charged again.
+    // in their own read, neither probed (the page is not in the cache yet) nor counted again.
+    std::vector<size_t> device;  // the runs whose page the device reads: one device read each
     uint32_t started = UINT32_MAX;
     for (size_t k = w; k < end; ++k) {
       Run& r = runs[k];
       if (r.page == started) continue;
-      if (budget_) {
-        if (PreadCached(fd_, got.data() + r.first * vb, r.count * vb, r.off)) {
-          r.here = true;
-          continue;
-        }
-        budget_->Charge(1, ReadClass::kPeer);  // one device read per page, for a peer (RAW_GET)
+      if (budget_ && PreadCached(fd_, got.data() + r.first * vb, r.count * vb, r.off)) {
+        r.here = true;
+        continue;
       }
-      // Only a hint: if it fails, the read below waits out the device alone.
-      ::posix_fadvise(fd_, static_cast<off_t>(r.off), static_cast<off_t>(r.count * vb), POSIX_FADV_WILLNEED);
+      device.push_back(k);
       started = r.page;
     }
+    // A peer's reads (RAW_GET), admitted together: with --peer-reads-first they go to the device
+    // ahead of the node's own.
+    const auto a = Admit(budget_, device.size(), ReadClass::kPeer);
+    for (size_t k : device)  // only a hint: if it fails, the read below waits out the device alone
+      ::posix_fadvise(fd_, static_cast<off_t>(runs[k].off), static_cast<off_t>(runs[k].count * vb), POSIX_FADV_WILLNEED);
     for (size_t k = w; k < end; ++k)
       if (!runs[k].here) PreadAll(fd_, got.data() + runs[k].first * vb, runs[k].count * vb, runs[k].off, path_);
   }

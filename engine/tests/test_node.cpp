@@ -2126,6 +2126,43 @@ void TestReadBudget() {
     CHECK(since(t0) >= 0.19);
   }
   {
+    // No rate, no order: the reads are counted, by class, and nothing waits.
+    ReadBudget b(0, false, 1);
+    const ReadBudget::Admission x = b.Admit(5);
+    const auto t0 = Clock::now();
+    const ReadBudget::Admission y = b.Admit(3, ReadClass::kPeer);
+    b.Charge(2);
+    const ReadBudgetStats st = b.Stats();
+    CHECK(since(t0) < 0.05 && st.reads_per_sec == 0 && st.depth == 0 && st.charged == 10 && st.peer == 3 &&
+          st.wait_us == 0);
+  }
+  {
+    // Peers first with no rate: one read at the device at once (depth 1), and a peer's read goes in
+    // ahead of an own read that waited longer. The own read goes in once the peer's is done.
+    ReadBudget b(0, true, 1);
+    std::atomic<int> seq{0};
+    int own_at = 0, peer_at = 0;
+    auto held = std::make_unique<ReadBudget::Admission>(b.Admit(4));  // more than the depth: all of it
+    std::thread own([&] {
+      const ReadBudget::Admission a = b.Admit(1);
+      own_at = ++seq;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::thread peer([&] {
+      const ReadBudget::Admission a = b.Admit(1, ReadClass::kPeer);
+      peer_at = ++seq;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));  // at the device a while
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool both_waited = seq.load() == 0;
+    held.reset();
+    own.join();
+    peer.join();
+    const ReadBudgetStats st = b.Stats();
+    CHECK(both_waited && peer_at == 1 && own_at == 2 && st.depth == 1 && st.charged == 6 && st.peer == 1 &&
+          st.wait_us >= 100000);
+  }
+  {
     RawLayout L;
     L.vec_bytes = 1000;
     L.vectors_per_page = 4;
@@ -2217,9 +2254,10 @@ void TestReadBudget() {
       const uint32_t nb = ref->SearchLocal(0, q, sp, ib.data(), db.data(), &qb);
       same = same && na == nb && ia == ib && da == db;
     }
-    const ReadBudgetStats rs = node->read_budget_stats();
-    CHECK(same && rs.reads_per_sec == 2000 && rs.charged > 400 && rs.wait_us > 0 &&
-          ref->read_budget_stats().charged == 0 && ref->read_budget_stats().reads_per_sec == 0);
+    // A node with no rate counts its reads too: the same reads, none of them waited for.
+    const ReadBudgetStats rs = node->read_budget_stats(), rr = ref->read_budget_stats();
+    CHECK(same && rs.reads_per_sec == 2000 && rs.charged > 400 && rs.wait_us > 0 && rr.reads_per_sec == 0 &&
+          rr.charged == rs.charged && rr.wait_us == 0);
   }
 }
 

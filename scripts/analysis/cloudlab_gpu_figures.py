@@ -6,6 +6,7 @@ the runs' experiment.json.
 
     python3 scripts/analysis/cloudlab_gpu_figures.py [--runs results/cloudlab-gpu] [--out results/cloudlab-gpu-figures/SERIES]
         [--series 4to8] [--calibrations 4to8] [--before SERIES] [--fetch-bound-mb 2048] [--drained] [--lazy-series SERIES]
+        [--window 5]
 
 The runs directory is what came back from the control node (the runbook's section 8); the
 figures go to a directory of their own, so that copying the runs again leaves them alone: by
@@ -22,7 +23,8 @@ into --out:
   4to8.svg, 4to8-rep1.svg, 4to8-rep2.svg, 4to8to4.svg
                     compare_runs.py: lazy against copy-then-flip (the repetitions pooled, then
                     each one that ran both), and 4 -> 8 -> 4 under lazy; a .csv and a .json beside
-                    each
+                    each. Every compare_runs.py timeline is drawn per --window seconds (WINDOW,
+                    5 s): its own default, 0.5 s, draws minutes of load as noise
   4to8-stream-first.svg
                     with rep1/ and rep2/ copy-then-flip-stream-first: lazy, copy-then-flip, and
                     copy-then-flip whose stream the queries yield to (--peer-reads-first)
@@ -59,8 +61,8 @@ into --out:
                     backlog, the latency against 8 warm nodes', and the raw vectors fetched against
                     what copy-then-flip copies (calibrate-8)
   keepup-all.svg    lazy and copy-then-flip's two baselines until every query is answered, as
-                    compare_runs.py draws them (per 5 s, the latency on a log scale, no title: a
-                    paper figure); with --lazy-series, lazy's runs from a series with a longer load
+                    compare_runs.py draws them (per --window, the latency on a log scale, no title:
+                    a paper figure); with --lazy-series, lazy's runs from a series with a longer load
   NAME-drained.svg  with --drained: each compare_runs.py timeline again, past the load's end until
                     every query is answered (compare_runs.py --until answer), for a series whose
                     backlogs outlast the load
@@ -88,6 +90,10 @@ LAZY, CTF = FIXED_SLOT["lazy"], FIXED_SLOT["copy-then-flip"]
 # (OKLab dE x 100: 35.8 / 26.6 at worst in light, 24.6 / 9.4 in dark), where four nodes in
 # four slots would not (green against pink: 1.6 in dark); the other nodes are context, in grey.
 HOT_A, HOT_B = 2, 6
+# Seconds per point of the compare_runs.py timelines and keepup-all.svg (--window). compare_runs.py's
+# own default, 0.5 s, suits the end-to-end tests' seconds; minutes of load at hundreds of queries a
+# second it draws as noise.
+WINDOW = 5.0
 CTX = ("#bdbcb4", "#6e6d66")      # context lines: apart from both highlights (dE >= 18 / 15)
 # copy-then-flip whose stream goes first: the slot compare_runs.py gives its label in
 # 4to8-stream-first.svg, the first one free after lazy's and copy-then-flip's.
@@ -143,6 +149,13 @@ def lead_run(runs, runset):
     the same): its first lazy run, else its first copy-then-flip run."""
     rs = reps(runs, runset, "lazy", "experiment.json") + reps(runs, runset, "copy-then-flip", "experiment.json")
     return rs[0] if rs else os.path.join(runs, runset, "rep1", "lazy")
+
+
+def read_budget(run):
+    """The data nodes' read budget a run had (NodeResources.ReadIOPSPerNode, reads/s), 0 for none:
+    no experiment has set one since 2026-11-12, and the nodes then count their reads unlimited."""
+    res = load_json(os.path.join(run, "experiment.json")).get("NodeResources") or {}
+    return int(res.get("ReadIOPSPerNode") or 0)
 
 
 def rep_name(run):
@@ -495,9 +508,10 @@ def compare_specs(runs, runset, before=None):
     return specs
 
 
-def timelines(runs, out, specs, until="load"):
-    """compare_runs.py's timelines. until "answer": past the load's end until every query is
-    answered, the backlogs drained, as NAME-drained.svg beside the ones cut at the load's end."""
+def timelines(runs, out, specs, until="load", window=WINDOW):
+    """compare_runs.py's timelines, per window seconds. until "answer": past the load's end until
+    every query is answered, the backlogs drained, as NAME-drained.svg beside the ones cut at the
+    load's end."""
     for name, title, dirs, labels, slots, *more in specs:
         paths = [os.path.join(runs, d) for d in dirs]
         if not all(os.path.exists(os.path.join(p, "latency.csv")) for p in paths):
@@ -505,7 +519,7 @@ def timelines(runs, out, specs, until="load"):
             continue
         name += "-drained" if until == "answer" else ""
         cmd = [sys.executable, os.path.join(os.path.dirname(HERE), "compare_runs.py")] + paths + \
-              ["--out", os.path.join(out, name), "--title", title, "--until", until]
+              ["--out", os.path.join(out, name), "--title", title, "--until", until, "--window", "%g" % window]
         if labels:
             cmd += ["--labels", labels]
         if slots:
@@ -565,15 +579,20 @@ def capacity(runs, out, runset, calibrations):
     time_axis(svg, p2, p2.y0 + p2.ph, *xr, label="offered queries per second (Poisson arrivals)")
     svg.legend(W - RIGHT + 16, p1.y0 + 10, [(l, "c%d" % s, "line") for l, s, _ in cals])
     shares = [read_shares(os.path.join(runs, calibrations, c)) for c in ("calibrate-4", "calibrate-8")]
-    budget = next((sh["budget"] for sh in shares if sh), 0)
+    budget = read_budget(os.path.join(runs, calibrations, "calibrate-4"))
     text = "The plateau is the mean of the last three steps. "
-    if all(shares):
+    if all(shares) and budget:
         text += ("A query re-ranks %.0f candidates in %.0f page reads. The busiest node's budget of %s reads/s bounds "
                  "every step (node_reads.py): it takes %.0f%% of the reads on 4 nodes and %.0f%% on 8, %.2f and %.2f "
                  "times an even share, which predicts %.0f and %.0f q/s. "
                  % (shares[0]["cands"], shares[0]["pages"], "{:,}".format(budget), 100 * shares[0]["top"],
                     100 * shares[1]["top"], 4 * shares[0]["top"], 8 * shares[1]["top"], shares[0]["predicted"],
                     shares[1]["predicted"]))
+    elif all(shares):  # no read limit: what bounds a step is the busiest node's device, or more
+        text += ("A query re-ranks %.0f candidates in %.0f page reads. The busiest node takes %.0f%% of the reads on 4 "
+                 "nodes and %.0f%% on 8, %.2f and %.2f times an even share (node_reads.py). "
+                 % (shares[0]["cands"], shares[0]["pages"], 100 * shares[0]["top"], 100 * shares[1]["top"],
+                    4 * shares[0]["top"], 8 * shares[1]["top"]))
     text += ("8 nodes carry %.2f times what 4 carry. The runs offer %.0f q/s, then %.0f: above 4 nodes' capacity, "
              "below 8 nodes'." % (plateaus[1] / plateaus[0], lo_rate, hi_rate))
     notes = textwrap.wrap(text, 100)
@@ -581,7 +600,8 @@ def capacity(runs, out, runset, calibrations):
         svg.text(LEFT, p2.y0 + p2.ph + 62 + 15 * i, n, "note")
     load = load_json(os.path.join(runs, calibrations, "calibrate-4", "experiment.json")).get("Load", {})
     return svg.save(out, "capacity.svg", p2.y0 + p2.ph + 62 + 15 * len(notes) + 10,
-                    "Capacity on CloudLab c240g5: 4 and 8 nodes, %s reads/s per node" % "{:,}".format(budget or 40000),
+                    "Capacity on CloudLab c240g5: 4 and 8 nodes, %s"
+                    % ("%s reads/s per node" % "{:,}".format(budget) if budget else "no read limit"),
                     "the calibrations: 30 s per offered rate, the same queries (NProbe %s, N %s, k %s); "
                     "8 nodes after copy-then-flip moved every raw vector"
                     % (load.get("NProbe", "?"), load.get("N", "?"), load.get("K", "?")))
@@ -1295,7 +1315,14 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
     pw = W - LEFT - RIGHT
     row, gap = 16, 2
     y = 94
-    budget = 40000
+    budget = read_budget(runs_[0][1])
+    scale = budget  # the colour scale's end: the budget, else the busiest node's rate in round steps
+    if not scale:
+        top = max((v for _, run in runs_ for n in nodes
+                   for _, v in rates(series(jsonl(os.path.join(run, "stats-%s.jsonl" % n)), "reads.charged", load_start(run)),
+                                     lo, hi, step) if v is not None), default=0)
+        unit = 1000 * len(HEAT[0])
+        scale = max(unit, math.ceil(top / unit) * unit)
     p = None
     for rel, run in runs_:
         t0 = load_start(run)
@@ -1313,7 +1340,7 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
             for t, v in rs:
                 if v is None:
                     continue
-                k = min(len(HEAT[0]) - 1, int(v / (budget / len(HEAT[0]))))
+                k = min(len(HEAT[0]) - 1, int(v / (scale / len(HEAT[0]))))
                 svg.add('<rect class="h%d" x="%.1f" y="%.1f" width="%.1f" height="%d"><title>%s, %.0f–%.0f s: %s reads/s</title></rect>'
                         % (k, p.x(t - step / 2), ry, p.x(t + step / 2) - p.x(t - step / 2) - 0.6, row,
                            n, t - step / 2, t + step / 2, "{:,.0f}".format(v)))
@@ -1333,24 +1360,30 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
             p.vline(e, "new entries" if i == 0 else None, above=True)
         time_axis(svg, p, y + ph, lo, hi)
         y += ph + 80
-    # the colour bar: 5K steps up to the budget
+    # the colour bar: 8 steps up to the scale's end (the budget, 5K steps at 40K/s)
     bx, by = W - RIGHT + 16, 94
     svg.text(bx, by - 6, "reads/s", "legend")
     for k in range(len(HEAT[0])):
         yy = by + k * 14
         svg.add('<rect class="h%d" x="%d" y="%d" width="14" height="12" rx="2"/>' % (len(HEAT[0]) - 1 - k, bx, yy))
-        lo_k = budget / len(HEAT[0]) * (len(HEAT[0]) - 1 - k)
-        svg.text(bx + 22, yy + 10, ("≥ %s" % fmt_k(lo_k)) if k == 0 else "%s–%s" % (fmt_k(lo_k), fmt_k(lo_k + budget / len(HEAT[0]))), "legend")
-    svg.text(bx, by + 14 * len(HEAT[0]) + 14, "budget 40K/s", "legend")
+        lo_k = scale / len(HEAT[0]) * (len(HEAT[0]) - 1 - k)
+        svg.text(bx + 22, yy + 10, ("≥ %s" % fmt_k(lo_k)) if k == 0 else "%s–%s" % (fmt_k(lo_k), fmt_k(lo_k + scale / len(HEAT[0]))), "legend")
+    svg.text(bx, by + 14 * len(HEAT[0]) + 14, "budget %s/s" % fmt_k(budget) if budget else "no read limit", "legend")
     if all(events(run)[1] > hi for _, run in runs_):
         notes = textwrap.wrap("n1-n4 hold the data from the start; n5-n8 join at the flip, which comes after the "
                               "load's end under every protocol here: through the load the initial nodes carry every "
-                              "query, and those at their budget bound the capacity.", 108)
-    else:
+                              "query, and %s the capacity."
+                              % ("those at their budget bound" if budget else "the busiest of them bounds"), 108)
+    elif budget:
         notes = ["n1-n4 hold the data from the start; n5-n8 join at the flip. Under lazy, the new nodes take the reads as",
                  "their fetches warm them up; a node at the end of the scale is at its budget and bounds the capacity.",
                  "Under copy-then-flip, the new nodes serve nothing before the flip: the initial nodes carry the queries",
                  "and the raw stream on one budget."]
+    else:
+        notes = textwrap.wrap("n1-n4 hold the data from the start; n5-n8 join at the flip. Under lazy, the new nodes take "
+                              "the reads as their fetches warm them up; the busiest node bounds the capacity. Under "
+                              "copy-then-flip, the new nodes serve nothing before the flip: the initial nodes carry the "
+                              "queries and the raw stream on one device.", 108)
     if len(runs_) > 2:
         notes += textwrap.wrap("With the stream first, the stream's reads go ahead of the queries' (ctf-budget.svg "
                                "splits them) until the flip at %.0f s; then the new nodes take their share."
@@ -1358,8 +1391,11 @@ def node_reads(runs, out, runset, lo=30.0, hi=360.0, step=5.0):
     for i, n in enumerate(notes):
         svg.text(LEFT, y - 24 + 15 * i, n, "note")
     return svg.save(out, "node-reads.svg", y + 15 * len(notes) - 14,
-                    "Reads per second charged to each node's budget, per 5 s",
-                    "the same queries in every run; the colour scale ends at the budget, 40,000 reads/s")
+                    "Reads per second charged to each node's budget, per 5 s" if budget
+                    else "Device reads per second on each node, per 5 s",
+                    "the same queries in every run; the colour scale ends at %s"
+                    % ("the budget, %s reads/s" % "{:,}".format(budget) if budget
+                       else "%s reads/s, round above the busiest node's (no read limit)" % "{:,}".format(scale)))
 
 
 def calibration_trigger(run):
@@ -1713,7 +1749,7 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
                     % ("both repetitions" if len(per) == 2 else ", ".join(rep_name(q["run"]) for q in per)))
 
 
-def keepup_all(runs, out, runset, lazy_set):
+def keepup_all(runs, out, runset, lazy_set, window=WINDOW):
     """Lazy and copy-then-flip's two baselines until every query is answered, drawn by
     compare_runs.py as the series' other timelines are: offered and answered queries, the backlog
     and the mean latency; the reconfigurations; the data each transferred, per run. Lazy's runs
@@ -1734,7 +1770,7 @@ def keepup_all(runs, out, runset, lazy_set):
     subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "compare_runs.py")] + paths +
                    ["--labels", ",".join(["lazy"] * 2 + ["copy-then-flip"] * 2 + ["ctf stream-first"] * 2),
                     "--until", "answer" if len(ends) < 2 else "%g" % ends[0],
-                    "--window", "5", "--log-latency", "--title", "", "--out", path],
+                    "--window", "%g" % window, "--log-latency", "--title", "", "--out", path],
                    check=True, stdout=subprocess.DEVNULL)
     print("wrote", path + ".svg")
     return path + ".svg"
@@ -1754,13 +1790,15 @@ def main():
                     "against --series' copy-then-flip runs (default: --series)")
     ap.add_argument("--drained", action="store_true",
                     help="also draw each timeline until every query is answered, the backlogs drained (NAME-drained.svg)")
+    ap.add_argument("--window", type=float, default=WINDOW,
+                    help="seconds per point of the compare_runs.py timelines and keepup-all.svg (default %g)" % WINDOW)
     args = ap.parse_args()
     args.out = args.out or os.path.join("results/cloudlab-gpu-figures", args.series)
     os.makedirs(args.out, exist_ok=True)
     specs = compare_specs(args.runs, args.series, args.before)
-    timelines(args.runs, args.out, specs)
+    timelines(args.runs, args.out, specs, window=args.window)
     if args.drained:
-        timelines(args.runs, args.out, specs, until="answer")
+        timelines(args.runs, args.out, specs, until="answer", window=args.window)
     made = [capacity(args.runs, args.out, args.series, args.calibrations),
             lazy_fetch(args.runs, args.out, args.series, args.calibrations, args.fetch_bound_mb),
             lazy_stall(args.runs, args.out, args.series),
@@ -1770,7 +1808,7 @@ def main():
             ctf_stream(args.runs, args.out, args.series, args.calibrations),
             ctf_budget(args.runs, args.out, args.series),
             lazy_keepup(args.runs, args.out, args.series, args.calibrations),
-            keepup_all(args.runs, args.out, args.series, args.lazy_series or args.series)]
+            keepup_all(args.runs, args.out, args.series, args.lazy_series or args.series, args.window)]
     made += [os.path.join(args.out, spec[0] + suffix + ".svg") for spec in specs
              for suffix in ("", "-drained") if suffix == "" or args.drained]
     if shutil.which("rsvg-convert"):

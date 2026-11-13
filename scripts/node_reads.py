@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Where a run's reads went, per data node and window: what each node's read budget charged
-(stats-<node>.jsonl, "reads"), how long its readers waited for the budget, and what the whole
+"""Where a run's reads went, per data node and window: each node's device reads (stats-<node>.jsonl,
+"reads", counted with or without a read budget), how long its readers waited for a budget or, with
+--peer-reads-first, for their turn, and what the whole
 data disk served (cgroups.jsonl "host" records: everyone's reads, other users' included). On a
 cluster (run_cluster.py) each node has a disk of its own: its host's ("<node>-host" records).
 
@@ -12,8 +13,9 @@ one sets the cluster's capacity) and, with GPUs, the GPUs' peak utilization and 
     python3 scripts/node_reads.py results/wiki-gpu/calibrate-4 [--window 20] [--last 320]
 
 Times are seconds from the load's start (clock.json) when the run has one, else from the end
-(calibration runs). Needs runs with --read-iops for the per-node columns; the disk columns need
-"NodeResources" on one machine, the agents' samples on a cluster (cgroups.jsonl).
+(calibration runs). The per-node columns need the reads counted: every run since 2026-11-12, and
+before it only runs with --read-iops. The disk columns need "NodeResources" on one machine, the
+agents' samples on a cluster (cgroups.jsonl).
 """
 
 import argparse
@@ -108,7 +110,7 @@ def main() -> None:
     total = {n: st[n][-1]["reads"]["charged"] - st[n][0]["reads"]["charged"] for n in names}
     all_reads = sum(total.values())
     budget = st[names[0]][-1]["reads"]["budget"]
-    print(f"\nreads per node over the run (budget {budget}/s each): " +
+    print(f"\nreads per node over the run ({f'budget {budget}/s each' if budget else 'no read limit'}): " +
           ", ".join(f"{n} {total[n]:,} ({total[n] / all_reads:.0%})" for n in names if all_reads))
     gpus = {}
     # A cluster's hosts number their GPUs alike: each is named with its node there.

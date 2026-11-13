@@ -303,14 +303,13 @@ class NodeEngineImpl : public NodeEngine {
     raw_layout.num_pages = std::max<uint64_t>(raw_layout.num_pages, o.max_pages);
     FUSION_CHECK(!o.raw_reuse || !o.raw_file.empty(), "raw vectors to reuse need their file (--raw-file)");
     raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io, o.raw_reuse);
-    if (o.read_iops) {
-      budget_ = std::make_unique<ReadBudget>(o.read_iops, o.peer_reads_first);
-      raw_->SetReadBudget(budget_.get());
-    }
+    // Every device read is counted; with --peer-reads-first, at most --io-depth are at the device
+    // at once, peers' first; only --read-iops limits their rate (fusion/read_budget.h).
+    budget_ = std::make_unique<ReadBudget>(o.read_iops, o.peer_reads_first, o.io_depth);
+    raw_->SetReadBudget(budget_.get());
     for (int i = 0; i < o.num_workers; ++i) {
       auto w = std::make_unique<Worker>();
-      w->reader = MakePageReader(raw_->pages(), o.io, o.io_depth);
-      if (budget_) w->reader = ChargedPageReader(std::move(w->reader), budget_.get());
+      w->reader = ChargedPageReader(MakePageReader(raw_->pages(), o.io, o.io_depth), budget_.get());
       w->scratch = std::make_unique<RerankScratch>(o.max_rerank, man.raw.page_size);
       w->qf.resize(dim_);
       w->locs.resize(o.max_rerank);
@@ -1819,9 +1818,12 @@ class NodeEngineImpl : public NodeEngine {
                    raw.present * raw.vec_bytes / mb, (unsigned long long)raw.pending,
                    layout_name_.c_str(), raw_->path().c_str(),
                    raw_->pages().direct() ? "direct" : "buffered");
-    if (budget_)
-      s += StrFormat("  read budget      : %llu device reads/s%s\n", (unsigned long long)opts_.read_iops,
-                     opts_.peer_reads_first ? ", peers' first" : "");
+    if (opts_.read_iops || opts_.peer_reads_first)
+      s += StrFormat("  device reads     : %s%s\n",
+                     opts_.read_iops ? StrFormat("%llu a second", (unsigned long long)opts_.read_iops).c_str()
+                                     : "no limit",
+                     opts_.peer_reads_first ? StrFormat(", peers' first, %u at the device at once", opts_.io_depth).c_str()
+                                            : "");
     s += StrFormat("  workers          : %d, max candidates/request %u\n", num_workers(),
                    max_candidates_);
     return s;

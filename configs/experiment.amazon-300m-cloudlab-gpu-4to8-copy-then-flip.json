@@ -35,9 +35,6 @@
     "--max-rerank",
     "1000"
   ],
-  "NodeResources": {
-    "ReadIOPSPerNode": 40000
-  },
   "Nodes": 8,
   "InitialNodes": 4,
   "Protocol": "copy-then-flip",

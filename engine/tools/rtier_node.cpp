@@ -44,14 +44,17 @@ static void Usage() {
                          pq_codes.bin, which a node opens only to read a code from it
   --layout L             bucket | id (default: the layout the partitions were written for)
   --io B                 auto | uring | aio | pread (default auto)
-  --io-depth D           (default 64)
+  --io-depth D           (default 64): each reader's queue depth, and with --peer-reads-first the
+                         device reads the node has at the device at once
   --no-direct            buffered instead of O_DIRECT reads
   --read-iops N          device reads per second this node may issue (default 0 = no limit): a
                          node's own share of an SSD that several nodes use, where no cgroup can
-                         set one (fusion/read_budget.h says what is charged)
-  --peer-reads-first     the reads served to other nodes (RAW_GET) go before this node's own,
-                         whose queries get what a transfer leaves: a baseline, copy-then-flip
-                         whose stream goes first (fusion/read_budget.h)
+                         set one (fusion/read_budget.h says what counts as a read)
+  --peer-reads-first     the reads served to other nodes (RAW_GET) go to the device before this
+                         node's own, whose queries get what a transfer leaves: a baseline,
+                         copy-then-flip whose stream goes first. Needs no --read-iops: at most
+                         --io-depth reads at the device at once, a peer's let in first
+                         (fusion/read_budget.h)
   --max-vectors N        vector-ID space, with room for inserted vectors (U14; default: the
                          index's vectors)
   --max-pages N          page-file pages, with room for inserted vectors' locations (default: the

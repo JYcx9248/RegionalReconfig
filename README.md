@@ -463,7 +463,9 @@ node and its agent are pinned to their CPUs with `taskset` and run in a user sco
 `"IOReadIOPSMax"` fails; `"ReadIOPSPerNode": 40000` gives each data node a read budget of its
 own instead (`rtier_node --read-iops`, `engine/include/fusion/read_budget.h`): it charges
 re-ranking's page reads, the pages the fetch writer reads back and the `RAW_GET` reads the page
-cache misses, as io.max would, and works as root too. The kernel's read-ahead is not charged:
+cache misses, as io.max would, and works as root too. A node counts these reads with or without
+a budget (stats `reads`), and no experiment sets one since 2026-11-12: on a cluster each node has
+a device of its own. The kernel's read-ahead is not charged:
 scattered vectors get none, a stream's sorted batches some (`engine/README.md`, known limits). Checked against io.max on BIGANN-10M
 (lazy, 2 → 3 nodes at 40K reads/s each, open loop 400 → 700 q/s): the same capacity (625 q/s
 on 2 nodes), flip time, latency below capacity and backlog, and the reads it charged matched the

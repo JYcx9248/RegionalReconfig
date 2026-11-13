@@ -1174,10 +1174,11 @@ std::string NodeServer::FetchJson() const {
 std::string NodeServer::StatsJson() const {
   const fusion::ReadBudgetStats r = engine_->read_budget_stats();
   return "{\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() +
-         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"charged\":%llu,\"wait_us\":%llu}"
+         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"depth\":%u,\"charged\":%llu,\"peer\":%llu,\"wait_us\":%llu}"
                            ",\"raw_bytes\":{\"sent\":%llu,\"received\":%llu}}",
-                           static_cast<unsigned long long>(r.reads_per_sec),
+                           static_cast<unsigned long long>(r.reads_per_sec), r.depth,
                            static_cast<unsigned long long>(r.charged),
+                           static_cast<unsigned long long>(r.peer),
                            static_cast<unsigned long long>(r.wait_us),
                            static_cast<unsigned long long>(raw_sent_.load(std::memory_order_relaxed)),
                            static_cast<unsigned long long>(raw_received_.load(std::memory_order_relaxed)));
