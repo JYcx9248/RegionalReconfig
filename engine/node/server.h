@@ -30,7 +30,7 @@
 
 namespace rtier {
 
-// Connections to other data nodes, for RAW_GET. Idle connections are kept per address; a
+// Connections to other data nodes, for RAW_GET (and RAW_BITMAP). Idle connections are kept per address; a
 // request takes one, or opens one, for its duration. Thread-safe.
 class PeerPool {
  public:
@@ -42,8 +42,13 @@ class PeerPool {
   // Fetches n raw vectors (vec_bytes each, in the order of locs) from the data node at addr
   // ("host:port") into out. Throws std::runtime_error on failure.
   void RawGet(const std::string& addr, const uint32_t* locs, size_t n, uint32_t vec_bytes, uint8_t* out);
+  // The presence bitmap of the data node at addr (its RAW_BITMAP), for lazy-balanced's choice of
+  // holder (fusion::NodeEngine::LoadHolderBitmaps). Throws std::runtime_error on failure.
+  std::vector<uint64_t> RawBitmap(const std::string& addr);
 
  private:
+  // One request on a pooled connection; throws on failure or a status other than OK.
+  Frame Call(const std::string& addr, Frame req, const char* name);
   int Take(const std::string& addr);
   void Give(const std::string& addr, int fd);
 

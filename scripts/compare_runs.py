@@ -86,7 +86,7 @@ PALETTE = [("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"
            ("#eda100", "#c98500"), ("#e87ba4", "#d55181"), ("#008300", "#008300"),
            ("#4a3aa7", "#9085e9"), ("#e34948", "#e66767")]
 # A protocol keeps its colour in every figure, whichever runs are compared.
-FIXED_SLOT = {"lazy": 0, "copy-then-flip": 1, "stop-and-copy": 2, "lazy-stream": 3}
+FIXED_SLOT = {"lazy": 0, "copy-then-flip": 1, "stop-and-copy": 2, "lazy-stream": 3, "lazy-balanced": 4}
 
 W, LEFT, RIGHT, TOP, PLOT_H = 900, 64, 132, 60, 260
 # A title longer than this wraps: about what fits across the figure at 14 px, semibold, in the

@@ -66,6 +66,7 @@ const (
 	opSegmentGet     uint8 = 0x45
 	opSegmentPut     uint8 = 0x46
 	opSegmentInstall uint8 = 0x47
+	opHolderBitmaps  uint8 = 0x48
 	opFetchExtra     uint8 = 0x49
 )
 
@@ -716,6 +717,26 @@ func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
 		out.Words[i] = r.U64()
 	}
 	return out, r.Err
+}
+
+// HolderBitmaps has the node read the presence bitmaps of the data nodes ids itself (their
+// RAW_BITMAP, at the addresses SetNodes gave): protocol lazy-balanced, where a fetch asks
+// whichever holder of a vector has the fewest of the node's fetches in flight. Each replaces the
+// bitmap read from that node before. It returns the bytes read.
+func (c *Client) HolderBitmaps(ctx context.Context, ids []uint16) (uint64, error) {
+	var w frame.Writer
+	w.U32(uint32(len(ids)))
+	for _, id := range ids {
+		w.U16(id)
+		w.U16(0)
+	}
+	b, err := c.do(ctx, opHolderBitmaps, 0, w.B)
+	if err != nil {
+		return 0, err
+	}
+	r := frame.NewReader(b)
+	n := r.U64()
+	return n, r.Err
 }
 
 // FetchExtra has the node follow each request a query's fetch sends to one of the holders from

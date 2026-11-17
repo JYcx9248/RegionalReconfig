@@ -2452,6 +2452,123 @@ void TestRawMigration() {
   CHECK(same && both && met && ss.fetched > 0 && ss.fetches > split->fetch_stats().fetch_calls);
 }
 
+// The choice of holder (protocol lazy-balanced): `bal` takes partition 2 from src (node 1), so its
+// postings name src; src2 (node 9) holds those vectors too, and bal reads its bitmap. While one
+// query's fetch from src is held, another query's misses go to src2, which has none in flight --
+// and give answers the same as src's. A drain of src2 (RawHeldBy) drops its bitmap, and waits for
+// a fetch that went to src2 through it.
+void TestHolderChoice() {
+  Fixture& f = GetFixture();
+  auto src = OpenNode(f, {0, 1, 2, 3}, true);
+  src->SetNodes(1, {});
+  auto src2 = OpenNode(f, {2, 3}, false);
+  src2->SetNodes(9, {});
+  auto bal = OpenNode(f, {}, false, f.index_nopages, 0, 4);
+  bal->SetNodes(13, {{1, "node-1"}, {9, "node-9"}});
+  std::mutex mu;
+  std::condition_variable cv;
+  std::map<std::string, bool> closed;     // a peer's fetches wait while it is closed
+  std::map<std::string, size_t> arrived;  // fetch requests that reached a peer
+  bal->SetRawFetcher([&](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+    {
+      std::unique_lock<std::mutex> l(mu);
+      ++arrived[peer];
+      cv.notify_all();
+      cv.wait(l, [&] { return !closed[peer]; });
+    }
+    (peer == "node-1" ? src : src2)->RawGet(locs, n, out);
+  });
+  bal->SetBitmapFetcher([&](const std::string& peer) { return (peer == "node-1" ? src : src2)->RawBitmap(); });
+  auto gate = [&](const std::string& peer, bool close) {
+    std::lock_guard<std::mutex> l(mu);
+    closed[peer] = close;
+    cv.notify_all();
+  };
+  auto wait_arrived = [&](const std::string& peer, size_t n) {
+    std::unique_lock<std::mutex> l(mu);
+    return cv.wait_for(l, std::chrono::seconds(10), [&] { return arrived[peer] >= n; });
+  };
+  StageFrom(f, bal.get(), src.get(), {2});
+  const size_t words = (bal->raw_stats(false).locations + 63) / 64;
+  CHECK(bal->LoadHolderBitmaps({9}) == words * 8 && bal->fetch_stats().holder_bitmaps == 1);
+
+  // Candidates of partition 2 in disjoint sets, re-ranked as they are (a fixed n), each with the
+  // lists naming it.
+  const std::vector<uint32_t> ids = Named(f, {2}).first;
+  CHECK(ids.size() >= 70);
+  auto slice = [&](size_t from, size_t n) { return std::vector<uint32_t>(ids.begin() + from, ids.begin() + from + n); };
+  const float* q = &f.queries[0];
+  struct Out {
+    std::vector<uint32_t> ids = std::vector<uint32_t>(5);
+    std::vector<float> dists = std::vector<float>(5);
+  };
+  auto rerank = [&](NodeEngine* at, int w, const std::vector<uint32_t>& cand) {
+    const std::vector<uint32_t> lists = ListsNaming(f, 2, cand);
+    Out o;
+    RerankStats st;
+    const uint32_t n = at->Rerank(w, q, cand.data(), static_cast<uint32_t>(cand.size()), 5, lists.data(), nullptr,
+                                  static_cast<uint32_t>(lists.size()), o.ids.data(), o.dists.data(), &st);
+    o.ids.resize(n);
+    o.dists.resize(n);
+    return o;
+  };
+  auto same = [&](const Out& a, const std::vector<uint32_t>& cand) {
+    const Out b = rerank(src.get(), 0, cand);
+    return a.ids == b.ids && a.dists == b.dists;
+  };
+
+  // Nothing in flight anywhere: the recorded holder.
+  const std::vector<uint32_t> a0 = slice(0, 10);
+  CHECK(same(rerank(bal.get(), 0, a0), a0) && bal->fetch_stats().rerouted == 0 &&
+        src2->raw_stats(true).served == 0);
+
+  // 20 vectors held at src; then 10 more misses go to src2, which has none in flight.
+  const std::vector<uint32_t> a = slice(10, 20), b = slice(30, 10);
+  gate("node-1", true);
+  Out ra;
+  std::thread held([&] { ra = rerank(bal.get(), 0, a); });
+  CHECK(wait_arrived("node-1", 2));
+  Out rb;
+  std::atomic<bool> b_done{false};
+  std::thread other([&] {
+    rb = rerank(bal.get(), 1, b);
+    b_done = true;
+  });
+  for (int i = 0; i < 1000 && !b_done.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(b_done.load());  // without waiting for src
+  gate("node-1", false);
+  other.join();
+  held.join();
+  CHECK(same(rb, b) && bal->fetch_stats().rerouted == b.size() && src2->raw_stats(true).served == b.size());
+  CHECK(same(ra, a) && bal->fetch_stats().rerouted == b.size());
+
+  // src2 leaves while a fetch chosen through its bitmap is held: its drain waits for that fetch.
+  const std::vector<uint32_t> c = slice(40, 20), d = slice(60, 10);
+  gate("node-1", true);
+  gate("node-9", true);
+  Out rc, rd;
+  std::thread held1([&] { rc = rerank(bal.get(), 0, c); });
+  CHECK(wait_arrived("node-1", 3));
+  std::thread held9([&] { rd = rerank(bal.get(), 1, d); });
+  CHECK(wait_arrived("node-9", 2));
+  std::atomic<bool> drained{false};
+  HeldBy hb;
+  std::thread drain([&] {
+    hb = bal->RawHeldBy(9);
+    drained = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK(!drained.load() && bal->fetch_stats().holder_bitmaps == 0);
+  gate("node-9", false);
+  drain.join();
+  gate("node-1", false);
+  held9.join();
+  held1.join();
+  // No posting here names src2: nothing to pull from it.
+  CHECK(drained.load() && hb.repointed == 0 && hb.missing.locs.empty() && same(rc, c) && same(rd, d) &&
+        bal->fetch_stats().rerouted == b.size() + d.size());
+}
+
 // FetchExtra (U9): with n on for a holder, each request a query's fetch sends to it is followed,
 // in the background, by one of up to n more vectors of the lists the query fetched through whose
 // postings name that holder -- the first ones in list order that are not here. The query does not
@@ -3225,6 +3342,24 @@ void TestWire() {
   const int fd2 = Connect(port2);
   r = Call(fd2, rtier::kSetNodes, set_nodes(2, {{1, peer1}}), 56);
   CHECK(r.status == rtier::kOk);
+  // HOLDER_BITMAPS: node 2 reads node 1's bitmap itself (RAW_BITMAP over its peer pool); one of
+  // a node it does not know is refused.
+  auto holders = [](std::vector<uint16_t> ids) {
+    rtier::BodyWriter w;
+    w.Put<uint32_t>(static_cast<uint32_t>(ids.size()));
+    for (uint16_t id : ids) {
+      w.Put<uint16_t>(id);
+      w.Put<uint16_t>(0);
+    }
+    return w;
+  };
+  r = Call(fd2, rtier::kHolderBitmaps, holders({1}), 156);
+  {
+    rtier::BodyReader hr(r.body.data(), r.body.size());
+    const uint64_t words = (fresh->raw_stats(false).locations + 63) / 64;
+    CHECK(r.status == rtier::kOk && hr.Get<uint64_t>() == words * 8 && fresh->fetch_stats().holder_bitmaps == 1);
+  }
+  CHECK(Call(fd2, rtier::kHolderBitmaps, holders({7}), 157).status != rtier::kOk);
   r = Call(fd2, rtier::kLoadPartition, load0(0, seg0), 59);
   CHECK(r.status == rtier::kRawAbsent);
   auto put0 = [&](uint64_t off, size_t n) {
@@ -4316,6 +4451,7 @@ int main() {
       {"node_read_cache", TestNodeReadCache},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
+      {"holder_choice", TestHolderChoice},
       {"fetch_extra", TestFetchExtra},
       {"fetch_extra_migrate", TestFetchExtraMigrate},
       {"read_budget", TestReadBudget},

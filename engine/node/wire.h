@@ -73,6 +73,11 @@
 //                   0 = not given, which a node with --max-candidates refuses)
 //   RAW_BITMAP      -                                         -> u64 locations, u64 words[]
 //                   (the raw vectors the node holds, one bit per location)
+//   HOLDER_BITMAPS  u32 n, (u16 id, u16 pad)[n]               -> u64 bytes
+//                   (protocol lazy-balanced: the node reads those data nodes' RAW_BITMAPs itself,
+//                   at the addresses SET_NODES gave, and from then on asks a missing vector of
+//                   whichever of its holders has the fewest of its fetches in flight; each
+//                   replaces the bitmap read from that node before. bytes: what it read)
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
 //                                                                version is evicted, and the
 //                                                                received ones are dropped)
@@ -273,6 +278,7 @@ enum Op : uint8_t {
   kSegmentGet = 0x45,
   kSegmentPut = 0x46,
   kSegmentInstall = 0x47,
+  kHolderBitmaps = 0x48,
   kFetchExtra = 0x49,
 };
 

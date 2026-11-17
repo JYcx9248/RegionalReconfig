@@ -218,6 +218,9 @@ using RawPutResult = PQPutResult;
 // RAW_GET).
 using RawFetcher = std::function<void(const std::string& peer, const uint32_t* locs, size_t n,
                                       uint8_t* out)>;
+// Reads the presence bitmap of the data node at `peer` (its RAW_BITMAP: one bit per location,
+// 64 per word). Throws on failure. The node server installs one.
+using BitmapFetcher = std::function<std::vector<uint64_t>(const std::string& peer)>;
 
 // Raw-vector locations held by one node, each with a posting list here that names it
 // (parallel arrays).
@@ -264,6 +267,10 @@ struct FetchStats {
   uint64_t coalesced = 0;        // missing vectors a query or a pull (RawPull) waited for instead of
                                  // fetching: another query or pull was fetching them
   uint64_t fetch_us = 0;         // time those callers waited for them, backpressure included
+  uint64_t rerouted = 0;         // of fetched, asked of another holder than the one their posting
+                                 // records, which had more of this node's fetches in flight
+                                 // (LoadHolderBitmaps)
+  uint64_t holder_bitmaps = 0;   // now: other nodes' presence bitmaps held (LoadHolderBitmaps)
   uint64_t written = 0;          // installed on the SSD by the writer
   uint64_t write_batches = 0;
   uint64_t write_us = 0;         // writer time in RawStore::Put
@@ -483,6 +490,8 @@ class NodeEngine {
   // whose vector is here now are made to name this node, and the vectors of the others go to
   // sink, each once, to be pulled from it (RawPull); returns how many postings it repointed.
   // Once they are pulled, no posting here names the node. RawHeldBy collects them, sorted.
+  // First the node's presence bitmap is dropped (LoadHolderBitmaps) and the fetches asked of it
+  // through that bitmap are waited for: then no fetch here needs the node once it has left.
   virtual uint64_t RawHeldByStream(uint16_t holder, const RawSink& sink) = 0;
   HeldBy RawHeldBy(uint16_t holder);
   // Which of locs[0..n) are not on this node (sorted, without duplicates): the stream asks
@@ -547,6 +556,18 @@ class NodeEngine {
   virtual RawCacheStats raw_cache_stats() const = 0;      // zeros without a read cache
   // How the node fetches raw vectors on demand (without one it cannot).
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;
+  // Where else a missing raw vector can be fetched from (protocol lazy-balanced): the presence
+  // bitmaps of these data nodes (RawBitmap, at the addresses SetNodes gave) replace the ones held
+  // for them. A fetch then asks, of the nodes holding a vector -- the one its posting records and
+  // those whose bitmap has it -- the one with the fewest of this node's fetches in flight as it
+  // starts, the recorded one on a tie (with none in flight anywhere, the fetches are lazy's): a
+  // holder slowed by its own queries keeps more of them in flight, so the fetches move to holders
+  // with reads to spare. A bitmap read earlier only misses vectors,
+  // since no node drops a raw vector it has held: it never names a node that cannot serve one.
+  // Returns the bytes read.
+  virtual uint64_t LoadHolderBitmaps(const std::vector<uint16_t>& nodes) = 0;
+  // How the node reads other nodes' bitmaps (without one, LoadHolderBitmaps fails).
+  virtual void SetBitmapFetcher(BitmapFetcher fetcher) = 0;
 
   // Primitives. `query` points to dim() elements of dtype(). Worker `w` must be used by one
   // thread at a time. ef = 0 means 2 * nprobe (as in fusion::Engine). Navigate searches the

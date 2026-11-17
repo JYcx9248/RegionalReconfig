@@ -70,9 +70,9 @@ func New(cfg config.Controller) (*Controller, error) {
 		return nil, fmt.Errorf("controller: InitialNodes must be >= 1")
 	}
 	switch cfg.Protocol {
-	case "lazy", "lazy-stream", "copy-then-flip", "stop-and-copy":
+	case "lazy", "lazy-balanced", "lazy-stream", "copy-then-flip", "stop-and-copy":
 	default:
-		return nil, fmt.Errorf("controller: unknown protocol %q (lazy | lazy-stream | copy-then-flip | stop-and-copy)", cfg.Protocol)
+		return nil, fmt.Errorf("controller: unknown protocol %q (lazy | lazy-balanced | lazy-stream | copy-then-flip | stop-and-copy)", cfg.Protocol)
 	}
 	for key, v := range map[string]string{"GraphPriority": cfg.GraphPriority, "RawPriority": cfg.RawPriority} {
 		switch v {

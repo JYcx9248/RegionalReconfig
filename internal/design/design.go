@@ -315,14 +315,20 @@ var Open = map[string]Question{
 			"its own while none is queued, and at the fetch cache's half it waits for the writer " +
 			"rather than drop one -- until no posting names the source, when the migration returns " +
 			"and the source is offline as far as the system is concerned (migrateRaw). The queries' " +
-			"own fetches go first and wait for none of it. Open: whether a scale-out ablation goes " +
-			"into the evaluation, whether a scale-in also moves its leaving nodes' vectors this way " +
-			"instead of the drain, and chunks (U12)",
+			"own fetches go first and wait for none of it. Under test (2026-11-13, protocol " +
+			"\"lazy-balanced\"): a fetch asks, of the nodes holding a vector, the one with the fewest " +
+			"of the fetching node's fetches in flight as it starts, not always the one its posting " +
+			"records -- the destinations read the presence bitmaps of the nodes that stay before the " +
+			"flip (HOLDER_BITMAPS), and a drain drops a leaving node's bitmap and waits for the " +
+			"fetches sent through it. Open: whether a scale-out ablation goes into the evaluation, " +
+			"whether a scale-in also moves its leaving nodes' vectors this way instead of the drain, " +
+			"whether lazy-balanced relieves a hot old owner enough to keep, and chunks (U12)",
 		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw, migrateRaw, fetchExtra), " +
 			"internal/controller/rebuild.go (rebuild), " +
-			"internal/agent/control.go (StageRaw, DrainRaw, FetchExtra), engine/src/node_engine.cpp " +
-			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull, QueueExtra, PullExtra, FillFromCursor), " +
-			"engine/node/server.cpp (PeerPool, RERANK, FETCH_EXTRA)"},
+			"internal/agent/control.go (StagePartitions, StageRaw, DrainRaw, FetchExtra), " +
+			"engine/src/node_engine.cpp (EnsureRawInLists, FetchForQuery, AssignHolders, " +
+			"LoadHolderBitmaps, RawHeldBy, RawPull, QueueExtra, PullExtra, FillFromCursor), " +
+			"engine/node/server.cpp (PeerPool, RERANK, HOLDER_BITMAPS, FETCH_EXTRA)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
 			"single-machine prototype uses. What happens when the controller fails mid-flip is out of " +

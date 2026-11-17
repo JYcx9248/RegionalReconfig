@@ -1380,6 +1380,20 @@ class NodeEngineImpl : public NodeEngine {
 
   uint64_t RawHeldByStream(uint16_t holder, const RawSink& sink) override {
     FUSION_CHECK(Fetchable(holder), "node ID %u is reserved", holder);
+    // The node leaves: no fetch asks it through its bitmap from now on, and the ones that did
+    // end before its drain does. The fetches its postings named need no wait here: the drain's
+    // pulls of what this lists (RawPull) claim the vectors, and so wait for a query's fetch.
+    {
+      std::unique_lock<std::mutex> l(asked_mu_);
+      {
+        std::lock_guard<std::mutex> r(raw_mu_);
+        holder_bits_.erase(holder);
+      }
+      asked_cv_.wait(l, [&] {
+        const auto it = asked_.find(holder);
+        return it == asked_.end() || it->second.chosen == 0;
+      });
+    }
     std::vector<std::shared_ptr<const ResidentSegment>> segs;
     {
       std::lock_guard<std::mutex> l(seg_mu_);
@@ -1668,6 +1682,11 @@ class NodeEngineImpl : public NodeEngine {
     f.fetch_calls = get(fc_.fetch_calls);
     f.coalesced = get(fc_.coalesced);
     f.fetch_us = get(fc_.fetch_us);
+    f.rerouted = get(fc_.rerouted);
+    {
+      std::lock_guard<std::mutex> l(raw_mu_);
+      f.holder_bitmaps = holder_bits_.size();
+    }
     f.written = get(fc_.written);
     f.write_us = get(fc_.write_us);
     f.sync_installed = get(fc_.sync_installed);
@@ -1705,6 +1724,40 @@ class NodeEngineImpl : public NodeEngine {
   void SetRawFetcher(RawFetcher fetcher) override {
     std::lock_guard<std::mutex> l(raw_mu_);
     fetcher_ = std::move(fetcher);
+  }
+
+  void SetBitmapFetcher(BitmapFetcher fetcher) override {
+    std::lock_guard<std::mutex> l(raw_mu_);
+    bitmap_fetcher_ = std::move(fetcher);
+  }
+
+  uint64_t LoadHolderBitmaps(const std::vector<uint16_t>& nodes) override {
+    std::vector<std::pair<uint16_t, std::string>> where;
+    BitmapFetcher fetch;
+    {
+      std::lock_guard<std::mutex> l(raw_mu_);
+      for (uint16_t id : nodes) {
+        FUSION_CHECK(Fetchable(id) && id != self_id_.load(), "node %u cannot hold vectors for this node", id);
+        const auto it = book_.find(id);
+        FUSION_CHECK(it != book_.end(), "node %u's address is not known here (SetNodes)", id);
+        where.emplace_back(id, it->second);
+      }
+      fetch = bitmap_fetcher_;
+    }
+    FUSION_CHECK(where.empty() || fetch, "this node has no way to read other nodes' bitmaps");
+    const size_t words = (raw_->layout().locations() + 63) / 64;
+    std::vector<std::pair<uint16_t, std::shared_ptr<const std::vector<uint64_t>>>> got;
+    uint64_t bytes = 0;
+    for (const auto& [id, addr] : where) {
+      auto bits = std::make_shared<const std::vector<uint64_t>>(fetch(addr));
+      FUSION_CHECK(bits->size() == words, "node %u's bitmap has %zu words, this index's locations %zu",
+                   id, bits->size(), words);
+      bytes += bits->size() * sizeof(uint64_t);
+      got.emplace_back(id, std::move(bits));
+    }
+    std::lock_guard<std::mutex> l(raw_mu_);
+    for (auto& [id, bits] : got) holder_bits_[id] = std::move(bits);
+    return bytes;
   }
 
   // --------------------------------------------------------------- primitives
@@ -2462,13 +2515,14 @@ class NodeEngineImpl : public NodeEngine {
     // Claimed, but the posting says here: an installer that does not claim -- a stream through
     // the agents (RawPut) -- brought the vector since the claim. It is here, and its claim ends well.
     std::vector<uint32_t> arrived;
+    std::vector<std::pair<size_t, uint16_t>> held;  // (index into miss, the holder its posting records)
     size_t unknown = 0;
     uint32_t first = 0;
     bool listed = false;  // whether a list of the query names the first one
     for (size_t i : mine) {
       const uint16_t h = via[i].seg ? via[i].seg->Holder(via[i].j) : kNoHolder;
       if (Fetchable(h)) {
-        by[h].push_back(i);
+        held.emplace_back(i, h);
       } else if (h == kSelfHolder) {
         arrived.push_back(miss[i]);
       } else if (unknown++ == 0) {
@@ -2481,6 +2535,8 @@ class NodeEngineImpl : public NodeEngine {
                                       "location %u, %s)", unknown, first,
                                       listed ? "its posting records no holder" : "no list of the query names it"));
     if (!arrived.empty()) claims.Settle(arrived, true);
+    std::map<uint16_t, uint64_t> chosen;  // of `by`, the vectors asked of a holder through its bitmap
+    AssignHolders(miss, held, &by, &chosen);
     // The holders at once, one request each: a node that took partitions from several donors
     // (the graph placement picks them by the partition graph, not as contiguous ranges) meets a
     // query's misses at several holders, and the query then waits for the slowest fetch instead
@@ -2490,6 +2546,13 @@ class NodeEngineImpl : public NodeEngine {
     std::vector<size_t> got(jobs.size(), 0);
     std::vector<std::exception_ptr> failed(jobs.size());
     auto run = [&](size_t k) {
+      struct Done {  // the request has ended, well or not: no longer in flight at the holder
+        NodeEngineImpl* e;
+        uint16_t holder;
+        uint64_t n, chosen;
+        ~Done() { e->Unask(holder, n, chosen); }
+      } done{this, jobs[k].first, jobs[k].second.size(),
+             chosen.count(jobs[k].first) ? chosen.at(jobs[k].first) : 0};
       try {
         std::vector<uint32_t> ls;
         for (size_t i : jobs[k].second) ls.push_back(miss[i]);  // ascending, as miss
@@ -2522,9 +2585,6 @@ class NodeEngineImpl : public NodeEngine {
     }
     for (const auto& e : failed)
       if (e) std::rethrow_exception(e);
-    std::vector<std::pair<size_t, uint16_t>> held;  // (index into miss, the holder its posting records)
-    for (const auto& [h, is] : by)
-      for (size_t i : is) held.emplace_back(i, h);
     QueueExtra(held, via_list);
     size_t fetched = 0;
     for (size_t g : got) fetched += g;
@@ -2795,6 +2855,61 @@ class NodeEngineImpl : public NodeEngine {
           break;
       }
     }
+  }
+
+  // Gives each missing vector (held: an index into miss and the holder its posting records) to a
+  // node holding it, in *by: the recorded holder, or, of the holders whose bitmaps this node has
+  // read too (LoadHolderBitmaps), the one with the fewest of this node's fetches in flight as the
+  // call starts -- the recorded holder on a tie. So with no fetch in flight anywhere a call asks
+  // what its postings record, as without bitmaps, and does not split itself over the holders: the
+  // choice follows backlogs, and only those. The vectors given to a holder count in asked_ until
+  // the request ends (Unask); *chosen counts those given through a bitmap. The bitmaps are looked
+  // at under asked_mu_, so that a holder's leaving (RawHeldByStream) either comes before this call
+  // sees its bitmap or waits for its requests.
+  void AssignHolders(const std::vector<uint32_t>& miss, const std::vector<std::pair<size_t, uint16_t>>& held,
+                     std::map<uint16_t, std::vector<size_t>>* by, std::map<uint16_t, uint64_t>* chosen) {
+    if (held.empty()) return;
+    std::lock_guard<std::mutex> l(asked_mu_);
+    std::vector<std::pair<uint16_t, std::shared_ptr<const std::vector<uint64_t>>>> others;
+    {
+      std::lock_guard<std::mutex> r(raw_mu_);
+      others.assign(holder_bits_.begin(), holder_bits_.end());
+    }
+    auto in_flight = [&](uint16_t id) {
+      const auto it = asked_.find(id);
+      return it == asked_.end() ? uint64_t{0} : it->second.all;
+    };
+    uint64_t rerouted = 0;
+    for (const auto& [i, h] : held) {
+      const uint32_t loc = miss[i];
+      uint16_t best = h;
+      uint64_t least = others.empty() ? 0 : in_flight(h);
+      for (const auto& [id, bits] : others) {
+        if (id == h || (loc >> 6) >= bits->size() || !(((*bits)[loc >> 6] >> (loc & 63)) & 1)) continue;
+        const uint64_t n = in_flight(id);
+        if (n < least) {
+          best = id;
+          least = n;
+        }
+      }
+      if (best != h) {
+        ++(*chosen)[best];
+        ++rerouted;
+      }
+      (*by)[best].push_back(i);
+    }
+    for (const auto& [id, is] : *by) asked_[id].all += is.size();  // after the choices: as the call started
+    for (const auto& [id, n] : *chosen) asked_[id].chosen += n;
+    if (rerouted) fc_.rerouted.fetch_add(rerouted, std::memory_order_relaxed);
+  }
+
+  // A request of n vectors to holder, chosen of them through its bitmap, has ended.
+  void Unask(uint16_t holder, uint64_t n, uint64_t chosen) {
+    std::lock_guard<std::mutex> l(asked_mu_);
+    Asked& a = asked_[holder];
+    a.all -= n;
+    a.chosen -= chosen;
+    if (chosen) asked_cv_.notify_all();
   }
 
   // Whether the raw vector at loc is here: on the SSD, or fetched and in the cache. Both under
@@ -3113,6 +3228,19 @@ class NodeEngineImpl : public NodeEngine {
   mutable std::mutex raw_mu_;
   std::atomic<uint16_t> self_id_{kNoHolder};
   std::unordered_map<uint16_t, std::string> book_;
+  // Other holders (lazy-balanced, LoadHolderBitmaps): the presence bitmaps of other data nodes,
+  // read from them, by node ID; and how to read them.
+  std::unordered_map<uint16_t, std::shared_ptr<const std::vector<uint64_t>>> holder_bits_;
+  BitmapFetcher bitmap_fetcher_;
+  // The vectors this node has asked of each holder and not received yet, by node ID: how far
+  // behind that holder is. `chosen` counts those asked through a bitmap, which RawHeldByStream
+  // waits for before the holder leaves. Under asked_mu_.
+  struct Asked {
+    uint64_t all = 0, chosen = 0;
+  };
+  std::mutex asked_mu_;
+  std::condition_variable asked_cv_;  // a holder's chosen count went down
+  std::unordered_map<uint16_t, Asked> asked_;
   // Fetches in flight, by location (under cache_mu_): a query that misses a vector another one
   // is fetching waits for that fetch.
   std::unordered_map<uint32_t, std::shared_ptr<InFlight>> inflight_;
@@ -3138,7 +3266,7 @@ class NodeEngineImpl : public NodeEngine {
   bool update_paused_ = false;
   std::chrono::steady_clock::time_point next_update_write_{};  // update_write_bps
   struct FetchCounters {  // fetch_stats
-    std::atomic<uint64_t> fetched{0}, fetch_calls{0}, coalesced{0}, fetch_us{0}, written{0}, write_us{0},
+    std::atomic<uint64_t> fetched{0}, fetch_calls{0}, coalesced{0}, fetch_us{0}, rerouted{0}, written{0}, write_us{0},
         sync_installed{0}, sync_us{0}, drain_calls{0}, drain_waiting{0}, drain_us{0},
         rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0}, added{0},
         added_written{0}, added_wait_us{0}, extra_queued{0}, extra_dropped{0}, extra_requests{0},

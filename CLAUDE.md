@@ -126,7 +126,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   Alongside grace and reclaim, `promoteEntries` flips every `EntryFlipInterval` to make
   entries of the new nodes whose graph has loaded, each connected to every aggregator first;
   the rescale waits for it. Raw vectors do
-  not move with a scale-out: `lazy` fetches one only when a query needs it (below). Baselines:
+  not move with a scale-out: `lazy` fetches one only when a query needs it (below);
+  `lazy-balanced` (under test, branch `second-holder`) fetches it from the least behind of its
+  holders, known from the presence bitmaps of the nodes that stay (`HOLDER_BITMAPS`). Baselines:
   `lazy-stream` also streams the rest in after the flip (`StageRaw`; the rescale waits for it),
   `copy-then-flip` and `stop-and-copy` stream them before the flip (eager). A rescale to a plan
   (`rtier-client rescale -plan`) carries out any target placement. The token bucket paces only

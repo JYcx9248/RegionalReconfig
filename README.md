@@ -154,7 +154,16 @@ device serves copy-then-flip's stream and its own queries at once, and where the
 keep it busy, every read the stream takes is one the queries lose. Its two variants set the order
 (`rtier_node --peer-reads-first` and `--own-reads-first`, `fusion/read_budget.h`): the stream
 first, which flips as early as the copy allows and costs the queries most, or the queries first,
-which keeps their capacity and flips only once the load lets the stream through. Streams and the
+which keeps their capacity and flips only once the load lets the stream through. Under test
+(2026-11-13): `"lazy-balanced"` is lazy, but a fetch asks, of the nodes that hold the vector, the
+one with the fewest of the fetching node's fetches in flight as it starts -- the one its posting
+records on a tie, so with no backlog anywhere it fetches as lazy does. Before the flip each
+destination reads the presence bitmaps of the nodes that stay (`HOLDER_BITMAPS`, one bit per
+vector each; `bitmap_bytes` in the reply), so it knows every old holder of a vector, not only the
+old owner of its partition: a vector whose lists lie in partitions of several nodes is held by
+each of them. A fetch can then leave an old owner busy with its own queries for one with reads to
+spare (the nodes' stats count them: `fetch.rerouted`). A drain drops a leaving node's bitmap and
+waits for the fetches sent through it. Streams and the
 drain run data node to data node by default (`RAW_PULL`), unpaced like the queries' fetches;
 only through the agents (`RawPath: agent`, the default when the agents are paced) do they take a
 token-bucket class: `RawPriority` (background by default) after the flip and for the drain,
@@ -577,8 +586,9 @@ when there are fewer GPUs than nodes). With `"NodeResources"`, the `"host"` reco
 `cgroups.jsonl` then also have those GPUs' utilization and memory in use, other users' jobs
 included.
 
-`"Protocol"` picks the reconfiguration protocol (`lazy`, the default; `lazy-stream`,
-`copy-then-flip` and `stop-and-copy` as baselines). `"RawStreams"`, `"RawBatchBytes"` and
+`"Protocol"` picks the reconfiguration protocol (`lazy`, the default; `lazy-balanced`, lazy with
+the fetches spread over a vector's holders, under test; `lazy-stream`, `copy-then-flip` and
+`stop-and-copy` as baselines). `"RawStreams"`, `"RawBatchBytes"` and
 `"RawPath"` set how a stream pulls (`"RawPath"`: `node`, or `agent`, the default only when
 `"TransferRateBytesPerSec"` paces the agents), and `"RawPriority"` its class on the agent path.
 Each node keeps its raw vectors in `<WorkDir>/<node>/raw.pages`.

@@ -157,6 +157,10 @@ type PartitionVersion struct {
 type StagePartitionsReq struct {
 	Sources []Source                            `json:"sources"`
 	Nodes   map[placement.NodeID]epoch.NodeInfo `json:"nodes,omitempty"`
+	// HolderBitmaps (protocol lazy-balanced): once the partitions are loaded, the data node reads
+	// these nodes' presence bitmaps, so that a fetch can ask any node holding a vector, not only
+	// the one its posting records.
+	HolderBitmaps []placement.NodeID `json:"holder_bitmaps,omitempty"`
 }
 
 // StageReply reports what a staging step moved. Bytes counts everything received (segment
@@ -171,8 +175,10 @@ type StageReply struct {
 	RawBytes   int64 `json:"raw_bytes,omitempty"`
 	// Repointed (DrainRaw): postings that named a leaving node and whose vector was here
 	// already; they name this node now, nothing moved for them.
-	Repointed int64   `json:"repointed,omitempty"`
-	Seconds   float64 `json:"seconds"`
+	Repointed int64 `json:"repointed,omitempty"`
+	// BitmapBytes (StagePartitions with HolderBitmaps): the presence bitmaps the data node read.
+	BitmapBytes int64   `json:"bitmap_bytes,omitempty"`
+	Seconds     float64 `json:"seconds"`
 }
 
 // StageRawReq asks the agent to stream in the raw vectors that the given partitions (already
@@ -388,6 +394,9 @@ type RescaleReply struct {
 	// GraphBytes: navigation graphs copied to the new entries (in the background, see
 	// EntryFlips), counted once every pull has ended.
 	GraphBytes int64 `json:"graph_bytes,omitempty"`
+	// BitmapBytes (lazy-balanced): the holders' presence bitmaps the destinations read before
+	// the flip.
+	BitmapBytes int64 `json:"bitmap_bytes,omitempty"`
 	// RawFetched: raw vectors that queries fetched on demand while the reconfiguration ran
 	// (lazy protocols), from every node's counter before and after. With lazy the fetches go
 	// on after the rescale returns, for as long as queries meet vectors that have not moved.

@@ -189,11 +189,31 @@ func (a *Agent) handleStagePartitions(ctx context.Context, body json.RawMessage)
 		return nil, err
 	}
 	reply.Bytes += reply.PQBytes
+	// 4. lazy-balanced: the other holders' bitmaps, read by the data node from them directly.
+	if ids := a.otherNodes(req.HolderBitmaps); len(ids) > 0 {
+		n, err := a.localBulk.HolderBitmaps(ctx, ids)
+		if err != nil {
+			return nil, fmt.Errorf("reading the holders' bitmaps: %w", err)
+		}
+		reply.BitmapBytes = int64(n)
+		a.reg.Counter("bulk.bitmap_bytes").Add(reply.BitmapBytes)
+	}
 	a.setReady(config.RoleData)
 	a.reg.Counter("bulk.bytes_received").Add(reply.Bytes)
 	a.reg.Counter("bulk.pq_codes_received").Add(reply.PQCodes)
 	reply.Seconds = time.Since(start).Seconds()
 	return reply, nil
+}
+
+// otherNodes is ids without this node, as data-node IDs.
+func (a *Agent) otherNodes(ids []placement.NodeID) []uint16 {
+	var out []uint16
+	for _, id := range ids {
+		if id != a.ID() {
+			out = append(out, uint16(id))
+		}
+	}
+	return out
 }
 
 // beginStaging registers a StagePartitions call so that stopStaging can cancel it and wait for

@@ -147,6 +147,7 @@ const char* OpName(uint8_t op) {
     case kSegmentGet: return "segment_get";
     case kSegmentPut: return "segment_put";
     case kSegmentInstall: return "segment_install";
+    case kHolderBitmaps: return "holder_bitmaps";
     case kFetchExtra: return "fetch_extra";
     default: return nullptr;
   }
@@ -332,6 +333,28 @@ void PeerPool::Give(const std::string& addr, int fd) {
   ::close(fd);
 }
 
+Frame PeerPool::Call(const std::string& addr, Frame req, const char* name) {
+  req.req_id = next_id_.fetch_add(1);
+  const int fd = Take(addr);
+  Frame resp;
+  try {
+    WriteFrame(fd, req);
+    if (!ReadFrame(fd, &resp)) throw std::runtime_error("connection closed");
+  } catch (const std::exception& e) {
+    ::close(fd);
+    throw std::runtime_error(std::string(name) + " to " + addr + ": " + e.what());
+  }
+  if (resp.req_id != req.req_id || resp.type != req.type || !(resp.flags & kFlagResponse)) {
+    ::close(fd);
+    throw std::runtime_error(std::string(name) + " to " + addr + ": mismatched response");
+  }
+  Give(addr, fd);
+  if (resp.status != kOk)
+    throw std::runtime_error(fusion::StrFormat("%s to %s: status %u: %s", name, addr.c_str(), resp.status,
+                                               std::string(resp.body.begin(), resp.body.end()).c_str()));
+  return resp;
+}
+
 void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, uint32_t vec_bytes,
                       uint8_t* out) {
   for (size_t done = 0; done < n;) {  // frames stay far below kMaxFrameBytes
@@ -339,28 +362,11 @@ void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, u
         {n - done, kMaxRawBatch, std::max<size_t>(1, (kMaxFrameBytes / 4) / vec_bytes)});
     Frame req;
     req.type = kRawGet;
-    req.req_id = next_id_.fetch_add(1);
     BodyWriter w;
     w.Put<uint32_t>(static_cast<uint32_t>(batch));
     w.PutBytes(locs + done, batch * 4);
     req.body = std::move(w.buf);
-    const int fd = Take(addr);
-    Frame resp;
-    try {
-      WriteFrame(fd, req);
-      if (!ReadFrame(fd, &resp)) throw std::runtime_error("connection closed");
-    } catch (const std::exception& e) {
-      ::close(fd);
-      throw std::runtime_error("RAW_GET to " + addr + ": " + e.what());
-    }
-    if (resp.req_id != req.req_id || resp.type != kRawGet || !(resp.flags & kFlagResponse)) {
-      ::close(fd);
-      throw std::runtime_error("RAW_GET to " + addr + ": mismatched response");
-    }
-    Give(addr, fd);
-    if (resp.status != kOk)
-      throw std::runtime_error(fusion::StrFormat("RAW_GET to %s: status %u: %s", addr.c_str(),
-                                                 resp.status, std::string(resp.body.begin(), resp.body.end()).c_str()));
+    const Frame resp = Call(addr, std::move(req), "RAW_GET");
     BodyReader r(resp.body.data(), resp.body.size());
     const uint32_t vb = r.Get<uint32_t>();
     if (vb != vec_bytes || r.remaining() != batch * vb)
@@ -371,6 +377,21 @@ void PeerPool::RawGet(const std::string& addr, const uint32_t* locs, size_t n, u
   }
 }
 
+std::vector<uint64_t> PeerPool::RawBitmap(const std::string& addr) {
+  Frame req;
+  req.type = kRawBitmap;
+  const Frame resp = Call(addr, std::move(req), "RAW_BITMAP");
+  BodyReader r(resp.body.data(), resp.body.size());
+  const uint64_t locations = r.Get<uint64_t>();
+  const size_t words = static_cast<size_t>((locations + 63) / 64);
+  if (r.remaining() != words * sizeof(uint64_t))
+    throw std::runtime_error(fusion::StrFormat("RAW_BITMAP to %s: %zu bytes for %llu locations", addr.c_str(),
+                                               r.remaining(), static_cast<unsigned long long>(locations)));
+  std::vector<uint64_t> bits(words);
+  std::memcpy(bits.data(), r.Bytes(words * sizeof(uint64_t)), words * sizeof(uint64_t));
+  return bits;
+}
+
 // ------------------------------------------------------------------------------ server
 NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
   for (int i = engine->num_workers() - 1; i >= 0; --i) free_workers_.push_back(i);
@@ -379,11 +400,13 @@ NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
     peers_.RawGet(peer, locs, n, vb, out);
     raw_received_.fetch_add(static_cast<uint64_t>(n) * vb, std::memory_order_relaxed);
   });
+  engine->SetBitmapFetcher([this](const std::string& peer) { return peers_.RawBitmap(peer); });
 }
 
 NodeServer::~NodeServer() {
   Stop();
   engine_->SetRawFetcher(nullptr);  // peers_ goes away with the server
+  engine_->SetBitmapFetcher(nullptr);
 }
 
 int NodeServer::ListenTcp(const std::string& host, int port) {
@@ -635,6 +658,17 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         const std::vector<uint64_t> bits = e.RawBitmap();
         w.Put<uint64_t>(e.raw_stats(false).locations);
         w.PutBytes(bits.data(), bits.size() * sizeof(uint64_t));
+        break;
+      }
+      case kHolderBitmaps: {
+        const uint32_t n = r.Get<uint32_t>();
+        Require(r.remaining() == static_cast<size_t>(n) * 4, "HOLDER_BITMAPS: a node ID and a pad each");
+        std::vector<uint16_t> ids(n);
+        for (uint32_t i = 0; i < n; ++i) {
+          ids[i] = r.Get<uint16_t>();
+          r.Get<uint16_t>();  // pad
+        }
+        w.Put<uint64_t>(e.LoadHolderBitmaps(ids));
         break;
       }
       case kFetchExtra: {
@@ -1176,7 +1210,8 @@ std::string NodeServer::FetchJson() const {
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
   return fusion::StrFormat(
       "{\"present\":%llu,\"cached\":%llu,\"queued\":%llu,\"queued_peak\":%llu,\"fetched\":%llu,"
-      "\"fetch_calls\":%llu,\"coalesced\":%llu,\"fetch_us\":%llu,\"written\":%llu,\"write_batches\":%llu,"
+      "\"fetch_calls\":%llu,\"coalesced\":%llu,\"fetch_us\":%llu,\"rerouted\":%llu,\"holder_bitmaps\":%llu,"
+      "\"written\":%llu,\"write_batches\":%llu,"
       "\"write_us\":%llu,\"sync_installed\":%llu,\"sync_us\":%llu,\"drain_calls\":%llu,"
       "\"drain_waiting\":%llu,\"drain_us\":%llu,\"rerank_disk\":%llu,\"rerank_mem\":%llu,"
       "\"pending_recounts\":%llu,\"pending_us\":%llu,\"added\":%llu,\"added_queued\":%llu,"
@@ -1184,7 +1219,7 @@ std::string NodeServer::FetchJson() const {
       "\"extra\":{\"n\":%llu,\"queued\":%llu,\"dropped\":%llu,\"requests\":%llu,\"failed\":%llu,"
       "\"fetched\":%llu,\"us\":%llu,\"refill\":%llu,\"refills\":%llu,\"wait_us\":%llu,\"done\":%s}}",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
-      u(f.coalesced), u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
+      u(f.coalesced), u(f.fetch_us), u(f.rerouted), u(f.holder_bitmaps), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
       u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us), u(f.added), u(f.added_queued),
       u(f.added_written), u(f.added_wait_us), u(f.cache_bound), u(f.extra), u(f.extra_queued),

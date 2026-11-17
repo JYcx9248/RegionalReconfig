@@ -216,7 +216,12 @@ func checkResidency(t *testing.T, cl *cluster) {
 
 // rawComplete: whether a protocol leaves every node with all the raw vectors of its partitions.
 // The lazy protocol moves one only when a query needs it (U9); the rest stay with the old owner.
-func rawComplete(protocol string) bool { return protocol != "lazy" }
+func rawComplete(protocol string) bool { return protocol != "lazy" && protocol != "lazy-balanced" }
+
+// fetchesOnDemand: whether a protocol's new owners fetch raw vectors when queries need them.
+func fetchesOnDemand(protocol string) bool {
+	return protocol == "lazy" || protocol == "lazy-balanced" || protocol == "lazy-stream"
+}
 
 // pqExpected is the number of PQ codes a reconfiguration from old to next has to pull: for each
 // node, the vectors named by its new partitions that no partition it has ever owned named (it
@@ -330,7 +335,7 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 		t.Errorf("%s installed %d raw vectors (%d streamed, reply received %d, drained %d; %d fetched), want %d",
 			what, streamed+fetched, streamed, out.RawVectors, out.DrainVectors, fetched, want)
 	}
-	if out.Protocol != "lazy" && out.Protocol != "lazy-stream" && (fetched != 0 || uint64(out.RawVectors+out.DrainVectors) != streamed) {
+	if !fetchesOnDemand(out.Protocol) && (fetched != 0 || uint64(out.RawVectors+out.DrainVectors) != streamed) {
 		t.Errorf("protocol %s: %d raw vectors fetched on demand, %d of %d streamed installed: want every one "+
 			"copied before the flip, once", out.Protocol, fetched, streamed, out.RawVectors)
 	}
@@ -351,7 +356,7 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 
 func TestReconfigUnderLoad(t *testing.T) {
 	f := getFixture(t)
-	for _, protocol := range []string{"lazy", "lazy-stream", "copy-then-flip", "stop-and-copy"} {
+	for _, protocol := range []string{"lazy", "lazy-balanced", "lazy-stream", "copy-then-flip", "stop-and-copy"} {
 		t.Run(protocol, func(t *testing.T) {
 			cl := newCluster(t, f, protocol, 2)
 			cl.addNode("n1", query.TwoPhase{})
@@ -367,6 +372,18 @@ func TestReconfigUnderLoad(t *testing.T) {
 			out := rescale(t, cl, 3)
 			if out.ToEpoch != out.FromEpoch+2 || len(out.Moved) == 0 || out.Bytes == 0 || out.PQCodes == 0 {
 				t.Errorf("scale-out reply %+v: want a data flip and an entry flip, moved partitions and PQ codes", out)
+			}
+			// lazy-balanced: the new node read both old nodes' bitmaps, a bit per location each.
+			if protocol == "lazy-balanced" {
+				info, err := nodeclient.New(cl.ctl.Status().Table.Nodes[out.Added[0]].NodeAddr, 1).Info(cl.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := 2 * 8 * int64((info.Raw.Locations+63)/64); out.BitmapBytes != want {
+					t.Errorf("scale-out read %d bytes of bitmaps, want %d", out.BitmapBytes, want)
+				}
+			} else if out.BitmapBytes != 0 {
+				t.Errorf("protocol %s read %d bytes of bitmaps", protocol, out.BitmapBytes)
 			}
 			time.Sleep(300 * time.Millisecond)
 			checkResidency(t, cl)
