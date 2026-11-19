@@ -74,7 +74,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `test/e2e` | end-to-end tests |
 | `config.yaml` | the system configuration (defaults committed; the runners rewrite it before each run) |
 | `configs/` | experiments (JSON, one file each) |
-| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `run_one.sh` (one run on a clean node state, on one machine or a cluster; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
+| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `score_answers.py` (recall per data version of a run with update batches), `run_one.sh` (one run on a clean node state, on one machine or a cluster; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
 
 ## Conventions
 
@@ -199,7 +199,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   `"Reconfigurations"` entries with `"Update"` (inserts, deletes, a major epoch after them),
   each run to its end in the same timeline as the rescales; `run_local.py` and `run_cluster.py`
   keep one router for the run on their own machine and record each batch in `updates.json`
-  (`rtier-updater -record`; the reply's phases now start with the staging, `stage`).
+  (`rtier-updater -record`; the reply's phases now start with the staging, `stage`). Such a run
+  also keeps the scored queries' answers with their epochs (`answers.bin`, `rtier-loadgen
+  -answers`, written at the end), and `scripts/score_answers.py` scores each against the ground
+  truth of its epoch's data version (`fusion_gt --exclude --insert`, kept by content next to the
+  base's): `latency.csv`'s recall holds only until the first batch flips.
 - **Full rebuild (U14, `rebuild.go`)**: moves the cluster to the next index generation, built
   outside with the same codebook, vector IDs and raw-vector locations. Spares take every
   partition by a lazy reconfiguration; the old nodes lose their roles and switch generations

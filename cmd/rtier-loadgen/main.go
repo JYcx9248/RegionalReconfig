@@ -161,6 +161,9 @@ func main() {
 	ef := flag.Int("ef", 0, "graph search width (0 = 2*nprobe)")
 	conns := flag.Int("conns", 64, "max in-flight queries per entry")
 	out := flag.String("out", "", "per-query CSV (sched_ms, latency_us, status, epoch, recall, attempts, users)")
+	answersPath := flag.String("answers", "", "the answers of the scored queries -- every -gt-stride-th, within -gt's rows "+
+		"when given -- with their epochs, binary (answers.go), written at the end as -out is: "+
+		"scripts/score_answers.py scores each against its epoch's data version (U14)")
 	seed := flag.Int64("seed", 1, "arrival seed")
 	retryFor := flag.Duration("retry-for", 0, "keep retrying an unavailable answer until this long "+
 		"after the scheduled time (0: three attempts); the wait counts in the latency")
@@ -221,8 +224,12 @@ func main() {
 	var (
 		mu   sync.Mutex
 		recs []record
+		ans  []answer
 		wg   sync.WaitGroup
 	)
+	// The scored queries: the ones the ground truth has a row for (every -gt-stride-th, within
+	// its rows), whose answers -answers keeps.
+	scored := func(qi int) bool { return qi%*gtStride == 0 && (gt == nil || qi / *gtStride < gt.NQ) }
 	lat := metrics.NewHistogram()
 	var sent, ok, failed atomic.Int64
 	start := time.Now()
@@ -240,6 +247,7 @@ func main() {
 		finish.Do(func() {
 			mu.Lock()
 			all := append([]record(nil), recs...)
+			answers := append([]answer(nil), ans...)
 			if stopped {
 				now := time.Since(start)
 				for _, r := range pending {
@@ -252,6 +260,11 @@ func main() {
 			summarize(all, gt != nil, ents.stale.Load())
 			if *out != "" {
 				if err := writeCSV(*out, all); err != nil {
+					log.Fatal(err)
+				}
+			}
+			if *answersPath != "" {
+				if err := writeAnswers(*answersPath, *k, *gtStride, answers); err != nil {
 					log.Fatal(err)
 				}
 			}
@@ -284,25 +297,34 @@ func main() {
 		rec.latency = time.Since(start.Add(sched))
 		rec.attempts = attempts
 		rec.epoch = res.Epoch
+		var kept *answer // the answer -answers keeps
 		if err != nil {
 			rec.status = statusName(err)
 			failed.Add(1)
 		} else {
 			ok.Add(1)
 			lat.Record(rec.latency)
-			if row := qi / *gtStride; gt != nil && qi%*gtStride == 0 && row < gt.NQ {
-				ids := make([]uint32, len(res.Candidates))
-				ds := make([]float32, len(res.Candidates))
+			if scored(qi) && (gt != nil || *answersPath != "") {
+				a := answer{query: qi, epoch: res.Epoch, sched: sched,
+					ids: make([]uint32, len(res.Candidates)), dists: make([]float32, len(res.Candidates))}
 				for j, c := range res.Candidates {
-					ids[j], ds[j] = c.ID, c.Dist
+					a.ids[j], a.dists[j] = c.ID, c.Dist
 				}
-				rec.recall = gt.Recall(row, ids, ds, *k)
-				rec.hasGT = true
+				if gt != nil {
+					rec.recall = gt.Recall(qi / *gtStride, a.ids, a.dists, *k)
+					rec.hasGT = true
+				}
+				if *answersPath != "" {
+					kept = &a
+				}
 			}
 		}
 		mu.Lock()
 		delete(pending, seq)
 		recs = append(recs, rec)
+		if kept != nil {
+			ans = append(ans, *kept)
+		}
 		mu.Unlock()
 	}
 	if userSched != nil {

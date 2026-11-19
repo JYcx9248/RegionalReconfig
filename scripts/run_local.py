@@ -14,7 +14,8 @@ reconfigurations -> collect results -> clean up), without Kafka and SSH:
   5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale, Rebuild; update batches
      through bin/rtier-updater)
   6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg,
-     reconfigurations.json (updates.json, the batches'); each node's stats log (stats-<node>.jsonl) and, with
+     reconfigurations.json (updates.json, the batches', and answers.bin, their runs' scored
+     answers); each node's stats log (stats-<node>.jsonl) and, with
      NodeResources, cgroups.jsonl, both on the monotonic clock of clock.json; the experiment as
      it ran (experiment.json, which the analysis scripts read) and the config.yaml the processes
      read, the code it ran (revision.txt, revision.diff) and the PQ budget it found
@@ -170,7 +171,11 @@ runs on this machine from the start; its state -- where the next batch's IDs and
 start, the major epochs' graph patches -- is in WorkDir/updater, emptied at the start of every
 run. updates.json in the results has each batch's record (rtier-updater -record: its epochs, its
 phases from the staging to the reclaim, the IDs it inserted), updater.log its output. A run with
-batches needs "Updates" (below), with room for every vector they insert.
+batches needs "Updates" (below), with room for every vector they insert. Its recall in
+latency.csv, against the one GroundTruth, holds only until the first batch flips: the load
+generator keeps the answers of the queries the ground truth covers, with their epochs
+(answers.bin, written at the end), and scripts/score_answers.py scores each against the data
+version its epoch read.
 
 "Updates": {"Headroom": 1.5} lets update batches (U14) run against the cluster
 (bin/rtier-updater; config.yaml's AllowUpdates). Every data node leaves room for 1.5 times the
@@ -447,7 +452,14 @@ def update_request(cfg: dict, rc: dict) -> dict:
             if not (up.get("Inserts") or up.get("Deletes")):
                 sys.exit(f"Reconfigurations: {rc}: {key} acts after a batch: give Inserts or Deletes too")
             args += [flag, str(int(up[key]))]
-    return {"at": rc["TriggerTimeSeconds"], "update": up, "updater_args": args,
+    # updates.json records the files as absolute paths, which scripts/score_answers.py reads to
+    # make the ground truth of each data version (a relative one depends on where the run
+    # started), and their digests, so that it refuses a file that changed since the run.
+    recorded = dict(up)
+    for key in ("Inserts", "Deletes"):
+        if up.get(key):
+            recorded[key], recorded[key + "Digest"] = os.path.abspath(up[key]), file_digest(up[key])
+    return {"at": rc["TriggerTimeSeconds"], "update": recorded, "updater_args": args,
             "what": "update batch: " + ", ".join(parts)}
 
 
@@ -1439,11 +1451,13 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
     load = cfg.get("Load", {})
     dur = load.get("DurationSeconds", 60)
 
-    def loadgen(rate, seconds, out_csv, steps=""):
+    def loadgen(rate, seconds, out_csv, steps="", answers=""):
         cmd = [f"{gbin}/rtier-loadgen", "-api", api_addr, "-queries", cfg["Queries"],
                "-rate", str(rate), "-duration", f"{seconds}s", "-k", str(load.get("K", 10)),
                "-nprobe", str(load.get("NProbe", 64)), "-n", str(load.get("N", 200)),
                "-arrivals", load.get("Arrivals", "poisson"), "-out", out_csv]
+        if answers:
+            cmd += ["-answers", answers]
         if steps:
             cmd += ["-rate-steps", steps]
         if load.get("Users"):  # closed loop: concurrent users instead of an arrival rate
@@ -1502,9 +1516,19 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
     # seconds). The zero is the one of latency.csv, which the load generator prints once it has
     # read its queries and ground truth: from its own start, a large query file would put every
     # trigger that much early on the timeline.
+    # With update batches the recall of latency.csv, against the one ground truth, holds only until
+    # the first batch flips: the scored queries' answers are kept (answers.bin) for
+    # scripts/score_answers.py, which scores each against the data version of its epoch.
+    answers = ""
+    if updater is not None:
+        if gt:
+            answers = os.path.join(out_dir, "answers.bin")
+        else:
+            log("update batches without GroundTruth: no answers kept, no recall per data version")
     line = procs.start("loadgen", loadgen(load.get("Rate", 100), dur,
                                           os.path.join(out_dir, "latency.csv"),
-                                          rate_steps(load.get("RateSteps"))), prefix=prefix, wait_line="START ")
+                                          rate_steps(load.get("RateSteps")), answers),
+                       prefix=prefix, wait_line="START ")
     t0 = float(line.split()[1])
     json.dump({"load_start": round(t0, 3)}, open(os.path.join(out_dir, "clock.json"), "w"))
     for rc in reconfigs:

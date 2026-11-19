@@ -12,6 +12,13 @@
 //
 // The base is read a chunk at a time and dropped from the page cache (VectorFile, or here), so it
 // can be larger than memory.
+//
+// --exclude and --insert give the ground truth of a data version after update batches (U14): the
+// base without the vectors the batches deleted (files of vector IDs, as rtier-updater -deletes
+// reads them: text, one per line, or the engine's uint32 array .bin) and with the ones they
+// inserted (FILE@FIRST: a batch's vectors, given IDs FIRST, FIRST+1, ... in the file's order, as
+// the update controller hands them out). A run's answers are scored against the version their
+// epoch read (scripts/score_answers.py).
 #include <fcntl.h>
 #include <omp.h>
 #include <unistd.h>
@@ -38,7 +45,8 @@ using namespace fusion;
 static void Usage() {
   std::fprintf(stderr,
                "usage: fusion_gt (--base FILE [--max-n N] [--dtype T] | --index DIR [--layout bucket])\n"
-               "                 --queries FILE --out FILE [--nq N] [--stride S] [--k 100] [--threads T]\n");
+               "                 --queries FILE --out FILE [--nq N] [--stride S] [--k 100] [--threads T]\n"
+               "                 [--exclude IDS[,IDS...]] [--insert FILE@FIRST_ID[,FILE@FIRST_ID...]]\n");
 }
 
 namespace {
@@ -121,6 +129,114 @@ Base IndexBase(const std::string& dir, const std::string& layout) {
   return b;
 }
 
+// Vector IDs a file names: the engine's uint32 array (.bin) or text, one per line, # comments.
+std::vector<uint32_t> ReadIDs(const std::string& path) {
+  if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".bin") == 0) return LoadU32Array(path);
+  FILE* f = std::fopen(path.c_str(), "r");
+  FUSION_CHECK(f != nullptr, "cannot open %s: %s", path.c_str(), std::strerror(errno));
+  std::vector<uint32_t> ids;
+  char line[256];
+  for (uint64_t no = 1; std::fgets(line, sizeof(line), f); ++no) {
+    char* p = line;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0' || *p == '\n' || *p == '#') continue;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(p, &end, 10);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) ++end;
+    if (errno != 0 || end == p || (end && *end != '\0') || v > UINT32_MAX) {
+      std::fclose(f);
+      throw std::runtime_error(StrFormat("%s:%llu: not a vector ID", path.c_str(), static_cast<unsigned long long>(no)));
+    }
+    ids.push_back(static_cast<uint32_t>(v));
+  }
+  std::fclose(f);
+  return ids;
+}
+
+std::vector<std::string> SplitList(const std::string& s) {
+  std::vector<std::string> out;
+  for (size_t i = 0; i <= s.size();) {
+    const size_t j = std::min(s.find(',', i), s.size());
+    if (j > i) out.push_back(s.substr(i, j - i));
+    i = j + 1;
+  }
+  return out;
+}
+
+// The base of a data version (--exclude, --insert): the base's vectors and then each insert
+// file's, without the excluded IDs.
+Base VersionBase(Base base, const std::vector<std::string>& exclude, const std::vector<std::string>& insert) {
+  struct Insert {
+    std::shared_ptr<VectorFile> f;
+    uint32_t first;
+  };
+  std::vector<Insert> ins;
+  uint64_t end = base.n, inserted = 0;  // IDs [0, end) are handed out: the base's, then the batches'
+  for (const std::string& spec : insert) {
+    const size_t at = spec.rfind('@');
+    FUSION_CHECK(at != std::string::npos && at > 0 && at + 1 < spec.size() &&
+                     spec.find_first_not_of("0123456789", at + 1) == std::string::npos,
+                 "--insert %s: FILE@FIRST_ID", spec.c_str());
+    const uint64_t first = std::stoull(spec.substr(at + 1));
+    std::shared_ptr<VectorFile> f = VectorFile::Open(spec.substr(0, at));
+    FUSION_CHECK(f->dtype() == base.dtype && f->dim() == base.dim, "%s holds %u-d %s vectors, the base %u-d %s",
+                 spec.c_str(), f->dim(), DTypeName(f->dtype()), base.dim, DTypeName(base.dtype));
+    // A batch's IDs follow the base's and the earlier batches' (a failed batch's are skipped).
+    FUSION_CHECK(first >= end && first + f->size() <= UINT32_MAX, "--insert %s: IDs from %llu overlap the ones before",
+                 spec.c_str(), static_cast<unsigned long long>(first));
+    end = first + f->size();
+    inserted += f->size();
+    ins.push_back({f, static_cast<uint32_t>(first)});
+  }
+  // Whether a vector of this version has the ID: the base's, or one an insert file gives.
+  auto has = [&](uint64_t id) {
+    if (id < base.n) return true;
+    for (const Insert& x : ins)
+      if (id >= x.first && id < x.first + x.f->size()) return true;
+    return false;
+  };
+  auto gone = std::make_shared<std::vector<uint64_t>>((end + 63) / 64, 0);
+  uint64_t named = 0;  // vectors of this version excluded
+  for (const std::string& path : exclude)
+    for (uint32_t id : ReadIDs(path)) {
+      if (id >= end) continue;  // no vector has it yet
+      uint64_t& w = (*gone)[id >> 6];
+      const uint64_t bit = uint64_t{1} << (id & 63);
+      if (!(w & bit) && has(id)) ++named;
+      w |= bit;
+    }
+  Log("data version: %llu base vectors and %llu inserted (%zu files), %llu of them excluded",
+      static_cast<unsigned long long>(base.n), static_cast<unsigned long long>(inserted), ins.size(),
+      static_cast<unsigned long long>(named));
+  auto scan = base.scan;
+  const size_t vb = base.vb;
+  base.scan = [scan, ins, gone, vb](const Sink& fn) {
+    std::vector<uint8_t> rows;
+    std::vector<uint32_t> ids;
+    auto kept = [&](const uint8_t* r, const uint32_t* id, uint64_t m) {
+      rows.resize(m * vb);
+      ids.clear();
+      for (uint64_t i = 0; i < m; ++i) {
+        if (((*gone)[id[i] >> 6] >> (id[i] & 63)) & 1) continue;
+        std::memcpy(&rows[ids.size() * vb], r + i * vb, vb);
+        ids.push_back(id[i]);
+      }
+      fn(rows.data(), ids.data(), ids.size());
+    };
+    scan(kept);
+    std::vector<uint32_t> fid;
+    for (const Insert& x : ins)
+      x.f->ForEachChunk([&](uint64_t r0, uint64_t r1, const uint8_t* r) {
+        fid.resize(r1 - r0);
+        std::iota(fid.begin(), fid.end(), x.first + static_cast<uint32_t>(r0));
+        kept(r, fid.data(), r1 - r0);
+      });
+  };
+  base.n = base.n + inserted - named;  // what the scan gives
+  return base;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -133,8 +249,10 @@ int main(int argc, char** argv) {
     }
     std::optional<DType> dt;
     if (a.Has("dtype")) dt = ParseDType(a.Str("dtype"));
-    const Base base = a.Has("base") ? FileBase(a.Required("base"), dt, a.U64("max-n", 0))
-                                    : IndexBase(a.Required("index"), a.Str("layout", "bucket"));
+    Base base = a.Has("base") ? FileBase(a.Required("base"), dt, a.U64("max-n", 0))
+                              : IndexBase(a.Required("index"), a.Str("layout", "bucket"));
+    if (a.Has("exclude") || a.Has("insert"))
+      base = VersionBase(std::move(base), SplitList(a.Str("exclude")), SplitList(a.Str("insert")));
     const uint64_t stride = a.U64("stride", 1);
     FUSION_CHECK(stride >= 1, "--stride must be at least 1");
     VectorSet q;  // queries 0, stride, 2*stride, ... of the first --nq

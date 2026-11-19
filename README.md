@@ -617,6 +617,21 @@ whose batches would not fit its headroom before the nodes start, and records eac
 `updates.json` (`rtier-updater -record`: epochs, phases from the staging to the reclaim, the
 inserted IDs and locations); `timeline.svg` shades them next to the rescales.
 
+A batch changes the data from its flip on, so `latency.csv`'s recall, against the one
+`GroundTruth`, holds only until the first batch flips. In a run with batches the load generator
+keeps, in memory, the answers of the queries the ground truth covers, with the epoch each ran in,
+and writes them at the end (`answers.bin`, `rtier-loadgen -answers`): nothing is written while
+the nodes' disks are measured. `scripts/score_answers.py RUN_DIR...` scores each answer against
+the data version its epoch read -- the base without the vectors the batches flipped by then
+deleted and with the ones they inserted, under their IDs (`fusion_gt --exclude --insert`, made
+once per version and kept by content next to the base's ground truth, so that every run of one
+experiment shares it; `updates.json` records each batch file's digest, and a file that changed
+since the run is refused). `--plan EXPERIMENT.json` makes them before any run, on whatever
+machine has the data (before a cluster reservation, say): each batch's inserts take the IDs a run
+gives them when every batch commits. It reports the recall per version and per epoch (and against the base's
+ground truth, what `latency.csv` showed), and the queries that got two answers on one index (the
+same data version and major epochs) within a run or across the runs given (`scores.json`).
+
 ## The smallest experiment: one node, then two
 
 A node is added because one node no longer serves the load, so the run has to put it under a
