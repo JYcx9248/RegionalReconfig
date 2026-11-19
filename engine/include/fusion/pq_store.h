@@ -37,7 +37,8 @@
 // slots' states; a load holds it once, over the segment's distinct vectors in ID order, and does
 // the per-posting work outside it, so that several partitions load at once. A Put holds it only
 // to hand out slots: it claims its IDs and writes their codes without it, so that a staging's
-// PQ_PUTs install side by side.
+// PQ_PUTs install side by side. A Put that meets an ID another Put has claimed waits for that
+// code, so that every code a Put was given is here when it returns.
 //
 // The store is also where the node looks up a vector's raw-vector location (fusion/layout.h,
 // RawLayout): the segments carry it next to every posting, and Ref records it with the code.
@@ -47,6 +48,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -114,11 +116,13 @@ class PQStore {
   // Same, for a staging: the codes that ARE here are protected (staged) until a partition
   // that names them loads, or ReleaseStaged, so that no Put of the same staging drops them.
   std::vector<uint32_t> Reserve(const uint32_t* ids, size_t n);
-  // Installs n codes (m bytes each, in the order of ids) as staged. IDs already held, or being
-  // installed by a concurrent Put, are skipped (their code is kept). Cached codes are dropped if
+  // Installs n codes (m bytes each, in the order of ids) as staged, and returns how many it
+  // installed: IDs already held are skipped (their code is kept). Cached codes are dropped if
   // the new ones do not fit otherwise; if they still do not fit, throws PQCapacityError and
-  // changes nothing. Returns the number of codes installed. Puts run concurrently, but for the
-  // slots' accounting.
+  // changes nothing. Puts run concurrently, but for the slots' accounting. An ID another Put
+  // has claimed is left to that Put and waited for, so that every code a Put was given is here
+  // when it returns (its caller references them next); if that Put fails, this one installs the
+  // code, and should it then not fit, the codes this one installed before stay.
   size_t Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigin origin);
   // Copies the codes of ids[0..n) into out (n x m bytes). Throws PQMissingError if one is absent.
   void Get(const uint32_t* ids, size_t n, uint8_t* out);
@@ -173,6 +177,14 @@ class PQStore {
   void Count(Category c, int64_t delta);
   void FreeLocked(uint32_t slot);
   void EvictLocked(uint64_t count);  // drops `count` cached codes; caller checked they exist
+  // One pass of Put over ids[pos[k]], k < count (ids[k] if pos is null): installs the codes of
+  // the IDs it claims, and lists in *theirs the positions of those another Put had claimed.
+  size_t PutRound(const uint32_t* ids, const uint8_t* codes, const size_t* pos, size_t count, PQOrigin origin,
+                  std::vector<size_t>* theirs);
+  // A Put's claims end -- published, or withdrawn by a Put that failed -- with EndClaims; a Put
+  // that met them waits in AwaitClaims until none of ids[pos[k]] is claimed.
+  void EndClaims() noexcept;
+  void AwaitClaims(const uint32_t* ids, const std::vector<size_t>& pos);
 
   // slot_of_ is written under the lock, except by Put, which claims an ID (kPending) and
   // publishes its slot without it; Locate and SlotOf read it without the lock. A slot is
@@ -208,6 +220,9 @@ class PQStore {
   uint64_t hand_ = 0;              // eviction sweep position
   PQStats st_;
   Mirror mirror_;
+  // Only to wait for claims to end: taken last (mu_ may be held), and nothing is taken under it.
+  std::mutex claim_mu_;
+  std::condition_variable claim_cv_;
 };
 
 }  // namespace fusion

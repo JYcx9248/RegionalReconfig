@@ -807,7 +807,8 @@ void TestStageVersions() {
 // Concurrent Puts, as a staging's PQ_PUTs from several sources run: each ID is installed once,
 // by whichever Put claims it first, and skipped by the others; every code is the one sent; the
 // accounting adds up; a reader never finds a slot before its code is whole. With room for only
-// half the codes, the Puts that do not fit change nothing: no ID stays claimed.
+// half the codes, a Put that does not fit installs nothing -- but what it installed before it
+// took over the claims of another Put that failed -- and no ID stays claimed.
 void TestPQStoreConcurrentPuts() {
   constexpr uint32_t kIds = 20000, kM = 8;
   constexpr int kWriters = 8;
@@ -898,10 +899,11 @@ void TestPQStoreConcurrentPuts() {
   PQStore half(kIds, kM, distinct.size() / 2);
   const Result h = run(half);
   st = half.Stats();
-  CHECK(h.refused > 0 && h.installed == st.resident && h.mirrored == st.resident && h.wrong == 0);
+  CHECK(h.refused > 0 && h.installed <= st.resident && st.received == st.resident && h.mirrored == st.resident &&
+        h.wrong == 0);
   CHECK(codes_right(half, &present) && present == st.resident);
   // Every refused ID went back to absent: once the staged codes are released, all of them fit
-  // again, one Put at a time (an ID left claimed would be skipped).
+  // again, one Put at a time (a Put would wait forever for an ID left claimed).
   CHECK(half.ReleaseStaged() == st.resident && half.Stats().resident == 0);
   std::vector<uint32_t> some(distinct.begin(), distinct.end());
   some.resize(half.capacity());
@@ -909,6 +911,108 @@ void TestPQStoreConcurrentPuts() {
   for (size_t i = 0; i < some.size(); ++i)
     for (uint32_t j = 0; j < kM; ++j) c[i * kM + j] = code(some[i], j);
   CHECK(half.Put(some.data(), some.size(), c.data(), PQOrigin::kReceived) == some.size());
+}
+
+// A Put that meets an ID another Put has claimed returns only once that code is here, since its
+// caller references the codes next: a node that loads two partitions of a next generation at
+// once, both lacking a code, failed now and then when the second load's Put skipped the code and
+// its Ref came before the first load published it. The Put publishes its own codes before it
+// waits, so no two Puts wait for each other; if the other Put fails, it installs the code itself.
+void TestPQStoreClaims() {
+  PQStore s(100, 2, 10);
+  auto codes_of = [](const std::vector<uint32_t>& ids, uint8_t tag) {
+    std::vector<uint8_t> c;
+    for (uint32_t id : ids) {
+      c.push_back(static_cast<uint8_t>(id));
+      c.push_back(tag);
+    }
+    return c;
+  };
+  auto here = [&](uint32_t id) { return s.SlotOf(id) != PQStore::kNoSlot; };
+  auto tag_of = [&](uint32_t id) {
+    uint8_t out[2];
+    s.Get(&id, 1, out);
+    return out[1];
+  };
+  auto eventually = [](const std::function<bool()>& cond) {  // within 10 s
+    for (int i = 0; i < 10000 && !cond(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return cond();
+  };
+  // The first Put of each case stops in the mirror -- its IDs claimed and their codes written,
+  // not published -- until the gate opens, and then fails if told to.
+  std::mutex mu;
+  std::condition_variable cv;
+  bool stopped = false, open = false, fail = false;
+  int calls = 0;
+  s.SetMirror([&](const uint32_t*, uint32_t) {
+    std::unique_lock<std::mutex> l(mu);
+    if (calls++ > 0) return;
+    stopped = true;
+    cv.notify_all();
+    cv.wait(l, [&] { return open; });
+    if (fail) throw std::runtime_error("device copy failed");
+  });
+  auto start_case = [&](bool fails) {
+    std::lock_guard<std::mutex> l(mu);
+    stopped = open = false;
+    fail = fails;
+    calls = 0;
+  };
+  auto until_stopped = [&] {
+    std::unique_lock<std::mutex> l(mu);
+    cv.wait(l, [&] { return stopped; });
+  };
+  auto open_gate = [&] {
+    std::lock_guard<std::mutex> l(mu);
+    open = true;
+    cv.notify_all();
+  };
+
+  // A stops holding its claims on 1-3. B, given 3 and 4, publishes 4 and waits for 3.
+  start_case(false);
+  const std::vector<uint32_t> a = {1, 2, 3}, b = {3, 4};
+  std::atomic<bool> b_done{false};
+  size_t got_a = 0, got_b = 0;
+  std::thread ta([&] { got_a = s.Put(a.data(), a.size(), codes_of(a, 1).data(), PQOrigin::kIndex); });
+  until_stopped();
+  std::thread tb([&] {
+    got_b = s.Put(b.data(), b.size(), codes_of(b, 2).data(), PQOrigin::kIndex);
+    b_done = true;
+  });
+  CHECK(eventually([&] { return here(4); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(!b_done && !here(3));
+  open_gate();
+  ta.join();
+  tb.join();
+  CHECK(got_a == 3 && got_b == 1 && tag_of(3) == 1 && tag_of(4) == 2);
+  std::vector<uint32_t> slots(b.size());
+  s.Ref(b.data(), b.size(), slots.data());  // what B's caller does next
+  PQStats st = s.Stats();
+  CHECK(st.resident == 4 && st.live == 2 && st.skipped == 1 && st.from_index == 4);
+
+  // C fails after D met its claim on 6: D installs 6 itself.
+  start_case(true);
+  const std::vector<uint32_t> c = {5, 6}, d = {6, 7};
+  bool c_failed = false;
+  size_t got_d = 0;
+  std::thread tc([&] {
+    try {
+      s.Put(c.data(), c.size(), codes_of(c, 3).data(), PQOrigin::kIndex);
+    } catch (const std::runtime_error&) {
+      c_failed = true;
+    }
+  });
+  until_stopped();
+  std::thread td([&] { got_d = s.Put(d.data(), d.size(), codes_of(d, 4).data(), PQOrigin::kIndex); });
+  CHECK(eventually([&] { return here(7); }));
+  open_gate();
+  tc.join();
+  td.join();
+  CHECK(c_failed && got_d == 2 && !here(5) && here(6) && tag_of(6) == 4);
+  st = s.Stats();
+  CHECK(st.resident == 6 && st.skipped == 1 && st.from_index == 6);
+  s.SetMirror(nullptr);
 }
 
 void TestPQStore() {
@@ -3506,6 +3610,7 @@ int main() {
       {"stage_versions", TestStageVersions},
       {"pq_store", TestPQStore},
       {"pq_store_concurrent_puts", TestPQStoreConcurrentPuts},
+      {"pq_store_claims", TestPQStoreClaims},
       {"pq_migration", TestPQMigration},
       {"pq_evict_under_load", TestPQEvictUnderLoad},
       {"pq_from_index", TestPQFromIndex},

@@ -10,7 +10,8 @@
 
 namespace fusion {
 namespace {
-// Marks an ID whose code is being installed by the current Put (never visible outside it).
+// Marks an ID whose code a Put is installing: its claim. Only Puts see it (to wait for it);
+// everything else reads the ID as absent (Held) until the claim ends.
 constexpr uint32_t kPending = 0xFFFFFFFEu;
 constexpr uint8_t kProtected = 1;       // a staging in progress needs this code
 constexpr uint8_t kEverReferenced = 2;  // a loaded partition has named this code
@@ -116,7 +117,7 @@ std::vector<uint32_t> PQStore::Reserve(const uint32_t* ids, size_t n) {
   std::lock_guard<std::mutex> l(mu_);
   for (uint32_t id : v) {
     const uint32_t s = Held(id);
-    if (s == kNoSlot) {  // or a Put of it in progress: listed again, the later Put skips it
+    if (s == kNoSlot) {  // or a Put of it in progress: listed again, a later Put waits for it
       missing.push_back(id);
       continue;
     }
@@ -140,21 +141,49 @@ std::vector<uint32_t> PQStore::Reserve(const uint32_t* ids, size_t n) {
 // slot is published, a claimed ID reads as absent everywhere (Held: kNoSlot), and its
 // slot -- staged, never referenced -- is left alone (EvictLocked drops only cached codes,
 // ReleaseStaged only published ones).
+//
+// So a Put that meets another's claim waits for it: its caller references the codes next. When
+// it skipped them instead (2026-11-08 to 11-17), loads of a next generation's partitions, 8 at
+// once, raced wherever two lacked the same code (FillFromIndex): the one whose Put met the
+// other's claim could reach Ref before that claim was published, and failed (PQMissingError; a
+// full rebuild's load, now and then). A Put waits only once it has published its own claims, so
+// no Put waits holding one, and no two wait for each other. A claim that ends withdrawn (its
+// Put failed) is claimed in the next round.
 size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigin origin) {
   for (size_t i = 0; i < n; ++i)
     if (ids[i] >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", ids[i]));
+  std::vector<size_t> theirs, again;
+  size_t installed = PutRound(ids, codes, nullptr, n, origin, &theirs);
+  while (!theirs.empty()) {
+    AwaitClaims(ids, theirs);
+    again.swap(theirs);
+    installed += PutRound(ids, codes, again.data(), again.size(), origin, &theirs);
+  }
+  return installed;
+}
+
+size_t PQStore::PutRound(const uint32_t* ids, const uint8_t* codes, const size_t* pos, size_t count,
+                         PQOrigin origin, std::vector<size_t>* theirs) {
   // Everything that allocates happens before the first change, so an allocation failure
   // leaves the store as it was.
   std::vector<size_t> fresh;
-  fresh.reserve(n);
+  fresh.reserve(count);
   std::vector<uint32_t> slots;
-  slots.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
+  slots.reserve(count);
+  theirs->clear();
+  theirs->reserve(count);
+  for (size_t k = 0; k < count; ++k) {
+    const size_t i = pos ? pos[k] : k;
     uint32_t was = kNoSlot;
-    if (slot_of_[ids[i]].compare_exchange_strong(was, kPending, std::memory_order_relaxed)) fresh.push_back(i);
+    if (slot_of_[ids[i]].compare_exchange_strong(was, kPending, std::memory_order_relaxed))
+      fresh.push_back(i);
+    else if (was == kPending)
+      theirs->push_back(i);  // another Put's (or this one's, for an ID repeated in ids)
   }
+  const size_t skipped = count - fresh.size() - theirs->size();
   auto unclaim = [&] {
     for (size_t i : fresh) SetSlot(ids[i], kNoSlot);
+    if (!fresh.empty()) EndClaims();
   };
   Mirror mirror;
   {
@@ -199,7 +228,7 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
       case PQOrigin::kSnapshot: st_.restored += fresh.size(); break;
       case PQOrigin::kReceived: st_.received += fresh.size(); break;
     }
-    st_.skipped += n - fresh.size();
+    st_.skipped += skipped;
   }
   for (size_t k = 0; k < fresh.size(); ++k)
     std::memcpy(codes_.get() + static_cast<uint64_t>(slots[k]) * m_, codes + fresh[k] * m_, m_);
@@ -209,28 +238,49 @@ size_t PQStore::Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigi
       std::sort(sorted.begin(), sorted.end());
       mirror(sorted.data(), static_cast<uint32_t>(sorted.size()));
     } catch (...) {
-      std::lock_guard<std::mutex> l(mu_);
-      for (size_t k = 0; k < fresh.size(); ++k) {
-        const uint32_t s = slots[k];
-        SetSlot(ids[fresh[k]], kNoSlot);
-        id_of_[s] = kNoSlot;
-        flags_[s] = 0;
-        free_.push_back(s);  // within its reserved capacity
+      {
+        std::lock_guard<std::mutex> l(mu_);
+        for (size_t k = 0; k < fresh.size(); ++k) {
+          const uint32_t s = slots[k];
+          SetSlot(ids[fresh[k]], kNoSlot);
+          id_of_[s] = kNoSlot;
+          flags_[s] = 0;
+          free_.push_back(s);  // within its reserved capacity
+        }
+        st_.resident -= fresh.size();
+        st_.staged -= fresh.size();
+        switch (origin) {
+          case PQOrigin::kIndex: st_.from_index -= fresh.size(); break;
+          case PQOrigin::kSnapshot: st_.restored -= fresh.size(); break;
+          case PQOrigin::kReceived: st_.received -= fresh.size(); break;
+        }
+        st_.skipped -= skipped;
       }
-      st_.resident -= fresh.size();
-      st_.staged -= fresh.size();
-      switch (origin) {
-        case PQOrigin::kIndex: st_.from_index -= fresh.size(); break;
-        case PQOrigin::kSnapshot: st_.restored -= fresh.size(); break;
-        case PQOrigin::kReceived: st_.received -= fresh.size(); break;
-      }
-      st_.skipped -= n - fresh.size();
+      EndClaims();
       throw;
     }
   }
   // Last: a reader that finds a slot (SlotLocked, Held, SlotOf: acquire) finds its code written.
   for (size_t k = 0; k < fresh.size(); ++k) SetSlot(ids[fresh[k]], slots[k]);
+  if (!fresh.empty()) EndClaims();
   return fresh.size();
+}
+
+// A waiter checks the claims under claim_mu_ and sleeps on claim_cv_ without letting it go in
+// between; the ender changes the claims before it takes claim_mu_, then notifies. So either the
+// waiter sees them ended, or it is asleep by the time the ender has taken the lock, and wakes.
+void PQStore::EndClaims() noexcept {
+  { std::lock_guard<std::mutex> l(claim_mu_); }
+  claim_cv_.notify_all();
+}
+
+void PQStore::AwaitClaims(const uint32_t* ids, const std::vector<size_t>& pos) {
+  std::unique_lock<std::mutex> l(claim_mu_);
+  claim_cv_.wait(l, [&] {
+    for (size_t i : pos)
+      if (slot_of_[ids[i]].load(std::memory_order_acquire) == kPending) return false;
+    return true;
+  });
 }
 
 void PQStore::Get(const uint32_t* ids, size_t n, uint8_t* out) {
