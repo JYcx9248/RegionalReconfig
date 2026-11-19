@@ -27,6 +27,7 @@
 #include "../node/stream.h"
 #include "fusion/builder.h"
 #include "fusion/dataset.h"
+#include "fusion/filter.h"
 #include "fusion/graph_image.h"
 #include "fusion/hnsw_space.h"
 #include "fusion/index_meta.h"
@@ -830,7 +831,7 @@ void TestPQStoreConcurrentPuts() {
   };
   auto run = [&](PQStore& s) {
     std::atomic<uint64_t> installed{0}, offered{0}, refused{0}, wrong{0}, unsorted{0}, mirrored{0};
-    s.SetMirror([&](const uint32_t* slots, uint32_t n) {
+    s.SetMirror([&](const uint32_t* slots, uint32_t n, const uint8_t*) {
       if (!std::is_sorted(slots, slots + n)) ++unsorted;
       mirrored += n;
     });
@@ -945,7 +946,7 @@ void TestPQStoreClaims() {
   std::condition_variable cv;
   bool stopped = false, open = false, fail = false;
   int calls = 0;
-  s.SetMirror([&](const uint32_t*, uint32_t) {
+  s.SetMirror([&](const uint32_t*, uint32_t, const uint8_t*) {
     std::unique_lock<std::mutex> l(mu);
     if (calls++ > 0) return;
     stopped = true;
@@ -1035,13 +1036,20 @@ void TestPQStore() {
     return false;
   };
   std::vector<uint32_t> mirrored;
-  s.SetMirror([&](const uint32_t* slots, uint32_t n) { mirrored.assign(slots, slots + n); });
+  std::vector<uint8_t> mirrored_codes;
+  s.SetMirror([&](const uint32_t* slots, uint32_t n, const uint8_t* codes) {
+    mirrored.assign(slots, slots + n);
+    mirrored_codes.assign(codes, codes + size_t{n} * 2);
+  });
 
-  // New codes arrive staged; a repeated ID is installed once.
+  // New codes arrive staged; a repeated ID is installed once. The mirror gets them in slot
+  // order, each its slot's code.
   const std::vector<uint32_t> a = {7, 3, 7, 9};
   CHECK((s.Missing(a.data(), a.size()) == std::vector<uint32_t>{3, 7, 9}));
   CHECK(s.Put(a.data(), a.size(), codes_of(a).data(), PQOrigin::kReceived) == 3);
   CHECK(mirrored.size() == 3 && std::is_sorted(mirrored.begin(), mirrored.end()));
+  for (size_t j = 0; j < mirrored.size(); ++j)
+    CHECK(std::memcmp(mirrored_codes.data() + j * 2, s.codes() + size_t{mirrored[j]} * 2, 2) == 0);
   PQStats st = s.Stats();
   CHECK(st.resident == 3 && st.staged == 3 && st.received == 3 && st.skipped == 1);
   CHECK(s.Missing(a.data(), a.size()).empty());
@@ -1051,7 +1059,7 @@ void TestPQStore() {
   CHECK(throws_capacity(b) && s.Stats().resident == 3 && s.Missing(b.data(), b.size()).size() == 3);
 
   // A mirror failure undoes the Put.
-  s.SetMirror([](const uint32_t*, uint32_t) { throw std::runtime_error("device copy failed"); });
+  s.SetMirror([](const uint32_t*, uint32_t, const uint8_t*) { throw std::runtime_error("device copy failed"); });
   const std::vector<uint32_t> one = {50};
   bool threw = false;
   try {
@@ -1411,7 +1419,9 @@ void TestPQSnapshot() {
   const std::vector<uint32_t> want = {0, 3, 7, 42, 99};
   PQStore t(100, 4, 8);
   std::vector<uint32_t> mirrored;
-  t.SetMirror([&](const uint32_t* slots, uint32_t n) { mirrored.insert(mirrored.end(), slots, slots + n); });
+  t.SetMirror([&](const uint32_t* slots, uint32_t n, const uint8_t*) {
+    mirrored.insert(mirrored.end(), slots, slots + n);
+  });
   CHECK(t.Restore(path, crc) == 5 && mirrored.size() == 5);
   st = t.Stats();
   CHECK(st.resident == 5 && st.staged == 5 && st.restored == 5 && st.from_index == 0 && st.received == 0);
@@ -1455,6 +1465,161 @@ void TestPQSnapshot() {
   // An empty store saves an empty snapshot.
   PQStore none(100, 4, 8), none2(100, 4, 8);
   CHECK(none.Save(bad, crc) == 0 && none2.Restore(bad, crc) == 0 && none2.Stats().resident == 0);
+}
+
+// A store without a host copy (the GPU backend, U15 under test): its codes are where the mirror
+// puts them -- here a stand-in for device memory -- and Get and Save read them back through the
+// reader. Concurrent Puts with Gets alongside: every code read is its vector's. A snapshot it
+// saves restores into a store with a host copy and into one without, with the same codes. With
+// room for 3 codes, cached ones make room and their slots take the new codes. No mirror: a Put
+// is refused and installs nothing; a mirror failure undoes the Put.
+void TestPQStoreNoHostCopy() {
+  static constexpr uint32_t kIds = 4000, kM = 4;
+  auto code = [](uint32_t id, uint32_t j) { return static_cast<uint8_t>(id * 5 + j * 11 + 1); };
+  auto codes_of = [&](const std::vector<uint32_t>& ids) {
+    std::vector<uint8_t> c;
+    for (uint32_t id : ids)
+      for (uint32_t j = 0; j < kM; ++j) c.push_back(code(id, j));
+    return c;
+  };
+  struct Device {  // kM bytes per slot, written by the mirror, read by the reader
+    std::vector<uint8_t> bytes;
+    std::atomic<uint64_t> written{0};
+  };
+  auto attach = [&](PQStore& s, Device& d) {
+    d.bytes.assign(s.capacity() * kM, 0);
+    s.SetMirror([&d](const uint32_t* slots, uint32_t n, const uint8_t* codes) {
+      for (uint32_t k = 0; k < n; ++k)
+        std::memcpy(&d.bytes[size_t{slots[k]} * kM], codes + size_t{k} * kM, kM);
+      d.written += n;
+    });
+    s.SetReader([&d](const uint32_t* slots, uint32_t n, uint8_t* out) {
+      for (uint32_t k = 0; k < n; ++k)
+        std::memcpy(out + size_t{k} * kM, &d.bytes[size_t{slots[k]} * kM], kM);
+    });
+  };
+  auto right = [&](PQStore& s, const std::vector<uint32_t>& ids) {
+    std::vector<uint8_t> got(ids.size() * kM);
+    s.Get(ids.data(), ids.size(), got.data());
+    return got == codes_of(ids);
+  };
+  const std::vector<uint32_t> five = {5};
+  auto throwing = [](const uint32_t*, uint32_t, const uint8_t*) { throw std::runtime_error("device copy failed"); };
+
+  {  // No mirror, or a failing one: nothing installed.
+    PQStore s(kIds, kM, 10, /*host_copy=*/false);
+    CHECK(s.codes() == nullptr);
+    CHECK(Throws([&] { s.Put(five.data(), 1, codes_of(five).data(), PQOrigin::kReceived); }));
+    CHECK(s.Stats().resident == 0 && s.SlotOf(5) == PQStore::kNoSlot);
+    s.SetMirror(throwing);
+    CHECK(Throws([&] { s.Put(five.data(), 1, codes_of(five).data(), PQOrigin::kReceived); }));
+    CHECK(s.Stats().resident == 0 && s.SlotOf(5) == PQStore::kNoSlot);
+  }
+
+  // Four writers put half the IDs each, in batches of 300, while a reader Gets random IDs.
+  PQStore s(kIds, kM, kIds, /*host_copy=*/false);
+  Device dev;
+  attach(s, dev);
+  std::vector<std::vector<uint32_t>> lists(4);
+  std::mt19937 rng(11);
+  for (auto& l : lists) {
+    for (uint32_t id = 0; id < kIds; ++id)
+      if (rng() % 2 == 0) l.push_back(id);
+    std::shuffle(l.begin(), l.end(), rng);
+  }
+  std::set<uint32_t> distinct;
+  for (const auto& l : lists) distinct.insert(l.begin(), l.end());
+  std::atomic<bool> done{false};
+  std::atomic<uint64_t> wrong{0};
+  std::thread reader([&] {
+    std::mt19937 r(3);
+    std::vector<uint8_t> out(kM);
+    while (!done) {
+      const uint32_t id = static_cast<uint32_t>(r() % kIds);
+      try {
+        s.Get(&id, 1, out.data());
+        for (uint32_t j = 0; j < kM; ++j)
+          if (out[j] != code(id, j)) ++wrong;
+      } catch (const PQMissingError&) {
+      }
+    }
+  });
+  std::vector<std::thread> writers;
+  for (const auto& l : lists)
+    writers.emplace_back([&] {
+      for (size_t lo = 0; lo < l.size(); lo += 300) {
+        const std::vector<uint32_t> part(l.begin() + lo, l.begin() + std::min(l.size(), lo + 300));
+        s.Put(part.data(), part.size(), codes_of(part).data(), PQOrigin::kReceived);
+      }
+    });
+  for (auto& t : writers) t.join();
+  done = true;
+  reader.join();
+  const std::vector<uint32_t> all(distinct.begin(), distinct.end());
+  CHECK(wrong == 0 && s.Stats().resident == all.size() && dev.written == all.size());
+  CHECK(right(s, all));
+
+  const std::string dir = TempDir(), path = dir + "/pq.codes";
+  CHECK(s.Save(path, 7) == all.size());
+  PQStore with(kIds, kM, kIds);
+  CHECK(with.Restore(path, 7) == all.size() && right(with, all));
+  PQStore without(kIds, kM, kIds, /*host_copy=*/false);
+  Device dev2;
+  attach(without, dev2);
+  CHECK(without.Restore(path, 7) == all.size() && right(without, all) && dev2.written == all.size());
+
+  // 10, 20, 30 take slots 0-2 and become cached; 40 and 50 evict 10 and 20 and take their slots.
+  PQStore small(kIds, kM, 3, /*host_copy=*/false);
+  Device dev3;
+  attach(small, dev3);
+  const std::vector<uint32_t> first = {10, 20, 30}, next = {40, 50}, kept = {30};
+  CHECK(small.Put(first.data(), first.size(), codes_of(first).data(), PQOrigin::kReceived) == 3);
+  std::vector<uint32_t> slots(3);
+  small.Ref(first.data(), first.size(), slots.data());
+  small.Unref(slots.data(), slots.size());
+  CHECK(small.Put(next.data(), next.size(), codes_of(next).data(), PQOrigin::kReceived) == 2);
+  CHECK(small.Stats().evicted == 2 && small.SlotOf(10) == PQStore::kNoSlot && small.SlotOf(20) == PQStore::kNoSlot);
+  CHECK(right(small, next) && right(small, kept));
+}
+
+// The GPU filter's codes in device memory, the node's only copy (U15, under test): StoreCodes
+// puts codes into slots and LoadCodes reads them back, in another order, across StoreCodes'
+// batches of 64K codes; a slot past the buffer is refused. Skipped without a GPU.
+void TestGpuCodes() {
+  if (!GpuFilterAvailable()) {
+    std::printf("    no GPU: skipped\n");
+    return;
+  }
+  constexpr uint32_t kDim = 16, kM = 8;
+  constexpr uint64_t kCap = 200000;
+  const PQCodebook cb(kDim, kM);
+  FilterConfig fc;
+  fc.num_workers = 1;
+  fc.max_candidates = 64;
+  fc.max_topn = 8;
+  fc.slot_addressed = true;
+  auto f = CreateGpuFilter(cb, nullptr, kCap, fc);
+  auto code = [](uint32_t slot, uint32_t j) { return static_cast<uint8_t>(slot * 3 + j * 7); };
+  std::vector<uint32_t> slots;  // every other slot: 100K, in two calls
+  for (uint32_t s = 0; s < kCap; s += 2) slots.push_back(s);
+  std::vector<uint8_t> codes(slots.size() * kM);
+  for (size_t k = 0; k < slots.size(); ++k)
+    for (uint32_t j = 0; j < kM; ++j) codes[k * kM + j] = code(slots[k], j);
+  const uint32_t half = static_cast<uint32_t>(slots.size() / 2);
+  f->StoreCodes(slots.data(), half, codes.data());
+  f->StoreCodes(slots.data() + half, static_cast<uint32_t>(slots.size()) - half, codes.data() + size_t{half} * kM);
+  std::vector<uint32_t> ask(slots.rbegin(), slots.rend());
+  ask.push_back(1);  // never written: zero
+  std::vector<uint8_t> got(ask.size() * kM);
+  f->LoadCodes(ask.data(), static_cast<uint32_t>(ask.size()), got.data());
+  bool right = true;
+  for (size_t k = 0; k + 1 < ask.size(); ++k)
+    for (uint32_t j = 0; j < kM; ++j) right = right && got[k * kM + j] == code(ask[k], j);
+  for (uint32_t j = 0; j < kM; ++j) right = right && got[(ask.size() - 1) * kM + j] == 0;
+  CHECK(right);
+  const uint32_t past = static_cast<uint32_t>(kCap);
+  CHECK(Throws([&] { f->LoadCodes(&past, 1, got.data()); }));
+  CHECK(Throws([&] { f->StoreCodes(&past, 1, codes.data()); }));
 }
 
 // A node started on a snapshot's PQ codes (NodeOptions::pq_file, PQSave) installs them at
@@ -3995,6 +4160,8 @@ int main() {
       {"pq_evict_under_load", TestPQEvictUnderLoad},
       {"pq_from_index", TestPQFromIndex},
       {"pq_snapshot", TestPQSnapshot},
+      {"pq_store_no_host_copy", TestPQStoreNoHostCopy},
+      {"gpu_codes", TestGpuCodes},
       {"node_pq_snapshot", TestNodePQSnapshot},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},

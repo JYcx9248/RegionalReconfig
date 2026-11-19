@@ -52,14 +52,14 @@ void ReadAllAt(int fd, void* data, size_t n, uint64_t off, const std::string& pa
 }
 }  // namespace
 
-PQStore::PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity)
+PQStore::PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity, bool host_copy)
     : n_(num_vectors), m_(m), capacity_(capacity) {
   FUSION_CHECK(m >= 1, "PQ codes need at least one byte");
   FUSION_CHECK(num_vectors < kPending, "vector IDs must fit in 32 bits");
   FUSION_CHECK(capacity >= 1 && capacity <= num_vectors, "PQ capacity %llu outside [1, %llu]",
                static_cast<unsigned long long>(capacity),
                static_cast<unsigned long long>(num_vectors));
-  codes_.reset(new uint8_t[capacity * m]);
+  if (host_copy) codes_.reset(new uint8_t[capacity * m]);
   slot_of_.reset(new std::atomic<uint32_t>[n_]);
   for (uint64_t i = 0; i < n_; ++i) slot_of_[i].store(kNoSlot, std::memory_order_relaxed);
   id_of_.assign(capacity_, kNoSlot);
@@ -75,6 +75,11 @@ PQStore::PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity)
 void PQStore::SetMirror(Mirror mirror) {
   std::lock_guard<std::mutex> l(mu_);
   mirror_ = std::move(mirror);
+}
+
+void PQStore::SetReader(Reader reader) {
+  std::lock_guard<std::mutex> l(mu_);
+  reader_ = std::move(reader);
 }
 
 PQStore::Category PQStore::CategoryOf(uint32_t s) const {
@@ -194,6 +199,10 @@ size_t PQStore::PutRound(const uint32_t* ids, const uint8_t* codes, const size_t
       unclaim();
       throw;
     }
+    if (!codes_ && !mirror && !fresh.empty()) {
+      unclaim();
+      throw std::logic_error("PQ store without a host copy: no mirror to put the codes on the device");
+    }
     const uint64_t free_slots = capacity_ - st_.resident;
     if (fresh.size() > free_slots) {
       const uint64_t need = fresh.size() - free_slots;
@@ -230,13 +239,23 @@ size_t PQStore::PutRound(const uint32_t* ids, const uint8_t* codes, const size_t
     }
     st_.skipped += skipped;
   }
-  for (size_t k = 0; k < fresh.size(); ++k)
-    std::memcpy(codes_.get() + static_cast<uint64_t>(slots[k]) * m_, codes + fresh[k] * m_, m_);
+  if (codes_)
+    for (size_t k = 0; k < fresh.size(); ++k)
+      std::memcpy(codes_.get() + static_cast<uint64_t>(slots[k]) * m_, codes + fresh[k] * m_, m_);
   if (mirror && !slots.empty()) {
     try {
-      std::vector<uint32_t> sorted(slots);
-      std::sort(sorted.begin(), sorted.end());
-      mirror(sorted.data(), static_cast<uint32_t>(sorted.size()));
+      // The codes in slot order, as the mirror takes them: without a host copy, their only way
+      // to the device.
+      std::vector<size_t> order(slots.size());
+      for (size_t k = 0; k < order.size(); ++k) order[k] = k;
+      std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return slots[a] < slots[b]; });
+      std::vector<uint32_t> sorted(slots.size());
+      std::vector<uint8_t> packed(slots.size() * m_);
+      for (size_t j = 0; j < order.size(); ++j) {
+        sorted[j] = slots[order[j]];
+        std::memcpy(packed.data() + j * m_, codes + fresh[order[j]] * m_, m_);
+      }
+      mirror(sorted.data(), static_cast<uint32_t>(sorted.size()), packed.data());
     } catch (...) {
       {
         std::lock_guard<std::mutex> l(mu_);
@@ -284,13 +303,21 @@ void PQStore::AwaitClaims(const uint32_t* ids, const std::vector<size_t>& pos) {
 }
 
 void PQStore::Get(const uint32_t* ids, size_t n, uint8_t* out) {
+  std::vector<uint32_t> slots(codes_ ? 0 : n);  // without a host copy: read from the device
   std::lock_guard<std::mutex> l(mu_);
   for (size_t i = 0; i < n; ++i) {
     const uint32_t id = ids[i];
     if (id >= n_) throw std::invalid_argument(StrFormat("vector ID %u out of range", id));
     const uint32_t s = Held(id);
     if (s == kNoSlot) throw PQMissingError(StrFormat("no PQ code for vector %u on this node", id));
-    std::memcpy(out + i * m_, codes_.get() + static_cast<uint64_t>(s) * m_, m_);
+    if (codes_)
+      std::memcpy(out + i * m_, codes_.get() + static_cast<uint64_t>(s) * m_, m_);
+    else
+      slots[i] = s;
+  }
+  if (!codes_ && n > 0) {
+    FUSION_CHECK(reader_, "PQ store without a host copy: no reader to read the codes from the device");
+    reader_(slots.data(), static_cast<uint32_t>(n), out);
   }
   st_.served += n;
 }
@@ -467,11 +494,19 @@ uint64_t PQStore::Save(const std::string& path, uint32_t codebook_crc) const {
     WriteAll(fd, hdr, sizeof(hdr), tmp);
     WriteAll(fd, ids.data(), ids.size() * sizeof(uint32_t), tmp);
     std::vector<uint8_t> buf;
+    std::vector<uint32_t> slots;  // without a host copy: read from the device
     for (size_t i = 0; i < ids.size(); i += kSnapChunk) {
       const size_t k = std::min<size_t>(kSnapChunk, ids.size() - i);
       buf.resize(k * m_);
-      for (size_t j = 0; j < k; ++j)
-        std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(Held(ids[i + j])) * m_, m_);
+      if (codes_) {
+        for (size_t j = 0; j < k; ++j)
+          std::memcpy(buf.data() + j * m_, codes_.get() + static_cast<uint64_t>(Held(ids[i + j])) * m_, m_);
+      } else {
+        FUSION_CHECK(reader_, "PQ store without a host copy: no reader to read the codes from the device");
+        slots.resize(k);
+        for (size_t j = 0; j < k; ++j) slots[j] = Held(ids[i + j]);
+        reader_(slots.data(), static_cast<uint32_t>(k), buf.data());
+      }
       WriteAll(fd, buf.data(), buf.size(), tmp);
     }
     FUSION_CHECK(::fsync(fd) == 0, "fsync %s: %s", tmp.c_str(), std::strerror(errno));

@@ -549,15 +549,18 @@ var Open = map[string]Question{
 			"internal/controller/reconfig.go (promoteEntries), cmd/rtier-loadgen/main.go " +
 			"(entries.catchUp)"},
 	"U15": {"U15", "The host copy of the PQ codes next to the GPU's",
-		"with the GPU backend a node holds every code twice: PQStore keeps the authoritative " +
-			"copy in host memory (capacity x m) and the filter a second one in device memory, " +
-			"filled by StoreCodes as partitions load. The host copy answers a peer's PQ_GET and " +
-			"carries the bookkeeping without touching the GPU; dropping it would save that DRAM " +
-			"but make a migration source read its codes back over D2H, competing with its own " +
-			"query kernels. No code path yet: both copies exist, and the CPU backend reads the " +
-			"host one directly (no second copy)",
-		"engine/include/fusion/pq_store.h (codes_), engine/src/node_engine.cpp (filter creation), " +
-			"engine/src/gpu_filter.cu (d_codes_, StoreCodes)"},
+		"with the GPU backend a node held every code twice: PQStore the authoritative copy in " +
+			"host memory (capacity x m) and the filter a second one in device memory. The host " +
+			"copy answers a peer's PQ_GET without touching the GPU; dropping it saves that DRAM " +
+			"but makes a migration source read its codes back over D2H, next to its own query " +
+			"kernels. Under test on branch no-host-pq (2026-11-19), against clusterExperiment, " +
+			"which keeps both: with the GPU backend PQStore keeps the bookkeeping but no code " +
+			"bytes; a Put hands its codes, in slot order, to the filter (StoreCodes), and a Get " +
+			"(PQ_GET) or a Save (PQ_SAVE) reads them back (LoadCodes: a gather kernel and a D2H " +
+			"copy, under the store's lock so that no slot is reused meanwhile). The CPU backend " +
+			"keeps the host copy it filters from",
+		"engine/include/fusion/pq_store.h (codes_, Mirror, Reader), engine/src/node_engine.cpp " +
+			"(filter creation), engine/src/gpu_filter.cu (d_codes_, StoreCodes, LoadCodes)"},
 }
 
 // Undecided returns an error for a placeholder tied to open question id.

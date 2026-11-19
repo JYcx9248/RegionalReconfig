@@ -148,7 +148,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   default) returns partitions to former owners so a scale-in moves no PQ code. The runners give
   every node a budget (`--pq-capacity`) of the fullest node's codes at the smallest cluster size,
   plus 10% (`"PQCapacity": "auto"`, `rtier-client pq-share`; a run with a rebuild gets the
-  whole ID space).
+  whole ID space). On branch `no-host-pq` (2026-11-19, U15 under test against
+  clusterExperiment) the GPU backend keeps the codes in device memory only: the store keeps
+  their bookkeeping, a Put hands them to the filter, and a peer's PQ_GET or a PQ_SAVE reads them
+  back (`LoadCodes`, D2H); the CPU backend keeps its host copy.
 - **Candidate buffers**: each filter worker's (on the GPU in device memory) are allocated once.
   A request names at most `max_nprobe` lists, each once, so with lists that never change the
   runners size them by the postings of the `max_nprobe` longest (`rtier_node --max-candidates`,
@@ -624,8 +627,9 @@ Next:
      `run_cluster.py` still copies whole (every segment to each initial node's host, and the
      page file and the PQ codes where there is no warmup snapshot), per-node
      structures sized by the dataset (`slot_of_`, the presence bitmap);
-   - elsewhere: chunk storage (U12, last), the host copy of the PQ codes (U15), the number of
-     partitions (U2), the PQ compression level.
+   - elsewhere: chunk storage (U12, last), the host copy of the PQ codes (U15; dropped on
+     branch no-host-pq, to be measured against clusterExperiment), the number of partitions
+     (U2), the PQ compression level.
 
 ## Working with the user
 

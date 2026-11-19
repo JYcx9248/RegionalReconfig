@@ -28,7 +28,9 @@
 // resident posting lists, one copy each (fusion/pq_store.h). The device buffer then has one
 // slot per code of the node's budget, StoreCodes copies newly installed codes into their
 // slots, and each query ships a slot array next to its candidate IDs. Keys still carry the
-// vector ID, so the order of results (and ties) is the same as with ID addressing.
+// vector ID, so the order of results (and ties) is the same as with ID addressing. The device
+// buffer is the node's only copy of its codes (U15, under test on this branch): LoadCodes reads
+// them back for a peer's PQ_GET and for a snapshot.
 
 #include <cuda_runtime.h>
 
@@ -126,7 +128,20 @@ __global__ void ScatterCodesKernel(const uint8_t* __restrict__ stage,
   }
 }
 
-// Codes staged per StoreCodes batch (pinned host buffer + device buffer).
+// The reverse: copies the codes of `count` slots into `stage`, m bytes each, in the order of
+// `slots`.
+__global__ void GatherCodesKernel(const uint8_t* __restrict__ codes,
+                                  const uint32_t* __restrict__ slots, uint32_t count, uint32_t m,
+                                  uint8_t* __restrict__ stage) {
+  const uint64_t total = static_cast<uint64_t>(count) * m;
+  for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+       i += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+    const uint64_t k = i / m;
+    stage[i] = codes[static_cast<uint64_t>(slots[k]) * m + (i - k * m)];
+  }
+}
+
+// Codes staged per StoreCodes or LoadCodes batch (pinned host buffer + device buffer).
 constexpr uint32_t kStageCodes = 1u << 16;
 
 // Carves aligned sub-buffers out of a block (or measures the block size when base is null).
@@ -365,7 +380,7 @@ class GpuFilterBackend : public FilterBackend {
                  "%.1f MB are free after loading %.1f MB of PQ codes",
                  cfg.num_workers, need / 1e6, free_b / 1e6, code_bytes_ / 1e6);
     FUSION_CUDA_CHECK(cudaMalloc(&pool_, need));
-    if (g_.slot_mode) {  // staging for StoreCodes
+    if (g_.slot_mode) {  // staging for StoreCodes and LoadCodes
       FUSION_CUDA_CHECK(cudaStreamCreateWithFlags(&store_stream_, cudaStreamNonBlocking));
       FUSION_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&h_stage_),
                                       static_cast<size_t>(kStageCodes) * g_.m, cudaHostAllocDefault));
@@ -380,28 +395,29 @@ class GpuFilterBackend : public FilterBackend {
           std::max<uint32_t>(cfg.max_topn, 1), sort_bytes));
     }
     Log("GPU backend on %s: %.1f MB for PQ codes (%s), %d x %.2f MB worker blocks", prop.name,
-        code_bytes_ / 1e6, g_.slot_mode ? "slots, filled as partitions arrive" : "all resident",
+        code_bytes_ / 1e6,
+        g_.slot_mode ? "slots, filled as partitions arrive; the node's only copy" : "all resident",
         cfg.num_workers, block / 1e6);
   }
 
-  void StoreCodes(const uint32_t* slots, uint32_t n, const uint8_t* host_codes) override {
+  void StoreCodes(const uint32_t* slots, uint32_t n, const uint8_t* codes) override {
     FUSION_CHECK(g_.slot_mode, "StoreCodes on a filter addressed by vector ID");
     std::lock_guard<std::mutex> l(store_mu_);
     FUSION_CUDA_CHECK(cudaSetDevice(g_.device));
     const uint32_t m = g_.m;
     const uint64_t num_slots = code_bytes_ / m;
-    // Per batch: gather the codes into pinned memory, copy them and their slots on a dedicated
-    // stream, scatter them on the device, and wait. Waiting matters twice: the staging buffers
-    // are reused, and queries (on the workers' non-blocking streams, which are not ordered
-    // after this one) may read the slots as soon as the partition that names them is loaded.
+    // Per batch: the codes and their slots into pinned memory, copied on a dedicated stream,
+    // scattered on the device, and waited for. Waiting matters twice: the staging buffers are
+    // reused, and queries (on the workers' non-blocking streams, which are not ordered after
+    // this one) may read the slots as soon as the partition that names them is loaded.
     for (uint32_t first = 0; first < n; first += kStageCodes) {
       const uint32_t cnt = std::min(kStageCodes, n - first);
       for (uint32_t k = 0; k < cnt; ++k) {
         const uint32_t s = slots[first + k];
         FUSION_CHECK(s < num_slots, "PQ slot %u out of range", s);
         h_stage_slots_[k] = s;
-        std::memcpy(h_stage_ + static_cast<size_t>(k) * m, host_codes + static_cast<uint64_t>(s) * m, m);
       }
+      std::memcpy(h_stage_, codes + static_cast<uint64_t>(first) * m, static_cast<size_t>(cnt) * m);
       FUSION_CUDA_CHECK(cudaMemcpyAsync(d_stage_, h_stage_, static_cast<size_t>(cnt) * m,
                                         cudaMemcpyHostToDevice, store_stream_));
       FUSION_CUDA_CHECK(cudaMemcpyAsync(d_stage_slots_, h_stage_slots_, cnt * sizeof(uint32_t),
@@ -413,6 +429,37 @@ class GpuFilterBackend : public FilterBackend {
           static_cast<uint8_t*>(d_codes_));
       FUSION_CUDA_CHECK(cudaGetLastError());
       FUSION_CUDA_CHECK(cudaStreamSynchronize(store_stream_));
+    }
+  }
+
+  void LoadCodes(const uint32_t* slots, uint32_t n, uint8_t* out) override {
+    FUSION_CHECK(g_.slot_mode, "LoadCodes on a filter addressed by vector ID");
+    std::lock_guard<std::mutex> l(store_mu_);
+    FUSION_CUDA_CHECK(cudaSetDevice(g_.device));
+    const uint32_t m = g_.m;
+    const uint64_t num_slots = code_bytes_ / m;
+    // Per batch, on StoreCodes' stream and buffers: the slots in, a gather on the device, the
+    // codes out. This copy back is what dropping the host copy costs (U15): a migration source
+    // serves its peers' PQ_GETs over the PCIe link and the SMs its queries' kernels use.
+    for (uint32_t first = 0; first < n; first += kStageCodes) {
+      const uint32_t cnt = std::min(kStageCodes, n - first);
+      for (uint32_t k = 0; k < cnt; ++k) {
+        const uint32_t s = slots[first + k];
+        FUSION_CHECK(s < num_slots, "PQ slot %u out of range", s);
+        h_stage_slots_[k] = s;
+      }
+      FUSION_CUDA_CHECK(cudaMemcpyAsync(d_stage_slots_, h_stage_slots_, cnt * sizeof(uint32_t),
+                                        cudaMemcpyHostToDevice, store_stream_));
+      const uint32_t blocks = static_cast<uint32_t>(std::min<uint64_t>(
+          CeilDiv(static_cast<uint64_t>(cnt) * m, kBlock), static_cast<uint64_t>(4 * g_.num_sms)));
+      GatherCodesKernel<<<blocks, kBlock, 0, store_stream_>>>(
+          static_cast<const uint8_t*>(d_codes_), static_cast<const uint32_t*>(d_stage_slots_), cnt, m,
+          static_cast<uint8_t*>(d_stage_));
+      FUSION_CUDA_CHECK(cudaGetLastError());
+      FUSION_CUDA_CHECK(cudaMemcpyAsync(h_stage_, d_stage_, static_cast<size_t>(cnt) * m,
+                                        cudaMemcpyDeviceToHost, store_stream_));
+      FUSION_CUDA_CHECK(cudaStreamSynchronize(store_stream_));
+      std::memcpy(out + static_cast<uint64_t>(first) * m, h_stage_, static_cast<size_t>(cnt) * m);
     }
   }
 

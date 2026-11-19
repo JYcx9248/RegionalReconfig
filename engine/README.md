@@ -198,9 +198,12 @@ dropped: the vectors of partitions that move away stay, like cached PQ codes, so
 can serve the peers whose postings name it, and a partition that comes back needs no transfer.
 
 Known limits of the PQ path:
-- The GPU backend keeps a host copy of the node's codes (capacity × m bytes of DRAM, used to
-  serve peers and to stage copies). Reading codes back from the device would save the copy:
-  whether to keep it is U15.
+- On this branch (no-host-pq, U15 under test) the GPU backend keeps no host copy of the node's
+  codes, which saves capacity × m bytes of DRAM: a Put hands its codes to the filter
+  (`StoreCodes`), and a peer's PQ_GET or a snapshot's PQ_SAVE reads them back from the device
+  (`LoadCodes`: a gather kernel and a D2H copy, in batches of 64K codes, under the store's lock).
+  A migration source thus serves its peers over the PCIe link its queries use. The CPU backend
+  keeps the host copy it filters from.
 - `PQStore::slot_of_` is a dense `int32` array indexed by vector ID, so it is sized by the whole
   dataset rather than by what the node holds: 4 MB at 1M vectors, 400 MB at 100M, 4 GB at 1B.
   That is the one place the engine breaks the rule that no per-node structure should be sized by

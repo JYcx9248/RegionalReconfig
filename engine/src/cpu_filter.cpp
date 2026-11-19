@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -86,7 +87,7 @@ class CpuFilterWorker : public FilterWorker {
 class CpuFilterBackend : public FilterBackend {
  public:
   CpuFilterBackend(const PQCodebook& cb, const uint8_t* codes, uint64_t n, const FilterConfig& cfg)
-      : cb_(cb), code_bytes_(n * cb.m()), slot_addressed_(cfg.slot_addressed) {
+      : cb_(cb), codes_(codes), code_bytes_(n * cb.m()), slot_addressed_(cfg.slot_addressed) {
     FUSION_CHECK(codes != nullptr || n == 0, "the CPU filter needs the host PQ codes");
     for (int i = 0; i < cfg.num_workers; ++i)
       workers_.push_back(std::make_unique<CpuFilterWorker>(cb_, codes, cfg));
@@ -98,9 +99,19 @@ class CpuFilterBackend : public FilterBackend {
     // The workers read the slot-addressed host store directly: nothing to copy.
     FUSION_CHECK(slot_addressed_, "StoreCodes on a filter addressed by vector ID");
   }
+  void LoadCodes(const uint32_t* slots, uint32_t n, uint8_t* out) override {
+    FUSION_CHECK(slot_addressed_, "LoadCodes on a filter addressed by vector ID");
+    const uint32_t m = cb_.m();
+    const uint64_t num_slots = code_bytes_ / m;
+    for (uint32_t i = 0; i < n; ++i) {
+      FUSION_CHECK(slots[i] < num_slots, "PQ slot %u out of range", slots[i]);
+      std::memcpy(out + static_cast<uint64_t>(i) * m, codes_ + static_cast<uint64_t>(slots[i]) * m, m);
+    }
+  }
 
  private:
   PQCodebook cb_;
+  const uint8_t* codes_;  // the host store's
   uint64_t code_bytes_;
   bool slot_addressed_;
   std::vector<std::unique_ptr<CpuFilterWorker>> workers_;

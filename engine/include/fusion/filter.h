@@ -61,15 +61,20 @@ class FilterBackend {
   virtual FilterWorker* worker(int i) = 0;
   // Bytes of device (or host, for CPU) memory reserved for PQ codes.
   virtual uint64_t code_bytes() const = 0;
-  // Slot-addressed backends only: the host store `host_codes` (slot-addressed, m bytes per
-  // slot) has new codes in `slots` (ascending). The GPU backend copies them to the device; the
-  // CPU backend reads the host store directly. No running query may read these slots.
-  virtual void StoreCodes(const uint32_t* slots, uint32_t n, const uint8_t* host_codes) = 0;
+  // Slot-addressed backends only: new codes for `slots` (ascending), m bytes each, in that order
+  // in `codes`. The GPU backend copies them to the device, where it keeps the node's only copy
+  // (the PQ store has none then, U15); the CPU backend reads the host store directly and ignores
+  // them. No running query may read these slots.
+  virtual void StoreCodes(const uint32_t* slots, uint32_t n, const uint8_t* codes) = 0;
+  // Slot-addressed backends only: copies the codes of slots[0..n) (any order) into out, n x m
+  // bytes in that order -- the GPU backend from device memory (a peer's PQ_GET, a snapshot), the
+  // CPU backend from the host store. The caller keeps the slots from being reused meanwhile.
+  virtual void LoadCodes(const uint32_t* slots, uint32_t n, uint8_t* out) = 0;
 };
 
 // `codes` (n x m bytes) must outlive the CPU backend. The GPU backend copies them to the
 // device, so the caller may free the host copy afterwards. With cfg.slot_addressed, `codes` is
-// the slot-addressed host store (n slots; the GPU backend may be given null and starts empty).
+// the slot-addressed host store (n slots); the GPU backend is given null and starts empty.
 std::unique_ptr<FilterBackend> CreateCpuFilter(const PQCodebook& cb, const uint8_t* codes,
                                                uint64_t n, const FilterConfig& cfg);
 std::unique_ptr<FilterBackend> CreateGpuFilter(const PQCodebook& cb, const uint8_t* codes,

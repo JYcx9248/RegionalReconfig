@@ -278,7 +278,10 @@ class NodeEngineImpl : public NodeEngine {
     const uint64_t cap = o.pq_capacity ? o.pq_capacity : ids_;
     FUSION_CHECK(cap <= ids_, "PQ capacity %llu exceeds the %llu vector IDs",
                  static_cast<unsigned long long>(cap), static_cast<unsigned long long>(ids_));
-    store_ = std::make_unique<PQStore>(ids_, cb.m(), cap);
+    // U15, under test on this branch: with the GPU backend the codes are in device memory only,
+    // and the store keeps their bookkeeping; the CPU backend filters from the store's host copy.
+    const bool gpu = o.device == FilterDevice::kGpu;
+    store_ = std::make_unique<PQStore>(ids_, cb.m(), cap, /*host_copy=*/!gpu);
     codebook_ = std::make_unique<PQCodebook>(cb);
     reclaimer_ = std::make_unique<Reclaimer>(store_.get());
 
@@ -288,17 +291,17 @@ class NodeEngineImpl : public NodeEngine {
     fc.max_topn = o.max_rerank;
     fc.gpu_device = o.gpu_device;
     fc.slot_addressed = true;
-    if (o.device == FilterDevice::kGpu) {
+    if (gpu) {
       filter_ = CreateGpuFilter(cb, nullptr, cap, fc);
+      FilterBackend* fb = filter_.get();
+      store_->SetMirror([fb](const uint32_t* slots, uint32_t n, const uint8_t* codes) {
+        fb->StoreCodes(slots, n, codes);
+      });
+      store_->SetReader([fb](const uint32_t* slots, uint32_t n, uint8_t* out) { fb->LoadCodes(slots, n, out); });
     } else {
       filter_ = CreateCpuFilter(cb, store_->codes(), cap, fc);
     }
-    FilterBackend* fb = filter_.get();
-    const uint8_t* host_codes = store_->codes();
-    store_->SetMirror([fb, host_codes](const uint32_t* slots, uint32_t n) {
-      fb->StoreCodes(slots, n, host_codes);
-    });
-    if (!o.pq_file.empty()) {  // with the mirror set, so that the filter gets them too
+    if (!o.pq_file.empty()) {  // with the mirror set, so that the device gets them
       Timer t;
       const uint64_t k = store_->Restore(o.pq_file, codebook_crc_);
       Log("PQ codes: %llu from %s in %.1f s", static_cast<unsigned long long>(k), o.pq_file.c_str(), t.Sec());
@@ -1886,11 +1889,12 @@ class NodeEngineImpl : public NodeEngine {
                    man->payload.c_str(), generation_.load());
     s += StrFormat("  navigation graph : %s\n", has_graph() ? "loaded" : "not loaded");
     s += StrFormat("  %s tier          : PQ codes of %llu vectors (%.1f MB; %llu live, %llu cached), "
-                   "one per vector, budget %llu codes (%.1f MB)\n",
+                   "one per vector, budget %llu codes (%.1f MB)%s\n",
                    std::strcmp(filter_->name(), "gpu") == 0 ? "GPU " : "host",
                    (unsigned long long)pq.resident, pq.resident * pq.m / mb,
                    (unsigned long long)pq.live, (unsigned long long)pq.cached,
-                   (unsigned long long)pq.capacity, filter_->code_bytes() / mb);
+                   (unsigned long long)pq.capacity, filter_->code_bytes() / mb,
+                   store_->codes() ? "" : ", no copy in host memory");
     const RawStats raw = raw_stats(false);
     s += StrFormat("  SSD tier         : raw vectors of %llu of %llu locations (%.1f MB, %llu pending), "
                    "a sparse copy of the '%s' page file in %s (%s I/O)\n",

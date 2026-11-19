@@ -3,8 +3,14 @@
 // A node keeps exactly one copy of each vector's PQ code, however many of its resident posting
 // lists -- of however many partitions -- contain the vector. (FusionANNS replicates boundary
 // vectors into up to 8 lists, so partitions share many vectors; storing codes per partition
-// would duplicate them in the scarce GPU memory.) Codes live in fixed-size slots of a buffer
-// sized to the node's budget (`capacity` codes: the HBM budget); an ID -> slot map finds them.
+// would duplicate them in the scarce GPU memory.) Codes live in fixed-size slots, as many as the
+// node's budget (`capacity` codes: the HBM budget); an ID -> slot map finds them.
+//
+// Where the slots are (U15, under test on this branch): with the CPU backend, in a buffer here --
+// the host copy its filter reads. With the GPU backend, in device memory only: the store keeps
+// every slot's bookkeeping but no code bytes, hands new codes to the filter (the mirror) and
+// reads them back from it for a peer's PQ_GET and for a snapshot (the reader), so a node holds
+// no second copy of its codes in DRAM (capacity x m bytes).
 //
 // Every code is in one of three states:
 //   live    named by at least one resident segment (a partition's version): one reference per
@@ -97,19 +103,27 @@ class PQStore {
  public:
   static constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
   static constexpr uint32_t kNoLoc = 0xFFFFFFFFu;
-  // Called after Put wrote new codes into `slots` (ascending) of codes(), before it publishes
-  // them, without the store's lock (Puts may call it concurrently); the GPU filter copies them
-  // into device memory. If it throws, the Put is undone.
-  using Mirror = std::function<void(const uint32_t* slots, uint32_t n)>;
+  // Called with the new codes of a Put -- codes holds those of `slots` (ascending), m bytes each,
+  // in that order -- before it publishes them, without the store's lock (Puts may call it
+  // concurrently). The GPU filter copies them into device memory: without a host copy, the only
+  // place they are kept. If it throws, the Put is undone.
+  using Mirror = std::function<void(const uint32_t* slots, uint32_t n, const uint8_t* codes)>;
+  // Without a host copy: copies the codes of slots[0..n) (any order) into out, n x m bytes in
+  // that order -- the GPU filter, from device memory. Called under the store's lock, so that no
+  // slot it reads is freed and handed out again meanwhile.
+  using Reader = std::function<void(const uint32_t* slots, uint32_t n, uint8_t* out)>;
 
   // num_vectors: size of the ID space; m: bytes per code; capacity: slots (<= num_vectors).
-  PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity);
+  // host_copy false: no code bytes here (the GPU backend); the mirror and the reader must be set
+  // before a Put, a Get or a Save.
+  PQStore(uint64_t num_vectors, uint32_t m, uint64_t capacity, bool host_copy = true);
 
   uint32_t m() const { return m_; }
   uint64_t capacity() const { return capacity_; }
-  // capacity x m bytes, addressed by slot. The pointer never changes.
+  // capacity x m bytes, addressed by slot, or null without a host copy. The pointer never changes.
   const uint8_t* codes() const { return codes_.get(); }
   void SetMirror(Mirror mirror);
+  void SetReader(Reader reader);
 
   // IDs among ids[0..n) that have no code here: sorted, without duplicates.
   std::vector<uint32_t> Missing(const uint32_t* ids, size_t n) const;
@@ -125,6 +139,7 @@ class PQStore {
   // code, and should it then not fit, the codes this one installed before stay.
   size_t Put(const uint32_t* ids, size_t n, const uint8_t* codes, PQOrigin origin);
   // Copies the codes of ids[0..n) into out (n x m bytes). Throws PQMissingError if one is absent.
+  // Under the store's lock; without a host copy it reads them from the device meanwhile.
   void Get(const uint32_t* ids, size_t n, uint8_t* out);
   // Adds a reference to the code of each of ids[0..n) -- ascending, without duplicates: the
   // distinct vectors of one segment, which references each once -- making it live, and writes
@@ -203,7 +218,7 @@ class PQStore {
   const uint64_t n_;
   const uint32_t m_;
   const uint64_t capacity_;
-  std::unique_ptr<uint8_t[]> codes_;  // capacity x m
+  std::unique_ptr<uint8_t[]> codes_;  // capacity x m: the host copy, or null (codes on the device)
   mutable std::mutex mu_;
   // Per vector ID; kNoSlot = no code here. Sized by the whole dataset, not by what this node
   // holds (4 GB at a billion vectors) -- the accounting cost of overlapping posting lists, and
@@ -220,6 +235,7 @@ class PQStore {
   uint64_t hand_ = 0;              // eviction sweep position
   PQStats st_;
   Mirror mirror_;
+  Reader reader_;
   // Only to wait for claims to end: taken last (mu_ may be held), and nothing is taken under it.
   std::mutex claim_mu_;
   std::condition_variable claim_cv_;
