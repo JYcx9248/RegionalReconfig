@@ -458,6 +458,10 @@ type UpdateReply struct {
 	Changed   []int              `json:"changed"` // partitions at a new version
 	Graph     uint32             `json:"graph,omitempty"`
 	Phases    map[string]float64 `json:"phases"` // seconds per phase
+	// From the start of the phases to the flip's compare-and-swap, when queries began to read
+	// the batch's data, as RescaleReply's from its trigger; 0 if it did not flip. The controller
+	// counts from its commit, and the update controller adds its staging (the phase "stage").
+	FlipSeconds float64 `json:"flip_seconds,omitempty"`
 }
 
 // AbortUpdateReq ends a lease without a flip. What the batch staged is the update

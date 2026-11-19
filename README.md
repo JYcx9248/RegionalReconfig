@@ -236,6 +236,9 @@ placement current in the epoch store.
   lazy-stream's stream.
 - The reply gives it as `flip_seconds` after the trigger, and the timelines draw it at
   `trigger_seconds` plus that. A full rebuild flips more than once, so it names its steps instead.
+  An update batch flips the same way: its record in `updates.json` gives `flip_seconds` after its
+  trigger (and `major_flip_seconds` for a major epoch after it), and `compare_runs.py` draws
+  batches with the rescales.
 
 **Dataset updates (decided part of U14, first version):** updates come in batches, and each
 batch is a content epoch that reuses staging, flip, grace and reclaim. Vectors are immutable and

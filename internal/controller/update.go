@@ -169,7 +169,8 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 	if req.FromEpoch != cur.Epoch {
 		return reply, fmt.Errorf("controller: the batch was staged for epoch %d, the current epoch is %d", req.FromEpoch, cur.Epoch)
 	}
-	mark := time.Now()
+	start := time.Now()
+	mark := start
 	phase := func(name string) { // one clock reading per phase end, as copyThenFlip's
 		now := time.Now()
 		s := now.Sub(mark).Seconds()
@@ -295,6 +296,7 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 	if err := c.store.CompareAndSwap(cur.Epoch, next); err != nil {
 		return reply, err
 	}
+	reply.FlipSeconds = time.Since(start).Seconds()
 	flipped = true
 	afterFlip := func(err error) error {
 		return fmt.Errorf("controller: update batch stopped after flipping to epoch %d; the replaced versions are "+

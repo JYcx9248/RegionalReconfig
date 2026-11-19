@@ -6,7 +6,8 @@
     python3 scripts/compare_runs.py results/e2e/rep*/lazy results/e2e/rep*/copy-then-flip \\
         results/e2e/rep*/stop-and-copy --window 0.02      # repetitions pooled per protocol
 
-Each directory holds a latency.csv and, optionally, a reconfigurations.json, as written by
+Each directory holds a latency.csv and, optionally, a reconfigurations.json (and an updates.json,
+whose update batches are drawn as reconfigurations: a batch flips as a rescale does), as written by
 run_local.py or run_cluster.py (one run per protocol, same config) or by TestReconfigUnderLoad with
 RTIER_E2E_TIMELINE set. A run is labelled with its directory name unless --labels is given,
 and runs that share a label are pooled into one line: their queries are merged, so a window's
@@ -64,8 +65,8 @@ import sys
 import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from plot_run import (answered_at, esc, flip_time, fmt, load_end, nice_ticks, read_latency,  # noqa: E402
-                      reconfigurations, windows)
+from plot_run import (answered_at, batch_events, esc, flip_time, fmt, load_end, nice_ticks,  # noqa: E402
+                      read_latency, reconfigurations, windows)
 
 # Categorical slots of the reference palette in their fixed order, (light, dark); validated
 # as a set (adjacent pairs, both modes; the first three all-pairs too).
@@ -224,7 +225,10 @@ def load(label, dirs, skip):
         rows = [r for r in read_latency(path) if r["t"] >= skip]
         if not rows:
             sys.exit("%s has no query sent after %g s" % (path, skip))
-        runs.append((rows, reconfigurations(os.path.join(d, "reconfigurations.json"))))
+        # Update batches (updates.json) are reconfigurations too, in the same timeline (U14).
+        rcs = (reconfigurations(os.path.join(d, "reconfigurations.json")) +
+               batch_events(os.path.join(d, "updates.json")))
+        runs.append((rows, sorted(rcs, key=lambda r: r[0])))
     if len({len(rcs) for _, rcs in runs}) > 1:
         sys.exit("%s: the runs have different numbers of reconfigurations; pool only runs of one schedule"
                  % label)
@@ -541,29 +545,30 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         svg.append('<text class="legend" x="%d" y="%d">flip</text>' % (lx + 22, ly))
 
     # Reconfigurations: one strip per label, on the same time axis, every run's spans in it.
-    svg.append('<text class="sub" x="%d" y="%d">reconfigurations (target data nodes)</text>'
-               % (LEFT, strip_top - 10))
+    batches = any(rc[2].startswith("batch") for _, _, _, runs_rcs, _ in lines for rcs in runs_rcs for rc in rcs)
+    svg.append('<text class="sub" x="%d" y="%d">reconfigurations (target data nodes)%s</text>'
+               % (LEFT, strip_top - 10, " and update batches" if batches else ""))
     for i, (label, slot, _, runs_rcs, _) in enumerate(lines):
         ry = strip_top + i * STRIP_ROW
         svg.append('<line class="grid" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (LEFT, ry + 6, W - RIGHT, ry + 6))
-        labels = []  # (end of the bars, the label's text, whether they run past the axis' end)
+        labels = []  # (start and end of the bars, the label's text, whether they run past the axis' end)
         for j in range(len(runs_rcs[0]) if runs_rcs else 0):
             starts = [rcs[j][0] for rcs in runs_rcs]
             if min(starts) >= span and labels:
                 # A reconfiguration that waited past the axis' end for the one before it (a
                 # scale-in behind a scale-out that ends after the load): no bar, and its label
                 # would sit on the one before, both ending at the axis' end; that one names it.
-                x1, text, _ = labels[-1]
-                labels[-1] = (x1, text + "; %s from %.0f s" % (
+                x0, x1, text, _ = labels[-1]
+                labels[-1] = (x0, x1, text + "; %s from %.0f s" % (
                     esc(runs_rcs[0][j][2].replace("rescale to ", "→")), min(starts)), True)
                 continue
-            end, last = 0.0, 0.0
+            begin, end, last = float("inf"), 0.0, 0.0
             for rcs in runs_rcs:
                 t0, dur, name, _ = rcs[j]
                 # A reconfiguration can outlast the load (copy-then-flip under overload): the bar
                 # stops at the axis' end and the label says when it ended.
                 x0, x1 = x(t0), min(max(x(t0 + dur), x(t0) + 3), x(span))
-                end, last = max(end, x1), max(last, t0 + dur)
+                begin, end, last = min(begin, x0), max(end, x1), max(last, t0 + dur)
                 svg.append('<rect class="span f%d" x="%.1f" y="%d" width="%.1f" height="8" rx="2">'
                            '<title>%s: %s, %.2f s from %.2f s</title></rect>'
                            % (slot, x0, ry + 2, x1 - x0, esc(label), esc(name), dur, t0))
@@ -572,16 +577,30 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
             if ts:  # the runs' flips: their mean when they agree within a second, else the range
                 name += ", flip at %s s" % ("%.1f" % (sum(ts) / len(ts)) if max(ts) - min(ts) < 1
                                             else "%.0f–%.0f" % (min(ts), max(ts)))
-            labels.append((end, name + (", ended at %.0f s" % last if last > span else ""), last > span))
-        for end, text, past in labels:  # names are escaped above
+            labels.append((begin, end, name + (", ended at %.0f s" % last if last > span else ""), last > span))
+        # A label goes beside its bars if it ends before the next ones and the axis' end; by the
+        # axis' end, where it would run into the legend, above them, ending with them; and where
+        # the next bars are nearer than its width (update batches between rescales), above them
+        # from where they start.
+        right = {"beside": float("-inf"), "above": float("-inf")}  # where each text row's last label ends
+        for k, (begin, end, text, past) in enumerate(labels):  # names are escaped above
+            w = 6.2 * len(text)  # 11 px text, about 6.2 px a character
+            nxt = labels[k + 1][0] if k + 1 < len(labels) else W - RIGHT
             if past:
                 svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s ▸</text>' % (end, ry, text))
-            elif end + 3 + 6.2 * len(text) > W - RIGHT:
-                # Beside a bar that ends near the axis' end the label would run into the legend
-                # (11 px text, about 6.2 px a character): above the bar, ending with it.
-                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, text))
-            else:
+                right["above"] = end
+            elif end + 3 >= right["beside"] + 6 and end + 3 + w <= min(nxt - 3, W - RIGHT):
                 svg.append('<text class="tick" x="%.1f" y="%d">%s</text>' % (end + 3, ry + 10, text))
+                right["beside"] = end + 3 + w
+            elif end + 3 + w > W - RIGHT and end - w >= right["above"] + 6:
+                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, text))
+                right["above"] = end
+            elif begin >= right["above"] + 6 and begin + w <= W - RIGHT:
+                svg.append('<text class="tick" x="%.1f" y="%d">%s</text>' % (begin, ry, text))
+                right["above"] = begin + w
+            else:
+                svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, text))
+                right["above"] = end
         lx = W - RIGHT + 16
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ry + 6, lx + 16, ry + 6))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ry + 10, esc(label)))

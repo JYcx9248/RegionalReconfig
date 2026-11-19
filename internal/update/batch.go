@@ -227,8 +227,8 @@ func (u *Updater) Execute(ctx context.Context, b *Batch) (*protocol.UpdateReply,
 }
 
 // withStage adds the staging, which the update controller runs, to the phases of a reply, which
-// the controller's commit times (check, flip, drain, reclaim): the reply then covers a batch
-// from its staging on, as a rescale's covers the rescale.
+// the controller's commit times (check, flip, drain, reclaim), and to its flip time: the reply
+// then covers a batch from its staging on, as a rescale's covers the rescale.
 func withStage(reply *protocol.UpdateReply, seconds float64) {
 	if reply == nil {
 		return
@@ -237,6 +237,9 @@ func withStage(reply *protocol.UpdateReply, seconds float64) {
 		reply.Phases = map[string]float64{}
 	}
 	reply.Phases["stage"] = seconds
+	if reply.FlipSeconds > 0 { // the controller counted from its commit, after the staging
+		reply.FlipSeconds += seconds
+	}
 }
 
 // stage sends each owner the PQ codes and raw vectors of its inserts, then has every data node

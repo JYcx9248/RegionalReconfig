@@ -92,8 +92,15 @@ type record struct {
 	PatchBytes    int                   `json:"major_patch_bytes,omitempty"`
 	MajorDecide   float64               `json:"major_decide_seconds,omitempty"`
 	MajorApply    float64               `json:"major_apply_seconds,omitempty"`
-	Error         string                `json:"error,omitempty"`
+	// When the batch and the major epoch flipped, in seconds since this process started -- when
+	// the runner triggered it (updates.json's trigger_seconds): the timelines draw them there.
+	FlipSeconds      float64 `json:"flip_seconds,omitempty"`
+	MajorFlipSeconds float64 `json:"major_flip_seconds,omitempty"`
+	Error            string  `json:"error,omitempty"`
 }
+
+// started is when the process started, which the record's flip times count from.
+var started = time.Now()
 
 func main() {
 	var o options
@@ -275,8 +282,12 @@ func run(o options, rec *record) error {
 			rec.IDs = []uint64{uint64(b.Inserts[0].ID), uint64(b.Inserts[n-1].ID) + 1}
 			rec.Locations = []uint64{uint64(b.Inserts[0].Loc), uint64(b.Inserts[n-1].Loc) + 1}
 		}
+		executing := time.Since(started).Seconds()
 		reply, err := u.Execute(ctx, b)
 		rec.Batch, rec.ApplySeconds = reply, time.Since(start).Seconds()-decided.Seconds()
+		if reply != nil && reply.FlipSeconds > 0 {
+			rec.FlipSeconds = executing + reply.FlipSeconds
+		}
 		if reply != nil {
 			out, _ := json.MarshalIndent(reply, "", "  ")
 			fmt.Println(string(out))
@@ -318,8 +329,12 @@ func runMajor(ctx context.Context, u *update.Updater, statePath string, alloc *u
 	for _, cs := range mj.Codes {
 		rec.MajorMoved += len(cs.IDs)
 	}
+	executing := time.Since(started).Seconds()
 	reply, err := u.ExecuteMajor(ctx, mj)
 	rec.Major, rec.MajorApply = reply, time.Since(start).Seconds()-decided.Seconds()
+	if reply != nil && reply.FlipSeconds > 0 {
+		rec.MajorFlipSeconds = executing + reply.FlipSeconds
+	}
 	if reply != nil {
 		out, _ := json.MarshalIndent(reply, "", "  ")
 		fmt.Println(string(out))

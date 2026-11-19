@@ -147,6 +147,7 @@ func testUpdateBatch(t *testing.T, f *fixture, proto string) {
 		if reply.FromEpoch != from || reply.ToEpoch != from+1 || len(reply.Changed) == 0 {
 			t.Fatalf("%s: reply %+v, want a flip from epoch %d that changes partitions", what, reply, from)
 		}
+		checkUpdateFlip(t, what, reply)
 		lists, _, _ := b.Postings()
 		t.Logf("%s: %d inserts (%d postings), %d deletes; epoch %d -> %d, partitions %v at new versions, phases %v",
 			what, len(b.Inserts), len(lists), len(b.Deleted), reply.FromEpoch, reply.ToEpoch, reply.Changed, reply.Phases)
@@ -470,4 +471,16 @@ func shifted(row []byte, d float32) []byte {
 		binary.LittleEndian.PutUint32(out[j:], math.Float32bits(v))
 	}
 	return out
+}
+
+// checkUpdateFlip: a batch's phases tile its time from the staging, as a rescale's from its
+// trigger, so its flip -- the compare-and-swap, when queries began to read its data -- falls
+// after its staging and its check, within its flip phase (the timelines draw it there).
+func checkUpdateFlip(t *testing.T, what string, reply *protocol.UpdateReply) {
+	t.Helper()
+	before := reply.Phases["stage"] + reply.Phases["check"]
+	if reply.FlipSeconds < before-1e-3 || reply.FlipSeconds > before+reply.Phases["flip"]+1e-3 {
+		t.Errorf("%s: flip at %.6f s, its staging and check end at %.6f s, the flip phase takes %.6f s (phases %v)",
+			what, reply.FlipSeconds, before, reply.Phases["flip"], reply.Phases)
+	}
 }

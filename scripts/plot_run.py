@@ -294,6 +294,19 @@ def update_batches(path):
     return out
 
 
+
+def batch_events(path):
+    """Update batches (updates.json) as reconfigurations, (trigger_s, elapsed_s, label, reply), for
+    the timelines that draw those: a batch is one, and flips as a rescale does. Its flip is the
+    record's flip_seconds, from the trigger (a major epoch after it flips later, on the same data;
+    one alone has only its own). Runs before 2026-11-17 recorded none: their batches then show no
+    flip."""
+    out = []
+    for t0, dur, label, rec in update_batches(path):
+        flip = rec.get("flip_seconds") or rec.get("major_flip_seconds")
+        out.append((t0, dur, label, {"flip_seconds": flip} if flip else {}))
+    return out
+
 # ---------------------------------------------------------------- SVG
 
 W, PANEL_H, GAP = 900, 200, 52

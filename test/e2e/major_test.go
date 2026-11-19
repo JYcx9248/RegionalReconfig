@@ -165,6 +165,7 @@ func TestMajorEpoch(t *testing.T) {
 	if reply.FromEpoch != from || reply.ToEpoch != from+1 || reply.Graph != 1 || len(reply.Changed) == 0 {
 		t.Fatalf("major epoch reply %+v: want a flip from epoch %d to graph version 1", reply, from)
 	}
+	checkUpdateFlip(t, "major epoch", reply)
 	after := cl.ctl.Status().Table
 	for _, c := range sp.Children {
 		if p, ok := after.Lists[c]; !ok || p != sp.Partition {
