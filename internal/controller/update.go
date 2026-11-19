@@ -170,11 +170,12 @@ func (c *Controller) commitUpdate(ctx context.Context, req protocol.CommitUpdate
 		return reply, fmt.Errorf("controller: the batch was staged for epoch %d, the current epoch is %d", req.FromEpoch, cur.Epoch)
 	}
 	mark := time.Now()
-	phase := func(name string) {
-		s := time.Since(mark).Seconds()
+	phase := func(name string) { // one clock reading per phase end, as copyThenFlip's
+		now := time.Now()
+		s := now.Sub(mark).Seconds()
+		mark = now
 		reply.Phases[name] = s
 		c.event("update."+name+"_s", s)
-		mark = time.Now()
 	}
 	np := cur.Placement.NumPartitions()
 	next := cur.Clone()

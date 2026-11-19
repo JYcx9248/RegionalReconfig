@@ -160,11 +160,12 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	reply := &protocol.RebuildReply{FromEpoch: cur.Epoch, ToEpoch: cur.Epoch, Generation: gen.id, Nodes: ids(old),
 		Phases: map[string]float64{}}
 	mark := time.Now()
-	phase := func(name string) {
-		s := time.Since(mark).Seconds()
+	phase := func(name string) { // one clock reading per phase end, as copyThenFlip's
+		now := time.Now()
+		s := now.Sub(mark).Seconds()
+		mark = now
 		reply.Phases[name] = s
 		c.event("rebuild."+name+"_s", s)
-		mark = time.Now()
 	}
 	c.event("rebuild.start", float64(cur.Epoch))
 	log.Printf("controller: full rebuild to index generation %d (%s), epoch %d, %d nodes", gen.id, gen.partsDir,

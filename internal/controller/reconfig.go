@@ -333,13 +333,17 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 
 	reply := &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
 		Added: ids(added), Removed: ids(removed), Moved: changes.Moved(), Phases: map[string]float64{}}
-	// The phases tile the time from the trigger: "plan" is what working out the target took.
+	// The phases tile the time from the trigger: "plan" is what working out the target took. One
+	// clock reading ends a phase and starts the next, so that the time its event takes (a write to
+	// the metrics file, which may wait for an agent's report) falls in the next phase rather than
+	// in none, and the flip's compare-and-swap always lies within the flip phase.
 	mark := triggered
 	phase := func(name string) {
-		s := time.Since(mark).Seconds()
+		now := time.Now()
+		s := now.Sub(mark).Seconds()
+		mark = now
 		reply.Phases[name] = s
 		c.event("reconfig."+name+"_s", s)
-		mark = time.Now()
 	}
 	phase("plan")
 	c.event("reconfig.start", float64(cur.Epoch))
