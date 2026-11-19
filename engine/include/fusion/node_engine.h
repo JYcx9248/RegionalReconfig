@@ -104,6 +104,12 @@ struct NodeOptions {
   // after the vectors fetched for queries; RawAdd blocks while more than this many bytes wait.
   uint64_t update_buffer_bytes = 256ull << 20;
   uint64_t update_write_bps = 0;  // bytes/s the writer spends on inserted vectors; 0 = no limit
+  // The fetch cache's bound: raw vectors fetched for queries that may wait in memory for the
+  // writer. Past it the fetching query installs its own, so that a disk slower than the fetches
+  // cannot grow the cache without end. rtier_node sets it as a share of the memory the node may
+  // use (--fetch-cache-share, an experiment's "FetchCacheShare"), so that one setting fits
+  // every machine; 2 GB without one.
+  uint64_t fetch_cache_bytes = 2ull << 30;
   // Longest posting list a request may gather (0 = the manifest's): inserts make lists longer,
   // and the filter's candidate buffers are sized by it.
   uint32_t max_list_len = 0;
@@ -240,6 +246,7 @@ struct FetchStats {
   uint64_t cached = 0;           // now: fetched, not on the SSD yet (served from memory)
   uint64_t queued = 0;           // now: of those, waiting for the writer
   uint64_t queued_peak = 0;
+  uint64_t cache_bound = 0;      // the bound on queued, in bytes (NodeOptions::fetch_cache_bytes)
   uint64_t fetched = 0;          // new vectors fetched from peers
   uint64_t fetch_calls = 0;      // calls that missed a vector, fetching it or waiting for another
                                  // fetch of it (RERANK, SEARCH_LOCAL)

@@ -173,6 +173,13 @@ every node room for the whole ID space (rtier_node's default), as does "auto" fo
 rebuild, whose placement is made at run time, or for one whose fullest node names nearly every
 vector anyway. --pq-capacity in NodeArgs wins over all of them.
 
+"FetchCacheShare": 0.05 bounds each data node's fetch cache -- raw vectors fetched for queries,
+kept in memory until the writer has put them on the SSD; past the bound a fetching query installs
+its own -- at that share of the memory the node may use (rtier_node --fetch-cache-share): its
+cgroup's limit (NodeResources' MemoryMax here) or else its machine's. A share, so that one
+setting fits every machine; without one the bound is 2 GB. It is a write buffer, not a read
+cache: it holds what was fetched and not yet written, whatever the bound.
+
 Placeholders of decided design questions (see `bin/rtier-client design`) fail with "undecided":
   U5  "Strategy": "two-phase", the default, is the decided one (exactly the single-node
       answer); "proportional-quota" is the placeholder.
@@ -903,11 +910,16 @@ def revision(out_dir: str) -> None:
 
 
 def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: str) -> list:
-    """rtier_node's flags beyond the ones every node has: NodeArgs, the read budget,
-    room for updates, the PQ budget."""
+    """rtier_node's flags beyond the ones every node has: NodeArgs, the read budget, the fetch
+    cache's bound, room for updates, the PQ budget."""
     res = cfg.get("NodeResources") or {}
     args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
                                       if res.get("ReadIOPSPerNode") else [])
+    share = cfg.get("FetchCacheShare")
+    if share is not None:
+        if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0 < share <= 1:
+            sys.exit(f"FetchCacheShare is {share!r}: a share of each data node's memory, in (0, 1]")
+        args += ["--fetch-cache-share", repr(float(share))]
     args += update_args(cfg, index, parts)
     return args + pq_args(cfg, index, parts, args, reconfigs, out_dir)
 

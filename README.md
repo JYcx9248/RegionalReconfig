@@ -80,7 +80,10 @@ holding no engine worker meanwhile, nor a connection slot of the aggregator's th
 (RERANKs have their own, `NodeConns` of each kind), and makes that posting name itself;
 queries that miss the same vector meanwhile wait for the one fetch. Fetched vectors are
 re-ranked from memory, and a background writer installs them on the SSD with whole-page direct
-writes, off the query path. Nothing else moves and a scale-out does
+writes, off the query path -- up to a bound on what waits for it, past which a fetching query
+installs its own. An experiment sets that bound as a share of each data node's memory
+(`"FetchCacheShare"`, 5% in the CloudLab GPU experiments; 2 GB without it): a write buffer, not a
+read cache, holding what was fetched and not yet written. Nothing else moves and a scale-out does
 not wait for raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it
 ran, and each node reports `raw.fetched` (installed or still in memory), `raw.pending` (named by
 its partitions, not needed so far) and `raw.present` in its metrics. A scale-in does stream:

@@ -61,6 +61,10 @@ static void Usage() {
                          index's pages)
   --update-buffer-mb N   inserted vectors that may wait in memory for the writer (default 256)
   --update-write-mbps N  MB/s the writer spends on inserted vectors (default 0 = no limit)
+  --fetch-cache-share F  the fetch cache's bound -- raw vectors fetched for queries that may wait
+                         in memory for the writer before a fetching query installs its own -- as
+                         a share of the memory this node may use: its cgroup's limit, else the
+                         machine's (an experiment's "FetchCacheShare"; default: 2 GB)
   --max-list-len N       longest posting list a request may gather, with room for inserts
                          (default: the partitions' longest)
   --graph-headroom F     room for the heads and lists major epochs add, as a fraction of the
@@ -115,6 +119,15 @@ int main(int argc, char** argv) {
     o.max_pages = a.U64("max-pages", 0);
     o.update_buffer_bytes = a.U64("update-buffer-mb", 256) << 20;
     o.update_write_bps = a.U64("update-write-mbps", 0) * 1000000;
+    if (a.Has("fetch-cache-share")) {
+      const double share = std::stod(a.Str("fetch-cache-share", ""));
+      FUSION_CHECK(share > 0 && share <= 1, "--fetch-cache-share %g: want a share of memory in (0, 1]", share);
+      const uint64_t memory = MemoryLimitBytes();
+      FUSION_CHECK(memory > 0, "--fetch-cache-share: the memory this node may use is unknown");
+      o.fetch_cache_bytes = std::max<uint64_t>(static_cast<uint64_t>(share * static_cast<double>(memory)), 1);
+      Log("fetch cache: at most %.2f GB, %g of the %.2f GB this node may use", o.fetch_cache_bytes / 1e9, share,
+          memory / 1e9);
+    }
     o.max_list_len = static_cast<uint32_t>(a.U64("max-list-len", 0));
     o.graph_headroom = a.Has("graph-headroom") ? std::stod(a.Str("graph-headroom", "0.2")) : 0.2;
     o.gpu_device = static_cast<int>(a.U64("gpu", 0));

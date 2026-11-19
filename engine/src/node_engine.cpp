@@ -244,6 +244,7 @@ class NodeEngineImpl : public NodeEngine {
                  man.raw.vec_bytes, dim_ * DTypeSize(DTypeOf<T>()));
     FUSION_CHECK(o.num_workers >= 1, "need at least one worker");
     FUSION_CHECK(o.max_nprobe >= 1 && o.max_rerank >= 1, "max_nprobe and max_rerank must be >= 1");
+    FUSION_CHECK(o.fetch_cache_bytes > 0, "the fetch cache's bound must be above 0");
     geom_ = man.raw;
     layout_name_ = man.layout;
     payload_ = man.payload;
@@ -1574,6 +1575,7 @@ class NodeEngineImpl : public NodeEngine {
 
   FetchStats fetch_stats() const override {
     FetchStats f;
+    f.cache_bound = opts_.fetch_cache_bytes;
     {
       std::lock_guard<std::mutex> l(cache_mu_);
       f.cached = cache_.size();
@@ -1824,6 +1826,8 @@ class NodeEngineImpl : public NodeEngine {
                                      : "no limit",
                      opts_.peer_reads_first ? StrFormat(", peers' first, %u at the device at once", opts_.io_depth).c_str()
                                             : "");
+    s += StrFormat("  fetch cache      : at most %.1f MB of fetched raw vectors waiting for the writer\n",
+                   opts_.fetch_cache_bytes / mb);
     s += StrFormat("  workers          : %d, max candidates/request %u\n", num_workers(),
                    max_candidates_);
     return s;
@@ -2449,20 +2453,21 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // Keeps fetched vectors for the queries and queues them for the SSD; returns how many were
-  // new. Past kMaxQueuedBytes of queued vectors the fetching query installs them itself:
-  // backpressure, so that a slow disk cannot grow the cache without bound. The bound holds a new
-  // node's burst of fetches right after a flip: a SATA SSD's writer installed at most 6.6-8.6K
-  // 4 KB vectors/s, below what the new owners of the hottest partitions fetched, and a 64 MB
-  // bound put those writes on the queries for about 50 s (CloudLab, 2026-11-03/04), where a whole
-  // new node's fetches came to 1.35 GB at most.
+  // new. Past the bound (NodeOptions::fetch_cache_bytes) of queued vectors the fetching query
+  // installs them itself: backpressure, so that a slow disk cannot grow the cache without bound.
+  // The bound holds a new node's burst of fetches right after a flip: a SATA SSD's writer
+  // installed at most 6.6-8.6K 4 KB vectors/s, below what the new owners of the hottest partitions
+  // fetched, and a 64 MB bound put those writes on the queries for about 50 s (CloudLab,
+  // 2026-11-03/04), where a whole new node's fetches came to 1.35 GB at most. It is set as a share
+  // of the node's memory since 2026-11-16, as a write buffer, not a read cache: what it holds is
+  // what was fetched and not yet written, whatever the bound.
   size_t Cache(const uint32_t* locs, size_t n, const uint8_t* vecs) {
-    static constexpr size_t kMaxQueuedBytes = size_t{2} << 30;
     const uint32_t vb = raw_->layout().vec_bytes;
     std::vector<uint32_t> fresh;
     bool full = false;
     {
       std::lock_guard<std::mutex> l(cache_mu_);
-      full = (queued_ + n) * vb > kMaxQueuedBytes;
+      full = (queued_ + n) * vb > opts_.fetch_cache_bytes;
       if (!full) {
         for (size_t i = 0; i < n; ++i) {
           if (HeldLocked(locs[i])) continue;  // fetched twice: once is enough

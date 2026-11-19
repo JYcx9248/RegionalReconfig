@@ -17,7 +17,8 @@ run_one.sh wrote them; a protocol may have run in one repetition only, not the s
 (amazon-4to8-v4: rep1/copy-then-flip and rep2/lazy), and the figures then take the repetitions
 that ran. The calibrations (calibrate-4, calibrate-8) can come from another series, as for a
 rerun after a change. --fetch-bound-mb is the fetch cache's bound the runs had (64 before
-2026-11-04, 2048 since). Every number a figure's notes cite is computed from the runs. Writes,
+2026-11-04, 2048 since), for runs whose stats do not report it: since 2026-11-16 they do
+(fetch.cache_bound, a share of each node's memory, "FetchCacheShare"). Every number a figure's notes cite is computed from the runs. Writes,
 into --out:
 
   4to8.svg, 4to8-rep1.svg, 4to8-rep2.svg, 4to8to4.svg
@@ -681,11 +682,20 @@ def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=None):
     call_bin = {n: {int((t - lo) // step): v for t, v in per_call[n]} for n in new}
     writes = {n: rates([(r["t"] - t0, r["disk"]["wbytes"]) for r in host_records(run, n)], lo, hi, step, 1e-6)
               for n in new}
-    # The cache's bound (engine/src/node_engine.cpp, kMaxQueuedBytes: 64 MB until 2026-11-04, 2 GB
-    # since) in vectors of this index; drawn when it is within reach of what the cache held.
+    # The cache's bound in vectors of this index; drawn when it is within reach of what the cache
+    # held. The runs' own (fetch.cache_bound, since 2026-11-16; the largest, should the new nodes'
+    # memories differ), else bound_mb (a constant in engine/src/node_engine.cpp: 64 MB until
+    # 2026-11-04, 2 GB until 2026-11-16).
     reply = events(run)[3]["reply"]  # the bytes per raw vector, as the rescale counted its fetches
     vec_bytes = reply["raw_fetched_bytes"] // reply["raw_fetched"] if reply.get("raw_fetched") else 4096
-    bound = bound_mb * (1 << 20) // vec_bytes
+    reported = {st[n][-1]["fetch"].get("cache_bound") for n in new} - {None}
+    if reported:
+        bound_bytes = max(reported)
+        size = "%.1f GB" % (bound_bytes / (1 << 30)) if bound_bytes >= 1 << 30 else "%d MB" % (bound_bytes >> 20)
+    else:
+        bound_bytes = bound_mb * (1 << 20)
+        size = "%d GB" % (bound_mb // 1024) if bound_mb >= 1024 else "%d MB" % bound_mb
+    bound = bound_bytes // vec_bytes
     peak = {n: max(v for _, v in queued[n]) for n in new}
     top = max(peak.values()) or 1
     show_bound = bound <= 2 * top
@@ -726,7 +736,6 @@ def lazy_fetch(runs, out, runset, calibrations, bound_mb, lo=80.0, hi=None):
     if c4:  # labelled at the right end, where the line runs above it
         p1.hline(c4, "4 nodes' capacity, %.0f q/s" % c4, dy=12)
     p1.line(answered, "c%d" % LAZY)
-    size = "%d GB" % (bound_mb // 1024) if bound_mb >= 1024 else "%d MB" % bound_mb
     if show_bound:
         p2.hline(bound, "the bound, %s: past it the query that fetched writes its vectors itself" % size, dy=-5)
     for n in [n for n in new if n not in hot] + hot:  # context first, highlights over it
@@ -1785,7 +1794,8 @@ def main():
                     help="the directory under --runs with calibrate-4 and calibrate-8 (default 4to8)")
     ap.add_argument("--before", help="another series, whose lazy runs lazy-before-after.svg draws against these")
     ap.add_argument("--fetch-bound-mb", type=int, default=2048,
-                    help="the fetch cache's bound the runs had (default 2048; 64 before 2026-11-04, as in 4to8)")
+                    help="the fetch cache's bound the runs had, when their stats do not report it (default 2048; "
+                         "64 before 2026-11-04, as in 4to8)")
     ap.add_argument("--lazy-series", help="keepup-all.svg: lazy's runs from this series (a longer load), "
                     "against --series' copy-then-flip runs (default: --series)")
     ap.add_argument("--drained", action="store_true",

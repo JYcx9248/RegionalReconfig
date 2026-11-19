@@ -7,9 +7,12 @@
 
 #include <cerrno>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 
@@ -178,6 +181,42 @@ std::vector<uint8_t> ReadFile(const std::string& path) {
   std::fclose(f);
   FUSION_CHECK(r == buf.size(), "short read from %s", path.c_str());
   return buf;
+}
+
+uint64_t MemoryLimitBytes() {
+  uint64_t limit = 0;
+  {
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    uint64_t kb = 0;
+    while (f >> key >> kb) {  // "MemTotal:  10182540 kB"
+      if (key == "MemTotal:") {
+        limit = kb << 10;
+        break;
+      }
+      f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+  }
+  std::string path;  // cgroup v2: the line "0::/path"
+  {
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(f, line))
+      if (line.rfind("0::", 0) == 0) path = line.substr(3);
+  }
+  // A limit set higher up holds too: a scope inside a slice that has one.
+  while (!path.empty() && path[0] == '/') {
+    std::ifstream f("/sys/fs/cgroup" + (path == "/" ? std::string() : path) + "/memory.max");
+    std::string v;
+    if (f >> v && v != "max") {
+      const uint64_t b = std::strtoull(v.c_str(), nullptr, 10);
+      if (b && (!limit || b < limit)) limit = b;
+    }
+    if (path == "/") break;
+    const size_t slash = path.rfind('/');
+    path = slash == 0 ? "/" : path.substr(0, slash);
+  }
+  return limit;
 }
 
 }  // namespace fusion

@@ -37,6 +37,7 @@
   "InitialNodes": 4,
   "Protocol": "copy-then-flip",
   "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
   "Backend": "gpu",
   "Load": {
     "K": 10,

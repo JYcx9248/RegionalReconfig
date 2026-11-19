@@ -1163,12 +1163,12 @@ std::string NodeServer::FetchJson() const {
       "\"write_us\":%llu,\"sync_installed\":%llu,\"sync_us\":%llu,\"drain_calls\":%llu,"
       "\"drain_waiting\":%llu,\"drain_us\":%llu,\"rerank_disk\":%llu,\"rerank_mem\":%llu,"
       "\"pending_recounts\":%llu,\"pending_us\":%llu,\"added\":%llu,\"added_queued\":%llu,"
-      "\"added_written\":%llu,\"added_wait_us\":%llu}",
+      "\"added_written\":%llu,\"added_wait_us\":%llu,\"cache_bound\":%llu}",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
       u(f.coalesced), u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
       u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us), u(f.added), u(f.added_queued),
-      u(f.added_written), u(f.added_wait_us));
+      u(f.added_written), u(f.added_wait_us), u(f.cache_bound));
 }
 
 std::string NodeServer::StatsJson() const {

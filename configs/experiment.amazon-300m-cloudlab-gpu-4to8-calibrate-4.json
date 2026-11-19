@@ -40,6 +40,7 @@
   "Protocol": "lazy",
   "StageTimeout": "2h",
   "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
   "Backend": "gpu",
   "Load": {
     "K": 10,

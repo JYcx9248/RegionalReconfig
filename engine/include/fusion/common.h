@@ -111,4 +111,10 @@ void SyncAndDropFromPageCache(const std::string& path);
 // new file or the old one, after a crash too.
 void RenameDurably(const std::string& tmp, const std::string& path);
 
+// The memory this process may use, in bytes: the lowest memory.max of its cgroup (v2) and of the
+// cgroups above it, else the machine's (MemTotal); 0 if neither can be read. A node that a runner
+// confines to a share of a shared machine (a scope's MemoryMax) then sizes what it keeps in
+// memory by that share, not by the machine.
+uint64_t MemoryLimitBytes();
+
 }  // namespace fusion

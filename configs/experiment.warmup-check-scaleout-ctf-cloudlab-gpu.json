@@ -12,6 +12,7 @@
   },
   "Placement": "even-reversible-graph",
   "Strategy": "two-phase",
+  "FetchCacheShare": 0.05,
   "Backend": "gpu",
   "Nodes": 4,
   "InitialNodes": 2,

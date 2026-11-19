@@ -3469,6 +3469,33 @@ void TestGenerations() {
 
 }  // namespace
 
+// The fetch cache's bound (NodeOptions::fetch_cache_bytes, rtier_node --fetch-cache-share): with
+// room for 4 vectors, the queries install what they fetch past it themselves, and answer as the
+// old owner does; the stats report each node's bound. MemoryLimitBytes, which the share is of,
+// reads this process's.
+void TestFetchCacheBound() {
+  Fixture& f = GetFixture();
+  auto src = OpenNode(f, {2, 3}, true);  // SameRerank navigates here
+  src->SetNodes(1, {});
+  const uint32_t vb = src->raw_stats(false).vec_bytes;
+  NodeOptions o;
+  o.index_dir = f.index_nopages;
+  o.partitions_dir = f.parts;
+  o.max_nprobe = 64;
+  o.max_rerank = 4096;
+  o.direct_io = false;
+  o.fetch_cache_bytes = 4ull * vb;
+  auto small = NodeEngine::Open(o);
+  LinkPeers(small.get(), 2, {{1, src.get()}});
+  StageFrom(f, small.get(), src.get(), {2, 3});
+  bool same = true;
+  for (uint32_t qi = 0; qi < f.nq / 2; ++qi) same = SameRerank(f, qi, small.get(), src.get(), {2, 3}) && same;
+  const FetchStats fs = small->fetch_stats();
+  CHECK(same && small->raw_stats(true).fetched > 0 && fs.sync_installed > 0 && fs.cache_bound == 4ull * vb &&
+        src->fetch_stats().cache_bound == (2ull << 30));
+  CHECK(MemoryLimitBytes() > (64ull << 20));
+}
+
 int main() {
   const std::vector<std::pair<const char*, std::function<void()>>> tests = {
       {"crc32", TestCrc32},
@@ -3494,6 +3521,7 @@ int main() {
       {"streamer", TestStreamer},
       {"wire", TestWire},
       {"fetch_holds_no_worker", TestFetchHoldsNoWorker},
+      {"fetch_cache_bound", TestFetchCacheBound},
   };
   int failed = 0;
   for (const auto& t : tests) {
