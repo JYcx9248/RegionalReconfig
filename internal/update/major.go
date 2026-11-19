@@ -94,10 +94,16 @@ type PartEdits struct {
 	Created, Removed []uint32
 	Lists, IDs, Locs []uint32
 	Holders          []uint16
+	// Postings dropped: a reassigned vector leaves a list it no longer belongs to (spfresh.go).
+	DropLists, DropIDs []uint32
 }
 
 func (e *PartEdits) add(list, id, loc uint32, holder uint16) {
 	e.Lists, e.IDs, e.Locs, e.Holders = append(e.Lists, list), append(e.IDs, id), append(e.Locs, loc), append(e.Holders, holder)
+}
+
+func (e *PartEdits) drop(list, id uint32) {
+	e.DropLists, e.DropIDs = append(e.DropLists, list), append(e.DropIDs, id)
 }
 
 // CodeSet is PQ codes (M bytes each) of the vectors IDs.
@@ -121,8 +127,73 @@ type Major struct {
 	// Codes: by node, the PQ codes of the postings that move to it from another owner.
 	Codes map[placement.NodeID]*CodeSet
 	// Staged: by owner, the next version of each partition it staged (ExecuteMajor).
-	Staged  map[placement.NodeID][]protocol.PartitionVersion
-	patched []placement.NodeID // entries that staged the patch
+	Staged map[placement.NodeID][]protocol.PartitionVersion
+	// Reassign: what SPFresh's reassign checked and changed (Policy "spfresh"; nil otherwise).
+	Reassign *ReassignStats
+	patched  []placement.NodeID                   // entries that staged the patch
+	sent     map[placement.NodeID]map[uint32]bool // the codes in Codes, by node
+}
+
+// partitionOf is list l's partition after the epoch: a list it creates is in its parent's.
+func (mj *Major) partitionOf(t *epoch.Table, m *partitioning.Manifest, l uint32) int {
+	if p, created := mj.Lists[l]; created {
+		return p
+	}
+	return t.PartitionOf(l, m)
+}
+
+// sendCode has node to receive vector id's PQ code before it stages a posting of it, once.
+func (mj *Major) sendCode(to placement.NodeID, id uint32, code []byte) {
+	if mj.sent == nil {
+		mj.sent = map[placement.NodeID]map[uint32]bool{}
+	}
+	if mj.sent[to] == nil {
+		mj.sent[to] = map[uint32]bool{}
+	}
+	if mj.sent[to][id] {
+		return
+	}
+	mj.sent[to][id] = true
+	cs, ok := mj.Codes[to]
+	if !ok {
+		cs = &CodeSet{}
+		mj.Codes[to] = cs
+	}
+	cs.IDs = append(cs.IDs, id)
+	cs.Codes = append(cs.Codes, code...)
+}
+
+// listMembers is a posting list as its owner holds it at the epoch's version -- postings with
+// their holders -- and its members' PQ codes.
+type listMembers struct {
+	p       int
+	IDs     []uint32
+	Locs    []uint32
+	Holders []uint16
+	codes   []byte
+}
+
+func (lm *listMembers) code(k, m int) []byte { return lm.codes[k*m : (k+1)*m] }
+
+// readList reads list l from its owner at t's version; m is the PQ code size (0 if the list is
+// empty).
+func (u *Updater) readList(ctx context.Context, t *epoch.Table, l uint32) (lm listMembers, m int, err error) {
+	if _, created := t.Lists[l]; !created && int(l) >= u.Manifest.NumLists {
+		return lm, 0, fmt.Errorf("update: list %d does not exist", l)
+	}
+	p := t.PartitionOf(l, u.Manifest)
+	nc := u.client(t.Nodes[t.Owner(p)].NodeAddr)
+	lp, err := nc.ListGet(ctx, l, t.Version(p))
+	if err != nil {
+		return lm, 0, fmt.Errorf("update: list %d of partition %d: %w", l, p, err)
+	}
+	lm = listMembers{p: p, IDs: lp.IDs, Locs: lp.Locs, Holders: lp.Holders}
+	if len(lp.IDs) > 0 {
+		if m, lm.codes, err = nc.PQGet(ctx, lp.IDs); err != nil {
+			return lm, 0, fmt.Errorf("update: the PQ codes of list %d: %w", l, err)
+		}
+	}
+	return lm, m, nil
 }
 
 func (mj *Major) part(p int) *PartEdits {
@@ -147,7 +218,8 @@ func (mj *Major) Versions() []protocol.PartitionVersion {
 // Edits is the nodeclient form of partition p's edits.
 func (mj *Major) Edits(p int) nodeclient.Edits {
 	pe := mj.Parts[p]
-	e := nodeclient.Edits{Lists: pe.Lists, IDs: pe.IDs, Locs: pe.Locs, Holders: pe.Holders, Removed: pe.Removed}
+	e := nodeclient.Edits{Lists: pe.Lists, IDs: pe.IDs, Locs: pe.Locs, Holders: pe.Holders, Removed: pe.Removed,
+		DropLists: pe.DropLists, DropIDs: pe.DropIDs}
 	for _, c := range pe.Created {
 		e.Created = append(e.Created, nodeclient.CreatedList{List: c, Partition: p})
 	}
@@ -199,6 +271,11 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 	if u.Router == nil {
 		return nil, errors.New("update: no router: a major epoch edits the update controller's own navigation graph")
 	}
+	switch u.Policy {
+	case "", PolicyThreshold, PolicySPFresh:
+	default:
+		return nil, fmt.Errorf("update: unknown policy %q (%s or %s)", u.Policy, PolicyThreshold, PolicySPFresh)
+	}
 	lease, err := u.Controller.BeginUpdate(ctx, protocol.BeginUpdateReq{})
 	if err != nil {
 		return nil, err
@@ -224,41 +301,23 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 
 	// The members of every list the epoch changes, as their owners hold them: postings with
 	// their holders, and PQ codes.
-	type members struct {
-		p     int
-		lp    nodeclient.ListPostings
-		codes []byte
+	read := func(l uint32) (listMembers, error) {
+		lm, m, err := u.readList(ctx, t, l)
+		if m > 0 {
+			mj.M = m
+		}
+		return lm, err
 	}
-	read := func(l uint32) (members, error) {
-		if _, created := t.Lists[l]; !created && int(l) >= u.Manifest.NumLists {
-			return members{}, fmt.Errorf("update: list %d does not exist", l)
-		}
-		p := t.PartitionOf(l, u.Manifest)
-		nc := u.client(t.Nodes[t.Owner(p)].NodeAddr)
-		lp, err := nc.ListGet(ctx, l, t.Version(p))
-		if err != nil {
-			return members{}, fmt.Errorf("update: list %d of partition %d: %w", l, p, err)
-		}
-		out := members{p: p, lp: lp}
-		if len(lp.IDs) > 0 {
-			m, codes, err := nc.PQGet(ctx, lp.IDs)
-			if err != nil {
-				return members{}, fmt.Errorf("update: the PQ codes of list %d: %w", l, err)
-			}
-			mj.M, out.codes = m, codes
-		}
-		return out, nil
-	}
-	sl := make([]members, len(splits))
+	sl := make([]listMembers, len(splits))
 	for i, l := range splits {
 		if sl[i], err = read(l); err != nil {
 			return nil, err
 		}
-		if len(sl[i].lp.IDs) < 2 {
-			return nil, fmt.Errorf("update: list %d holds %d postings, too few to split", l, len(sl[i].lp.IDs))
+		if len(sl[i].IDs) < 2 {
+			return nil, fmt.Errorf("update: list %d holds %d postings, too few to split", l, len(sl[i].IDs))
 		}
 	}
-	ml := make([]members, len(merges))
+	ml := make([]listMembers, len(merges))
 	for i, l := range merges {
 		if ml[i], err = read(l); err != nil {
 			return nil, err
@@ -269,19 +328,21 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 	children := u.Alloc.TakeLists(2*len(splits), listFloor(t, u.Manifest))
 	var labels, dead []uint32
 	var vecs []byte
+	sides := make([][]uint8, len(splits))
 	for i, l := range splits {
 		s := sl[i]
 		side, heads, err := u.Router.SplitList(ctx, s.codes, mj.M)
 		if err != nil {
 			return nil, fmt.Errorf("update: splitting list %d: %w", l, err)
 		}
+		sides[i] = side
 		sp := Split{List: l, Partition: s.p, Children: [2]uint32{children[2*i], children[2*i+1]}}
 		pe := mj.part(s.p)
 		pe.Removed = append(pe.Removed, l)
 		for c := 0; c < 2; c++ {
 			j := heads[c]
-			sp.Heads[c] = s.lp.IDs[j]
-			v, err := u.rawVector(ctx, t, s.lp.Locs[j], s.lp.Holders[j])
+			sp.Heads[c] = s.IDs[j]
+			v, err := u.rawVector(ctx, t, s.Locs[j], s.Holders[j])
 			if err != nil {
 				return nil, fmt.Errorf("update: the head of list %d's child: %w", l, err)
 			}
@@ -289,8 +350,8 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 			pe.Created = append(pe.Created, sp.Children[c])
 			mj.Lists[sp.Children[c]] = s.p
 		}
-		for k := range s.lp.IDs {
-			pe.add(sp.Children[side[k]], s.lp.IDs[k], s.lp.Locs[k], s.lp.Holders[k])
+		for k := range s.IDs {
+			pe.add(sp.Children[side[k]], s.IDs[k], s.Locs[k], s.Holders[k])
 			sp.Sizes[side[k]]++
 		}
 		mj.Splits = append(mj.Splits, sp)
@@ -304,7 +365,8 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 	}
 	edited = true
 
-	// Merges: every posting to the list of its nearest live head on the edited graph.
+	// Merges: every posting to the list of its nearest live head on the edited graph, or by
+	// SPFresh's policy to every list the build's rule gives it there.
 	ef := u.MergeEF
 	if ef <= 0 {
 		ef = 64
@@ -313,29 +375,38 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 		s := ml[i]
 		pe := mj.part(s.p)
 		pe.Removed = append(pe.Removed, l)
-		mj.Merges = append(mj.Merges, Merge{List: l, Partition: s.p, Postings: len(s.lp.IDs)})
-		if len(s.lp.IDs) == 0 {
+		mj.Merges = append(mj.Merges, Merge{List: l, Partition: s.p, Postings: len(s.IDs)})
+		if len(s.IDs) == 0 {
 			continue
 		}
-		targets, err := u.Router.NearestHeads(ctx, s.codes, mj.M, ef)
-		if err != nil {
-			return nil, fmt.Errorf("update: merging list %d: %w", l, err)
+		var targets [][]uint32
+		if u.Policy == PolicySPFresh {
+			if targets, err = u.assignCodes(ctx, s.codes, mj.M); err != nil {
+				return nil, fmt.Errorf("update: merging list %d: %w", l, err)
+			}
+		} else {
+			nearest, err := u.Router.NearestHeads(ctx, s.codes, mj.M, ef)
+			if err != nil {
+				return nil, fmt.Errorf("update: merging list %d: %w", l, err)
+			}
+			targets = make([][]uint32, len(nearest))
+			for k, tl := range nearest {
+				targets[k] = []uint32{tl}
+			}
 		}
-		for k, tl := range targets {
-			tp, created := mj.Lists[tl]
-			if !created {
-				tp = t.PartitionOf(tl, u.Manifest)
-			}
-			mj.part(tp).add(tl, s.lp.IDs[k], s.lp.Locs[k], s.lp.Holders[k])
-			if to := t.Owner(tp); to != t.Owner(s.p) {
-				cs, ok := mj.Codes[to]
-				if !ok {
-					cs = &CodeSet{}
-					mj.Codes[to] = cs
+		for k := range s.IDs {
+			for _, tl := range targets[k] {
+				tp := mj.partitionOf(t, u.Manifest, tl)
+				mj.part(tp).add(tl, s.IDs[k], s.Locs[k], s.Holders[k])
+				if to := t.Owner(tp); to != t.Owner(s.p) {
+					mj.sendCode(to, s.IDs[k], s.code(k, mj.M))
 				}
-				cs.IDs = append(cs.IDs, s.lp.IDs[k])
-				cs.Codes = append(cs.Codes, s.codes[k*mj.M:(k+1)*mj.M]...)
 			}
+		}
+	}
+	if u.Policy == PolicySPFresh {
+		if err := u.reassign(ctx, t, mj, sl, sides); err != nil {
+			return nil, err
 		}
 	}
 	return mj, nil
@@ -414,6 +485,7 @@ func (u *Updater) stageMajor(ctx context.Context, mj *Major) error {
 			e.Lists, e.IDs, e.Locs = append(e.Lists, pe.Lists...), append(e.IDs, pe.IDs...), append(e.Locs, pe.Locs...)
 			e.Holders = append(e.Holders, pe.Holders...)
 			e.Created, e.Removed = append(e.Created, pe.Created...), append(e.Removed, pe.Removed...)
+			e.DropLists, e.DropIDs = append(e.DropLists, pe.DropLists...), append(e.DropIDs, pe.DropIDs...)
 		}
 		res, err := u.client(t.Nodes[o].NodeAddr).StageVersions(ctx, vs, e)
 		if err != nil {

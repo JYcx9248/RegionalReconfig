@@ -172,6 +172,13 @@ struct VersionEdits {
   // Lists the next version no longer has (a split parent, a merged list), postings and all.
   const uint32_t* removed = nullptr;
   size_t nremoved = 0;
+  // Postings to drop: list drop_lists[i] no longer holds vector drop_ids[i], which stays in its
+  // other lists (SPFresh's reassign moves a vector out of a list it no longer belongs to, U14).
+  // Each must be a posting of the list's base version; the list is neither created nor removed
+  // by this version, and no add names the same vector for it.
+  const uint32_t* drop_lists = nullptr;
+  const uint32_t* drop_ids = nullptr;
+  size_t ndrops = 0;
 };
 
 // One posting list as its owner holds it (GetList): every posting's holder, this node by its ID
@@ -364,6 +371,18 @@ class NodeEngine {
   // never a result), searched with width ef.
   virtual void SplitCodes(const uint8_t* codes, uint32_t n, uint8_t* side, uint32_t heads[2]) const = 0;
   virtual void NearestHeads(const uint8_t* codes, uint32_t n, uint32_t ef, uint32_t* lists) const = 0;
+  // The router's decisions for SPFresh's reassign (U14), on PQ codes too. AssignCodes: the lists
+  // Assign's rule gives each decoded code, assign_replicas() per code, padded with kInvalidId --
+  // a reassigned vector is inserted again by the index's own rule. HeadDistances: the distance
+  // (squared L2, the graph's) from each decoded code i to the heads heads[i * k .. i * k + k),
+  // deleted heads too: they keep their vectors as routing points. HeadNeighbors: the k nearest
+  // live heads of each head's vector, the head itself left out (padded with kInvalidId), searched
+  // with width ef. The last two read heads' vectors from the graph, so a node with a staged patch
+  // (whose new heads are in the patch) refuses them; the router never stages one.
+  virtual void AssignCodes(const uint8_t* codes, uint32_t n, uint32_t* lists) const = 0;
+  virtual void HeadDistances(const uint8_t* codes, uint32_t n, const uint32_t* heads, uint32_t k,
+                             float* out) const = 0;
+  virtual void HeadNeighbors(const uint32_t* heads, uint32_t n, uint32_t k, uint32_t ef, uint32_t* out) const = 0;
   // Loads version `version` of partition p's posting lists from a segment file, replacing that
   // version if it is resident; the partition's other versions stay. Every vector they name must
   // end up with a PQ code on this node (see PQSource); the partition's postings then hold

@@ -3873,6 +3873,46 @@ void TestGraphPatches() {
   std::vector<uint32_t> nearest(n);
   router->NearestHeads(codes.data(), n, 32, nearest.data());
   for (uint32_t c : nearest) CHECK(c < nl + 4 && c != dead[0] && c != dead[1]);
+
+  // SPFresh's reassign (U14): each code's lists by Assign's rule -- the first NEAREST_HEADS' at
+  // Assign's width (max(ef 128, candidates 64)), the others live, distinct and in order of
+  // distance -- the distances to heads, deleted ones too, and each head's nearest live heads.
+  const uint32_t r = router->assign_replicas();
+  std::vector<uint32_t> assigned(static_cast<size_t>(n) * r), nearest128(n);
+  router->AssignCodes(codes.data(), n, assigned.data());
+  router->NearestHeads(codes.data(), n, 128, nearest128.data());
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t* a = &assigned[static_cast<size_t>(i) * r];
+    uint32_t cnt = 0;
+    while (cnt < r && a[cnt] != kInvalidId) ++cnt;
+    CHECK(cnt >= 1 && a[0] == nearest128[i]);
+    for (uint32_t j = cnt; j < r; ++j) CHECK(a[j] == kInvalidId);
+    const std::set<uint32_t> distinct(a, a + cnt);
+    CHECK(distinct.size() == cnt && !distinct.count(dead[0]) && !distinct.count(dead[1]));
+    std::vector<uint8_t> same;  // code i once per assigned list
+    for (uint32_t j = 0; j < cnt; ++j) same.insert(same.end(), &codes[static_cast<size_t>(i) * m], &codes[static_cast<size_t>(i + 1) * m]);
+    std::vector<float> d(cnt);
+    router->HeadDistances(same.data(), cnt, a, 1, d.data());
+    for (uint32_t j = 1; j < cnt; ++j) CHECK(d[j - 1] <= d[j]);
+  }
+  float dd[2] = {-1, -1};
+  router->HeadDistances(codes.data(), 1, dead.data(), 2, dd);  // deleted heads keep their vectors
+  CHECK(dd[0] >= 0 && dd[1] >= 0);
+  const uint32_t unknown = g1.capacity + 7;
+  CHECK(Throws([&] { router->HeadDistances(codes.data(), 1, &unknown, 1, dd); }));
+  const uint32_t probe[2] = {nl, dead[0]};
+  std::vector<uint32_t> nb(2 * 8), nb2(2 * 8);
+  router->HeadNeighbors(probe, 2, 8, 64, nb.data());
+  router->HeadNeighbors(probe, 2, 8, 64, nb2.data());
+  CHECK(nb == nb2);
+  for (int i = 0; i < 2; ++i) {
+    const std::set<uint32_t> s(nb.begin() + 8 * i, nb.begin() + 8 * (i + 1));
+    CHECK(s.size() == 8 && !s.count(kInvalidId) && !s.count(probe[i]) && !s.count(dead[0]) && !s.count(dead[1]));
+  }
+  // A node with a staged patch has the new heads' vectors in the patch: it refuses both.
+  other->StageGraphPatch(patch.data(), patch.size());
+  CHECK(Throws([&] { other->HeadDistances(codes.data(), 1, &nl, 1, dd); }));
+  CHECK(Throws([&] { other->HeadNeighbors(&nl, 1, 4, 32, nb.data()); }));
 }
 
 // List edits (U14 major epochs): a list split inside its partition, a list merged into a list
@@ -4035,6 +4075,59 @@ void TestListEdits() {
   beyond.ncreated = 1;
   CHECK(Throws([&] { x->StageVersions({{0, 1, 2}}, beyond); }));
   CHECK(y->ResidentVersions() == vy && x->ResidentVersions() == vx);
+
+  // A posting dropped (SPFresh's reassign): a vector leaves child nl for nl + 1, which did not
+  // hold it; every other posting stays.
+  const ListPostings c0 = x->GetList(nl, 1), c1 = x->GetList(nl + 1, 1);
+  CHECK(c0.ids.size() >= 2);
+  const uint32_t mv = c0.ids[0], mv_loc = c0.locs[0], nl1 = nl + 1;
+  VersionEdits dr;
+  dr.drop_lists = &nl;
+  dr.drop_ids = &mv;
+  dr.ndrops = 1;
+  dr.lists = &nl1;
+  dr.ids = &mv;
+  dr.locs = &mv_loc;
+  dr.nadds = 1;
+  const auto rd = x->StageVersions({{0, 1, 2}}, dr);
+  CHECK(rd.size() == 1 && rd[0].changed && rd[0].removed == 1 && rd[0].added == 1);
+  std::map<uint32_t, uint32_t> dl(rd[0].lengths.begin(), rd[0].lengths.end());
+  CHECK(dl.size() == 2 && dl[nl] == c0.ids.size() - 1 && dl[nl1] == c1.ids.size() + 1);
+  const ListPostings d0 = x->GetList(nl, 2), d1 = x->GetList(nl1, 2);
+  CHECK(d0.ids.size() == c0.ids.size() - 1 && std::find(d0.ids.begin(), d0.ids.end(), mv) == d0.ids.end());
+  CHECK(std::find(d1.ids.begin(), d1.ids.end(), mv) != d1.ids.end());
+  CHECK(std::equal(d0.ids.begin(), d0.ids.end(), c0.ids.begin() + 1));
+  // Refused, with nothing changed: a vector the list does not hold (any more), a list the version
+  // removes, a posting dropped twice, a vector a list both drops and gets.
+  const auto vx2 = x->ResidentVersions();
+  VersionEdits not_held;
+  not_held.drop_lists = &nl;
+  not_held.drop_ids = &mv;
+  not_held.ndrops = 1;
+  CHECK(Throws([&] { x->StageVersions({{0, 2, 3}}, not_held); }));
+  VersionEdits removed_too;
+  removed_too.removed = &nl;
+  removed_too.nremoved = 1;
+  removed_too.drop_lists = &nl;
+  removed_too.drop_ids = &d0.ids[0];
+  removed_too.ndrops = 1;
+  CHECK(Throws([&] { x->StageVersions({{0, 2, 3}}, removed_too); }));
+  const uint32_t twice_lists[2] = {nl, nl}, twice_ids[2] = {d0.ids[0], d0.ids[0]};
+  VersionEdits twice;
+  twice.drop_lists = twice_lists;
+  twice.drop_ids = twice_ids;
+  twice.ndrops = 2;
+  CHECK(Throws([&] { x->StageVersions({{0, 2, 3}}, twice); }));
+  VersionEdits both;
+  both.drop_lists = &nl;
+  both.drop_ids = &d0.ids[0];
+  both.ndrops = 1;
+  both.lists = &nl;
+  both.ids = &d0.ids[0];
+  both.locs = &d0.locs[0];
+  both.nadds = 1;
+  CHECK(Throws([&] { x->StageVersions({{0, 2, 3}}, both); }));
+  CHECK(x->ResidentVersions() == vx2);
 }
 
 // A second generation of the fixture's index (U14 full rebuild): re-clustered with another seed

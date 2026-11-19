@@ -73,7 +73,7 @@ SCHEMA = {
         "Rebuild": {"Index": None, "Partitions": None, "Spares": None, "Placement": None, "Seed": None,
                     "StopTheWorld": None},
         "Update": {"Inserts": None, "Deletes": None, "Split": None, "Merge": None, "SplitLen": None,
-                   "MergeLen": None, "MajorMax": None}},
+                   "MergeLen": None, "MajorMax": None, "Policy": None, "ReassignRange": None}},
 }
 
 

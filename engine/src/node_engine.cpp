@@ -747,6 +747,57 @@ class NodeEngineImpl : public NodeEngine {
     }
   }
 
+  void HeadDistances(const uint8_t* codes, uint32_t n, const uint32_t* heads, uint32_t k,
+                     float* out) const override {
+    const GraphRef r = Graph(kNewestGraph);
+    FUSION_CHECK(!r.patch, "the graph has a staged patch: head distances are the router's");
+    std::unordered_map<uint32_t, const T*> vec;  // each head looked up once
+    for (size_t j = 0; j < static_cast<size_t>(n) * k; ++j)
+      if (!vec.count(heads[j])) vec.emplace(heads[j], HeadVector(*r.g, heads[j]));
+    const uint32_t m = codebook_->m();
+    std::vector<float> xf(dim_);
+    std::vector<T> q(dim_);
+    for (uint32_t i = 0; i < n; ++i) {
+      codebook_->Decode(codes + static_cast<size_t>(i) * m, xf.data());
+      for (uint32_t d = 0; d < dim_; ++d) q[d] = FromFloat(xf[d]);
+      for (uint32_t j = 0; j < k; ++j) {
+        const size_t at = static_cast<size_t>(i) * k + j;
+        out[at] = L2Sqr(q.data(), vec.at(heads[at]), dim_);
+      }
+    }
+  }
+
+  void HeadNeighbors(const uint32_t* heads, uint32_t n, uint32_t k, uint32_t ef, uint32_t* out) const override {
+    const GraphRef r = Graph(kNewestGraph);
+    FUSION_CHECK(!r.patch, "the graph has a staged patch: head neighbors are the router's");
+    std::vector<std::pair<float, uint32_t>> found;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t* o = out + static_cast<size_t>(i) * k;
+      std::fill(o, o + k, kInvalidId);
+      // The graph keeps ef 1 (see Assign): asking for max(ef, k + 1) results searches that wide.
+      auto res = r.Search(HeadVector(*r.g, heads[i]), std::max(ef, k + 1));
+      found.clear();
+      while (!res.empty()) {
+        if (res.top().second != heads[i]) found.emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
+        res.pop();
+      }
+      std::sort(found.begin(), found.end());
+      for (size_t j = 0; j < found.size() && j < k; ++j) o[j] = found[j].second;
+    }
+  }
+
+  // A head's vector as the graph holds it; a deleted head keeps its own (a routing point).
+  const T* HeadVector(const HnswIndex& g, uint32_t label) const {
+    hnswlib::tableint id;
+    {
+      std::lock_guard<std::mutex> l(g.label_lookup_lock);
+      const auto it = g.label_lookup_.find(label);
+      FUSION_CHECK(it != g.label_lookup_.end(), "head %u is not in the graph", label);
+      id = it->second;
+    }
+    return reinterpret_cast<const T*>(g.getDataByInternalId(id));
+  }
+
   void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq, uint32_t version,
                      uint16_t fallback_holder) override {
     const uint32_t num_parts = Man()->num_partitions;
@@ -1033,6 +1084,20 @@ class NodeEngineImpl : public NodeEngine {
     std::sort(del.begin(), del.end());
     del.erase(std::unique(del.begin(), del.end()), del.end());
     auto is_deleted = [&](uint32_t id) { return std::binary_search(del.begin(), del.end(), id); };
+    // The postings to drop, by partition and list (IDs sorted).
+    std::vector<std::map<uint32_t, std::vector<uint32_t>>> drops(parts.size());
+    for (size_t d = 0; d < e.ndrops; ++d) {
+      const uint32_t list = e.drop_lists[d];
+      FUSION_CHECK(created_in.count(list) == 0 && gone.count(list) == 0,
+                   "a dropped posting names list %u, which the batch creates or removes", list);
+      drops[staged(PartOf(list), "a dropped posting names", list)][list].push_back(e.drop_ids[d]);
+    }
+    for (auto& per : drops)
+      for (auto& kv : per) {
+        std::sort(kv.second.begin(), kv.second.end());
+        FUSION_CHECK(std::adjacent_find(kv.second.begin(), kv.second.end()) == kv.second.end(),
+                     "list %u drops a posting twice", kv.first);
+      }
 
     // Build every next version first; install only if all could be built. A built segment
     // holds PQ references from the moment it exists, and drops them (through the reclaimer)
@@ -1059,6 +1124,8 @@ class NodeEngineImpl : public NodeEngine {
       for (const auto& kv : adds[i])
         FUSION_CHECK(in_base(kv.first) || created_in.count(kv.first) != 0,
                      "list %u is not in partition %u's segment", kv.first, vs.partition);
+      for (const auto& kv : drops[i])
+        FUSION_CHECK(in_base(kv.first), "list %u is not in partition %u's segment", kv.first, vs.partition);
       // The next version's lists: the base's without the removed ones, with the created ones.
       std::vector<uint32_t> next_lists;
       for (uint32_t list : b.list_ids)
@@ -1082,17 +1149,34 @@ class NodeEngineImpl : public NodeEngine {
         post.clear();
         uint32_t base_len = 0;
         const uint32_t* bv = in_base(list) ? b.Find(list, &base_len) : nullptr;
+        const auto dit = drops[i].find(list);
+        const std::vector<uint32_t>* dl = dit != drops[i].end() ? &dit->second : nullptr;
+        auto is_dropped = [&](uint32_t id) { return dl && std::binary_search(dl->begin(), dl->end(), id); };
+        size_t dropped = 0;
         if (bv) {
           const size_t at = static_cast<size_t>(bv - b.ids.data());
           for (size_t j = at; j < at + base_len; ++j) {
-            if (is_deleted(b.ids[j])) {
+            const bool drop = is_dropped(b.ids[j]);
+            dropped += drop;
+            if (drop || is_deleted(b.ids[j])) {
               ++out[i].removed;
               continue;
             }
             post.push_back({b.ids[j], b.locs[j], base->Holder(j)});
           }
         }
+        if (dl && dropped != dl->size()) {
+          for (uint32_t id : *dl) {
+            bool held = false;
+            for (size_t j = 0; bv && j < base_len && !held; ++j) held = bv[j] == id;
+            FUSION_CHECK(held, "list %u drops vector %u, which it does not hold", list, id);
+          }
+        }
         const auto it = adds[i].find(list);
+        if (it != adds[i].end() && dl) {
+          for (const Post& x : it->second)
+            FUSION_CHECK(!is_dropped(x.id), "list %u both drops and adds vector %u", list, x.id);
+        }
         if (it != adds[i].end()) {
           const size_t kept = post.size();
           for (const Post& x : it->second)
@@ -1518,33 +1602,54 @@ class NodeEngineImpl : public NodeEngine {
     const GraphRef g = Graph(kNewestGraph);
     const AssignParams ap = AssignNow();
     FUSION_CHECK(!ap.rng, "the index was built with RNG pruning, which Assign does not reproduce");
-    const uint32_t r = ap.replicas;
-    const float closure = (1.f + ap.closure_eps) * (1.f + ap.closure_eps);
-    const uint32_t width = std::max(ap.ef, ap.candidates);
     const T* x = static_cast<const T*>(vecs);
     std::vector<std::pair<float, uint32_t>> cand;
     for (uint32_t i = 0; i < n; ++i) {
       const T* v = x + static_cast<size_t>(i) * dim_;
-      auto res = g.Search(v, width);
-      while (res.size() > ap.candidates) res.pop();
-      cand.clear();
-      while (!res.empty()) {
-        cand.emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
-        res.pop();
-      }
-      std::reverse(cand.begin(), cand.end());  // ascending distance
-      uint32_t* out = lists + static_cast<size_t>(i) * r;
-      std::fill(out, out + r, kInvalidId);
-      if (!cand.empty()) {
-        uint32_t cnt = 0;
-        const float d1 = cand[0].first;
-        out[cnt++] = cand[0].second;
-        for (size_t j = 1; j < cand.size() && cnt < r; ++j) {
-          if (cand[j].first > closure * d1) break;  // Eq. 2 closure rule (candidates are sorted)
-          out[cnt++] = cand[j].second;
-        }
-      }
+      AssignOne(g, ap, v, lists + static_cast<size_t>(i) * ap.replicas, &cand);
       codebook_->Encode(v, codes + static_cast<size_t>(i) * codebook_->m());
+    }
+  }
+
+  void AssignCodes(const uint8_t* codes, uint32_t n, uint32_t* lists) const override {
+    const GraphRef g = Graph(kNewestGraph);
+    const AssignParams ap = AssignNow();
+    FUSION_CHECK(!ap.rng, "the index was built with RNG pruning, which Assign does not reproduce");
+    const uint32_t m = codebook_->m();
+    std::vector<float> xf(dim_);
+    std::vector<T> q(dim_);
+    std::vector<std::pair<float, uint32_t>> cand;
+    for (uint32_t i = 0; i < n; ++i) {
+      codebook_->Decode(codes + static_cast<size_t>(i) * m, xf.data());
+      for (uint32_t d = 0; d < dim_; ++d) q[d] = FromFloat(xf[d]);
+      AssignOne(g, ap, q.data(), lists + static_cast<size_t>(i) * ap.replicas, &cand);
+    }
+  }
+
+  // One vector by the build's rule: its nearest head, then the next ones in order of distance
+  // within the closure, up to ap.replicas lists in out (padded with kInvalidId). G is GraphRef,
+  // declared further down.
+  template <class G>
+  void AssignOne(const G& g, const AssignParams& ap, const T* v, uint32_t* out,
+                 std::vector<std::pair<float, uint32_t>>* cand) const {
+    const uint32_t r = ap.replicas;
+    const float closure = (1.f + ap.closure_eps) * (1.f + ap.closure_eps);
+    auto res = g.Search(v, std::max(ap.ef, ap.candidates));
+    while (res.size() > ap.candidates) res.pop();
+    cand->clear();
+    while (!res.empty()) {
+      cand->emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
+      res.pop();
+    }
+    std::reverse(cand->begin(), cand->end());  // ascending distance
+    std::fill(out, out + r, kInvalidId);
+    if (cand->empty()) return;
+    uint32_t cnt = 0;
+    const float d1 = (*cand)[0].first;
+    out[cnt++] = (*cand)[0].second;
+    for (size_t j = 1; j < cand->size() && cnt < r; ++j) {
+      if ((*cand)[j].first > closure * d1) break;  // Eq. 2 closure rule (candidates are sorted)
+      out[cnt++] = (*cand)[j].second;
     }
   }
 

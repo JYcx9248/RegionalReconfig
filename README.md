@@ -348,6 +348,24 @@ The update controller decides on PQ codes, so no raw vector is read but the new 
   posting that changes owner moves as (vector ID, location, holder) with its PQ code, and its raw
   vector follows on demand from the node that holds it, as after a migration.
 
+With `-policy spfresh` (an experiment's `"Policy": "spfresh"`), a major epoch also runs
+SPFresh's reassign, as SPFresh's code does it (`internal/update/spfresh.go`). After the splits,
+the update controller checks, for each split, the members of its children, then those of the
+lists whose heads are nearest the old head (`-reassign-range`, 64), nearest first. A posting is a
+candidate under SPFresh's conditions: in a child, if the old head is closer to it than the
+child's head; in a neighboring list, if a new head is closer than both the old head and that
+list's head. A split queues a vector once, in the first list where it is a candidate, and the
+vector is inserted again by the build's rule (`ASSIGN_CODES`: ASSIGN's rule on its PQ code) if
+that list is no longer among its lists. Then it joins every list of its new set and leaves every
+list it was seen in that the set lacks (`STAGE_VERSIONS` drops those postings). A vector in a
+child is checked in that child only, so a member that keeps its child does not take the other
+one too. A merged list's postings go into every list the rule gives them. Unlike SPFresh, the
+decisions use PQ codes; replicas follow this index's rule (its 8 nearest heads, no RNG pruning);
+SPFresh's code also checks a child's member in the neighboring lists when the old head is no
+closer to it than its child's head, which by our rule would often put it in both children; copies
+in lists the reassign did not read stay, as SPFresh's stale copies stay until their posting is
+next split or merged; and the policy runs once per batch.
+
 The graph changes without any node holding two versions of it. The update controller's router
 inserts the new heads and marks the removed ones deleted (routing points, never a result), and
 exports the bytes that changed: a patch (`engine/include/fusion/graph_patch.h`). Every entry
@@ -410,11 +428,11 @@ without spares: admission is paused while every node switches where it is. Updat
 reconfigurations wait until the rebuild ends. Not there yet: the trigger (only the manual one).
 
 Not there yet for updates: growing the ID and location spaces, a response to a batch over budget
-(it fails before anything is sent), reassigning the vectors of neighboring lists in a split
-(SPFresh's LIRE), and a log to replay batches from. Deleted vectors' pages are kept (U1).
-`test/e2e/update_test.go`, `test/e2e/major_test.go` and `test/e2e/rebuild_test.go` check every
-answer against an oracle that applies the same decisions, across batches, a failed batch, a major
-epoch, a full rebuild and rescales.
+(it fails before anything is sent), Quake's cost-driven maintenance, and a log to replay batches
+from. Deleted vectors' pages are kept (U1). `test/e2e/update_test.go`, `test/e2e/major_test.go`,
+`test/e2e/spfresh_test.go` and `test/e2e/rebuild_test.go` check every answer against an oracle
+that applies the same decisions, across batches, a failed batch, major epochs (SPFresh's
+reassign too), a full rebuild and rescales.
 
 ## Layout
 

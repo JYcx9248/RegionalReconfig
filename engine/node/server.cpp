@@ -125,6 +125,9 @@ const char* OpName(uint8_t op) {
     case kSplitList: return "split_list";
     case kNearestHeads: return "nearest_heads";
     case kEditGraph: return "edit_graph";
+    case kAssignCodes: return "assign_codes";
+    case kHeadDistances: return "head_distances";
+    case kHeadNeighbors: return "head_neighbors";
     case kStageVersions: return "stage_versions";
     case kDropVersion: return "drop_version";
     case kForget: return "forget";
@@ -937,8 +940,12 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
           created_parts[i] = r.Get<uint32_t>();
         }
         const uint32_t nr = r.Get<uint32_t>();
-        Require(static_cast<uint64_t>(nr) * 4 == r.remaining(), "STAGE_VERSIONS: removed lists do not match");
+        Require(static_cast<uint64_t>(nr) * 4 <= r.remaining(), "STAGE_VERSIONS: removed lists truncated");
         const auto removed = TakeArray<uint32_t>(&r, nr);
+        const uint32_t ndrop = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(ndrop) * 8 == r.remaining(), "STAGE_VERSIONS: dropped postings do not match");
+        const auto drop_lists = TakeArray<uint32_t>(&r, ndrop);
+        const auto drop_ids = TakeArray<uint32_t>(&r, ndrop);
         fusion::VersionEdits ed;
         ed.lists = lists.data();
         ed.ids = ids.data();
@@ -952,6 +959,9 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         ed.ncreated = nc;
         ed.removed = removed.data();
         ed.nremoved = nr;
+        ed.drop_lists = drop_lists.data();
+        ed.drop_ids = drop_ids.data();
+        ed.ndrops = ndrop;
         const auto res = e.StageVersions(parts, ed);
         w.Put<uint32_t>(static_cast<uint32_t>(res.size()));
         for (const auto& x : res) {
@@ -1017,6 +1027,44 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         Require(static_cast<uint64_t>(n) * m == r.remaining(), "NEAREST_HEADS: body is not n codes");
         std::vector<uint32_t> lists(n);
         e.NearestHeads(r.Bytes(static_cast<size_t>(n) * m), n, ef, lists.data());
+        w.PutBytes(lists.data(), lists.size() * 4);
+        break;
+      }
+      case kAssignCodes: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        const uint32_t rep = e.assign_replicas();
+        Require(m == e.pq_m(), "ASSIGN_CODES: codes of the wrong size");
+        Require(static_cast<uint64_t>(n) * m == r.remaining(), "ASSIGN_CODES: body is not n codes");
+        Require(static_cast<uint64_t>(n) * 4 * rep <= kMaxFrameBytes / 2, "ASSIGN_CODES batch too large");
+        std::vector<uint32_t> lists(static_cast<size_t>(n) * rep);
+        e.AssignCodes(r.Bytes(static_cast<size_t>(n) * m), n, lists.data());
+        w.Put<uint32_t>(rep);
+        w.PutBytes(lists.data(), lists.size() * 4);
+        break;
+      }
+      case kHeadDistances: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        const uint32_t k = r.Get<uint32_t>();
+        Require(m == e.pq_m(), "HEAD_DISTANCES: codes of the wrong size");
+        Require(static_cast<uint64_t>(n) * (m + 4ull * k) == r.remaining(), "HEAD_DISTANCES: body is not n codes and heads");
+        const uint8_t* codes = r.Bytes(static_cast<size_t>(n) * m);
+        const auto heads = TakeArray<uint32_t>(&r, static_cast<size_t>(n) * k);
+        std::vector<float> d(static_cast<size_t>(n) * k);
+        e.HeadDistances(codes, n, heads.data(), k, d.data());
+        w.PutBytes(d.data(), d.size() * 4);
+        break;
+      }
+      case kHeadNeighbors: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t k = r.Get<uint32_t>();
+        const uint32_t ef = r.Get<uint32_t>();
+        Require(k >= 1 && static_cast<uint64_t>(n) * 4 == r.remaining(), "HEAD_NEIGHBORS: body is not n heads");
+        Require(static_cast<uint64_t>(n) * 4 * k <= kMaxFrameBytes / 2, "HEAD_NEIGHBORS: too many neighbors");
+        const auto heads = TakeArray<uint32_t>(&r, n);
+        std::vector<uint32_t> lists(static_cast<size_t>(n) * k);
+        e.HeadNeighbors(heads.data(), n, k, ef, lists.data());
         w.PutBytes(lists.data(), lists.size() * 4);
         break;
       }

@@ -67,6 +67,12 @@ type Updater struct {
 	GraphPath string
 	PatchDir  string
 	MergeEF   int
+	// Policy: how a major epoch moves postings besides its splits (spfresh.go): PolicyThreshold
+	// ("" too) or PolicySPFresh. ReassignRange: under PolicySPFresh, how many lists nearest each
+	// split list's old head have their members checked (SPFresh's ReassignK; 0: only the split's
+	// own members).
+	Policy        string
+	ReassignRange int
 	// gen is the index generation Manifest belongs to (U14 full rebuild): the updater follows
 	// the lease's epoch to the next one (follow).
 	gen uint32

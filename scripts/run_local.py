@@ -179,7 +179,10 @@ type, .fbin/.u8bin/.i8bin) are inserted and the IDs in Deletes (text, one per li
 deleted, as one content epoch -- staged next to the current version, flipped, the old epoch's
 queries let finish, reclaimed. Their paths are relative to the repository, as Base's. With
 "SplitLen" and "MergeLen" a major epoch follows the batch when its owners report a list longer or
-shorter than that (at most "MajorMax" lists); "Split" and "Merge" name lists for one. Like a
+shorter than that (at most "MajorMax" lists); "Split" and "Merge" name lists for one. "Policy":
+"spfresh" adds SPFresh's reassign to it (rtier-updater -policy: the members of the lists nearest
+each split one, "ReassignRange" of them, 64 by default, are checked and inserted again by the
+build's rule where they no longer belong); "threshold", the default, does not. Like a
 rescale, an entry runs to its end before the next one starts, whatever its trigger time: a batch
 and a rescale never overlap. The update controller's router (an rtier_node on the index's graph)
 runs on this machine from the start; its state -- where the next batch's IDs and locations
@@ -621,6 +624,18 @@ def update_request(cfg: dict, rc: dict) -> dict:
             if not (up.get("Inserts") or up.get("Deletes")):
                 sys.exit(f"Reconfigurations: {rc}: {key} acts after a batch: give Inserts or Deletes too")
             args += [flag, str(int(up[key]))]
+    major = any(up.get(k) for k in ("Split", "Merge", "SplitLen", "MergeLen"))
+    if up.get("Policy") is not None or up.get("ReassignRange") is not None:
+        policy = up.get("Policy", "threshold")
+        if policy not in ("threshold", "spfresh") or not major:
+            sys.exit(f"Reconfigurations: {rc}: Policy is threshold or spfresh, for a major epoch (Split, Merge, "
+                     "SplitLen or MergeLen)")
+        args += ["-policy", policy]
+        if up.get("ReassignRange") is not None:
+            if policy != "spfresh" or int(up["ReassignRange"]) < 0:
+                sys.exit(f"Reconfigurations: {rc}: ReassignRange (0 or more) is the spfresh policy's")
+            args += ["-reassign-range", str(int(up["ReassignRange"]))]
+        parts.append(f"policy {policy}")
     # updates.json records the files as absolute paths, which scripts/score_answers.py reads to
     # make the ground truth of each data version (a relative one depends on where the run
     # started), and their digests, so that it refuses a file that changed since the run.
@@ -1602,6 +1617,7 @@ class Updater:
             f"{b.get('from_epoch')} -> {b.get('to_epoch')}, phases {b.get('phases')}"
             + (f"; major epoch {m.get('from_epoch')} -> {m.get('to_epoch')}, splits {rec.get('splits')}, "
                f"merges {rec.get('merges')}" if m else "")
+            + (f", reassign {rec['reassign']}" if rec.get("reassign") else "")
             + f"; {self.results[-1]['elapsed_seconds']:.1f} s in all")
         if done.returncode != 0:
             raise RuntimeError(f"update batch {k} failed: {rec.get('error') or f'exit {done.returncode}'} "

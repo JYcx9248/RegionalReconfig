@@ -68,7 +68,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
 | `internal/controller` | registration, placement, reconfiguration (`reconfig.go`), update leases (`update.go`), full rebuild (`rebuild.go`); collects metrics and the nodes' diagnostics |
 | `internal/agent` | staging, epoch install, entry and aggregator roles (`serve.go`), generations (`generation.go`), diagnostics forwarding (`diag.go`), the graph's yield to data (`yield.go`) |
-| `internal/update` | update batches (`batch.go`) and major epochs (`major.go`), with their router |
+| `internal/update` | update batches (`batch.go`) and major epochs (`major.go`; SPFresh's reassign, `spfresh.go`), with their router |
 | `internal/query` | selectors (aggregator choice), strategies (`TwoPhase`), wire format |
 | `internal/placement`, `internal/transfer` | placement policies, plans, the rebuild's placement (`affinity.go`); bulk transfer + token bucket |
 | `internal/design` | registry of open design questions (U1–U17) |
@@ -223,7 +223,15 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   each changed partition staged next to the current one (`STAGE_VERSIONS`), then commit = flip,
   grace, reclaim (deleted vectors' codes are freed, never cached). A major epoch splits and
   merges posting lists and ships the graph change as a patch every entry stages, searches
-  through after the flip and merges after the grace period. Only with the controller's
+  through after the flip and merges after the grace period. With `"Policy": "spfresh"`
+  (`rtier-updater -policy`, `spfresh.go`, 2026-11-18) it also runs SPFresh's reassign as
+  SPFresh's code does it, on PQ codes and with the build's own rule (8 nearest heads, no RNG
+  pruning): the members of the split lists' children and of the `"ReassignRange"` (64) lists
+  nearest each old head are checked, each split queuing a vector once, in the first list where
+  SPFresh's conditions hold (a vector in a child is checked there only, so one that keeps its
+  child does not take the other too), and a vector whose queued list left its new set joins
+  every list of the set and leaves the lists read that lack it (`STAGE_VERSIONS` drops postings;
+  the router's `ASSIGN_CODES`, `HEAD_DISTANCES`, `HEAD_NEIGHBORS`). Only with the controller's
   `AllowUpdates` (`"Updates"` in an experiment). An experiment triggers batches as
   `"Reconfigurations"` entries with `"Update"` (inserts, deletes, a major epoch after them),
   each run to its end in the same timeline as the rescales; `run_local.py` and `run_cluster.py`

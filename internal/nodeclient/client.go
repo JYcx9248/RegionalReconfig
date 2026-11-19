@@ -45,6 +45,9 @@ const (
 	opSplitList      uint8 = 0x25
 	opNearestHeads   uint8 = 0x26
 	opEditGraph      uint8 = 0x27
+	opAssignCodes    uint8 = 0x28
+	opHeadDistances  uint8 = 0x29
+	opHeadNeighbors  uint8 = 0x2A
 	opStageVersions  uint8 = 0x30
 	opDropVersion    uint8 = 0x31
 	opForget         uint8 = 0x32
@@ -1084,6 +1087,9 @@ type Edits struct {
 	Deleted          []uint32      // vector IDs deleted from every list
 	Created          []CreatedList // lists the next version creates
 	Removed          []uint32      // lists the next version no longer has
+	// Postings to drop: DropLists[i] no longer holds DropIDs[i], which stays in its other lists
+	// (SPFresh's reassign, U14). Each is a posting of the base version.
+	DropLists, DropIDs []uint32
 }
 
 // CreatedList is a list a major epoch creates, in its partition.
@@ -1100,7 +1106,8 @@ type ListPostings struct {
 
 // StageVersions builds, for each of parts, the next version of its posting lists from the base
 // version: without the removed lists and with the created ones, plus the added postings naming
-// its lists, minus the deleted IDs. Partitions the batch does not change get no new version.
+// its lists, minus the deleted IDs and the dropped postings. Partitions the batch does not change
+// get no new version.
 // All or nothing: StatusPQAbsent or StatusRawAbsent if an added vector's code is not on the node
 // yet (PQPut) or its raw vector is neither there (RawAdd) nor held by the node its posting names,
 // StatusNotResident if a base version is not there.
@@ -1108,6 +1115,9 @@ func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, e Edit
 	n := len(e.Lists)
 	if len(e.IDs) != n || len(e.Locs) != n || (e.Holders != nil && len(e.Holders) != n) {
 		return nil, fmt.Errorf("nodeclient: %d lists, %d IDs, %d locations, %d holders", n, len(e.IDs), len(e.Locs), len(e.Holders))
+	}
+	if len(e.DropLists) != len(e.DropIDs) {
+		return nil, fmt.Errorf("nodeclient: %d lists and %d IDs of dropped postings", len(e.DropLists), len(e.DropIDs))
 	}
 	var w frame.Writer
 	w.U32(uint32(len(parts)))
@@ -1136,6 +1146,9 @@ func (c *Client) StageVersions(ctx context.Context, parts []VersionStage, e Edit
 	}
 	w.U32(uint32(len(e.Removed)))
 	w.U32s(e.Removed)
+	w.U32(uint32(len(e.DropLists)))
+	w.U32s(e.DropLists)
+	w.U32s(e.DropIDs)
 	b, err := c.do(ctx, opStageVersions, 0, w.B)
 	if err != nil {
 		return nil, err
@@ -1247,6 +1260,91 @@ func (c *Client) NearestHeads(ctx context.Context, codes []byte, m, ef int) ([]u
 	r := frame.NewReader(b)
 	lists := r.U32s(n)
 	return lists, r.Err
+}
+
+// AssignCodes asks the router for the lists the build's rule (ASSIGN's) gives each decoded PQ
+// code (m bytes each): SPFresh's reassign inserts a vector again by the index's own rule (U14).
+func (c *Client) AssignCodes(ctx context.Context, codes []byte, m int) ([][]uint32, error) {
+	if m <= 0 || len(codes)%m != 0 {
+		return nil, fmt.Errorf("nodeclient: %d bytes of %d-byte codes", len(codes), m)
+	}
+	n := len(codes) / m
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(m))
+	w.Bytes(codes)
+	b, err := c.do(ctx, opAssignCodes, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	rep := int(r.U32())
+	lists := r.U32s(n * rep)
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	out := make([][]uint32, n)
+	for i := range out {
+		for _, l := range lists[i*rep : (i+1)*rep] {
+			if l != noList {
+				out[i] = append(out[i], l)
+			}
+		}
+	}
+	return out, nil
+}
+
+// HeadDistances asks the router for the distance (squared L2, the graph's) from each decoded PQ
+// code i (m bytes each) to the k heads heads[i*k : (i+1)*k], deleted heads too.
+func (c *Client) HeadDistances(ctx context.Context, codes []byte, m int, heads []uint32, k int) ([]float32, error) {
+	if m <= 0 || len(codes)%m != 0 || k <= 0 || len(heads) != len(codes)/m*k {
+		return nil, fmt.Errorf("nodeclient: %d bytes of %d-byte codes and %d heads, %d each", len(codes), m, len(heads), k)
+	}
+	n := len(codes) / m
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(m))
+	w.U32(uint32(k))
+	w.Bytes(codes)
+	w.U32s(heads)
+	b, err := c.do(ctx, opHeadDistances, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	d := r.F32s(n * k)
+	return d, r.Err
+}
+
+// HeadNeighbors asks the router for the k nearest live heads of each head's vector, the head
+// itself left out, searched with width ef.
+func (c *Client) HeadNeighbors(ctx context.Context, heads []uint32, k, ef int) ([][]uint32, error) {
+	if k <= 0 {
+		return nil, fmt.Errorf("nodeclient: %d neighbors", k)
+	}
+	var w frame.Writer
+	w.U32(uint32(len(heads)))
+	w.U32(uint32(k))
+	w.U32(uint32(ef))
+	w.U32s(heads)
+	b, err := c.do(ctx, opHeadNeighbors, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	lists := r.U32s(len(heads) * k)
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	out := make([][]uint32, len(heads))
+	for i := range out {
+		for _, l := range lists[i*k : (i+1)*k] {
+			if l != noList {
+				out[i] = append(out[i], l)
+			}
+		}
+	}
+	return out, nil
 }
 
 // EditGraph has the router insert the heads labels (vecs: one vector each, in the index's

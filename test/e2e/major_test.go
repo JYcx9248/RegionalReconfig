@@ -253,6 +253,7 @@ func applyMajorOracle(t *testing.T, ctx context.Context, nc *nodeclient.Client, 
 		e.Lists, e.IDs, e.Locs = append(e.Lists, pe.Lists...), append(e.IDs, pe.IDs...), append(e.Locs, pe.Locs...)
 		e.Holders = append(e.Holders, pe.Holders...)
 		e.Created, e.Removed = append(e.Created, pe.Created...), append(e.Removed, pe.Removed...)
+		e.DropLists, e.DropIDs = append(e.DropLists, pe.DropLists...), append(e.DropIDs, pe.DropIDs...)
 	}
 	res, err := nc.StageVersions(ctx, vs, e)
 	if err != nil {

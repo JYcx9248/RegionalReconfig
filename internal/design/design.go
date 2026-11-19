@@ -392,6 +392,23 @@ var Open = map[string]Question{
 			"partition; a merge sends each member to the list of its nearest live head on the " +
 			"edited graph, whatever its partition -- a posting that changes owner moves as " +
 			"(vector ID, location, holder) with its PQ code, its raw vector following on demand. " +
+			"Decided (2026-11-18): a major epoch's policy (rtier-updater -policy) is threshold, " +
+			"the above, or spfresh: SPFresh's reassign as its code does it (CollectReAssign, " +
+			"CheckIsNeedReassign, Reassign; its paper writes LIRE per nearest posting and leaves " +
+			"how a vector's replicas are chosen to the code), on PQ " +
+			"codes, with the build's own assignment rule (the 8 nearest heads, no RNG pruning: the " +
+			"build follows FusionANNS) in place of SPANN's RNG-pruned one. Each split checks the " +
+			"members of its children, then those of the -reassign-range (64) lists nearest its old " +
+			"head, nearest first, by SPFresh's conditions, and queues a vector once, in the first " +
+			"list where they hold. A vector in a child is checked there only: SPFresh's code also " +
+			"checks a child's member in the neighboring lists when the old head is no closer to it " +
+			"than its child's head, and by our rule such a member would often take the other child " +
+			"too. A queued vector whose list is not among the lists the rule now gives it joins " +
+			"every list of that set and leaves every list read that lacks it (STAGE_VERSIONS drops " +
+			"single postings); a merged list's postings go " +
+			"into every list the rule gives them. Copies in lists not read stay (SPFresh's stale " +
+			"copies stay until their posting is next split or merged); it runs once per batch, " +
+			"not per insert (internal/update/spfresh.go). " +
 			"The update controller's router edits its graph (new heads in, removed heads marked " +
 			"deleted, routing points but never a result) and exports the bytes that changed as a " +
 			"patch (fusion/graph_patch.h). No node holds two versions of the graph: every entry " +
@@ -437,11 +454,10 @@ var Open = map[string]Question{
 			"(agreed 2026-10-13: a partition over about 1.5x the average size splits in two by a " +
 			"cut of the partition graph, both halves staying on its owner, and a scale-in below " +
 			"the size that fits is refused; whether to scale out first is open -- a batch over " +
-			"budget now fails before anything is sent); reassigning the vectors of neighboring " +
-			"lists in a split (SPFresh's LIRE, a recall matter); the full rebuild's trigger " +
-			"(manual only: rtier-client rebuild; the probe-set check is design only), a " +
-			"generation that includes inserted vectors (the builder would need their IDs and " +
-			"locations); a graph patch over one frame (256 MB); the decision log and " +
+			"budget now fails before anything is sent); Quake's cost-driven policy (per-list " +
+			"access counts, which nothing collects yet); the full rebuild's trigger " +
+			"(manual only: rtier-client rebuild; the probe-set check is design only); a graph " +
+			"patch over one frame (256 MB); the decision log and " +
 			"replay (the pages of deleted vectors are kept: U1). An inserted vector stays with " +
 			"the owner that added it when its partition moves on (the postings name that node as " +
 			"its holder), and a node that leaves is drained first (U9). Open: versions staged " +
@@ -450,7 +466,7 @@ var Open = map[string]Question{
 		"internal/epoch/table.go (Versions, Graph, Lists, Generation), " +
 			"engine/include/fusion/node_engine.h (partition versions, Assign, RawAdd, " +
 			"StageVersions, graph patches, SwitchGeneration), " +
-			"engine/include/fusion/graph_patch.h, internal/update (batch.go, major.go), " +
+			"engine/include/fusion/graph_patch.h, internal/update (batch.go, major.go, spfresh.go), " +
 			"internal/controller/update.go, internal/controller/rebuild.go, " +
 			"internal/placement/affinity.go, internal/controller/reconfig.go (copyThenFlip, " +
 			"drainRaw), engine/include/fusion/pq_store.h (cached codes, Forget), " +

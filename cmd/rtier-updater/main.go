@@ -7,7 +7,7 @@
 //	rtier-updater -api ADDR -partitions DIR [-state FILE] [-inserts V.fbin] [-deletes IDS]
 //	              [-router ADDR [-graph PATH] | -index DIR [-node-bin PATH]] [-patches DIR]
 //	              [-split L,L,... -merge L,L,... | -split-len N -merge-len N [-major-max K]]
-//	              [-record FILE]
+//	              [-policy threshold|spfresh [-reassign-range R]] [-record FILE]
 //
 // Inserts are routed by the update controller's own rtier_node, which holds the index's
 // navigation graph and codebook and nothing else -- never by a serving node, whose navigation
@@ -30,6 +30,11 @@
 // DIR (-patches, by default next to FILE) keeps the patch of every committed graph version, with
 // which a router started later is brought to the cluster's version. -graph names the build's
 // graph as a -router reads it, to reload it when an edit did not commit (-index: its graph.hnsw).
+// -policy spfresh adds SPFresh's reassign to the major epoch (internal/update/spfresh.go): the
+// members of each split's children and of the -reassign-range lists nearest its old head are
+// checked, a vector once (one in a child only there), and a vector that no longer belongs to the
+// list it was queued in is inserted again by the build's rule; a merged list's postings go into
+// every list the rule gives them.
 //
 // -record FILE writes, as JSON, what the batch and the major epoch did: their replies (epochs,
 // partitions, and the phases from the staging to the reclaim), the inserted IDs and locations,
@@ -70,8 +75,8 @@ type state struct {
 type options struct {
 	api, parts, statePath, inserts, deletes string
 	router, index, nodeBin, graph, patches  string
-	split, merge, record                    string
-	splitLen, mergeLen, majorMax            int
+	split, merge, record, policy            string
+	splitLen, mergeLen, majorMax, reassign  int
 	timeout                                 time.Duration
 }
 
@@ -89,6 +94,7 @@ type record struct {
 	Splits        []uint32              `json:"splits,omitempty"`
 	Merges        []uint32              `json:"merges,omitempty"`
 	MajorMoved    int                   `json:"major_moved_postings,omitempty"` // to another owner
+	Reassign      *update.ReassignStats `json:"reassign,omitempty"`             // -policy spfresh
 	PatchBytes    int                   `json:"major_patch_bytes,omitempty"`
 	MajorDecide   float64               `json:"major_decide_seconds,omitempty"`
 	MajorApply    float64               `json:"major_apply_seconds,omitempty"`
@@ -119,12 +125,17 @@ func main() {
 	flag.IntVar(&o.splitLen, "split-len", 0, "after the batch, split the lists longer than this (0: never)")
 	flag.IntVar(&o.mergeLen, "merge-len", 0, "after the batch, merge the lists shorter than this (0: never)")
 	flag.IntVar(&o.majorMax, "major-max", 0, "at most this many lists per major epoch (0: no limit)")
+	flag.StringVar(&o.policy, "policy", update.PolicyThreshold, "a major epoch's policy: threshold, or spfresh (its reassign)")
+	flag.IntVar(&o.reassign, "reassign-range", 64, "-policy spfresh: lists nearest a split list's old head whose members are checked")
 	flag.StringVar(&o.record, "record", "", "write what the batch and the major epoch did here, as JSON")
 	flag.DurationVar(&o.timeout, "timeout", 30*time.Minute, "")
 	flag.Parse()
 	if o.parts == "" || (o.inserts == "" && o.deletes == "" && o.split == "" && o.merge == "") {
 		flag.Usage()
 		os.Exit(2)
+	}
+	if (o.policy != update.PolicyThreshold && o.policy != update.PolicySPFresh) || o.reassign < 0 {
+		log.Fatalf("-policy %q -reassign-range %d: want threshold or spfresh, and a range of 0 or more", o.policy, o.reassign)
 	}
 	var rec record
 	err := run(o, &rec)
@@ -232,7 +243,7 @@ func run(o options, rec *record) error {
 	major := len(splits)+len(merges) > 0 || o.splitLen > 0 || o.mergeLen > 0
 
 	u := &update.Updater{Controller: update.Remote{Conn: conn}, Manifest: m, Alloc: alloc,
-		GraphPath: o.graph, PatchDir: o.patches}
+		GraphPath: o.graph, PatchDir: o.patches, Policy: o.policy, ReassignRange: o.reassign}
 	if u.PatchDir == "" {
 		u.PatchDir = filepath.Join(filepath.Dir(o.statePath), "graph-patches")
 	}
@@ -326,7 +337,7 @@ func runMajor(ctx context.Context, u *update.Updater, statePath string, alloc *u
 		return err
 	}
 	decided := time.Since(start)
-	rec.MajorDecide, rec.PatchBytes = decided.Seconds(), len(mj.Patch)
+	rec.MajorDecide, rec.PatchBytes, rec.Reassign = decided.Seconds(), len(mj.Patch), mj.Reassign
 	for _, cs := range mj.Codes {
 		rec.MajorMoved += len(cs.IDs)
 	}

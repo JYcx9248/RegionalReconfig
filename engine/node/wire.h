@@ -171,11 +171,14 @@
 //                   u32 locs[nadds], u16 holders[nadds],         u32 nlens, (u32 list,
 //                   u32 ndel, u32 deleted[ndel], u32 ncreated,   u32 postings)[nlens])[nparts]
 //                   (u32 list, u32 partition)[ncreated],
-//                   u32 nremoved, u32 removed[nremoved]
+//                   u32 nremoved, u32 removed[nremoved],
+//                   u32 ndrops, u32 drop_lists[ndrops],
+//                   u32 drop_ids[ndrops]
 //                   (an update batch, U14: each partition's next version = base - the removed
-//                   lists + the created ones + the postings naming its lists - the deleted IDs;
-//                   all or nothing. holders[i]: the node holding the vector if it is not here,
-//                   0 = it must be here. The reply names the lists whose length changed.)
+//                   lists + the created ones + the postings naming its lists - the deleted IDs
+//                   - the dropped postings (drop_lists[i] loses drop_ids[i]); all or nothing.
+//                   holders[i]: the node holding the vector if it is not here, 0 = it must be
+//                   here. The reply names the lists whose length changed.)
 //   LIST_GET        u32 list, u32 version                     -> u32 n, u32 ids[n], u32 locs[n],
 //                                                                u16 holders[n]
 //                   (a posting list of a resident version, every holder by node ID)
@@ -191,6 +194,15 @@
 //                   side s's mean)
 //   NEAREST_HEADS   u32 n, u32 m, u32 ef, u8 codes[n * m]     -> u32 lists[n]
 //                   (the router: the nearest live head of each decoded code)
+//   ASSIGN_CODES    u32 n, u32 m, u8 codes[n * m]             -> u32 r, u32 lists[n * r]
+//                   (the router: ASSIGN's lists for each decoded code, padded with 0xFFFFFFFF)
+//   HEAD_DISTANCES  u32 n, u32 m, u32 k, u8 codes[n * m],     -> f32 dists[n * k]
+//                   u32 heads[n * k]
+//                   (the router: squared L2 from decoded code i to heads[i * k + j], deleted
+//                   heads too)
+//   HEAD_NEIGHBORS  u32 n, u32 k, u32 ef, u32 heads[n]        -> u32 lists[n * k]
+//                   (the router: each head's k nearest live heads, itself left out, padded with
+//                   0xFFFFFFFF)
 //   EDIT_GRAPH      u32 version, u32 nnew, u32 labels[nnew],  -> patch (version - 1 -> version)
 //                   vectors[nnew], u32 ndel, u32 deleted[ndel]
 //                   (the router: heads inserted and marked deleted in its own graph)
@@ -247,6 +259,9 @@ enum Op : uint8_t {
   kSplitList = 0x25,
   kNearestHeads = 0x26,
   kEditGraph = 0x27,
+  kAssignCodes = 0x28,
+  kHeadDistances = 0x29,
+  kHeadNeighbors = 0x2A,
   kStageVersions = 0x30,
   kDropVersion = 0x31,
   kForget = 0x32,

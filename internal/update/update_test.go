@@ -87,3 +87,32 @@ func TestTakeLists(t *testing.T) {
 }
 
 func first(next uint64, _ uint32) uint64 { return next }
+
+// SPFresh's conditions (CheckIsNeedReassign), on squared distances: a child's member is checked
+// when the old head was closer than its child's head; a neighbor's member when a new head is
+// closer than both the old head and its own list's head -- strictly, as in SPFresh's code.
+func TestSPFreshConditions(t *testing.T) {
+	for _, c := range []struct {
+		dOld, dChild float32
+		want         bool
+	}{{1, 2, true}, {2, 1, false}, {2, 2, false}} {
+		if got := childCandidate(c.dOld, c.dChild); got != c.want {
+			t.Errorf("childCandidate(%v, %v) = %v, want %v", c.dOld, c.dChild, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		dOld, dNew0, dNew1, dOwn float32
+		want                     bool
+	}{
+		{5, 3, 9, 4, true},  // the first new head beats both
+		{5, 9, 3, 4, true},  // the second one does
+		{5, 6, 7, 1, false}, // the old head is nearer than both new ones
+		{5, 3, 9, 2, false}, // its own list's head is nearer than both new ones
+		{3, 3, 9, 4, false}, // ties do not count
+		{5, 3, 9, 3, false},
+	} {
+		if got := neighborCandidate(c.dOld, c.dNew0, c.dNew1, c.dOwn); got != c.want {
+			t.Errorf("neighborCandidate(%v, %v, %v, %v) = %v, want %v", c.dOld, c.dNew0, c.dNew1, c.dOwn, got, c.want)
+		}
+	}
+}
