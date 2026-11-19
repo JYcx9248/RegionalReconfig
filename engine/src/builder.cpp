@@ -1,6 +1,7 @@
 #include "fusion/builder.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <random>
 #include <unordered_set>
 
@@ -34,6 +35,12 @@ std::vector<uint64_t> SampleIndices(uint64_t n, uint64_t s, uint64_t seed) {
   return out;
 }
 
+// A version's rows as the vector IDs they hold (VersionParams).
+std::vector<uint32_t> ToIDs(std::vector<uint32_t> rows, const std::vector<uint32_t>& ids) {
+  for (uint32_t& r : rows) r = ids[r];
+  return rows;
+}
+
 std::vector<std::string> LayoutNames(const std::string& spec) {
   if (spec == "both") return {"bucket", "id"};
   FUSION_CHECK(spec == "bucket" || spec == "id", "unknown layout '%s' (bucket, id or both)",
@@ -55,11 +62,24 @@ void BuildIndex(const BuildParams& p) {
   auto need = [&](const std::string& f) { return p.overwrite || !FileExists(path(f)); };
   Log("building index for %llu x %u %s vectors from %s", (unsigned long long)n, d, DTypeName(dt),
       p.base_path.c_str());
+  const VersionParams* ver = p.version.get();
+  if (ver) {
+    FUSION_CHECK(ver->ids.size() == n && ver->locs.size() == n, "the version names %zu IDs and %zu locations for %llu rows",
+                 ver->ids.size(), ver->locs.size(), (unsigned long long)n);
+    for (uint64_t r = 1; r < n; ++r) FUSION_CHECK(ver->ids[r] > ver->ids[r - 1], "the version's IDs must ascend");
+    FUSION_CHECK(n == 0 || ver->ids.back() < ver->id_end, "vector ID %u beyond the version's %llu IDs", ver->ids.back(),
+                 (unsigned long long)ver->id_end);
+    // The codebook stays: the nodes' PQ codes were made with it, and are kept.
+    if (!FileExists(path(files::kPQCodebook)))
+      std::filesystem::copy_file(JoinPath(ver->from_index, files::kPQCodebook), path(files::kPQCodebook));
+    Log("a data version of %s: %llu IDs handed out", ver->from_index.c_str(), (unsigned long long)ver->id_end);
+  }
+  const uint64_t id_space = ver ? ver->id_end : n;  // meta num_vectors
 
   // Refuse to mix stages built from different inputs.
   if (!p.overwrite && FileExists(path(files::kMeta))) {
     IndexMeta old = IndexMeta::Load(path(files::kMeta));
-    FUSION_CHECK(old.GetU64("num_vectors") == n && old.GetU64("dim") == d,
+    FUSION_CHECK(old.GetU64("num_vectors") == id_space && old.GetU64("dim") == d,
                  "%s holds an index for different data; use --overwrite", p.out_dir.c_str());
   }
   Timer total;
@@ -76,7 +96,7 @@ void BuildIndex(const BuildParams& p) {
         "%u levels, %.1fs",
         cs.num_leaves, 100.0 * cs.num_leaves / static_cast<double>(n), cs.min_leaf, cs.mean_leaf,
         cs.max_leaf, cs.levels, t.Sec());
-    SaveU32Array(path(files::kHeads), heads);
+    SaveU32Array(path(files::kHeads), ver ? ToIDs(heads, ver->ids) : heads);
     std::vector<uint8_t> hv(heads.size() * vb);
     data->Gather(heads.data(), heads.size(), hv.data());
     SaveBin(path(files::kCentroids), dt, heads.size(), d, hv.data());
@@ -115,6 +135,12 @@ void BuildIndex(const BuildParams& p) {
                   &as);
     Log("      %.2f replicas/vector, list size mean/max = %.1f/%u, %u empty lists, %.1fs",
         as.avg_replicas, as.mean_list, as.max_list, as.empty_lists, t.Sec());
+    if (ver) {  // vector IDs, and the primary list of each (none for an ID no vector of the version has)
+      for (uint32_t& id : lists.ids) id = ver->ids[id];
+      std::vector<uint32_t> by_id(ver->id_end, UINT32_MAX);
+      for (uint64_t r = 0; r < n; ++r) by_id[ver->ids[r]] = primary[r];
+      primary.swap(by_id);
+    }
     lists.Save(path(files::kPostings));
     SaveU32Array(path(files::kPrimary), primary);
     SyncAndDropFromPageCache(path(files::kPostings));
@@ -131,7 +157,28 @@ void BuildIndex(const BuildParams& p) {
 
   // ---- Stage 4: product quantization -> codes for the GPU tier --------------------------
   uint32_t pq_m = p.pq_m ? p.pq_m : DefaultPQM(d);
-  if (need(files::kPQCodebook) || need(files::kPQCodes)) {
+  if (ver && need(files::kPQCodes)) {
+    // The kept codebook's codes, by vector ID: the inserted vectors' are the ones the update
+    // controller's router made with it (the same encoder), and an ID no vector of the version has
+    // gets zeros, which no segment names.
+    Timer t;
+    PQCodebook cb = PQCodebook::Load(path(files::kPQCodebook));
+    pq_m = cb.m();
+    std::vector<uint8_t> codes(ver->id_end * pq_m, 0);
+    DispatchDType(dt, [&](auto tag) {
+      using T = decltype(tag);
+      data->ForEachChunk([&](uint64_t b0, uint64_t b1, const uint8_t* rows) {
+#pragma omp parallel for schedule(static, 4096)
+        for (int64_t i = static_cast<int64_t>(b0); i < static_cast<int64_t>(b1); ++i)
+          cb.Encode(reinterpret_cast<const T*>(rows + (static_cast<uint64_t>(i) - b0) * vb),
+                    &codes[static_cast<uint64_t>(ver->ids[static_cast<uint64_t>(i)]) * pq_m]);
+      });
+    });
+    SavePQCodes(path(files::kPQCodes), codes.data(), ver->id_end, pq_m);
+    SyncAndDropFromPageCache(path(files::kPQCodes));
+    Log("[4/5] PQ: %s's codebook (m=%u), codes of %llu vectors by ID, %.1fs", ver->from_index.c_str(), pq_m,
+        (unsigned long long)n, t.Sec());
+  } else if (need(files::kPQCodebook) || need(files::kPQCodes)) {
     Timer t;
     std::vector<uint64_t> idx = SampleIndices(n, p.pq_train_n, p.seed + 1);
     Log("[4/5] training PQ (m=%u, %u dims/sub-space) on %zu samples", pq_m, d / pq_m, idx.size());
@@ -174,6 +221,39 @@ void BuildIndex(const BuildParams& p) {
       Log("[5/5] layout '%s': reusing", name.c_str());
       continue;
     }
+    if (ver) {
+      // from_index's locations, and the inserted vectors' where the update controller put them:
+      // after from_index's pages, which every node's raw store holds at the same offsets.
+      LayoutMap map = LayoutMap::Load(JoinPath(ver->from_index, files::LayoutMap(name)));
+      FUSION_CHECK(map.vec_bytes == vb && map.size() <= ver->id_end, "%s's layout '%s' is not of this data's vectors",
+                   ver->from_index.c_str(), name.c_str());
+      const uint64_t own = map.size(), first_free = map.num_pages * map.vectors_per_page;
+      map.page_of.resize(ver->id_end, UINT32_MAX);
+      map.slot_of.resize(ver->id_end, 0);
+      uint64_t added = 0;
+      for (uint64_t r = 0; r < n; ++r) {
+        const uint32_t id = ver->ids[r], loc = ver->locs[r];
+        if (loc == VersionParams::kNoLoc) {
+          FUSION_CHECK(id < own, "vector %u has no location: neither %s's nor an inserted one", id,
+                       ver->from_index.c_str());
+          continue;
+        }
+        FUSION_CHECK(id >= own && loc >= first_free, "inserted vector %u at location %u: within %s's vectors or pages",
+                     id, loc, ver->from_index.c_str());
+        map.page_of[id] = loc / map.vectors_per_page;
+        map.slot_of[id] = static_cast<uint16_t>(loc % map.vectors_per_page);
+        map.num_pages = std::max<uint64_t>(map.num_pages, map.page_of[id] + uint64_t{1});
+        ++added;
+      }
+      map.Save(path(files::LayoutMap(name)));
+      // The page file: from_index's (the inserted vectors are on the nodes, not in it).
+      std::filesystem::remove(path(files::LayoutVectors(name)));
+      std::filesystem::create_symlink(std::filesystem::absolute(JoinPath(ver->from_index, files::LayoutVectors(name))),
+                                      path(files::LayoutVectors(name)));
+      Log("[5/5] layout '%s': %s's, and %llu inserted vectors' locations (%llu pages)", name.c_str(),
+          ver->from_index.c_str(), (unsigned long long)added, (unsigned long long)map.num_pages);
+      continue;
+    }
     Timer t;
     LayoutStats ls;
     LayoutMap map = name == "bucket"
@@ -193,10 +273,10 @@ void BuildIndex(const BuildParams& p) {
   IndexMeta meta;
   if (FileExists(path(files::kMeta))) meta = IndexMeta::Load(path(files::kMeta));
   meta.Set("format_version", 1);
-  meta.Set("source", p.base_path);
+  meta.Set("source", ver ? "a data version of " + ver->from_index + " (version.json)" : p.base_path);
   meta.Set("dtype", DTypeName(dt));
   meta.Set("dim", d);
-  meta.Set("num_vectors", n);
+  meta.Set("num_vectors", id_space);
   meta.Set("vec_bytes", vb);
   meta.Set("num_heads", num_heads);
   meta.Set("total_postings", as.total_entries);
@@ -221,6 +301,13 @@ void BuildIndex(const BuildParams& p) {
     meta.Set("hnsw_ef_construction", p.graph.ef_construction);
   }
   meta.Save(path(files::kMeta));
+  if (ver) {  // what the version is made of: the runner checks it against the batches a run committed
+    const std::string rec = path("version.json");
+    FILE* f = std::fopen(rec.c_str(), "w");
+    FUSION_CHECK(f != nullptr, "cannot write %s", rec.c_str());
+    const bool ok = std::fwrite(ver->record.data(), 1, ver->record.size(), f) == ver->record.size();
+    FUSION_CHECK(std::fclose(f) == 0 && ok, "cannot write %s", rec.c_str());
+  }
   Log("index written to %s in %.1fs", p.out_dir.c_str(), total.Sec());
 }
 

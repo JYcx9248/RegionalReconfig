@@ -211,7 +211,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   vectors are (presence bitmaps, `placement.Affinity`); the old nodes load them, replay recent
   queries to warm up, and take over in one flip; the spares are released. Manual trigger only
   (`rtier-client rebuild`, `"Reconfigurations": [{"Rebuild": ...}]`); baselines: random placement,
-  no warm-up, stop-the-world.
+  no warm-up, stop-the-world. After update batches the next generation holds their data:
+  `fusion_build --from-index` re-clusters the version (deletes out, inserts in, with the IDs and
+  locations they got; `version.json`), and `run_local.py` refuses a rebuild whose generation
+  does not hold exactly the batches before it.
 - **Clients' entry lists (U17)**: a client (`rtier-loadgen`) reads the entries from the
   controller every 500 ms, and at once when an entry refuses a query under a newer epoch than
   its list's (the queries that meet the stale list share one read); a refusal under the list's
@@ -566,8 +569,8 @@ Next:
    figures still need an in-place baseline that holds both generations' graph and lists on
    every node (or memory accounting in its place: `timeline.svg` draws each node's memory, and
    compare_runs.py counts a rebuild's transfers, 2026-10-28). Not implemented: the rebuild's probe-set
-   trigger, a generation that includes inserted vectors, a priority between the warm-up's
-   fetches and the spares'.
+   trigger, a priority between the warm-up's fetches and the spares' (a generation of the data
+   batches made: `fusion_build --from-index`, 2026-11-17).
 5. More data and scale: GP on real datasets (U2: the number of partitions), non-repeating real
    query streams (MS MARCO), BIGANN-100M, SPACEV-100M.
 6. Skew mitigation, the last experiment: once the workload is final, each partition's load is

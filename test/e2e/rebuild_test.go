@@ -317,3 +317,207 @@ func TestFullRebuildStopTheWorld(t *testing.T) {
 	}
 	exactPass(t, cl, nil)
 }
+
+// TestFullRebuildAfterBatch moves a cluster, after an update batch, to a next generation of the
+// data the batch made (U14): fusion_build --from-index re-clusters the version -- the base
+// without the batch's deletes, with its inserts -- keeping every vector's ID and raw-vector
+// location and the codebook, so the PQ codes and raw vectors the nodes hold stay valid. Every
+// answer is exact for its epoch: the first generation before the batch, with the batch until the
+// rebuild flips, the next generation from it on. The oracle is one node that applied the batch
+// and then switched generations as the old nodes do. After the rebuild no answer names a deleted
+// vector, and each query whose copy the batch inserted finds it first.
+func TestFullRebuildAfterBatch(t *testing.T) {
+	f := getFixture(t)
+	m, err := partitioning.LoadManifest(f.parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraIDs := 1024
+	room := []string{"--max-vectors", strconv.Itoa(numVectors + extraIDs),
+		"--max-pages", strconv.FormatUint(m.NumPages+uint64(extraIDs)/m.VectorsPerPage+2, 10), "--max-list-len", "4096"}
+	cl := newCluster(t, f, "lazy", 2, func(c *config.Controller) {
+		c.AllowUpdates = true
+		c.WorkDir, c.BulkListen = t.TempDir(), "127.0.0.1:0"
+	})
+	cl.addNode("n1", query.TwoPhase{}, room...)
+	cl.addNode("n2", query.TwoPhase{}, room...)
+	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
+		t.Fatalf("initial deployment: %v (%s)", err, cl.ctl.LastError())
+	}
+	cl.addNode("s1", query.TwoPhase{}, room...)
+	cl.addNode("s2", query.TwoPhase{}, room...)
+	ctx := cl.ctx
+
+	// The oracle: one node with every partition of the first generation.
+	oaddr, stopOracle, err := startNodeWith(f, f.index, f.parts, append([]string{"--load", "all", "--graph", "index"}, room...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := stopOracle(); err != nil {
+			t.Error(err)
+		}
+	}()
+	oracle := nodeclient.New(oaddr, 1)
+	defer oracle.Close()
+	in, err := oracle.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alloc, err := update.NewAllocator(numVectors, in.IDCapacity, m.Locations(), in.Raw.Locations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(f.dir, fmt.Sprintf("router-%d.log", nodeSeq.Add(1)))
+	logf, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.indexNoBootstrap, f.parts, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := stopRouter()
+		logf.Close()
+		out, _ := os.ReadFile(logPath)
+		if err != nil || strings.Contains(string(out), "Sanitizer") || strings.Contains(string(out), "runtime error:") {
+			t.Errorf("router: %v (log %s)", err, logPath)
+		}
+	}()
+	router := nodeclient.New(raddr, 2)
+	defer router.Close()
+	u := &update.Updater{Controller: cl.ctl, Manifest: m, Alloc: alloc, Router: router,
+		GraphPath: filepath.Join(f.indexNoBootstrap, "graph.hnsw"), PatchDir: t.TempDir()}
+	defer u.Close()
+
+	// The batch: copies of the first 40 queries, and the two nearest neighbours of the first 20
+	// in the first generation deleted.
+	before := oracleAnswers(t, ctx, f, oracle)
+	const copies, emptied = 40, 20
+	var vecs []byte
+	for i := 0; i < copies; i++ {
+		vecs = append(vecs, f.queries.Row(i)...)
+	}
+	seen := map[uint32]bool{}
+	var dels []uint32
+	for i := 0; i < emptied; i++ {
+		for _, c := range before[i][:2] {
+			if !seen[c.ID] {
+				seen[c.ID] = true
+				dels = append(dels, c.ID)
+			}
+		}
+	}
+	stop := startLoad(cl, 4)
+	time.Sleep(200 * time.Millisecond)
+	b, err := u.Prepare(ctx, vecs, len(f.queries.Row(0)), dels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyOracle(t, ctx, oracle, b, make([]uint32, numPartitions))
+	cl.expect(b.Lease.Table.Epoch+1, oracleAnswers(t, ctx, f, oracle))
+	if _, err := u.Execute(ctx, b); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+
+	// The next generation over the batch's data, in 6 partitions.
+	dir := t.TempDir()
+	insPath, delPath := filepath.Join(dir, "inserts.fbin"), filepath.Join(dir, "deletes.bin")
+	hdr := make([]byte, 8)
+	putU32(hdr, uint32(copies))
+	putU32(hdr[4:], uint32(len(f.queries.Row(0))/4))
+	if err := os.WriteFile(insPath, append(hdr, vecs...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := partitioning.WriteU32Array(delPath, dels); err != nil {
+		t.Fatal(err)
+	}
+	index, parts := filepath.Join(dir, "index"), filepath.Join(dir, "parts")
+	if out, err := exec.Command(filepath.Join(f.bin, "fusion_build"), "--from-index", f.index, "--exclude", delPath,
+		"--insert", fmt.Sprintf("%s@%d@%d", insPath, b.Inserts[0].ID, b.Inserts[0].Loc), "--out", index,
+		"--threads", "2", "--seed", "13").CombinedOutput(); err != nil {
+		t.Fatalf("fusion_build: %v\n%s", err, out)
+	}
+	heads, err := partitioning.ReadU32Array(filepath.Join(index, "heads.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const nextParts = 6
+	assign := make([]uint32, len(heads))
+	for c := range assign {
+		assign[c] = uint32(c * nextParts / len(heads))
+	}
+	assignPath := filepath.Join(dir, "assign.bin")
+	if err := partitioning.WriteU32Array(assignPath, assign); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(filepath.Join(f.bin, "rtier_segment"), "--index", index, "--assign", assignPath,
+		"--out", parts).CombinedOutput(); err != nil {
+		t.Fatalf("rtier_segment: %v\n%s", err, out)
+	}
+
+	// The oracle switches as an old node does: every partition out, then the next generation's
+	// in, with the raw vectors and PQ codes it holds.
+	for p := 0; p < numPartitions; p++ {
+		if _, err := oracle.EvictPartition(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := oracle.SwitchGeneration(ctx, 1, index, parts); err != nil {
+		t.Fatal(err)
+	}
+	if err := oracle.LoadGraph(ctx, filepath.Join(index, "graph.hnsw")); err != nil {
+		t.Fatal(err)
+	}
+	for p := 0; p < nextParts; p++ {
+		seg := filepath.Join(parts, partitioning.SegmentName(p))
+		if err := oracle.LoadPartition(ctx, p, 0, seg, nodeclient.LoadGeneration); err != nil {
+			t.Fatalf("oracle: partition %d of the next generation: %v", p, err)
+		}
+	}
+	next := oracleAnswers(t, ctx, f, oracle)
+	var flipAt uint64
+	cl.ctl.BeforeGenerationFlip = func(e uint64) {
+		flipAt = e
+		cl.expect(e, next)
+	}
+	reply, err := cl.ctl.Rebuild(ctx, protocol.RebuildReq{
+		Source: protocol.GenerationSource{Kind: "dir", IndexDir: index, PartsDir: parts}})
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	t.Logf("rebuild after the batch: epoch %d -> %d, %d of %d vectors local, %d fetched, phases %v",
+		reply.FromEpoch, reply.ToEpoch, reply.Local, reply.Vectors, reply.RawFetched, reply.Phases)
+	time.Sleep(300 * time.Millisecond)
+	st := stop()
+	if st.mismatches > 0 || st.errors > 0 {
+		t.Fatalf("%d mismatches, %d errors; first: %s", st.mismatches, st.errors, st.firstProblem)
+	}
+	var withBatch, afterFlip int64
+	for e, k := range st.epochs {
+		if e >= flipAt {
+			afterFlip += k
+		} else if e > b.Lease.Table.Epoch {
+			withBatch += k
+		}
+	}
+	if withBatch == 0 || afterFlip == 0 {
+		t.Fatalf("load did not span the batch and the rebuild (flip at epoch %d): %v", flipAt, st.epochs)
+	}
+	exactPass(t, cl, next)
+	for i, a := range next {
+		for _, c := range a {
+			if seen[c.ID] {
+				t.Fatalf("query %d: deleted vector %d in an answer of the next generation", i, c.ID)
+			}
+		}
+		if i < copies && (len(a) == 0 || a[0].ID != b.Inserts[i].ID) {
+			t.Errorf("query %d: its inserted copy %d is not its first answer (%v)", i, b.Inserts[i].ID, a)
+		}
+	}
+}
+
+func putU32(b []byte, v uint32) {
+	b[0], b[1], b[2], b[3] = byte(v), byte(v>>8), byte(v>>16), byte(v>>24)
+}

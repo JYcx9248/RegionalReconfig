@@ -22,9 +22,10 @@ base's: a brute force over the base and the inserts.
 Prints, and writes into each run directory (scores.json):
 - the recall per data version and per epoch, against the version's ground truth, and against the
   base's (what latency.csv reported);
-- the scored queries that got different answers on the same index -- the same data version and
-  the same major epochs (they split and merge lists) -- within a run and, given several runs of
-  one experiment, across them: a query's answer depends only on the index its epoch names.
+- the scored queries that got different answers on the same index -- the same data version, the
+  same major epochs (they split and merge lists) and the same full rebuilds (a next generation of
+  the same data) -- within a run and, given several runs of one experiment, across them: a
+  query's answer depends only on the index its epoch names.
 
 --plan makes the ground truth of every data version an experiment's batches will make, before
 any run: each batch's inserts take the IDs after the index's vectors (meta.txt num_vectors) and
@@ -117,6 +118,20 @@ def events_of(run: str):
     return batches, majors
 
 
+def rebuilds_of(run: str) -> list:
+    """The epochs from which each full rebuild's next generation answered (reconfigurations.json:
+    the reply's to_epoch). The data stays, the index changes."""
+    path = os.path.join(run, "reconfigurations.json")
+    if not os.path.exists(path):
+        return []
+    out = []
+    for e in json.load(open(path)):
+        r = e.get("reply") or {}
+        if (e.get("rebuild") or "generation" in r) and r.get("to_epoch"):
+            out.append(r["to_epoch"])
+    return out
+
+
 class Versions:
     """The ground truth of each data version of one experiment, made once and kept by content."""
 
@@ -196,6 +211,7 @@ def score(run: str, versions: Versions, groups: dict) -> dict:
     if stride != want:
         sys.exit(f"{run}: answers kept every {stride}-th query, the ground truth has every {want}-th")
     batches, majors = events_of(run)
+    rebuilds = rebuilds_of(run)
     # The files must be the ones the run applied: the ground truth is made of them.
     for b in batches:
         for path, digest in b["digests"].items():
@@ -229,7 +245,7 @@ def score(run: str, versions: Versions, groups: dict) -> dict:
             acc[0] += 1
             acc[1] += r
             acc[2] += r0
-        index = (key, sum(1 for t in majors if t <= epoch), q)
+        index = (key, sum(1 for t in majors if t <= epoch), sum(1 for t in rebuilds if t <= epoch), q)
         same[index].add(ids)
         groups[index].setdefault(ids, set()).add(run)
     first_epoch = {0: 1, **{i + 1: b["to_epoch"] for i, b in enumerate(batches)}}

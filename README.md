@@ -306,7 +306,15 @@ directory from `fusion_build` and a partition directory from `rtier_segment`). I
 codebook, the vector IDs and the raw-vector locations: `fusion_build` reuses `pq_codebook.bin`,
 `pq_codes.bin` and the page layout when they are already in its output directory. So the PQ
 codes and raw vectors every node holds stay valid, and no node ever holds two generations' lists
-or graphs. With N data nodes and N spares (idle nodes; `-spares`):
+or graphs. After update batches the next generation holds the data they made:
+`fusion_build --from-index DIR --exclude IDS,... --insert FILE@FIRST_ID@FIRST_LOC,...` re-clusters
+the version -- DIR's vectors without the batches' deletes, with their inserts under the IDs and
+locations the update controller gave them -- with DIR's codebook. Its postings name vector IDs,
+its PQ codes and layout map are indexed by them, and its page file is DIR's (the inserted vectors
+are on the nodes; none bootstraps on it). `version.json` records the batches' files (CRC-32)
+and first IDs and locations, and `run_local.py` refuses a rebuild whose generation does not hold
+exactly the batches before it: by their files before the deployment, by what the batches got
+when it is due. With N data nodes and N spares (idle nodes; `-spares`):
 
 1. The spares take over every partition by a lazy reconfiguration. The old nodes stay members
    that only serve raw vectors (they are not drained), and lose the entry role once the spares
@@ -330,7 +338,6 @@ read. A node that joins later moves to the table's generation before it stages a
 update controller's router follows the lease's generation. `-stop-the-world` is the baseline
 without spares: admission is paused while every node switches where it is. Updates and other
 reconfigurations wait until the rebuild ends. Not there yet: the trigger (only the manual one),
-a generation that includes inserted vectors (the builder would need their IDs and locations),
 and a priority between the warm-up's fetches and the spares' (only the warm-up's pace is set).
 
 Not there yet for updates: growing the ID and location spaces, a response to a batch over budget

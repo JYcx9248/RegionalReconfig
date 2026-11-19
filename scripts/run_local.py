@@ -156,7 +156,10 @@ nodes). "Placement": "affinity" (default) or "random", "Warmup": recent queries 
 the next generation goes online (0: every one the entries kept, QuerySample per entry, default
 1024; -1: none), "WarmupConcurrency", and "StopTheWorld": true for the baseline without spares.
 The data nodes need room for the next generation's lists (--max-list-len in NodeArgs, or
-Updates.MaxListLen).
+Updates.MaxListLen). After update batches the generation must hold the data they made
+(fusion_build --from-index ... --exclude ... --insert FILE@FIRST_ID@FIRST_LOC: version.json): a
+rebuild whose generation does not hold exactly the batches before it -- their files, and the IDs
+and locations they got -- stops the run, before the deployment where the files tell.
 
 {"TriggerTimeSeconds": 180, "Update": {"Inserts": FILE, "Deletes": FILE}} applies a batch of
 dataset updates at 180 s (U14, bin/rtier-updater): the vectors in Inserts (the index's element
@@ -225,6 +228,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import experiment_config  # noqa: E402
@@ -384,6 +388,78 @@ def check_load(cfg: dict) -> None:
                  'set them to numbers (RateSteps: "seconds:rate,...")')
 
 
+_crcs = {}
+
+
+def file_crc32(path: str) -> str:
+    """CRC-32 of a file, as fusion_build records a data version's files (version.json)."""
+    key = (path, os.path.getsize(path), os.path.getmtime(path))
+    if key not in _crcs:
+        crc = 0
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                crc = zlib.crc32(chunk, crc)
+        _crcs[key] = "%08x" % (crc & 0xFFFFFFFF)
+    return _crcs[key]
+
+
+def generation_version(index_dir: str):
+    """The data version a next generation holds (version.json: fusion_build --from-index), as
+    (each inserts file's (CRC-32, first ID, first location), in order; the deletes files' CRC-32s,
+    sorted); None for a generation built from data alone."""
+    path = os.path.join(index_dir, "version.json")
+    if not os.path.exists(path):
+        return None
+    rec = json.load(open(path))
+    return ([(e["crc32"], e["first_id"], e["first_loc"]) for e in rec["insert"]],
+            sorted(e["crc32"] for e in rec["exclude"]))
+
+
+def check_generations(reqs: list) -> None:
+    """A full rebuild keeps the data: its next generation must hold what the batches before it made
+    (U14) -- their inserts and deletes, the same files in the same order -- and a generation
+    built from data alone fits only a rebuild that no batch precedes. Checked before the
+    deployment on the files; the IDs and locations the batches got, when the rebuild is due
+    (check_rebuild)."""
+    ins, dels = [], []
+    for rc in reqs:
+        if "update" in rc:
+            if rc["update"].get("Inserts"):
+                ins.append(file_crc32(rc["update"]["Inserts"]))
+            if rc["update"].get("Deletes"):
+                dels.append(file_crc32(rc["update"]["Deletes"]))
+            continue
+        if not rc.get("rebuild"):
+            continue
+        index = rc["request"]["source"]["index_dir"]
+        v = generation_version(index)
+        have = ([c for c, _, _ in v[0]], v[1]) if v else ([], [])
+        if have != (ins, sorted(dels)):
+            sys.exit(f"Reconfigurations: {rc['what']}: {index} holds "
+                     + (f"a data version of {len(v[0])} inserts files and {len(v[1])} deletes files" if v
+                        else "the data it was built from")
+                     + f", but the batches before it insert from {len(ins)} files and delete from {len(dels)} "
+                     "(fusion_build --from-index, version.json)")
+
+
+def check_rebuild(rc: dict, updater) -> None:
+    """A full rebuild that is due: its next generation holds the data the run's committed batches
+    made, with the IDs and raw-vector locations they got (updates.json)."""
+    v = generation_version(rc["request"]["source"]["index_dir"]) or ([], [])
+    ins, dels = [], []
+    for e in (updater.results if updater else []):
+        b = e.get("batch") or {}
+        if b.get("to_epoch", 0) <= b.get("from_epoch", 0):
+            continue  # it did not flip
+        if e.get("inserted"):
+            ins.append((file_crc32(e["update"]["Inserts"]), e["ids"][0], e["locations"][0]))
+        if e["update"].get("Deletes"):
+            dels.append(file_crc32(e["update"]["Deletes"]))
+    if (v[0], v[1]) != (ins, sorted(dels)):
+        raise RuntimeError(f"{rc['what']}: the next generation holds inserts {v[0]} and deletes {v[1]}, the run "
+                           f"committed inserts {ins} and deletes {sorted(dels)} ((CRC-32, first ID, first location))")
+
+
 def reconfig_requests(cfg: dict) -> list:
     """The reconfigurations as Rescale and Rebuild requests, in trigger order. Plan files are read now, so a
     missing or malformed one stops the run before the deployment. Their paths, and a rebuild's, are
@@ -424,6 +500,7 @@ def reconfig_requests(cfg: dict) -> list:
             sys.exit(f'Reconfigurations: plan {name}: want {{"owners": {{"NODE": [partitions], ...}}}}')
         out.append({"at": rc["TriggerTimeSeconds"], "request": {"plan": plan}, "data_nodes": len(plan["owners"]),
                     "plan": name, "what": f"reconfigure to plan {name} ({len(plan['owners'])} data nodes)"})
+    check_generations(out)
     return out
 
 
@@ -1474,6 +1551,8 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
         if "update" in rc:
             updater.run(rc, t0)
             return
+        if rc.get("rebuild"):
+            check_rebuild(rc, updater)
         log(rc["what"])
         started = time.monotonic()
         reply = api.call(rc.get("method", "Rescale"), rc["request"])

@@ -1,8 +1,11 @@
 // Offline construction of the multi-tiered index (paper Section 3.1, Figure 6).
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "fusion/assignment.h"
 #include "fusion/clustering.h"
@@ -10,8 +13,27 @@
 
 namespace fusion {
 
+// The next generation of an index over a data version after update batches (U14 full rebuild):
+// re-clustered over the version's vectors, it keeps what the nodes hold of the generation they
+// serve -- every vector's ID and raw-vector location, and the PQ codebook -- so that their codes
+// and raw vectors stay valid. base_path then holds the version's vectors, one row each; ids[r] is
+// row r's vector ID, ascending; locs[r] its raw-vector location if it was inserted, kNoLoc if
+// from_index's layout has it. postings.bin, heads.bin and primary.bin name vector IDs, and
+// pq_codes.bin and the layout maps are indexed by vector ID up to id_end. The page files are
+// from_index's: they hold its vectors only, and a node never reads the inserted ones from them
+// (it holds them, or fetches them from a holder), so no node can bootstrap on this generation.
+struct VersionParams {
+  static constexpr uint32_t kNoLoc = 0xFFFFFFFFu;
+  std::string from_index;     // built from data: its page files hold every vector of it
+  std::vector<uint32_t> ids;  // per row of base_path
+  std::vector<uint32_t> locs;
+  uint64_t id_end = 0;        // meta num_vectors: the IDs handed out
+  std::string record;         // version.json: what the version is made of, for the runner's check
+};
+
 struct BuildParams {
   std::string base_path;
+  std::shared_ptr<const VersionParams> version;  // null: an index of base_path's vectors, ID = row
   std::optional<DType> dtype;  // default: from the file extension
   uint64_t max_n = 0;          // 0 = whole file
   std::string out_dir;
