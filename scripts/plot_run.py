@@ -13,6 +13,8 @@ Reads what run_local.py (or run_cluster.py) leaves in the results directory:
   reconfigurations.json  one entry per reconfiguration (a rescale, a plan or a full rebuild):
                          when it was triggered, how long it took, what it moved (older runs hold
                          the bare replies)
+  updates.json           where there is one: each update batch (U14), as run_local.py ran it
+                         (rtier-updater -record), drawn and summarized as the reconfigurations are
   cgroups.jsonl          where there is one (NodeResources, or a cluster's agents): each node's
                          samples, with clock.json, the load's start on their clock
 
@@ -277,6 +279,21 @@ def reconfigurations(path):
     return out
 
 
+def update_batches(path):
+    """Update batches (U14, updates.json) as (trigger_s, elapsed_s, label, record)."""
+    try:
+        with open(path) as f:
+            entries = json.load(f)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for k, e in enumerate(entries, 1):
+        if isinstance(e, dict) and "trigger_seconds" in e:
+            label = "batch %d" % k + (" + major" if e.get("major") else "")  # short: next to a rescale's
+            out.append((float(e["trigger_seconds"]), float(e.get("elapsed_seconds", 0)), label, e))
+    return out
+
+
 # ---------------------------------------------------------------- SVG
 
 W, PANEL_H, GAP = 900, 200, 52
@@ -477,7 +494,8 @@ def main():
         win = windows(rows, args.window, args.latency_at, span)
     marks = [(t, "epoch %d" % e) for t, e in epoch_marks(rows)]
     rcs = reconfigurations(os.path.join(args.results, "reconfigurations.json"))
-    bands = [(t0, dur, label) for t0, dur, label, _ in rcs if t0 < span]
+    ups = update_batches(os.path.join(args.results, "updates.json"))
+    bands = sorted((t0, dur, label) for t0, dur, label, _ in rcs + ups if t0 < span)
     marks = [(t, label) for t, label in marks if t <= span]  # a flip only the backlog saw, after the load
 
     mem = node_memory(args.results)
@@ -515,6 +533,13 @@ def main():
             continue
         print("%s: triggered at %.3f s, took %.3f s, %s bytes, %s PQ codes, phases %s"
               % (label, t0, dur, reply.get("bytes"), reply.get("pq_codes"), reply.get("phases")))
+    for t0, dur, label, rec in ups:
+        b, m = rec.get("batch") or {}, rec.get("major") or {}
+        print("%s: triggered at %.3f s, took %.3f s, %s inserted, %s deleted, epoch %s -> %s, phases %s%s"
+              % (label, t0, dur, rec.get("inserted"), rec.get("deleted"), b.get("from_epoch"), b.get("to_epoch"),
+                 b.get("phases"), "; major epoch %s -> %s, splits %s, merges %s, phases %s"
+                 % (m.get("from_epoch"), m.get("to_epoch"), rec.get("splits"), rec.get("merges"), m.get("phases"))
+                 if m else ""))
     # The transition's cost: the highest windowed mean and p99 while an epoch was changing.
     if bands and win:
         for key, name in (("mean_us", "mean"), ("p99_us", "p99")):

@@ -195,7 +195,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   grace, reclaim (deleted vectors' codes are freed, never cached). A major epoch splits and
   merges posting lists and ships the graph change as a patch every entry stages, searches
   through after the flip and merges after the grace period. Only with the controller's
-  `AllowUpdates` (`"Updates"` in an experiment).
+  `AllowUpdates` (`"Updates"` in an experiment). An experiment triggers batches as
+  `"Reconfigurations"` entries with `"Update"` (inserts, deletes, a major epoch after them),
+  each run to its end in the same timeline as the rescales; `run_local.py` and `run_cluster.py`
+  keep one router for the run on their own machine and record each batch in `updates.json`
+  (`rtier-updater -record`; the reply's phases now start with the staging, `stage`).
 - **Full rebuild (U14, `rebuild.go`)**: moves the cluster to the next index generation, built
   outside with the same codebook, vector IDs and raw-vector locations. Spares take every
   partition by a lazy reconfiguration; the old nodes lose their roles and switch generations

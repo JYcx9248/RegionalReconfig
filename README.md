@@ -607,6 +607,16 @@ its chunk's. `wiki_diff.py batches` cuts the result into batches of whole articl
 - Inserts take IDs after the base's and the earlier batches', in order (`batches.json`). Four
   such batches need an `"Updates"` headroom of at least 1.2.
 
+An experiment triggers batches like rescales, as `"Reconfigurations"` entries, in the same
+timeline: `{"TriggerTimeSeconds": 180, "Update": {"Inserts": "batch-1.fbin", "Deletes":
+"batch-1-deletes.bin"}}`, with `"SplitLen"`/`"MergeLen"` (and `"MajorMax"`) for a major epoch
+after the batch. Every entry runs to its end before the next starts, so a batch never overlaps a
+rescale. The runner starts the update controller's router with the run (on its own machine, also
+for a cluster), starts every run at the index's IDs and locations (`WorkDir/updater`), stops a run
+whose batches would not fit its headroom before the nodes start, and records each batch in
+`updates.json` (`rtier-updater -record`: epochs, phases from the staging to the reclaim, the
+inserted IDs and locations); `timeline.svg` shades them next to the rescales.
+
 ## The smallest experiment: one node, then two
 
 A node is added because one node no longer serves the load, so the run has to put it under a

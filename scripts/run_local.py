@@ -11,9 +11,10 @@ reconfigurations -> collect results -> clean up), without Kafka and SSH:
      node, each once the previous one registered (n1, n2, ... get IDs 1, 2, ...); initial nodes
      with a warmup snapshot start on it (below)
   4. wait for the initial deployment, start the open-loop load generator
-  5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale, Rebuild)
+  5. trigger the configured reconfigurations (rtier_ctl.py -> Rescale, Rebuild; update batches
+     through bin/rtier-updater)
   6. collect metrics.jsonl (+ SQLite in Koala's layout), loadgen CSV, logs, timeline.svg,
-     reconfigurations.json; each node's stats log (stats-<node>.jsonl) and, with
+     reconfigurations.json (updates.json, the batches'); each node's stats log (stats-<node>.jsonl) and, with
      NodeResources, cgroups.jsonl, both on the monotonic clock of clock.json; the experiment as
      it ran (experiment.json, which the analysis scripts read) and the config.yaml the processes
      read, the code it ran (revision.txt, revision.diff) and the PQ budget it found
@@ -156,6 +157,21 @@ the next generation goes online (0: every one the entries kept, QuerySample per 
 The data nodes need room for the next generation's lists (--max-list-len in NodeArgs, or
 Updates.MaxListLen).
 
+{"TriggerTimeSeconds": 180, "Update": {"Inserts": FILE, "Deletes": FILE}} applies a batch of
+dataset updates at 180 s (U14, bin/rtier-updater): the vectors in Inserts (the index's element
+type, .fbin/.u8bin/.i8bin) are inserted and the IDs in Deletes (text, one per line, or a u32 .bin)
+deleted, as one content epoch -- staged next to the current version, flipped, the old epoch's
+queries let finish, reclaimed. Their paths are relative to the repository, as Base's. With
+"SplitLen" and "MergeLen" a major epoch follows the batch when its owners report a list longer or
+shorter than that (at most "MajorMax" lists); "Split" and "Merge" name lists for one. Like a
+rescale, an entry runs to its end before the next one starts, whatever its trigger time: a batch
+and a rescale never overlap. The update controller's router (an rtier_node on the index's graph)
+runs on this machine from the start; its state -- where the next batch's IDs and locations
+start, the major epochs' graph patches -- is in WorkDir/updater, emptied at the start of every
+run. updates.json in the results has each batch's record (rtier-updater -record: its epochs, its
+phases from the staging to the reclaim, the IDs it inserted), updater.log its output. A run with
+batches needs "Updates" (below), with room for every vector they insert.
+
 "Updates": {"Headroom": 1.5} lets update batches (U14) run against the cluster
 (bin/rtier-updater; config.yaml's AllowUpdates). Every data node leaves room for 1.5 times the
 index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and for lists
@@ -199,6 +215,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -278,8 +295,17 @@ def update_args(cfg: dict, index: str, parts: str) -> list:
     if head < 1:
         raise RuntimeError("Updates.Headroom must be at least 1")
     max_len = upd.get("MaxListLen") or math.ceil(int(man["max_list_len"]) * float(upd.get("ListHeadroom", 2.0)))
-    return ["--max-vectors", str(math.ceil(int(meta["num_vectors"]) * head)),
-            "--max-pages", str(math.ceil(int(man["num_pages"]) * head)),
+    n, pages = int(meta["num_vectors"]), int(man["num_pages"])
+    # Every inserted vector takes an ID and a raw-vector location after the index's, never handed
+    # out again (deletes free neither): the batches the run triggers must fit, or the last one
+    # would fail half-way through the run.
+    ins = inserts_of(cfg)
+    vpp = int(man.get("vectors_per_page", 1))
+    need = max((n + ins) / n, (pages * vpp + ins) / vpp / pages)
+    if ins and (n + ins > math.ceil(n * head) or pages * vpp + ins > math.ceil(pages * head) * vpp):
+        sys.exit(f"Updates.Headroom {head:g} leaves too little room: the run's batches insert {ins} vectors, "
+                 f"each with an ID and a raw-vector location after the index's: set it to at least {need:.3f}")
+    return ["--max-vectors", str(math.ceil(n * head)), "--max-pages", str(math.ceil(pages * head)),
             "--max-list-len", str(int(max_len))]
 
 
@@ -359,6 +385,12 @@ def reconfig_requests(cfg: dict) -> list:
     absolute by now (experiment_config.load)."""
     out = []
     for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
+        kinds = [k for k in ("DataNodes", "Plan", "Rebuild", "Update") if k in rc]
+        if len(kinds) != 1:
+            sys.exit(f"Reconfigurations: {rc}: give DataNodes, Plan, Rebuild or Update, one of them")
+        if "Update" in rc:
+            out.append(update_request(cfg, rc))
+            continue
         if "Rebuild" in rc:
             rb = rc["Rebuild"]
             if not rb.get("Index") or not rb.get("Partitions"):
@@ -371,8 +403,6 @@ def reconfig_requests(cfg: dict) -> list:
             out.append({"at": rc["TriggerTimeSeconds"], "method": "Rebuild", "request": req, "rebuild": True,
                         "what": f"full rebuild to {src['parts_dir']}" + (" (stop-the-world)" if req["stop_the_world"] else "")})
             continue
-        if ("Plan" in rc) == ("DataNodes" in rc):
-            sys.exit(f"Reconfigurations: {rc}: give DataNodes, Plan or Rebuild, one of them")
         if "DataNodes" in rc:
             out.append({"at": rc["TriggerTimeSeconds"], "request": {"data_nodes": rc["DataNodes"]},
                         "data_nodes": rc["DataNodes"], "what": f"rescale to {rc['DataNodes']} data nodes"})
@@ -390,6 +420,46 @@ def reconfig_requests(cfg: dict) -> list:
         out.append({"at": rc["TriggerTimeSeconds"], "request": {"plan": plan}, "data_nodes": len(plan["owners"]),
                     "plan": name, "what": f"reconfigure to plan {name} ({len(plan['owners'])} data nodes)"})
     return out
+
+
+def update_request(cfg: dict, rc: dict) -> dict:
+    """An update batch (U14) as rtier-updater's flags. Its files must be there now: a missing one
+    stops the run before the deployment."""
+    up = rc["Update"]
+    if "Updates" not in cfg:
+        sys.exit(f'Reconfigurations: {rc}: a batch needs "Updates" (room for what it inserts, and the '
+                 "controller's AllowUpdates)")
+    args, parts = [], []
+    for key, flag in (("Inserts", "-inserts"), ("Deletes", "-deletes")):
+        if up.get(key):
+            if not os.path.isfile(up[key]):
+                sys.exit(f"Reconfigurations: {rc}: {key} {up[key]}: no such file")
+            args += [flag, os.path.abspath(up[key])]
+            parts.append(f"{key.lower()} {os.path.basename(up[key])}")
+    for key, flag in (("Split", "-split"), ("Merge", "-merge")):
+        if up.get(key):
+            args += [flag, ",".join(str(int(x)) for x in up[key])]
+            parts.append(f"{key.lower()} lists {up[key]}")
+    if not args:
+        sys.exit(f"Reconfigurations: {rc}: an update needs Inserts, Deletes, Split or Merge")
+    for key, flag in (("SplitLen", "-split-len"), ("MergeLen", "-merge-len"), ("MajorMax", "-major-max")):
+        if up.get(key):
+            if not (up.get("Inserts") or up.get("Deletes")):
+                sys.exit(f"Reconfigurations: {rc}: {key} acts after a batch: give Inserts or Deletes too")
+            args += [flag, str(int(up[key]))]
+    return {"at": rc["TriggerTimeSeconds"], "update": up, "updater_args": args,
+            "what": "update batch: " + ", ".join(parts)}
+
+
+def inserts_of(cfg: dict) -> int:
+    """How many vectors the run's batches insert: each Inserts file's header (u32 n, u32 dim)."""
+    total = 0
+    for rc in cfg.get("Reconfigurations", []):
+        path = (rc.get("Update") or {}).get("Inserts")
+        if path:
+            with open(path, "rb") as f:
+                total += struct.unpack("<I", f.read(4))[0]
+    return total
 
 
 class Procs:
@@ -1297,6 +1367,60 @@ def wait_deployment(cfg: dict, api: Controller) -> dict:
     return st
 
 
+class Updater:
+    """The update controller's side of a run (U14): its router, which stays up between batches,
+    and each batch through rtier-updater, recorded in updates.json."""
+
+    def __init__(self, cfg: dict, api_addr: str, out_dir: str, procs, prefix: list):
+        work, ebin, gbin = paths_of(cfg)
+        index, parts = index_and_parts(cfg)
+        # A run starts at the index's IDs and locations, as its nodes start at the index's
+        # vectors: an earlier run's state would hand out IDs from where that run's batches ended.
+        self.dir = os.path.join(work, "updater")
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        # Started before the load (the graph takes tens of seconds to load at scale), on the CPUs
+        # of the controller and the load generator: the batches' routing is no node's work.
+        line = procs.start("router", [f"{ebin}/rtier_node", "--index", index, "--partitions", parts,
+                                      "--listen", "127.0.0.1:0", "--graph", "index", "--pq-capacity", "1",
+                                      "--workers", "1"], prefix=prefix, wait_line="READY tcp=")
+        self.cmd = list(prefix) + [f"{gbin}/rtier-updater", "-api", api_addr, "-partitions", parts,
+                                   "-state", os.path.join(self.dir, "state.json"),
+                                   "-router", "127.0.0.1:" + line.split("=")[1],
+                                   "-graph", os.path.join(index, "graph.hnsw")]
+        if cfg.get("StageTimeout"):  # a batch is a staging, and its time is bounded as one
+            self.cmd += ["-timeout", str(cfg["StageTimeout"])]
+        self.out_dir, self.results = out_dir, []
+
+    def run(self, rc: dict, t0: float) -> None:
+        k = len(self.results) + 1
+        path = os.path.join(self.dir, f"record-{k}.json")
+        cmd = self.cmd + ["-record", path] + rc["updater_args"]
+        log(rc["what"])
+        started = time.monotonic()
+        with open(os.path.join(self.out_dir, "updater.log"), "a") as f:
+            f.write(f"== batch {k}, {started - t0:.3f} s after the load's start: {shlex.join(cmd)}\n")
+            f.flush()
+            done = subprocess.run(cmd, stdout=f, stderr=f)
+        rec = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                rec = json.load(f)
+        self.results.append({"update": rc["update"], "trigger_seconds": round(started - t0, 3),
+                             "elapsed_seconds": round(time.monotonic() - started, 3), **rec})
+        # After each one, as reconfigurations.json: a later one that fails ends the run.
+        json.dump(self.results, open(os.path.join(self.out_dir, "updates.json"), "w"), indent=2)
+        b, m = rec.get("batch") or {}, rec.get("major") or {}
+        log(f"batch {k}: {rec.get('inserted', 0)} inserted, {rec.get('deleted', 0)} deleted, epoch "
+            f"{b.get('from_epoch')} -> {b.get('to_epoch')}, phases {b.get('phases')}"
+            + (f"; major epoch {m.get('from_epoch')} -> {m.get('to_epoch')}, splits {rec.get('splits')}, "
+               f"merges {rec.get('merges')}" if m else "")
+            + f"; {self.results[-1]['elapsed_seconds']:.1f} s in all")
+        if done.returncode != 0:
+            raise RuntimeError(f"update batch {k} failed: {rec.get('error') or f'exit {done.returncode}'} "
+                               f"(updater.log)")
+
+
 def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir: str, procs, results: list,
           prefix: list, on_deploy=None) -> None:
     """Steps 4 and 5, wherever the nodes run: wait for the initial deployment (on_deploy, if
@@ -1307,6 +1431,8 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
     # controller bounds every step (stage_timeout): no deadline of its own here, which an hour-long
     # copy at scale would hit; a controller that dies closes the connection.
     api = Controller(api_addr, timeout=None)
+    # Before the load generator, which stays the last process started (the end waits for it).
+    updater = Updater(cfg, api_addr, out_dir, procs, prefix) if any("update" in rc for rc in reconfigs) else None
     st = wait_deployment(cfg, api)
     if on_deploy:
         on_deploy(st)
@@ -1331,6 +1457,9 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
         return cmd
 
     def reconfigure(rc: dict, t0: float) -> None:
+        if "update" in rc:
+            updater.run(rc, t0)
+            return
         log(rc["what"])
         started = time.monotonic()
         reply = api.call(rc.get("method", "Rescale"), rc["request"])
@@ -1452,20 +1581,25 @@ def record(cfg: dict, out_dir: str) -> None:
     revision(out_dir)
 
 
+def index_and_parts(cfg: dict) -> tuple:
+    """The index and the partition directories, on this machine."""
+    work = paths_of(cfg)[0]
+    return os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index")), os.path.join(work, "partitions")
+
+
 def stages(cfg: dict) -> tuple:
     """Steps 1-2, on this machine wherever the nodes run: the index, the ground truth and the
     partitions, made unless they are there. Returns the index, ground truth and partition paths."""
     work, ebin, _ = paths_of(cfg)
     os.makedirs(work, exist_ok=True)
     # 1. index and ground truth
-    index = os.path.abspath(cfg.get("IndexDir") or os.path.join(work, "index"))
+    index, parts = index_and_parts(cfg)
     build_index(cfg, index, ebin)
     gt = cfg.get("GroundTruth", "")
     if gt and cfg.get("Type") != "warmup":  # a warmup sends no query
         ground_truth(cfg, gt, ebin)
 
     # 2. partitions: the assignment (U2), then the segments
-    parts = os.path.join(work, "partitions")
     segment(index, make_assignment(cfg, index, work), parts, ebin)
     return index, gt, parts
 

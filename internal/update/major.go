@@ -346,6 +346,7 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 // after the grace period. If the staging fails, it drops what was staged, gives the lease up
 // and brings the router back to the epoch's graph.
 func (u *Updater) ExecuteMajor(ctx context.Context, mj *Major) (*protocol.UpdateReply, error) {
+	start := time.Now()
 	err := u.stageMajor(ctx, mj)
 	if err == nil && u.PatchDir != "" {
 		// Kept before the commit: a router started later is brought to the committed version
@@ -356,10 +357,13 @@ func (u *Updater) ExecuteMajor(ctx context.Context, mj *Major) (*protocol.Update
 		u.undoMajor(ctx, mj)
 		return nil, errors.Join(err, u.abort(ctx, mj.Lease))
 	}
+	staged := time.Since(start).Seconds()
 	// If the commit fails before the flip, the router is ahead of the epoch: the next batch's
 	// syncRouter brings it back.
-	return u.Controller.CommitUpdate(ctx, protocol.CommitUpdateReq{Token: mj.Lease.Token,
+	reply, err := u.Controller.CommitUpdate(ctx, protocol.CommitUpdateReq{Token: mj.Lease.Token,
 		FromEpoch: mj.Lease.Table.Epoch, Versions: mj.Versions(), Graph: mj.Graph, Lists: mj.Lists})
+	withStage(reply, staged)
+	return reply, err
 }
 
 // AbortMajor gives up a major epoch PrepareMajor decided and ExecuteMajor did not run: the

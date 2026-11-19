@@ -207,12 +207,15 @@ func (u *Updater) checkRoom(ctx context.Context, b *Batch) error {
 // staged and gives the lease up. If the commit fails, the controller has dropped the staged
 // versions when it failed before the flip, and stopped where it was after it (U13).
 func (u *Updater) Execute(ctx context.Context, b *Batch) (*protocol.UpdateReply, error) {
+	start := time.Now()
 	if err := u.stage(ctx, b); err != nil {
 		u.undo(ctx, b)
 		return nil, errors.Join(err, u.abort(ctx, b.Lease))
 	}
+	staged := time.Since(start).Seconds()
 	reply, err := u.Controller.CommitUpdate(ctx, protocol.CommitUpdateReq{Token: b.Lease.Token,
 		FromEpoch: b.Lease.Table.Epoch, Versions: b.Versions(), Deleted: b.Deleted})
+	withStage(reply, staged)
 	if err != nil {
 		// Whether the flip happened may be unknown here (a reply lost with the connection), so the
 		// inserts are not declared dead: only their unreferenced codes go -- those of versions the
@@ -221,6 +224,19 @@ func (u *Updater) Execute(ctx context.Context, b *Batch) (*protocol.UpdateReply,
 		return reply, err
 	}
 	return reply, nil
+}
+
+// withStage adds the staging, which the update controller runs, to the phases of a reply, which
+// the controller's commit times (check, flip, drain, reclaim): the reply then covers a batch
+// from its staging on, as a rescale's covers the rescale.
+func withStage(reply *protocol.UpdateReply, seconds float64) {
+	if reply == nil {
+		return
+	}
+	if reply.Phases == nil {
+		reply.Phases = map[string]float64{}
+	}
+	reply.Phases["stage"] = seconds
 }
 
 // stage sends each owner the PQ codes and raw vectors of its inserts, then has every data node

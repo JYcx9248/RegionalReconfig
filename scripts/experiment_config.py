@@ -23,7 +23,8 @@ all but RUNNER_KEYS, which the runners set from the run itself.
       "Calibrate": {"Rates", "SecondsPerRate"},
       "Updates": {"Headroom", "ListHeadroom", "MaxListLen"},
       "Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}, {..., "Plan": P},
-                           {..., "Rebuild": {"Index": DIR, "Partitions": DIR}}]
+                           {..., "Rebuild": {"Index": DIR, "Partitions": DIR}},
+                           {..., "Update": {"Inserts": FILE, "Deletes": FILE, "SplitLen": N, ...}}]
     }
 
 Paths are relative to the repository root, as run_local.py runs from there, except a plan file and
@@ -69,7 +70,9 @@ SCHEMA = {
     "Reconfigurations": {
         "TriggerTimeSeconds": None, "DataNodes": None, "Plan": "opaque",
         "Rebuild": {"Index": None, "Partitions": None, "Spares": None, "Placement": None, "Seed": None,
-                    "Warmup": None, "WarmupConcurrency": None, "StopTheWorld": None}},
+                    "Warmup": None, "WarmupConcurrency": None, "StopTheWorld": None},
+        "Update": {"Inserts": None, "Deletes": None, "Split": None, "Merge": None, "SplitLen": None,
+                   "MergeLen": None, "MajorMax": None}},
 }
 
 

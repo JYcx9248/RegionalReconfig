@@ -7,6 +7,7 @@
 //	rtier-updater -api ADDR -partitions DIR [-state FILE] [-inserts V.fbin] [-deletes IDS]
 //	              [-router ADDR [-graph PATH] | -index DIR [-node-bin PATH]] [-patches DIR]
 //	              [-split L,L,... -merge L,L,... | -split-len N -merge-len N [-major-max K]]
+//	              [-record FILE]
 //
 // Inserts are routed by the update controller's own rtier_node, which holds the index's
 // navigation graph and codebook and nothing else -- never by a serving node, whose navigation
@@ -29,6 +30,11 @@
 // DIR (-patches, by default next to FILE) keeps the patch of every committed graph version, with
 // which a router started later is brought to the cluster's version. -graph names the build's
 // graph as a -router reads it, to reload it when an edit did not commit (-index: its graph.hnsw).
+//
+// -record FILE writes, as JSON, what the batch and the major epoch did: their replies (epochs,
+// partitions, and the phases from the staging to the reclaim), the inserted IDs and locations,
+// and the time to decide and to apply each -- also when one failed, with the error. An
+// experiment's runner keeps it (scripts/run_local.py, updates.json).
 package main
 
 import (
@@ -64,9 +70,29 @@ type state struct {
 type options struct {
 	api, parts, statePath, inserts, deletes string
 	router, index, nodeBin, graph, patches  string
-	split, merge                            string
+	split, merge, record                    string
 	splitLen, mergeLen, majorMax            int
 	timeout                                 time.Duration
+}
+
+// record is what -record writes.
+type record struct {
+	Batch         *protocol.UpdateReply `json:"batch,omitempty"`
+	Inserted      int                   `json:"inserted"`
+	IDs           []uint64              `json:"ids,omitempty"`       // [first, end) of the inserted vectors
+	Locations     []uint64              `json:"locations,omitempty"` // [first, end) of their raw vectors
+	Deleted       int                   `json:"deleted"`
+	Postings      int                   `json:"postings_added"`
+	DecideSeconds float64               `json:"decide_seconds,omitempty"` // the lease, the routing
+	ApplySeconds  float64               `json:"apply_seconds,omitempty"`  // the staging to the reclaim
+	Major         *protocol.UpdateReply `json:"major,omitempty"`
+	Splits        []uint32              `json:"splits,omitempty"`
+	Merges        []uint32              `json:"merges,omitempty"`
+	MajorMoved    int                   `json:"major_moved_postings,omitempty"` // to another owner
+	PatchBytes    int                   `json:"major_patch_bytes,omitempty"`
+	MajorDecide   float64               `json:"major_decide_seconds,omitempty"`
+	MajorApply    float64               `json:"major_apply_seconds,omitempty"`
+	Error         string                `json:"error,omitempty"`
 }
 
 func main() {
@@ -86,18 +112,42 @@ func main() {
 	flag.IntVar(&o.splitLen, "split-len", 0, "after the batch, split the lists longer than this (0: never)")
 	flag.IntVar(&o.mergeLen, "merge-len", 0, "after the batch, merge the lists shorter than this (0: never)")
 	flag.IntVar(&o.majorMax, "major-max", 0, "at most this many lists per major epoch (0: no limit)")
+	flag.StringVar(&o.record, "record", "", "write what the batch and the major epoch did here, as JSON")
 	flag.DurationVar(&o.timeout, "timeout", 30*time.Minute, "")
 	flag.Parse()
 	if o.parts == "" || (o.inserts == "" && o.deletes == "" && o.split == "" && o.merge == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(o); err != nil {
+	var rec record
+	err := run(o, &rec)
+	if o.record != "" {
+		if err != nil {
+			rec.Error = err.Error()
+		}
+		if werr := writeRecord(o.record, &rec); werr != nil {
+			err = errors.Join(err, werr)
+		}
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(o options) error {
+// writeRecord writes rec to path whole or not at all.
+func writeRecord(path string, rec *record) error {
+	b, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func run(o options, rec *record) error {
 	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
 	defer cancel()
 	m, err := partitioning.LoadManifest(o.parts)
@@ -218,7 +268,15 @@ func run(o options) error {
 			return err
 		}
 		decided := time.Since(start)
+		lists, _, _ := b.Postings()
+		rec.Inserted, rec.Deleted, rec.Postings = n, len(b.Deleted), len(lists)
+		rec.DecideSeconds = decided.Seconds()
+		if n > 0 {
+			rec.IDs = []uint64{uint64(b.Inserts[0].ID), uint64(b.Inserts[n-1].ID) + 1}
+			rec.Locations = []uint64{uint64(b.Inserts[0].Loc), uint64(b.Inserts[n-1].Loc) + 1}
+		}
 		reply, err := u.Execute(ctx, b)
+		rec.Batch, rec.ApplySeconds = reply, time.Since(start).Seconds()-decided.Seconds()
 		if reply != nil {
 			out, _ := json.MarshalIndent(reply, "", "  ")
 			fmt.Println(string(out))
@@ -230,7 +288,6 @@ func run(o options) error {
 			fmt.Printf("inserted %d vectors: IDs [%d, %d), locations [%d, %d)\n", n, b.Inserts[0].ID,
 				uint64(b.Inserts[n-1].ID)+1, b.Inserts[0].Loc, uint64(b.Inserts[n-1].Loc)+1)
 		}
-		lists, _, _ := b.Postings()
 		fmt.Printf("%d postings added, %d IDs deleted; epoch %d -> %d, %d partitions at new versions; "+
 			"decided in %.2f s, applied in %.2f s\n", len(lists), len(b.Deleted), reply.FromEpoch, reply.ToEpoch,
 			len(reply.Changed), decided.Seconds(), time.Since(start).Seconds()-decided.Seconds())
@@ -241,12 +298,14 @@ func run(o options) error {
 	if len(splits)+len(merges) == 0 {
 		return nil
 	}
-	return runMajor(ctx, u, o.statePath, alloc, splits, merges)
+	return runMajor(ctx, u, o.statePath, alloc, splits, merges, rec)
 }
 
 // runMajor runs one major epoch that splits and merges those lists.
-func runMajor(ctx context.Context, u *update.Updater, statePath string, alloc *update.Allocator, splits, merges []uint32) error {
+func runMajor(ctx context.Context, u *update.Updater, statePath string, alloc *update.Allocator, splits, merges []uint32,
+	rec *record) error {
 	start := time.Now()
+	rec.Splits, rec.Merges = splits, merges
 	mj, err := u.PrepareMajor(ctx, splits, merges)
 	if serr := saveState(statePath, alloc); serr != nil {
 		return errors.Join(err, serr)
@@ -255,7 +314,12 @@ func runMajor(ctx context.Context, u *update.Updater, statePath string, alloc *u
 		return err
 	}
 	decided := time.Since(start)
+	rec.MajorDecide, rec.PatchBytes = decided.Seconds(), len(mj.Patch)
+	for _, cs := range mj.Codes {
+		rec.MajorMoved += len(cs.IDs)
+	}
 	reply, err := u.ExecuteMajor(ctx, mj)
+	rec.Major, rec.MajorApply = reply, time.Since(start).Seconds()-decided.Seconds()
 	if reply != nil {
 		out, _ := json.MarshalIndent(reply, "", "  ")
 		fmt.Println(string(out))
