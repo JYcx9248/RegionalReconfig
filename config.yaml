@@ -23,6 +23,7 @@ CallTimeout: 10s
 StageTimeout: 30m0s
 GraphPriority: background
 RawPriority: background
+FetchExtra: 0
 EntryFlipInterval: 1s
 AllowUpdates: false
 UpdateLease: 10m0s

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -79,6 +80,9 @@ func New(cfg config.Controller) (*Controller, error) {
 		default:
 			return nil, fmt.Errorf("controller: unknown %s %q (background | data)", key, v)
 		}
+	}
+	if cfg.FetchExtra < 0 || int64(cfg.FetchExtra) > math.MaxUint32 {
+		return nil, fmt.Errorf("controller: FetchExtra must be a count of vectors, >= 0, got %d", cfg.FetchExtra)
 	}
 	if cfg.EntryFlipInterval.Duration <= 0 {
 		return nil, fmt.Errorf("controller: EntryFlipInterval must be positive, got %v", cfg.EntryFlipInterval.Duration)

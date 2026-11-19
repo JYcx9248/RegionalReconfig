@@ -2166,6 +2166,236 @@ void TestRawMigration() {
   CHECK(same && both && met && ss.fetched > 0 && ss.fetches > split->fetch_stats().fetch_calls);
 }
 
+// FetchExtra (U9): with n on for a holder, each request a query's fetch sends to it is followed,
+// in the background, by one of up to n more vectors of the lists the query fetched through whose
+// postings name that holder -- the first ones in list order that are not here. The query does not
+// wait for it; a query that misses one of its vectors meanwhile waits for it, as for any fetch.
+// Nothing for other holders, nothing with n = 0, nothing while the fetch cache is half full; the
+// answers stay the same.
+void TestFetchExtra() {
+  Fixture& f = GetFixture();
+  auto src = OpenNode(f, {0, 1, 2, 3}, true);  // holder 1, of partition 2's postings
+  src->SetNodes(1, {});
+  auto src2 = OpenNode(f, {0, 1, 2, 3}, false);  // holder 9, of partition 3's
+  src2->SetNodes(9, {});
+  auto dst = OpenNode(f, {}, false, f.index_nopages);
+  dst->SetNodes(2, {{1, "node-1"}, {9, "node-9"}});
+  std::mutex mu;
+  std::condition_variable cv;
+  bool gated = false;           // the extras' requests wait while gated
+  std::set<uint32_t> cand_locs;  // the locations of every query's candidates (cand)
+  struct Asked {
+    std::string peer;
+    std::vector<uint32_t> locs;
+  };
+  std::vector<Asked> extras;  // the extras' requests -- not only candidates -- as they reached a holder
+  dst->SetRawFetcher([&](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+    {
+      std::unique_lock<std::mutex> l(mu);
+      bool extra = false;
+      for (size_t i = 0; i < n; ++i) extra = extra || !cand_locs.count(locs[i]);
+      if (extra) {
+        extras.push_back({peer, std::vector<uint32_t>(locs, locs + n)});
+        cv.notify_all();
+        cv.wait(l, [&] { return !gated; });
+      }
+    }
+    (peer == "node-1" ? src : src2)->RawGet(locs, n, out);
+  });
+  auto gate = [&](bool on) {
+    std::lock_guard<std::mutex> l(mu);
+    gated = on;
+    cv.notify_all();
+  };
+  struct Open {  // whatever happens, the worker is not left waiting at the gate
+    std::function<void(bool)> gate;
+    ~Open() { gate(false); }
+  } open{gate};
+  StageFrom(f, dst.get(), src.get(), {2});
+  StageFrom(f, dst.get(), src2.get(), {3});
+
+  const ListSegment s2 = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(2)));
+  const ListSegment s3 = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(3)));
+  std::map<uint32_t, uint32_t> id_of, loc_of;  // location -> vector ID, and back
+  for (const ListSegment* s : {&s2, &s3})
+    for (size_t j = 0; j < s->ids.size(); ++j) {
+      id_of[s->locs[j]] = s->ids[j];
+      loc_of[s->ids[j]] = s->locs[j];
+    }
+  const std::vector<uint32_t> ids3 = Named(f, {3}).first, ids2 = Named(f, {2}).first;
+  CHECK(ids3.size() >= 40 && ids2.size() >= 10);
+  const float* q = &f.queries[0];
+  struct Out {
+    std::vector<uint32_t> ids;
+    std::vector<float> dists;
+    bool operator==(const Out& o) const { return ids == o.ids && dists == o.dists; }
+  };
+  auto rerank = [&](NodeEngine* at, int w, const std::vector<uint32_t>& cand, const std::vector<uint32_t>& lists) {
+    const uint32_t k = static_cast<uint32_t>(std::min<size_t>(5, cand.size()));
+    Out o{std::vector<uint32_t>(k), std::vector<float>(k)};
+    RerankStats st;
+    const uint32_t n = at->Rerank(w, q, cand.data(), static_cast<uint32_t>(cand.size()), k, lists.data(), nullptr,
+                                  static_cast<uint32_t>(lists.size()), o.ids.data(), o.dists.data(), &st);
+    o.ids.resize(n);
+    o.dists.resize(n);
+    return o;
+  };
+  // Re-ranks cand at dst through lists, and checks the answer.
+  auto check = [&](const std::vector<uint32_t>& cand, const std::vector<uint32_t>& lists, int w = 0) {
+    {
+      std::lock_guard<std::mutex> l(mu);
+      for (uint32_t id : cand) cand_locs.insert(loc_of.at(id));
+    }
+    return rerank(dst.get(), w, cand, lists) == rerank(src.get(), 0, cand, lists);
+  };
+  auto slice = [](const std::vector<uint32_t>& v, size_t from, size_t n) {
+    return std::vector<uint32_t>(v.begin() + from, v.begin() + from + n);
+  };
+  auto wait_stats = [&](const std::function<bool(const FetchStats&)>& done) {
+    for (int i = 0; i < 1000; ++i) {
+      if (done(dst->fetch_stats())) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+  };
+  // The vectors an extra request of up to n asks for: of these lists of s in ascending order,
+  // postings in order, the first n distinct locations not here.
+  auto expected = [&](const ListSegment& s, std::vector<uint32_t> lists, size_t n) {
+    std::vector<uint32_t> all(s.locs.begin(), s.locs.end()), out;
+    std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
+    const std::vector<uint32_t> absent = dst->RawAbsent(all.data(), all.size());
+    std::sort(lists.begin(), lists.end());
+    lists.erase(std::unique(lists.begin(), lists.end()), lists.end());
+    for (uint32_t l : lists) {
+      const size_t k = static_cast<size_t>(std::lower_bound(s.list_ids.begin(), s.list_ids.end(), l) - s.list_ids.begin());
+      for (uint64_t j = s.offsets[k]; j < s.offsets[k + 1] && out.size() < n; ++j)
+        if (std::binary_search(absent.begin(), absent.end(), s.locs[j]) &&
+            std::find(out.begin(), out.end(), s.locs[j]) == out.end())
+          out.push_back(s.locs[j]);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+
+  // Off by default.
+  const std::vector<uint32_t> a1 = slice(ids3, 0, 5), l1 = ListsNaming(f, 3, a1);
+  CHECK(check(a1, l1));
+  CHECK(dst->fetch_stats().extra_queued == 0 && dst->fetch_stats().extra == 0);
+
+  // On for holder 1 only: a fetch from holder 9 brings nothing more.
+  dst->SetFetchExtra(8, {1});
+  const std::vector<uint32_t> a2 = slice(ids3, 5, 5), l2 = ListsNaming(f, 3, a2);
+  CHECK(check(a2, l2));
+  CHECK(dst->fetch_stats().extra_queued == 0 && dst->fetch_stats().extra == 8);
+
+  // On for holder 9: the query's answer comes while its extra request is held at the holder.
+  dst->SetFetchExtra(8, {9});
+  gate(true);
+  const std::vector<uint32_t> a3 = slice(ids3, 10, 10), l3 = ListsNaming(f, 3, a3);
+  std::atomic<bool> a3_done{false};
+  bool a3_same = false;
+  std::thread t3([&] {
+    a3_same = check(a3, l3);
+    a3_done = true;
+  });
+  bool asked = false;
+  {
+    std::unique_lock<std::mutex> l(mu);
+    asked = cv.wait_for(l, std::chrono::seconds(10), [&] { return !extras.empty(); });
+  }
+  CHECK(asked && wait_stats([&](const FetchStats&) { return a3_done.load(); }));  // not waiting for it
+  std::vector<uint32_t> held;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    if (!extras.empty()) held = extras[0].locs;
+    CHECK(extras.size() == 1 && extras[0].peer == "node-9");
+  }
+  CHECK(held == expected(s3, l3, 8) && held.size() == 8);
+  // A query that misses three of them waits for that request, and then has them.
+  std::vector<uint32_t> b;
+  for (size_t i = 0; i < 3 && i < held.size(); ++i) b.push_back(id_of[held[i]]);
+  std::sort(b.begin(), b.end());
+  const std::vector<uint32_t> lb = ListsNaming(f, 3, b);
+  const uint64_t coalesced = dst->fetch_stats().coalesced;
+  std::atomic<bool> b_done{false};
+  bool b_same = false;
+  std::thread tb([&] {
+    b_same = check(b, lb, 1);
+    b_done = true;
+  });
+  CHECK(wait_stats([&](const FetchStats& fs) { return fs.coalesced >= coalesced + 3; }) && !b_done.load());
+  gate(false);
+  tb.join();
+  t3.join();
+  CHECK(a3_same && b_same && b_done.load());
+  CHECK(wait_stats([](const FetchStats& fs) { return fs.extra_fetched == 8; }));
+  FetchStats fs = dst->fetch_stats();
+  CHECK(fs.extra_queued == 1 && fs.extra_requests == 1 && fs.extra_dropped == 0 && fs.extra_failed == 0);
+  // The others came with it: no fetch for them.
+  const uint64_t fetches = dst->raw_stats(true).fetches;
+  std::vector<uint32_t> rest;
+  for (size_t i = 3; i < held.size(); ++i) rest.push_back(id_of[held[i]]);
+  std::sort(rest.begin(), rest.end());
+  CHECK(check(rest, ListsNaming(f, 3, rest)) && dst->raw_stats(true).fetches == fetches);
+  CHECK(dst->RawAbsent(held.data(), held.size()).empty());
+
+  // Per request: a query whose misses lie at two holders is followed by one extra request to each.
+  dst->SetFetchExtra(4, {});
+  const std::vector<uint32_t> c2 = slice(ids2, 0, 5);
+  std::vector<uint32_t> c3;  // not here yet
+  for (size_t i = ids3.size(); i-- > 0 && c3.size() < 5;) {
+    const uint32_t loc = loc_of.at(ids3[i]);
+    if (!dst->RawAbsent(&loc, 1).empty()) c3.push_back(ids3[i]);
+  }
+  std::sort(c3.begin(), c3.end());
+  std::vector<uint32_t> c = c2, lc = ListsNaming(f, 2, c2);
+  c.insert(c.end(), c3.begin(), c3.end());
+  const std::vector<uint32_t> lc3 = ListsNaming(f, 3, c3);
+  lc.insert(lc.end(), lc3.begin(), lc3.end());
+  std::sort(c.begin(), c.end());
+  std::sort(lc.begin(), lc.end());
+  const size_t before = extras.size();
+  CHECK(check(c, lc));
+  CHECK(wait_stats([](const FetchStats& fs) { return fs.extra_requests == 3; }));
+  fs = dst->fetch_stats();
+  CHECK(fs.extra_queued == 3 && fs.extra_fetched == 16);
+  {
+    std::lock_guard<std::mutex> l(mu);
+    std::set<std::string> peers;
+    for (size_t i = before; i < extras.size(); ++i) {
+      peers.insert(extras[i].peer);
+      CHECK(extras[i].locs.size() == 4);
+    }
+    CHECK(extras.size() == before + 2 && peers == std::set<std::string>({"node-1", "node-9"}));
+  }
+
+  // Off: the call returns with nothing in flight, and fetches bring only what they need.
+  dst->SetFetchExtra(0, {});
+  const std::vector<uint32_t> d = slice(ids3, 20, 5), ld = ListsNaming(f, 3, d);
+  CHECK(check(d, ld));
+  fs = dst->fetch_stats();
+  CHECK(fs.extra == 0 && fs.extra_queued == 3 && fs.extra_requests == 3);
+
+  // A fetch cache half full holds every extra request back (here: less room than one).
+  const uint32_t vb = src->raw_stats(false).vec_bytes;
+  NodeOptions o;
+  o.index_dir = f.index_nopages;
+  o.partitions_dir = f.parts;
+  o.max_nprobe = 64;
+  o.max_rerank = 4096;
+  o.direct_io = false;
+  o.fetch_cache_bytes = 8ull * vb;
+  auto small = NodeEngine::Open(o);
+  LinkPeers(small.get(), 3, {{9, src2.get()}});
+  StageFrom(f, small.get(), src2.get(), {3});
+  small->SetFetchExtra(8, {});
+  CHECK(rerank(small.get(), 0, a3, l3) == rerank(src.get(), 0, a3, l3));
+  small->SetFetchExtra(0, {});
+  fs = small->fetch_stats();
+  CHECK(fs.extra_queued == 1 && fs.extra_dropped == 1 && fs.extra_requests == 0 && fs.extra_fetched == 0);
+}
+
 // Drops a file's pages from the page cache; false where that is not possible (tmpfs keeps a
 // file in its pages).
 bool EvictFromCache(const std::string& path) {
@@ -3618,6 +3848,7 @@ int main() {
       {"node_pq_snapshot", TestNodePQSnapshot},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
+      {"fetch_extra", TestFetchExtra},
       {"read_budget", TestReadBudget},
       {"graph_transfer", TestGraphTransfer},
       {"graph_patches", TestGraphPatches},

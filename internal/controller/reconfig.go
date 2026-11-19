@@ -604,7 +604,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 		go func() {
 			defer close(drainDone)
 			var st protocol.StageReply
-			st, drainErr = c.drainRaw(ctx, draft, removed, book)
+			st, drainErr = c.drainRaw(ctx, draft, added, removed, book)
 			reply.DrainVectors, reply.DrainBytes = st.RawVectors, st.RawBytes
 			reply.DrainSeconds = time.Since(flipDone).Seconds()
 			c.event("reconfig.drain_s", reply.DrainSeconds)
@@ -741,13 +741,29 @@ func (c *Controller) stageRaw(ctx context.Context, dests []*ManagedNode, sources
 }
 
 // drainRaw has every data node of t pull the raw vectors its postings say only the removed
-// nodes hold (at RawPriority), and adds up what moved.
-func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, removed []*ManagedNode,
+// nodes hold (at RawPriority), and adds up what moved. Meanwhile the nodes that stay -- not the
+// added ones -- fetch with FetchExtra from the removed ones (fetchExtra).
+func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, added, removed []*ManagedNode,
 	book map[placement.NodeID]epoch.NodeInfo) (protocol.StageReply, error) {
 	nodes, err := c.managed(t.Placement.Nodes())
 	if err != nil {
 		return protocol.StageReply{}, err
 	}
+	joined := map[placement.NodeID]bool{}
+	for _, n := range added {
+		joined[n.ID] = true
+	}
+	var stay []*ManagedNode
+	for _, n := range nodes {
+		if !joined[n.ID] {
+			stay = append(stay, n)
+		}
+	}
+	off, err := c.fetchExtra(ctx, stay, ids(removed))
+	if err != nil {
+		return protocol.StageReply{}, err
+	}
+	defer off()
 	req := protocol.DrainRawReq{From: ids(removed), Nodes: book, Priority: c.cfg.RawPriority}
 	var vectors, bytes atomic.Int64
 	err = forEach(nodes, func(n *ManagedNode) error {
@@ -758,6 +774,41 @@ func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, removed []*Ma
 		return err
 	})
 	return protocol.StageReply{RawVectors: vectors.Load(), RawBytes: bytes.Load()}, err
+}
+
+// fetchExtra turns FetchExtra on at nodes, for their fetches from the holders `from` (every
+// holder if empty), and returns what turns it off again. It is the one place that decides where
+// extra raw vectors move (U9): a fetch brings only what its query needs, except where nodes go
+// away, so that they can go sooner --
+//   - in a scale-in, at the nodes that stay, for their fetches from the nodes that leave, until
+//     the drain has taken over what only those hold (drainRaw);
+//   - in a full rebuild, at the old nodes, for their fetches in the next generation, until the
+//     rebuild returns and the spares go (rebuild).
+//
+// Never in a scale-out, nor at the nodes a plan adds while others leave: a new node fetches only
+// what its queries need. Whether a scale-out ablation goes into the evaluation is open
+// (2026-11-17); it would get its own setting here. With FetchExtra 0 this does nothing. Turning
+// it off is best effort, logged: by then no answer depends on it.
+func (c *Controller) fetchExtra(ctx context.Context, nodes []*ManagedNode, from []placement.NodeID) (off func(), err error) {
+	off = func() {}
+	if c.cfg.FetchExtra == 0 || len(nodes) == 0 {
+		return off, nil
+	}
+	set := func(ctx context.Context, n int) error {
+		return forEach(nodes, func(m *ManagedNode) error {
+			return m.call(ctx, c.stageTimeout(), protocol.FetchExtraM, protocol.FetchExtraReq{Extra: n, From: from}, nil)
+		})
+	}
+	off = func() {
+		if err := set(context.WithoutCancel(ctx), 0); err != nil {
+			log.Printf("controller: turning FetchExtra off: %v", err)
+		}
+	}
+	if err := set(ctx, c.cfg.FetchExtra); err != nil {
+		off()
+		return func() {}, fmt.Errorf("controller: FetchExtra: %w", err)
+	}
+	return off, nil
 }
 
 // graphDone reports how one new node's graph staging ended.

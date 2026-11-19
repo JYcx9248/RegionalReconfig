@@ -293,13 +293,25 @@ var Open = map[string]Question{
 			"with one request per holder, every holder at once. Under the graph placement a new " +
 			"node takes partitions from several donors, not one contiguous range, so a query's " +
 			"misses often lie at several holders, and the RERANK waits for the slowest request " +
-			"rather than their sum. Vectors move beyond what queries ask for only at a scale-in, " +
-			"where the drain hands over what only the leaving nodes hold (the baselines stream " +
-			"by design). Open: chunks (U12)",
-		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw), " +
-			"internal/agent/control.go (StageRaw, DrainRaw), engine/src/node_engine.cpp " +
-			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull), engine/node/server.cpp " +
-			"(PeerPool, RERANK)"},
+			"rather than their sum. Vectors move beyond what queries ask for only where nodes go " +
+			"away -- at a scale-in, where the drain hands over what only the leaving nodes hold " +
+			"(the baselines stream by design), and with FetchExtra. Decided (2026-11-17): " +
+			"FetchExtra N (default 0) has each request a fetch sends to a holder followed by one " +
+			"of up to N more vectors of the lists the query fetched through, from that holder " +
+			"(the first in list order not here), in the background: the query does not wait for " +
+			"it, it claims what it asks for as a query's fetch does, the requests queue up to a " +
+			"bound and are dropped past it, and one runs only while the fetch cache is less than " +
+			"half full. It applies in a scale-in to the fetches of the nodes that stay from the " +
+			"nodes that leave, until the drain ends, and in a full rebuild to the old nodes' " +
+			"fetches in the next generation, until the rebuild returns and the spares go; never " +
+			"in a scale-out, nor at the nodes a plan adds while others leave (one place decides: " +
+			"the controller's fetchExtra). Open: whether a scale-out ablation goes into the " +
+			"evaluation, and chunks (U12)",
+		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw, fetchExtra), " +
+			"internal/controller/rebuild.go (rebuild), " +
+			"internal/agent/control.go (StageRaw, DrainRaw, FetchExtra), engine/src/node_engine.cpp " +
+			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull, QueueExtra, PullExtra), " +
+			"engine/node/server.cpp (PeerPool, RERANK, FETCH_EXTRA)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
 			"single-machine prototype uses. What happens when the controller fails mid-flip is out of " +

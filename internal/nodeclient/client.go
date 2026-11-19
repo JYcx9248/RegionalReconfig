@@ -66,6 +66,7 @@ const (
 	opSegmentGet     uint8 = 0x45
 	opSegmentPut     uint8 = 0x46
 	opSegmentInstall uint8 = 0x47
+	opFetchExtra     uint8 = 0x49
 )
 
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
@@ -200,7 +201,28 @@ type Info struct {
 	Versions      [][2]uint32        `json:"versions"` // every resident (partition, version)
 	PQ            PQStats            `json:"pq"`
 	Raw           RawStats           `json:"raw"`
+	Fetch         FetchStats         `json:"fetch"`
 	Ops           map[string]OpStats `json:"ops"`
+}
+
+// FetchStats are the node's fetches on demand (fusion::FetchStats), of which only the extras
+// are read here.
+type FetchStats struct {
+	Extra FetchExtraStats `json:"extra"`
+}
+
+// FetchExtraStats count FetchExtra's requests (U9): N, the vectors each may bring now (0: off);
+// Queued, one per query and holder while it was on; of those, Dropped ones (the queue was full,
+// or the fetch cache half full) and the Requests sent, Failed ones among them; Fetched, the
+// vectors they brought.
+type FetchExtraStats struct {
+	N        uint64 `json:"n"`
+	Queued   uint64 `json:"queued"`
+	Dropped  uint64 `json:"dropped"`
+	Requests uint64 `json:"requests"`
+	Failed   uint64 `json:"failed"`
+	Fetched  uint64 `json:"fetched"`
+	Us       uint64 `json:"us"`
 }
 
 // GraphInfo is the node's navigation graph (U14 major epochs patch it).
@@ -666,6 +688,22 @@ func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
 		out.Words[i] = r.U64()
 	}
 	return out, r.Err
+}
+
+// FetchExtra has the node follow each request a query's fetch sends to one of the holders from
+// (every holder if empty) with one more, in the background, of up to n vectors of the lists the
+// query fetched through (FetchExtra, U9). n = 0 turns it off, and returns once the extra request
+// in flight has ended.
+func (c *Client) FetchExtra(ctx context.Context, n uint32, from []uint16) error {
+	var w frame.Writer
+	w.U32(n)
+	w.U32(uint32(len(from)))
+	for _, id := range from {
+		w.U16(id)
+		w.U16(0)
+	}
+	_, err := c.do(ctx, opFetchExtra, 0, w.B)
+	return err
 }
 
 // RawSave has the node sync its raw vectors and save their presence bits next to its raw file

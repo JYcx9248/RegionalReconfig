@@ -492,9 +492,21 @@ func (cl *cluster) stopDataNode(a *agent.Agent) {
 // each answer against answers (nil: the answers of the epoch it ran in, cluster.expected).
 func exactPass(t *testing.T, cl *cluster, answers [][]nodeclient.Candidate) {
 	t.Helper()
+	if err := checkPass(cl, answers); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkPass is exactPass's pass for any goroutine: the first answer that failed or was wrong.
+func checkPass(cl *cluster, answers [][]nodeclient.Candidate) error {
+	return checkQueries(cl, answers, 0, numQueries)
+}
+
+// checkQueries is checkPass over the queries [from, to).
+func checkQueries(cl *cluster, answers [][]nodeclient.Candidate, from, to int) error {
 	tbl := cl.ctl.Status().Table
 	clients := map[string]*query.Client{}
-	for qi := 0; qi < numQueries; qi++ {
+	for qi := from; qi < to; qi++ {
 		addr := tbl.Nodes[tbl.Entries[qi%len(tbl.Entries)]].QueryAddr
 		c, ok := clients[addr]
 		if !ok {
@@ -506,16 +518,17 @@ func exactPass(t *testing.T, cl *cluster, answers [][]nodeclient.Candidate) {
 			Params: query.Params{K: testK, NProbe: testNProbe, N: maxRerank}})
 		cancel()
 		if err != nil {
-			t.Fatalf("query %d at %s: %v", qi, addr, err)
+			return fmt.Errorf("query %d at %s: %v", qi, addr, err)
 		}
 		want := cl.expected(res.Epoch, qi)
 		if answers != nil {
 			want = answers[qi]
 		}
 		if !equal(res.Candidates, want) {
-			t.Fatalf("query %d at %s in epoch %d: got %v, want %v", qi, addr, res.Epoch, res.Candidates, want)
+			return fmt.Errorf("query %d at %s in epoch %d: got %v, want %v", qi, addr, res.Epoch, res.Candidates, want)
 		}
 	}
+	return nil
 }
 
 func (cl *cluster) entryClients() []*query.Client {

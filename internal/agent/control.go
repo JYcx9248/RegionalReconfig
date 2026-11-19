@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,6 +37,7 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	c.Handle(protocol.StageGraphM, a.handleStageGraph)
 	c.Handle(protocol.StageRawM, a.handleStageRaw)
 	c.Handle(protocol.DrainRawM, a.handleDrainRaw)
+	c.Handle(protocol.FetchExtraM, a.handleFetchExtra)
 	c.Handle(protocol.InstallEpochM, a.handleInstallEpoch)
 	c.Handle(protocol.WaitDrainedM, a.handleWaitDrained)
 	c.Handle(protocol.EvictM, a.handleEvict)
@@ -787,6 +789,11 @@ func (a *Agent) handleDrainRaw(ctx context.Context, body json.RawMessage) (any, 
 	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout())
 	defer cancel()
 	a.learnNodes(req.Nodes)
+	if a.beforeDrain != nil {
+		if err := a.beforeDrain(); err != nil {
+			return nil, err
+		}
+	}
 	start := time.Now()
 	var reply protocol.StageReply
 	for _, from := range req.From {
@@ -820,6 +827,23 @@ func (a *Agent) handleDrainRaw(ctx context.Context, body json.RawMessage) (any, 
 	}
 	reply.Seconds = time.Since(start).Seconds()
 	return reply, nil
+}
+
+func (a *Agent) handleFetchExtra(ctx context.Context, body json.RawMessage) (any, error) {
+	req, err := ctrl.Decode[protocol.FetchExtraReq](body)
+	if err != nil {
+		return nil, err
+	}
+	if req.Extra < 0 || req.Extra > math.MaxUint32 {
+		return nil, fmt.Errorf("FetchExtra %d out of range", req.Extra)
+	}
+	from := make([]uint16, len(req.From))
+	for i, id := range req.From {
+		from[i] = uint16(id)
+	}
+	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout()) // off waits for the request in flight
+	defer cancel()
+	return struct{}{}, a.localBulk.FetchExtra(ctx, uint32(req.Extra), from)
 }
 
 // rawPuller brings raw vectors into the data node as their listing streams in (RAW_MISSING,

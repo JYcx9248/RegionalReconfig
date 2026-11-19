@@ -269,6 +269,14 @@ struct FetchStats {
   uint64_t added_wait_us = 0;    // time RawAdd callers waited for room in the buffer
   uint64_t pending_recounts = 0; // scans of the resident postings for the pending count
   uint64_t pending_us = 0;
+  uint64_t extra = 0;            // now: vectors each extra request may bring (SetFetchExtra; 0 = off)
+  uint64_t extra_queued = 0;     // extra requests queued, one per query and holder
+  uint64_t extra_dropped = 0;    // of those, dropped: the queue was full, or the fetch cache was half
+                                 // full when their turn came
+  uint64_t extra_requests = 0;   // extra requests sent to holders
+  uint64_t extra_failed = 0;     // of those, failed
+  uint64_t extra_fetched = 0;    // vectors they brought (in fetched too)
+  uint64_t extra_us = 0;         // time the extras' worker spent on them
 };
 
 class NodeEngine {
@@ -476,6 +484,16 @@ class NodeEngine {
   // postings name this node. One a query is fetching comes with that fetch, and a query that
   // misses one of them meanwhile waits for this pull. RawMissingError if one has no holder.
   virtual RawPutResult RawPull(const uint32_t* locs, const uint32_t* lists, size_t n) = 0;
+  // FetchExtra (U9): from now on, each request a query's fetch sends to one of the holders
+  // `from` (every holder if empty) is followed by one more, of up to n vectors the query did not
+  // ask for -- of the lists it fetched through, those whose postings name that holder, in list
+  // order -- which a background worker sends after the query's own, into the fetch cache. The
+  // query does not wait for it: the requests queue up to a bound, past which they are dropped,
+  // and one runs only while the fetch cache is less than half full, so that the extras never
+  // put a query's fetch past the bound. It claims what it asks for, as a query's fetch does, and
+  // waits for no other fetch. n = 0 turns it off: the queue is emptied, and the call returns
+  // once the request in flight has ended.
+  virtual void SetFetchExtra(uint32_t n, const std::vector<uint16_t>& from) = 0;
   // Which raw vectors the node holds (on the SSD, or fetched and not written yet): one bit per
   // location, 64 per word -- what a full rebuild places the new partitions by (U14).
   virtual std::vector<uint64_t> RawBitmap() const = 0;

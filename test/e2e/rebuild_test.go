@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"rtier/internal/agent"
 	"rtier/internal/config"
 	"rtier/internal/nodeclient"
 	"rtier/internal/partitioning"
@@ -101,9 +102,11 @@ func buildGeneration2(f *fixture) (*generation2, error) {
 // while they serve raw vectors only, get the new partitions where most of their raw vectors
 // are, warm up with the queries the entries kept, and take over in one flip; the spares leave.
 // Every answer is exact for its epoch's generation: the first generation's oracle before the
-// flip, the second's from it on. Then the cluster lives on in the new generation: a minor batch
-// (the update controller's router follows to the new generation), and a scale-out to a node that
-// registered with the first generation's configuration.
+// flip, the second's from it on. FetchExtra is on: the old nodes' fetches in the new generation
+// bring more vectors until the rebuild returns, the spares' never. Then the cluster lives on in the
+// new generation: a minor batch (the update controller's router follows to the new generation),
+// and a scale-out to a node that registered with the first generation's configuration, which
+// fetches without extras.
 func TestFullRebuild(t *testing.T) {
 	f := getFixture(t)
 	g := getGeneration2(t, f)
@@ -118,7 +121,17 @@ func TestFullRebuild(t *testing.T) {
 	cl := newCluster(t, f, "lazy", 2, func(c *config.Controller) {
 		c.AllowUpdates = true
 		c.WorkDir, c.BulkListen = t.TempDir(), "127.0.0.1:0"
+		c.FetchExtra = 4
 	})
+	extras := func(a *agent.Agent) nodeclient.FetchExtraStats {
+		nc := nodeclient.New(a.Info().NodeAddr, 1)
+		defer nc.Close()
+		in, err := nc.InfoSettled(cl.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in.Fetch.Extra
+	}
 	n1 := cl.addNode("n1", query.TwoPhase{}, room...)
 	n2 := cl.addNode("n2", query.TwoPhase{}, room...)
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
@@ -191,6 +204,23 @@ func TestFullRebuild(t *testing.T) {
 	}
 	if reply.Local <= 0 || reply.Local > reply.Vectors || reply.WarmupQueries == 0 {
 		t.Errorf("reply: %d of %d vectors local, %d warm-up queries", reply.Local, reply.Vectors, reply.WarmupQueries)
+	}
+	var queued uint64
+	for _, a := range []*agent.Agent{n1, n2, s1, s2} {
+		e := extras(a)
+		switch {
+		case e.N != 0:
+			t.Errorf("%s after the rebuild: extras %+v, want them off", a.Info().Name, e)
+		case (a == s1 || a == s2) && e.Queued != 0:
+			t.Errorf("spare %s: extras %+v, want none", a.Info().Name, e)
+		}
+		if a == n1 || a == n2 {
+			queued += e.Queued
+			t.Logf("%s: extras %+v", a.Info().Name, e)
+		}
+	}
+	if reply.WarmupFetched > 0 && queued == 0 {
+		t.Errorf("the old nodes' warm-up fetched %d vectors, none with extras", reply.WarmupFetched)
 	}
 	exactPass(t, cl, nil)
 
@@ -278,6 +308,11 @@ func TestFullRebuild(t *testing.T) {
 		t.Errorf("node %d did not become an entry", n5.ID())
 	}
 	exactPass(t, cl, nil)
+	for _, a := range []*agent.Agent{n1, n2, n5} {
+		if e := extras(a); e.N != 0 || (a == n5 && e.Queued != 0) {
+			t.Errorf("%s after the scale-out: extras %+v, want them off, and none at the new node", a.Info().Name, e)
+		}
+	}
 }
 
 // TestFullRebuildStopTheWorld is the baseline without spares: admission is paused on every entry

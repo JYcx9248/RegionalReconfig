@@ -89,11 +89,23 @@ ran, and each node reports `raw.fetched` (installed or still in memory), `raw.pe
 its partitions, not needed so far) and `raw.present` in its metrics. A scale-in does stream:
 before it returns, each remaining node takes over the vectors that its postings say only a
 leaving node holds (the drain; `drain_vectors` and `drain_seconds` in the reply), so the nodes
-that leave can go offline. That is the only time vectors move beyond what queries ask for: a
-fetch brings the query's missing vectors and nothing more -- no page or list read ahead (decided
-2026-10-20) -- with one request per holder, every holder at once. A new node takes partitions
-from several donors, chosen by the partition graph, so a query's misses often lie at several
-holders, and the RERANK waits for the slowest request, not for their sum.
+that leave can go offline. Beyond what queries ask for, vectors move only where nodes go away:
+the drain, and FetchExtra (below). A fetch brings the query's missing vectors and nothing more --
+no page or list read ahead (decided 2026-10-20) -- with one request per holder, every holder at
+once. A new node takes partitions from several donors, chosen by the partition graph, so a
+query's misses often lie at several holders, and the RERANK waits for the slowest request, not for
+their sum. Where nodes go away, more vectors may follow the fetches, so that the nodes can go
+sooner (`"FetchExtra": N`, default 0; decided 2026-11-17): each request a fetch sends to a holder
+is followed, in the background, by one of up to N more vectors of the lists the query fetched
+through, from the same holder -- the first in list order that are not here. The query does not
+wait for it. In a scale-in it applies to the fetches of the nodes that stay from the nodes that
+leave, until the drain ends; in a full rebuild to the old nodes' fetches in the next generation,
+until the rebuild returns and the spares go; never in a scale-out, nor at the nodes a plan adds
+while others leave. The extra requests queue up to a bound, past which they are dropped, and one
+runs only while the fetch cache is less than half full, so that they never put a query's fetch
+past it; each claims what it asks for, as a query's fetch does, so no vector comes twice. The
+nodes' stats count them (`fetch.extra`). Whether a scale-out ablation goes into the evaluation is
+open.
 Holders stay valid because no node drops a raw vector it has held; a disk budget would need the
 same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
 (`StageRaw`; the rescale waits for it and reports `raw_vectors` / `raw_seconds`),

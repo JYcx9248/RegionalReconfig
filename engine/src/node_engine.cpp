@@ -317,9 +317,16 @@ class NodeEngineImpl : public NodeEngine {
       workers_.push_back(std::move(w));
     }
     writer_ = std::thread([this] { WriterLoop(); });
+    extra_worker_ = std::thread([this] { ExtraLoop(); });
   }
 
   ~NodeEngineImpl() override {
+    {
+      std::lock_guard<std::mutex> l(extra_mu_);
+      stop_extra_ = true;
+    }
+    extra_cv_.notify_all();
+    if (extra_worker_.joinable()) extra_worker_.join();  // it caches into the writer's queue
     {
       std::lock_guard<std::mutex> l(cache_mu_);
       stop_writer_ = true;
@@ -1170,6 +1177,19 @@ class NodeEngineImpl : public NodeEngine {
     }
   }
 
+  void SetFetchExtra(uint32_t n, const std::vector<uint16_t>& from) override {
+    std::unique_lock<std::mutex> l(extra_mu_);
+    extra_from_ = from;
+    std::sort(extra_from_.begin(), extra_from_.end());
+    extra_n_.store(n, std::memory_order_relaxed);
+    if (n) return;
+    // Off: what is queued goes, and the request in flight ends before the call returns, so that
+    // no extra vector moves once the reconfiguration that asked for them has returned.
+    fc_.extra_dropped.fetch_add(extra_queue_.size(), std::memory_order_relaxed);
+    extra_queue_.clear();
+    extra_idle_cv_.wait(l, [&] { return !extra_busy_; });
+  }
+
   // ---------------------------------------------------------------- PQ codes
   void PQMissingStream(const std::vector<std::vector<SegmentKey>>& groups,
                        const std::function<void(size_t, const uint32_t*, size_t)>& sink) override {
@@ -1604,6 +1624,13 @@ class NodeEngineImpl : public NodeEngine {
     f.added = get(fc_.added);
     f.added_written = get(fc_.added_written);
     f.added_wait_us = get(fc_.added_wait_us);
+    f.extra = extra_n_.load(std::memory_order_relaxed);
+    f.extra_queued = get(fc_.extra_queued);
+    f.extra_dropped = get(fc_.extra_dropped);
+    f.extra_requests = get(fc_.extra_requests);
+    f.extra_failed = get(fc_.extra_failed);
+    f.extra_fetched = get(fc_.extra_fetched);
+    f.extra_us = get(fc_.extra_us);
     return f;
   }
 
@@ -2234,6 +2261,7 @@ class NodeEngineImpl : public NodeEngine {
     const std::vector<uint32_t> miss = RawAbsent(locs, n);  // sorted, unique; cached is not missing
     if (miss.empty()) return 0;
     std::vector<Posting> via(miss.size());
+    std::vector<uint32_t> via_list(miss.size());  // the list of via[i] (FetchExtra)
     std::vector<std::shared_ptr<const ResidentSegment>> segs(nlists);
     {
       std::lock_guard<std::mutex> l(seg_mu_);
@@ -2252,11 +2280,12 @@ class NodeEngineImpl : public NodeEngine {
         const auto it = std::lower_bound(miss.begin(), miss.end(), segs[i]->seg.locs[j]);
         if (it != miss.end() && *it == segs[i]->seg.locs[j] && !via[it - miss.begin()].seg) {
           via[it - miss.begin()] = {segs[i], j};
+          via_list[it - miss.begin()] = lists[i];
           --left;
         }
       }
     }
-    return FetchForQuery(miss, via);
+    return FetchForQuery(miss, via, via_list);
   }
 
   // A fetch in flight -- a query's, or a stream's or a drain's (RawPull) -- that the others which
@@ -2326,11 +2355,13 @@ class NodeEngineImpl : public NodeEngine {
     });
   }
 
-  // Fetches miss[i] from the holder that posting via[i] records, one request per holder, and
-  // waits for those another query, a stream or a drain is fetching already; every posting used
-  // then names this node. Returns how many vectors this call installed. RawMissingError if one has
-  // no holder or a fetch fails (its own, or one it waited for).
-  size_t FetchForQuery(const std::vector<uint32_t>& miss, const std::vector<Posting>& via) {
+  // Fetches miss[i] from the holder that posting via[i] (in list via_list[i]) records, one
+  // request per holder, and waits for those another query, a stream or a drain is fetching
+  // already; every posting used then names this node. Returns how many vectors this call
+  // installed. RawMissingError if one has no holder or a fetch fails (its own, or one it waited
+  // for). With FetchExtra on, an extra request per holder follows, in the background.
+  size_t FetchForQuery(const std::vector<uint32_t>& miss, const std::vector<Posting>& via,
+                       const std::vector<uint32_t>& via_list) {
     Timer t;
     struct Count {  // also when a fetch throws
       FetchCounters& fc;
@@ -2425,6 +2456,10 @@ class NodeEngineImpl : public NodeEngine {
     }
     for (const auto& e : failed)
       if (e) std::rethrow_exception(e);
+    std::vector<std::pair<size_t, uint16_t>> held;  // (index into miss, the holder its posting records)
+    for (const auto& [h, is] : by)
+      for (size_t i : is) held.emplace_back(i, h);
+    QueueExtra(held, via_list);
     size_t fetched = 0;
     for (size_t g : got) fetched += g;
     if (!waits.empty()) {
@@ -2441,6 +2476,131 @@ class NodeEngineImpl : public NodeEngine {
     for (size_t i : here)
       if (via[i].seg) via[i].seg->SetHolder(via[i].j, kSelfHolder);
     return fetched;
+  }
+
+  // FetchExtra (SetFetchExtra): after a query's own fetches, one extra request for each holder
+  // its postings recorded (held: an index into miss, and that holder), if extras are on for that
+  // holder: up to extra_n_ more vectors of the lists the query fetched that holder's through.
+  // Queued for the worker, never waited for. The queue keeps about a quarter of a second of
+  // requests at a round trip each: an older one would follow queries that have moved on.
+  static constexpr size_t kExtraQueue = 256;
+  struct ExtraRequest {
+    uint16_t holder = 0;
+    std::vector<uint32_t> lists;  // sorted, unique
+  };
+  void QueueExtra(const std::vector<std::pair<size_t, uint16_t>>& held, const std::vector<uint32_t>& via_list) {
+    if (held.empty() || extra_n_.load(std::memory_order_relaxed) == 0) return;
+    std::map<uint16_t, std::vector<uint32_t>> by;  // lists, by holder
+    for (const auto& [i, h] : held) by[h].push_back(via_list[i]);
+    std::lock_guard<std::mutex> l(extra_mu_);
+    if (extra_n_.load(std::memory_order_relaxed) == 0) return;
+    for (auto& [h, lists] : by) {
+      if (!extra_from_.empty() && !std::binary_search(extra_from_.begin(), extra_from_.end(), h)) continue;
+      fc_.extra_queued.fetch_add(1, std::memory_order_relaxed);
+      if (extra_queue_.size() >= kExtraQueue) {
+        fc_.extra_dropped.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      std::sort(lists.begin(), lists.end());
+      lists.erase(std::unique(lists.begin(), lists.end()), lists.end());
+      extra_queue_.push_back({h, std::move(lists)});
+    }
+    extra_cv_.notify_one();
+  }
+
+  // The extras' worker: one request at a time, in the order the queries queued them.
+  void ExtraLoop() {
+    std::unique_lock<std::mutex> l(extra_mu_);
+    for (;;) {
+      extra_cv_.wait(l, [&] { return stop_extra_ || !extra_queue_.empty(); });
+      if (stop_extra_) return;
+      const ExtraRequest r = std::move(extra_queue_.front());
+      extra_queue_.pop_front();
+      const uint32_t n = extra_n_.load(std::memory_order_relaxed);
+      extra_busy_ = true;
+      l.unlock();
+      Timer t;
+      try {
+        PullExtra(r, n);
+      } catch (const std::exception& e) {
+        const uint64_t k = fc_.extra_failed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((k & (k - 1)) == 0) Log("extra raw vectors from node %u (%llu failed so far): %s", r.holder,
+                                    static_cast<unsigned long long>(k), e.what());
+      }
+      fc_.extra_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
+      l.lock();
+      extra_busy_ = false;
+      extra_idle_cv_.notify_all();
+    }
+  }
+
+  // One extra request: of r.lists, in their newest versions here, up to n postings that name
+  // r.holder and whose vector is neither here nor being fetched, in list order -- claimed,
+  // fetched from r.holder and cached as a query's fetch is, so that the postings then name this
+  // node. Only while the fetch cache is less than half full: the extras take the room the queries
+  // leave, and never put a query's fetch past the bound, where it would install on its own path.
+  // It waits for no other fetch: a vector being fetched comes with that fetch. A query that
+  // misses one of its vectors meanwhile waits for this request, as for any other fetch of it,
+  // and fails if it fails (the claims end failed). Throws on a failed fetch.
+  void PullExtra(const ExtraRequest& r, uint32_t n) {
+    if (n == 0) return;  // turned off since it was queued
+    const uint64_t vb = raw_->layout().vec_bytes;
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      if ((queued_ + n) * vb * 2 > opts_.fetch_cache_bytes) {
+        fc_.extra_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    std::vector<std::shared_ptr<const ResidentSegment>> segs(r.lists.size());
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (size_t k = 0; k < r.lists.size(); ++k) segs[k] = SegmentLocked(PartOf(r.lists[k]), nullptr);
+    }
+    std::vector<std::pair<size_t, size_t>> cand;  // (k, posting) naming r.holder, outside the cache's lock
+    for (size_t k = 0; k < r.lists.size(); ++k) {
+      if (!segs[k]) continue;  // evicted since
+      uint32_t len = 0;
+      const uint32_t* v = segs[k]->seg.Find(r.lists[k], &len);
+      if (!v) continue;
+      const size_t at = static_cast<size_t>(v - segs[k]->seg.ids.data());
+      for (size_t j = at; j < at + len; ++j)
+        if (segs[k]->Holder(j) == r.holder) cand.emplace_back(k, j);
+    }
+    Claims claims(this);
+    std::vector<Posting> mine;
+    std::vector<uint32_t> ls;
+    {
+      std::lock_guard<std::mutex> l(cache_mu_);
+      for (const auto& [k, j] : cand) {
+        const uint32_t loc = segs[k]->seg.locs[j];
+        if (claims.Has(loc)) {  // another list's posting of a vector claimed here
+          mine.push_back({segs[k], j});
+          continue;
+        }
+        if (ls.size() == n) break;
+        std::shared_ptr<InFlight> f;
+        switch (claims.TakeLocked(loc, &f)) {
+          case Claim::kHere:
+            segs[k]->SetHolder(j, kSelfHolder);
+            break;
+          case Claim::kWait:  // being fetched: it comes with that fetch
+            break;
+          case Claim::kMine:
+            mine.push_back({segs[k], j});
+            ls.push_back(loc);
+            break;
+        }
+      }
+    }
+    if (ls.empty()) return;
+    std::sort(ls.begin(), ls.end());  // unique: one claim each
+    fc_.extra_requests.fetch_add(1, std::memory_order_relaxed);
+    std::vector<uint8_t> buf;
+    FetchFrom(r.holder, ls, &buf);
+    fc_.extra_fetched.fetch_add(Cache(ls.data(), ls.size(), buf.data(), true), std::memory_order_relaxed);
+    for (const Posting& q : mine) q.seg->SetHolder(q.j, kSelfHolder);
+    claims.Settle(ls, true);
   }
 
   // Whether the raw vector at loc is here: on the SSD, or fetched and in the cache. Both under
@@ -2460,14 +2620,15 @@ class NodeEngineImpl : public NodeEngine {
   // fetched, and a 64 MB bound put those writes on the queries for about 50 s (CloudLab,
   // 2026-11-03/04), where a whole new node's fetches came to 1.35 GB at most. It is set as a share
   // of the node's memory since 2026-11-16, as a write buffer, not a read cache: what it holds is
-  // what was fetched and not yet written, whatever the bound.
-  size_t Cache(const uint32_t* locs, size_t n, const uint8_t* vecs) {
+  // what was fetched and not yet written, whatever the bound. An extra request's vectors
+  // (FetchExtra) are always cached: it runs only while half the bound is free (PullExtra).
+  size_t Cache(const uint32_t* locs, size_t n, const uint8_t* vecs, bool extra = false) {
     const uint32_t vb = raw_->layout().vec_bytes;
     std::vector<uint32_t> fresh;
     bool full = false;
     {
       std::lock_guard<std::mutex> l(cache_mu_);
-      full = (queued_ + n) * vb > opts_.fetch_cache_bytes;
+      full = !extra && (queued_ + n) * vb > opts_.fetch_cache_bytes;
       if (!full) {
         for (size_t i = 0; i < n; ++i) {
           if (HeldLocked(locs[i])) continue;  // fetched twice: once is enough
@@ -2777,11 +2938,23 @@ class NodeEngineImpl : public NodeEngine {
     std::atomic<uint64_t> fetched{0}, fetch_calls{0}, coalesced{0}, fetch_us{0}, written{0}, write_us{0},
         sync_installed{0}, sync_us{0}, drain_calls{0}, drain_waiting{0}, drain_us{0},
         rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0}, added{0},
-        added_written{0}, added_wait_us{0};
+        added_written{0}, added_wait_us{0}, extra_queued{0}, extra_dropped{0}, extra_requests{0},
+        extra_failed{0}, extra_fetched{0}, extra_us{0};
   };
   mutable FetchCounters fc_;
   bool stop_writer_ = false;
   std::thread writer_;
+  // FetchExtra (SetFetchExtra): the requests that follow queries' fetches, and their worker.
+  // extra_n_ is read without the lock on every fetch: 0 costs a query nothing.
+  std::atomic<uint32_t> extra_n_{0};
+  std::mutex extra_mu_;
+  std::condition_variable extra_cv_;       // a request queued, or stopping
+  std::condition_variable extra_idle_cv_;  // the request in flight ended
+  std::vector<uint16_t> extra_from_;       // sorted; empty: every holder
+  std::deque<ExtraRequest> extra_queue_;
+  bool extra_busy_ = false;
+  bool stop_extra_ = false;
+  std::thread extra_worker_;
   mutable std::mutex pending_mu_;
   mutable uint64_t named_version_ = 0;
   mutable std::vector<uint64_t> named_;  // locations the resident partitions name (a bit each)

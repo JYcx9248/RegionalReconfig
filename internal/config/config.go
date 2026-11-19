@@ -75,6 +75,12 @@ type Controller struct {
 	// demand meanwhile, so the stream only takes bandwidth nothing else wants) or "data". The
 	// lazy protocol has no stream; the eager ones stream raw vectors before the flip, as data.
 	RawPriority string `yaml:"RawPriority"`
+	// FetchExtra (U9): how many more raw vectors may follow each on-demand fetch, in the
+	// background -- vectors of the lists the query fetched through, from the same holder -- where
+	// nodes go away: in a scale-in, the fetches from the nodes that leave, until the drain ends;
+	// in a full rebuild, the old nodes' fetches in the next generation, until it returns. Never in
+	// a scale-out. Default 0: a fetch brings only what its query needs.
+	FetchExtra int `yaml:"FetchExtra"`
 	// EntryFlipInterval: while new nodes are fetching the navigation graph, every interval one
 	// flip makes entries of all those whose graph loaded since the previous flip (and when the
 	// last pull finishes, its nodes join at once). Default 1 s: clients refresh their entry

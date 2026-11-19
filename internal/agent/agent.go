@@ -60,6 +60,9 @@ type Options struct {
 	// BeforeRaw, when set, runs before the agent streams raw vectors in (StageRaw); an error
 	// fails it. Tests hold it so that queries must fetch raw vectors on demand.
 	BeforeRaw func() error
+	// BeforeDrain, when set, runs before the agent drains the nodes that leave (DrainRaw); an
+	// error fails it. Tests hold it so that queries fetch from those nodes meanwhile.
+	BeforeDrain func() error
 }
 
 // Agent is one node's agent.
@@ -90,6 +93,7 @@ type Agent struct {
 	beforeInstall func(epoch uint64) // test hooks (Options)
 	beforeGraph   func() error
 	beforeRaw     func() error
+	beforeDrain   func() error
 
 	id         atomic.Uint32
 	paused     atomic.Bool
@@ -171,6 +175,7 @@ func New(cfg config.Agent, opts Options) (*Agent, error) {
 		beforeInstall: opts.BeforeInstall,
 		beforeGraph:   opts.BeforeGraph,
 		beforeRaw:     opts.BeforeRaw,
+		beforeDrain:   opts.BeforeDrain,
 		limiter:       transfer.NewTokenBucket(rate, 0),
 		reg:           metrics.NewRegistry(),
 		Registered:    syncflag.NewSyncFlag(),

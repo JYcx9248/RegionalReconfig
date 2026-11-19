@@ -154,8 +154,12 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   needs it, and only then, from the holder that a posting of the query's lists on that node
   records: one hop, data node to data node (`RAW_GET`, `PeerPool`; nodes know each other by ID,
   `SET_NODES`), and that posting then names the fetching node. A fetch brings only what its
-  query needs, from every holder at once, no read-ahead: vectors move beyond that only in a
-  scale-in's drain (U9). A RERANK fetches before it takes an engine worker, and holds a
+  query needs, from every holder at once, no read-ahead: vectors move beyond that only where
+  nodes go away (U9) -- a scale-in's drain, and `"FetchExtra"` (default 0, 2026-11-17): up to N
+  more vectors of the query's lists follow each fetch request to the same holder, in the
+  background (`SetFetchExtra`, `FETCH_EXTRA`; dropped past a queue bound or with the fetch cache
+  half full), in a scale-in from the nodes that leave until the drain ends and in a full rebuild
+  at the old nodes until it returns -- never in a scale-out (the controller's `fetchExtra`). A RERANK fetches before it takes an engine worker, and holds a
   connection slot of its own at the aggregator (`nodeclient`): FILTERs wait behind it in
   neither place.
   Concurrent misses of one vector wait for one fetch, and a stream's or a drain's pull

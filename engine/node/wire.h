@@ -107,6 +107,11 @@
 //                   (the node fetches what it lacks from the holders its postings in those
 //                   lists record, with RAW_GET, and installs it: a stream that does not pass
 //                   through the agents; those postings then name this node)
+//   FETCH_EXTRA     u32 n, u32 m, (u16 id, u16 pad)[m]        -> -
+//                   (FetchExtra, U9: each request a query's fetch sends to one of those holders
+//                   -- every holder if m = 0 -- is followed, in the background, by one of up to n
+//                   more vectors of the lists it fetched through; n = 0 turns it off, and returns
+//                   once the extra request in flight has ended)
 //   RAW_TRAFFIC     -                                         -> u64 sent, u64 received
 //                   (raw-vector bytes since startup: served by RAW_GET, and brought here --
 //                   fetched from peers, on demand or by RAW_PULL, or put with RAW_PUT; an
@@ -261,6 +266,7 @@ enum Op : uint8_t {
   kSegmentGet = 0x45,
   kSegmentPut = 0x46,
   kSegmentInstall = 0x47,
+  kFetchExtra = 0x49,
 };
 
 enum Status : uint16_t {

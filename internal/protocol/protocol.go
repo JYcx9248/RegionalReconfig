@@ -42,6 +42,7 @@ const (
 	StageGraphM      = "StageGraph"      // fetch the navigation graph, load it
 	StageRawM        = "StageRaw"        // stream the raw vectors the node's partitions lack
 	DrainRawM        = "DrainRaw"        // before nodes leave: take over the raw vectors only they hold
+	FetchExtraM      = "FetchExtra"      // extra raw vectors after each on-demand fetch from these holders (U9)
 	InstallEpochM    = "InstallEpoch"    // switch routing to a new table
 	WaitDrainedM     = "WaitDrained"     // grace period: queries pinned to <= epoch finished
 	EvictM           = "Evict"           // drop partitions and their files
@@ -177,6 +178,15 @@ type DrainRawReq struct {
 	From     []placement.NodeID                  `json:"from"`
 	Nodes    map[placement.NodeID]epoch.NodeInfo `json:"nodes,omitempty"`
 	Priority string                              `json:"priority,omitempty"`
+}
+
+// FetchExtraReq sets FetchExtra on the agent's data node (U9): each request a query's fetch
+// sends to a holder of From (every holder if empty) is followed, in the background, by one of up
+// to Extra more vectors of the lists the query fetched through. Extra 0 turns it off; the call
+// then returns once the extra request in flight has ended.
+type FetchExtraReq struct {
+	Extra int                `json:"extra"`
+	From  []placement.NodeID `json:"from,omitempty"`
 }
 
 // StageGraphReq asks the agent to fetch and load the navigation graph. Priority is the

@@ -248,6 +248,14 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	if err != nil {
 		return reply, err
 	}
+	// The old nodes' fetches in the next generation, from the warm-up on, bring FetchExtra more
+	// until the spares go (fetchExtra); the spares' own fetches never do. The next generation's
+	// postings name old nodes only.
+	extraOff, err := c.fetchExtra(ctx, old, nil)
+	if err != nil {
+		return reply, err
+	}
+	defer extraOff()
 	draft, err := c.stageGeneration(ctx, t2, gen, old, sample, req, reply, phase)
 	if err != nil {
 		return reply, fmt.Errorf("controller: rebuild stopped before the flip to generation %d (the spares serve generation "+
