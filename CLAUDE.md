@@ -269,7 +269,8 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   for the GPU it finds, and node0 builds before its driver is loaded. The `amazon-300m-*`
   experiments run 4 → 8 there on 300M of the Amazon corpus's 560M documents
   (`scripts/data/subset_base.py`; at 2 nodes the PQ codes would exceed a P100), on a 4-node
-  snapshot made on the control node (`amazon-300m-warmup-4`). Their `4to8-worst-*` files are
+  snapshot (`amazon-300m-warmup-4`; made on the lab server since 2026-11-20, each part sent from
+  there to its host: that reservation's control node, node0 again, has no room for it). Their `4to8-worst-*` files are
   U11's worst case there: 2M of the base's vectors as queries, drawn on the control node from
   the page file, with the layout map rebuilt from the partitions' segments
   (`scripts/data/sample_queries.py map`: the control node has no map), and ground truth for every
