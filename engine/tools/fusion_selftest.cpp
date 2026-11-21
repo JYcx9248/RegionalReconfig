@@ -160,9 +160,12 @@ int main(int argc, char** argv) {
         auto gs = CreateGpuFilter(cb, nullptr, n, fs);
         std::vector<uint32_t> all(n);
         std::iota(all.begin(), all.end(), 0u);
-        const uint32_t half = static_cast<uint32_t>(n / 2);  // two StoreCodes calls
+        // Two StoreCodes calls, each given its slots' codes in order (U15: the device keeps the
+        // only copy, so a call passes just the new codes, not a slot-addressed host store).
+        const uint32_t half = static_cast<uint32_t>(n / 2);
         gs->StoreCodes(all.data(), half, slot_codes.data());
-        gs->StoreCodes(all.data() + half, static_cast<uint32_t>(n) - half, slot_codes.data());
+        gs->StoreCodes(all.data() + half, static_cast<uint32_t>(n) - half,
+                       slot_codes.data() + static_cast<uint64_t>(half) * m);
         ok = Same(RunFilterSlots(gs->worker(0), q.data(), cand, slot_of, topn), rc,
                   "gpu slots vs cpu", false) && ok;
       }
