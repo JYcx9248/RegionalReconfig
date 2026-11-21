@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5, Amazon 300M: 4 -> 8 at 90 s, back to 4 at 300 s, under lazy. Rates as in 4to8 (Rate about 0.6 x C4, then about 0.8 x C8 at 60 s), and from 280 s back to the first rate, below C4, before the scale-in. NProbe 128 and N 200 are the pilot's (recall 0.85 on its 782K documents) until a recall sweep on this index. StageTimeout 2h: copy-then-flip writes about 100 GB to each new node's S3500, over half an hour, past config.yaml's 30 minutes.",
+  "Comment": "CloudLab c240g5, Amazon 300M: 4 -> 8 at 90 s, back to 4 at 300 s, under lazy. Rates as in 4to8 (Rate about 0.6 x C4, then exactly twice that at 60 s), and from 280 s back to the first rate, below C4, before the scale-in. Here 530, 1060 and 530 q/s (C4 890, C8 1393, 2026-11-20). NProbe 128 and N 200 are the pilot's (recall 0.85 on its 782K documents) until a recall sweep on this index. StageTimeout 2h: copy-then-flip writes about 100 GB to each new node's S3500, over half an hour, past config.yaml's 30 minutes.",
   "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
   "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
   "EngineBin": "engine/build",
@@ -47,8 +47,8 @@
     "Arrivals": "poisson",
     "NProbe": 128,
     "N": 200,
-    "Rate": "350",
-    "RateSteps": "60:700,280:350",
+    "Rate": "530",
+    "RateSteps": "60:1060,280:530",
     "RetryForSeconds": 30,
     "DurationSeconds": 480,
     "WarmupSeconds": 30

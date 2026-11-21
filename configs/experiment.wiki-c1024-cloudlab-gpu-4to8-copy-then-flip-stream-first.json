@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5: 4 -> 8 at 90 s under copy-then-flip, its stream ahead of the queries: every node runs with --peer-reads-first, so an old node serves the stream's reads (RAW_GET) before its own queries' (fusion/read_budget.h). A baseline: how fast copy-then-flip copies under the load when the copy goes first, and what that costs the queries. Everything else is experiment.wiki-c1024-cloudlab-gpu-4to8-copy-then-flip.json's, with the rates the 4to8-v2 runs had (390 q/s, 780 from 60 s: about 0.6 x C4 and 0.8 x C8).",
+  "Comment": "CloudLab c240g5: 4 -> 8 at 90 s under copy-then-flip, its stream ahead of the queries: every node runs with --peer-reads-first, so an old node serves the stream's reads (RAW_GET) before its own queries' (fusion/read_budget.h). A baseline: how fast copy-then-flip copies under the load when the copy goes first, and what that costs the queries. Everything else is experiment.wiki-c1024-cloudlab-gpu-4to8-copy-then-flip.json's, with its rates (560 q/s, 1120 from 60 s: about 0.6 x C4, then exactly twice that).",
   "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
   "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
   "EngineBin": "engine/build",
@@ -44,8 +44,8 @@
     "Arrivals": "poisson",
     "NProbe": 64,
     "N": 200,
-    "Rate": "390",
-    "RateSteps": "60:780",
+    "Rate": "560",
+    "RateSteps": "60:1120",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
     "WarmupSeconds": 30
