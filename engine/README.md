@@ -232,7 +232,11 @@ Known limits of the raw-vector path:
   resident partitions name are collected into a bitmap after a load or an eviction (one pass
   over the resident postings); INFO counts with a word-wise pass over it and the presence bits.
   INFO waits for nothing: fetched vectors still in memory count as `cached`, and the settle flag
-  (tests) first waits for the writer.
+  (tests) first waits for the writer. INFO counts the fetch cache by its size and takes every
+  cached vector as named (2026-11-22): looking through it under the cache's lock, twice a second
+  for the metrics, held up the queries at a new node once millions of vectors waited for its
+  SSD (re-ranking 31 -> 290 ms, Amazon 300M without locality). Until the writer drops them, the
+  few vectors the SSD holds already count as cached too.
 - A re-ranking that must fetch waits for the round trip -- the slowest one when its misses lie
   at several holders, since those requests run at once (a short-lived thread for each holder but
   the first) -- and so does one that waits for another query's fetch of the same vector. A

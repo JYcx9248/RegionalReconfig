@@ -2744,12 +2744,22 @@ class NodeEngineImpl : public NodeEngine {
     fc_.drain_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
   }
 
-  // cached: fetched vectors not on the SSD yet (one the stream installed first is counted as
-  // present only, so that every cached one is later installed as fetched). pending: distinct
+  // cached: fetched (or inserted) vectors in memory, not on the SSD yet. pending: distinct
   // locations named by resident partitions whose vector is neither here nor fetched -- what the
   // lazy protocol leaves with the old owners until a query needs it. The locations the resident
   // partitions name are collected again only after a load or an eviction (a scan of every
-  // resident posting); the count is a word-wise pass over them and the presence bits.
+  // resident posting); the count is a word-wise pass over them and the presence bits, outside
+  // cache_mu_.
+  // The cache is counted by its size, not looked through: INFO is polled for metrics twice a
+  // second, and a pass over every cached vector under cache_mu_ held up the queries' presence
+  // checks, claims and installs, which take that lock -- 400-540 ms a call with 2.5M cached
+  // vectors (Amazon 300M, 4 -> 8 without locality, CloudLab 2026-11-21: re-ranking at a new node
+  // 31 -> 290 ms). Its size is the same count but for vectors the SSD holds already and the
+  // writer has yet to drop: its own round's for a moment, or one a stream or a drain installed
+  // meanwhile. And every cached vector is taken as named: a fetched one was asked for by a
+  // posting of a resident list; an inserted one (U14) that waits there before the version naming
+  // it is staged makes pending read low by one meanwhile. With nothing fetching, the settle flag
+  // first empties the cache of fetched vectors, and both counts are exact.
   void CountCachedAndPending(RawStats* st) const {
     std::lock_guard<std::mutex> l(pending_mu_);
     const uint64_t v = resident_version_.load();
@@ -2768,15 +2778,14 @@ class NodeEngineImpl : public NodeEngine {
       fc_.pending_recounts.fetch_add(1, std::memory_order_relaxed);
       fc_.pending_us.fetch_add(static_cast<uint64_t>(t.Us()), std::memory_order_relaxed);
     }
-    uint64_t pending = raw_->CountAbsent(named_), cached = 0;
-    std::lock_guard<std::mutex> cl(cache_mu_);
-    for (const auto& kv : cache_) {
-      if (raw_->Present(kv.first)) continue;
-      ++cached;
-      if (named_[kv.first >> 6] >> (kv.first & 63) & 1) --pending;
+    const uint64_t absent = raw_->CountAbsent(named_);
+    uint64_t cached = 0;
+    {
+      std::lock_guard<std::mutex> cl(cache_mu_);
+      cached = cache_.size();
     }
     st->cached = cached;
-    st->pending = pending;
+    st->pending = absent - std::min(absent, cached);
   }
 
   uint32_t NavigateImpl(const T* q, uint32_t nprobe, uint32_t ef, uint32_t graph, uint32_t* lists) const {
