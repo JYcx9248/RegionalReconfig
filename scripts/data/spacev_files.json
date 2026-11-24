@@ -1,0 +1,208 @@
+{
+ "hf": {
+  "repo": "jkhe/spacev1b",
+  "revision": "3f99b1e51e135fcf852736c70d384494d35ba76f",
+  "files": [
+   {
+    "path": "vectors.bin/vectors_1.bin",
+    "size": 4294967295,
+    "sha256": "802f735e6bd1472bacdd93eedf8d1305291659117c2b5e3ca9ac38feb89509af"
+   },
+   {
+    "path": "vectors.bin/vectors_2.bin",
+    "size": 4294967295,
+    "sha256": "c8f772d430aa817bbd60319486dce7390924a7b71c3038312c89ab93a6382d43"
+   },
+   {
+    "path": "vectors.bin/vectors_3.bin",
+    "size": 4294967295,
+    "sha256": "787c77685a1603d4aa7f2b4b7f9e19ddff2d828ea21554aca52c82e8d7a6a755"
+   },
+   {
+    "path": "vectors.bin/vectors_4.bin",
+    "size": 4294967295,
+    "sha256": "d2f3526062048781bdc36d3b0c80ce49c26a4874206109ff79064de2b3acc4dc"
+   },
+   {
+    "path": "vectors.bin/vectors_5.bin",
+    "size": 4294967295,
+    "sha256": "7b94a7e08eb31cf2fbe7d24b1e12b23f1341a75aeed96e4885f288333fdfdfbc"
+   },
+   {
+    "path": "vectors.bin/vectors_6.bin",
+    "size": 4294967295,
+    "sha256": "a2b2699313be8e6ca09dc67b3267b6bf42ab2ac350c1198041b2fa9778b7905c"
+   },
+   {
+    "path": "vectors.bin/vectors_7.bin",
+    "size": 4294967295,
+    "sha256": "7960bac8a7579fcaf27a17271a49d0d61f13bbf6397712f513892e84fe89a7d0"
+   },
+   {
+    "path": "vectors.bin/vectors_8.bin",
+    "size": 4294967295,
+    "sha256": "6f968cbd5bd1eb53722373ffedeb6bed9659a69a01df030e39f67a755418ca45"
+   },
+   {
+    "path": "vectors.bin/vectors_9.bin",
+    "size": 4294967295,
+    "sha256": "f50e029134bc17703be6bc69748953ef2c9bb81b29d2286bda4d006d8bfce34c"
+   },
+   {
+    "path": "vectors.bin/vectors_10.bin",
+    "size": 4294967295,
+    "sha256": "ca7053c8582853c7a9984b56be8b9954cd8cbeda159b9b63fa5a56f776561be2"
+   },
+   {
+    "path": "vectors.bin/vectors_11.bin",
+    "size": 4294967295,
+    "sha256": "b42ee98dbdf215d9c03e99d3c3ac401e615433d70119c7411c689884159773d1"
+   },
+   {
+    "path": "vectors.bin/vectors_12.bin",
+    "size": 4294967295,
+    "sha256": "0dd7f1a25a6aa53622fa3d66a35af760bccd187a82bbe39a0bf79c681b646289"
+   },
+   {
+    "path": "vectors.bin/vectors_13.bin",
+    "size": 4294967295,
+    "sha256": "69d09f33ba230ee9b38e6fc1bf949c7f57b755c49ae8cdaf13ebf14b12272fe5"
+   },
+   {
+    "path": "vectors.bin/vectors_14.bin",
+    "size": 4294967295,
+    "sha256": "d575a0ec126bfd3ffb6a3dfb7c36ad94c71a398c0a77b0462620feaa7181cbfb"
+   },
+   {
+    "path": "vectors.bin/vectors_15.bin",
+    "size": 4294967295,
+    "sha256": "0286768443fbdd55ec0ffd25cecf85121aafef6c65226dc2008dda2ece5c7c8e"
+   },
+   {
+    "path": "vectors.bin/vectors_16.bin",
+    "size": 4294967295,
+    "sha256": "b600774407a1446fcac0748c7beb5fa4214737bf406c2a162ccbb84254c5041d"
+   },
+   {
+    "path": "vectors.bin/vectors_17.bin",
+    "size": 4294967295,
+    "sha256": "5fb2167810380da46d894428ff8f2c61de05c9616a6343f1fa6d084759abb062"
+   },
+   {
+    "path": "vectors.bin/vectors_18.bin",
+    "size": 4294967295,
+    "sha256": "d2e69b2f20fb99063944379667b8b9dc33d672079fe6e744d83076c2de5b1ecc"
+   },
+   {
+    "path": "vectors.bin/vectors_19.bin",
+    "size": 4294967295,
+    "sha256": "1942f09f15c34c1e141a2bdb31138efcfda9a9fe5671c757e6b6a2e509864d65"
+   },
+   {
+    "path": "vectors.bin/vectors_20.bin",
+    "size": 4294967295,
+    "sha256": "2becd2dcedb147d6c3927fa3b6f2d0f5ede03870efad8c8d04055e25694d60b2"
+   },
+   {
+    "path": "vectors.bin/vectors_21.bin",
+    "size": 4294967295,
+    "sha256": "0cc41b1a8f6b3fb8ef87dd918b8f12433f1a4bac5711260e6722e9172de14754"
+   },
+   {
+    "path": "vectors.bin/vectors_22.bin",
+    "size": 4294967295,
+    "sha256": "8cb1780b449120a124d71d4a6e5268c1ac2ec57bf27bb37c23a859b41702f3b8"
+   },
+   {
+    "path": "vectors.bin/vectors_23.bin",
+    "size": 4294967295,
+    "sha256": "b04df15421deb05670f21f34a26b4c0d108e5dd0bc8e3024701e46a90bd2d222"
+   },
+   {
+    "path": "vectors.bin/vectors_24.bin",
+    "size": 4294967295,
+    "sha256": "2ec09e657776aec02783886de7448642a85ddb004d70df0d10537a7837d076f5"
+   },
+   {
+    "path": "vectors.bin/vectors_25.bin",
+    "size": 4294967295,
+    "sha256": "a4a3c0ccf4da399397f01748b54f686a416cd5719c126ec93ce9effa124debe3"
+   },
+   {
+    "path": "vectors.bin/vectors_26.bin",
+    "size": 4294967295,
+    "sha256": "20c541f53d1e0772a270df12543dc0d715b4edb17ca415ebdf45065d2440525f"
+   },
+   {
+    "path": "vectors.bin/vectors_27.bin",
+    "size": 4294967295,
+    "sha256": "69c820cd585cb7883e6489e1e96f8a943be7800bb21e25ed88cff1b63a11a660"
+   },
+   {
+    "path": "vectors.bin/vectors_28.bin",
+    "size": 4294967295,
+    "sha256": "d82070201cb0b34fa38579118ad01ba13efb62d8b45e30867ab763e7794ced54"
+   },
+   {
+    "path": "vectors.bin/vectors_29.bin",
+    "size": 4294967295,
+    "sha256": "a11ce9f677543ab2f4b71d199e41e2026020c23a47147f536cbdd93a4266fcd8"
+   },
+   {
+    "path": "vectors.bin/vectors_30.bin",
+    "size": 4294967295,
+    "sha256": "e426936bcc481e878b6f7ec32c1cb85438d23f63c0dd27330149f64053475a8d"
+   },
+   {
+    "path": "vectors.bin/vectors_31.bin",
+    "size": 4294967295,
+    "sha256": "351d25192805efc17f8fc588c872b907ca2b907ca9cb0d3f1413ea1d8fc09a8f"
+   },
+   {
+    "path": "vectors.bin/vectors_32.bin",
+    "size": 4294967295,
+    "sha256": "142c672c7c1f1e0df93ac87a3d39466c9a7fb199309761ba21771bb1f5d2de86"
+   },
+   {
+    "path": "vectors.bin/vectors_33.bin",
+    "size": 2763118568,
+    "sha256": "e7bb8962700f6b240481d462a6e0f1a997d085857690cf63b5b5be9270e17b5e"
+   },
+   {
+    "path": "query.bin",
+    "size": 2931608,
+    "sha256": "6a531887daca721f633da2b92dacc0aa4c3512aef8ae671031e825ce7134a9e6"
+   },
+   {
+    "path": "query_log.bin",
+    "size": 9416208,
+    "sha256": "d4768ea964b595302b08f0b9ef484d7003b2e7848f2f7baf9e2b4bbb3bb36c49"
+   }
+  ]
+ },
+ "bigann": {
+  "url": "https://comp21storage.z5.web.core.windows.net/comp21/spacev1b",
+  "files": [
+   {
+    "path": "public_query_gt100.bin",
+    "size": 23452808,
+    "sha256": "88fa5e13da538af8751090ce88bbcd583def8e20c8099175b17b71c465be18c9"
+   },
+   {
+    "path": "private_query_30k.bin",
+    "size": 3000008,
+    "sha256": "5a645f38045d1a050f69b03ba8c9661d9fcf4ff474f41453ee370a16acbf8043"
+   },
+   {
+    "path": "gt100_private_query_30k.bin",
+    "size": 24000008,
+    "sha256": "3de7c7b32c448248e29c5c9893d143158d78adc585c2587bfd7c8aabbe2691df"
+   }
+  ],
+  "base": {
+   "path": "spacev1b_base.i8bin",
+   "rows": 1000000000,
+   "dim": 100
+  }
+ }
+}

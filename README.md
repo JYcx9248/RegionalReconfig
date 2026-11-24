@@ -609,6 +609,18 @@ would exceed a P100's 12 GB. `amazon-300m-warmup-4` makes their 4-node snapshot 
 node (`scripts/run_local.py`), from the page file, and `StageTimeout` is 2 hours: a
 copy-then-flip scale-out writes about 100 GB to each new node.
 
+SPACEV-1B (big-ann-benchmarks' 1B base of Microsoft's SPACEV1B: 100-d int8, 40 vectors to a
+4 KB page) comes from `scripts/data/fetch_spacev.py OUT` (`--hf-endpoint https://hf-mirror.com`
+from China, where big-ann's Azure storage gives about 23 KB/s a connection).
+- **The base:** the first 1B vectors of SPTAG's release, byte for byte. The script fetches them
+  from a pinned Hugging Face copy of the release, checks each part's SHA-256, and joins the parts
+  under big-ann's header. It resumes where it stopped.
+- **Queries outside the base:** the release's next 30.8M vectors (`spacev1b_extra.i8bin`).
+- **Queries with ground truth:** the 29,316 public and 30,000 private queries, with big-ann's
+  ground truth in the 1B base.
+- **Queries without it:** the 94,162 of SPTAG's query log. The release's own `truth.bin` is in all
+  1.4B vectors, so it is not fetched.
+
 The `configs/experiment.wiki-c1024-aliyun-gpu-*.json` experiments run 2 → 4 on Alibaba Cloud:
 - one GPU instance (an A10) per data node, the nodes started on the lab's 2-node warmup snapshot;
 - C4 measured on the cluster a copy-then-flip scale-out leaves;
