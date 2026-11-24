@@ -18,6 +18,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <set>
 #include <thread>
@@ -3830,6 +3831,67 @@ void TestFetchCacheBound() {
   CHECK(MemoryLimitBytes() > (64ull << 20));
 }
 
+// The m longest lists of an index's posting lists, longest first, and their postings.
+std::pair<std::vector<uint32_t>, uint32_t> LongestLists(const std::string& index, uint32_t m) {
+  const PostingLists pl = PostingLists::Load(JoinPath(index, files::kPostings));
+  std::vector<uint32_t> order(pl.num_lists());
+  std::iota(order.begin(), order.end(), 0u);
+  std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return pl.Size(a) > pl.Size(b); });
+  order.resize(m);
+  uint32_t sum = 0;
+  for (uint32_t c : order) sum += pl.Size(c);
+  CHECK(pl.Size(order.front()) > pl.Size(order.back()));  // so that m x the longest is more
+  return {order, sum};
+}
+
+// Candidate buffers sized for the lists (NodeOptions::max_candidates): a request of the
+// max_nprobe longest lists fits them exactly; one that names the longest list max_nprobe times
+// -- which no query does -- is refused before anything is gathered past them. A node so sized
+// takes no update batch, and switches generations only when told what the new lists need, if
+// that fits.
+void TestCandidateBuffers() {
+  const Fixture& f = GetFixture();
+  const Generation& g2 = GetGeneration2();
+  const uint32_t m = 4;
+  const auto [longest, bound] = LongestLists(f.index, m);
+  const uint32_t bound2 = LongestLists(g2.index, m).second;
+  auto node_with = [&](uint32_t max_candidates) {
+    NodeOptions o;
+    o.index_dir = f.index;
+    o.partitions_dir = f.parts;
+    o.num_workers = 1;
+    o.max_nprobe = m;
+    o.max_rerank = 4096;
+    o.max_list_len = 4096;  // room for the second generation's lists
+    o.max_candidates = max_candidates;
+    o.direct_io = false;
+    return NodeEngine::Open(o);
+  };
+
+  auto e = node_with(bound);
+  for (uint32_t p = 0; p < f.num_parts; ++p)
+    e->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
+  std::vector<uint32_t> ids(4096);
+  std::vector<float> d(4096);
+  FilterStats fs;
+  const float* q = &f.queries[0];
+  CHECK(e->Filter(0, q, longest.data(), nullptr, m, 10, ids.data(), d.data(), &fs) > 0);
+  CHECK(fs.gathered == bound);
+  const std::vector<uint32_t> same(m, longest[0]);
+  CHECK(Throws([&] { e->Filter(0, q, same.data(), nullptr, m, 10, ids.data(), d.data(), &fs); }));
+  CHECK(e->Filter(0, q, longest.data(), nullptr, m, 10, ids.data(), d.data(), &fs) > 0);  // the worker is fine
+  CHECK(Throws([&] { e->StageVersions({VersionStage{0, 0, 1}}, nullptr, nullptr, nullptr, 0, nullptr, 0); }));
+
+  // Buffers for both generations' lists: the switch needs to be told the second's, and what it
+  // is told must fit.
+  auto s = node_with(std::max(bound, bound2));
+  CHECK(Throws([&] { s->SwitchGeneration(1, g2.index, g2.parts); }));
+  CHECK(Throws([&] { s->SwitchGeneration(1, g2.index, g2.parts, std::max(bound, bound2) + 1); }));
+  CHECK(s->generation() == 0);
+  s->SwitchGeneration(1, g2.index, g2.parts, bound2);
+  CHECK(s->generation() == 1);
+}
+
 int main() {
   const std::vector<std::pair<const char*, std::function<void()>>> tests = {
       {"crc32", TestCrc32},
@@ -3854,6 +3916,7 @@ int main() {
       {"graph_patches", TestGraphPatches},
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
+      {"candidate_buffers", TestCandidateBuffers},
       {"streamer", TestStreamer},
       {"wire", TestWire},
       {"fetch_holds_no_worker", TestFetchHoldsNoWorker},

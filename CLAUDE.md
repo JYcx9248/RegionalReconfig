@@ -39,7 +39,9 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   deployment run on a copy of the index without its page file and PQ codes
   (`indexNoBootstrap`): they can only get raw vectors and PQ codes from peers (so do the initial
   nodes of `TestBootstrapFromSnapshot`, which start on their saved raw vectors and PQ codes).
-  Every node runs with `--stream-batch 100`, so each staging and drain streams in many frames.
+  Every node runs with `--stream-batch 100`, so each staging and drain streams in many frames,
+  and, unless it leaves room for longer lists (`--max-list-len`), with candidate buffers sized for
+  its partitions' 64 longest lists (`--max-candidates`), as the runs without updates have them.
 - Configuration as in Koala: one system configuration, `config.yaml` at the repository root
   (the controller's and the agents' keys; `bin/rtier-controller -defaults` prints them all),
   which every process reads at startup, and one JSON file per experiment
@@ -60,7 +62,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | Path | What |
 |---|---|
 | `cmd/rtier-controller`, `cmd/rtier-agent` | control plane; per-node agent next to `rtier_node` |
-| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline) / a node's warmup snapshot: raw vectors (`save-raw`) and PQ codes (`save-pq`); open-loop or closed-loop load |
+| `cmd/rtier-client`, `cmd/rtier-loadgen` | status / rescale / rebuild / design list / each initial node's PQ codes (`pq-share`, offline) / the candidate buffers a request needs (`max-candidates`, offline) / a node's warmup snapshot: raw vectors (`save-raw`) and PQ codes (`save-pq`); open-loop or closed-loop load |
 | `cmd/rtier-updater` | the update controller's command: one batch of inserts and deletes, or a major epoch (U14) |
 | `cmd/rtier-overhead` | fan-out cost analysis: one data node emulates N owners (`-owners`, `-compare`) |
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
@@ -147,6 +149,13 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   every node a budget (`--pq-capacity`) of the fullest node's codes at the smallest cluster size,
   plus 10% (`"PQCapacity": "auto"`, `rtier-client pq-share`; a run with a rebuild gets the
   whole ID space).
+- **Candidate buffers**: each filter worker's (on the GPU in device memory) are allocated once.
+  A request names at most `max_nprobe` lists, each once, so with lists that never change the
+  runners size them by the postings of the `max_nprobe` longest (`rtier_node --max-candidates`,
+  `rtier-client max-candidates`); with `"Updates"` a node keeps room for `max_nprobe` lists of
+  `--max-list-len` (SPACEV-1B: 17.1 GiB for 8 workers against 1.83, 2026-11-24). Such a node takes
+  no update batch, and a rebuild's request carries its generation's bound
+  (`GenerationSource.MaxCandidates`), checked by each node when it switches.
 - **Raw vectors**: every posting carries its vector's canonical location in the index's page
   file and the node that holds it (segment v3); a node keeps a sparse local copy of that file
   with a presence bit per location (`engine/include/fusion/raw_store.h`) and looks locations up

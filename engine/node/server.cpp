@@ -626,8 +626,9 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         const uint32_t gen = r.Get<uint32_t>();
         const std::string index_dir = TakeStr(&r);
         const std::string partitions_dir = TakeStr(&r);
+        const uint32_t max_candidates = r.Get<uint32_t>();
         Require(r.remaining() == 0, "trailing bytes in SWITCH_GENERATION");
-        e.SwitchGeneration(gen, index_dir, partitions_dir);
+        e.SwitchGeneration(gen, index_dir, partitions_dir, max_candidates);
         break;
       }
       case kRawBitmap: {
@@ -1106,11 +1107,12 @@ std::string NodeServer::InfoJson(bool settle) const {
   std::string s = "{";
   s += fusion::StrFormat(
       "\"dtype\":\"%s\",\"dim\":%u,\"num_vectors\":%llu,\"num_lists\":%u,\"num_partitions\":%u,"
-      "\"max_nprobe\":%u,\"max_rerank\":%u,\"workers\":%d,\"filter\":\"%s\",\"payload\":\"%s\","
+      "\"max_nprobe\":%u,\"max_rerank\":%u,\"max_candidates\":%u,\"workers\":%d,\"filter\":\"%s\","
+      "\"payload\":\"%s\","
       "\"graph_loaded\":%s,\"max_epoch_seen\":%llu,\"id_capacity\":%llu,\"graph\":%s,"
       "\"generation\":%u,\"pid\":%d,",
       fusion::DTypeName(e.dtype()), e.dim(), static_cast<unsigned long long>(e.size()),
-      e.num_lists(), e.num_partitions(), o.max_nprobe, o.max_rerank, e.num_workers(),
+      e.num_lists(), e.num_partitions(), o.max_nprobe, o.max_rerank, o.max_candidates, e.num_workers(),
       e.filter_name(), e.payload().c_str(), e.has_graph() ? "true" : "false",
       static_cast<unsigned long long>(max_epoch_seen_.load()),
       static_cast<unsigned long long>(e.id_capacity()), GraphJson().c_str(), e.generation(),

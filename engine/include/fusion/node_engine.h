@@ -111,8 +111,14 @@ struct NodeOptions {
   // every machine; 2 GB without one.
   uint64_t fetch_cache_bytes = 2ull << 30;
   // Longest posting list a request may gather (0 = the manifest's): inserts make lists longer,
-  // and the filter's candidate buffers are sized by it.
+  // and without max_candidates the filter's candidate buffers are sized by it.
   uint32_t max_list_len = 0;
+  // The filter's candidate buffers, in postings per request, for lists that never change: the
+  // postings of the max_nprobe longest lists (rtier-client max-candidates), since a request
+  // names each of its lists once; at most max_nprobe * max_list_len. 0 = max_nprobe *
+  // max_list_len, room for any list to grow to max_list_len (U14 inserts). With it the node
+  // takes no update batch, and a generation switch must say what the generation's lists need.
+  uint32_t max_candidates = 0;
   // Room for the heads and lists that major epochs add (U14), as a fraction of the build's: the
   // graph is loaded with capacity for that many more elements, and list IDs up to the same
   // number are accepted.
@@ -306,9 +312,15 @@ class NodeEngine {
   // its graph and a staged patch are dropped, and the generation's manifest, PQ code file and
   // assignment rule replace the current ones -- the PQ codes and raw vectors stay. Refused, with
   // nothing changed, unless the generation has the same codebook, dimensions and page geometry
-  // and its lists fit max_list_len.
+  // and its lists fit max_list_len and the candidate buffers. max_candidates is the postings
+  // the generation's max_nprobe longest lists hold (0 = not given): a node whose buffers were
+  // sized for its lists (NodeOptions::max_candidates) needs it, since it sees none of the
+  // generation's lists before they arrive.
   virtual void SwitchGeneration(uint32_t generation, const std::string& index_dir,
-                                const std::string& partitions_dir) = 0;
+                                const std::string& partitions_dir, uint32_t max_candidates) = 0;
+  void SwitchGeneration(uint32_t generation, const std::string& index_dir, const std::string& partitions_dir) {
+    SwitchGeneration(generation, index_dir, partitions_dir, 0);
+  }
   virtual uint32_t generation() const = 0;
   virtual bool has_graph() const = 0;
   virtual GraphState graph_state() const = 0;

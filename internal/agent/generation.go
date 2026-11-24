@@ -52,6 +52,13 @@ func (a *Agent) handleSwitchGeneration(ctx context.Context, body json.RawMessage
 	if in.Generation == req.Generation && a.generation.Load() == req.Generation {
 		return struct{}{}, nil
 	}
+	// The data node refuses a generation whose lists may not fit candidate buffers sized for its
+	// own (--max-candidates); refused here, before its partitions are dropped.
+	if in.MaxCandidates > 0 && (req.MaxCandidates == 0 || req.MaxCandidates > in.MaxCandidates) {
+		return nil, fmt.Errorf("switching to index generation %d: the data node's candidate buffers hold %d "+
+			"postings (--max-candidates), and the generation's lists need %d (0: not given)",
+			req.Generation, in.MaxCandidates, req.MaxCandidates)
+	}
 	m, err := partitioning.LoadManifest(req.PartsDir)
 	if err != nil {
 		return nil, err
@@ -67,7 +74,7 @@ func (a *Agent) handleSwitchGeneration(ctx context.Context, body json.RawMessage
 	if _, err := a.localBulk.PQRelease(ctx); err != nil { // codes a staging that never ended protected
 		return nil, err
 	}
-	if err := a.localBulk.SwitchGeneration(ctx, req.Generation, req.IndexDir, req.PartsDir); err != nil {
+	if err := a.localBulk.SwitchGeneration(ctx, req.Generation, req.IndexDir, req.PartsDir, req.MaxCandidates); err != nil {
 		return nil, fmt.Errorf("switching to index generation %d: %w", req.Generation, err)
 	}
 	// The files peers pull from here are the generation's from now on.

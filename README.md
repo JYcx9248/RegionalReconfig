@@ -48,6 +48,23 @@ their headroom too, and a deleted vector's code is freed with its last version (
 initial deployment reads codes from the index. Known limits of this path are listed in
 `engine/README.md`.
 
+**Candidate buffers:** each filter worker has its buffers for one request's candidates -- the
+gathered postings, their PQ slots, the dedup table, the sort keys; on the GPU backend in device
+memory, about 40 B a posting -- allocated once, at startup; a query uses as many as it gathers.
+A request names at most `max_nprobe` lists, each once (its query's nearest heads), so with lists
+that never change it gathers at most the postings of the `max_nprobe` longest:
+`rtier_node --max-candidates`, which the runners set from the partitions (`bin/rtier-client
+max-candidates` sums them from the segments' list tables; `max-candidates.json` in the results).
+Without it a node keeps room for `max_nprobe` lists as long as the longest, which update batches
+need, since any list may grow to `--max-list-len`: runs with `"Updates"` keep that, as does
+`"--max-candidates 0"` in `NodeArgs`. The two differ where a few lists are very long: on
+SPACEV-1B (215,291 postings in the longest list, 749 on average) room for 256 lists is 55.1M
+postings and the 256 longest hold 5.58M: for 8 workers 17.1 GiB, more than a P100's 12 GB,
+against 1.83 GiB. On Amazon 300M it is 1.24 against 0.59 GiB per node, on Wikipedia 0.24 against
+0.06. Answers and query times are the same either way. A node so sized takes no update batch, and a rebuild's
+request carries what its generation's longest lists need (`GenerationSource.MaxCandidates`, which
+the runners fill in), which each node checks when it switches.
+
 **Raw vectors (the other decided part of U1):** addressed by a *canonical global offset*. The
 location -- `page * vectors_per_page + slot` in the index's page file, a `u32` next to the vector
 ID, 8 B per posting entry -- is written into the segments by `rtier_segment` (payload
@@ -332,7 +349,10 @@ when it is due. With N data nodes and N spares (idle nodes; `-spares`):
    that only serve raw vectors (they are not drained), and lose the entry role once the spares
    have the graph.
 2. The old nodes switch to the next generation (`SWITCH_GENERATION`). It drops their lists and
-   graph and keeps their PQ codes and raw vectors.
+   graph and keeps their PQ codes and raw vectors. Nodes whose candidate buffers are sized for
+   their lists (`--max-candidates`) need the request to say what the generation's longest lists
+   hold (`rtier-client rebuild -max-candidates`; the runners give it), and refuse a generation
+   that does not fit.
 3. The new partitions go where most of their raw vectors already are: the old nodes' presence
    bitmaps (`RAW_BITMAP`) weigh each (partition, node) pair, and a min-cost flow maximizes the
    total under the even policies' balance (`placement.Affinity`; `-placement random` is the
@@ -365,7 +385,7 @@ epoch, a full rebuild and rescales.
 |---|---|
 | `cmd/rtier-controller` | control plane: registration, placement, epochs, reconfiguration, metrics sink |
 | `cmd/rtier-agent` | per-node agent next to `rtier_node`: staging, epochs, entry + aggregator roles |
-| `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline / `pq-share` (each initial node's PQ codes, offline) / `save-raw`, `save-pq` (a node's warmup snapshot: its raw vectors, its PQ codes) |
+| `cmd/rtier-client` | status / rescale / rebuild (U14 full rebuild) / design / queries / single-node baseline / `pq-share` (each initial node's PQ codes, offline) / `max-candidates` (the candidate buffers a request needs, offline) / `save-raw`, `save-pq` (a node's warmup snapshot: its raw vectors, its PQ codes) |
 | `cmd/rtier-loadgen` | open-loop load (latency measured from the scheduled send time) with a rate schedule, or closed-loop users; follows the entry list (U17) |
 | `cmd/rtier-updater` | the update controller: applies one batch of inserts and deletes to a running cluster (U14), routing inserts with its own router (`-router`, or `-index` to start one), and runs major epochs (`-split-len`, `-merge-len`; `-split`, `-merge`) |
 | `cmd/rtier-overhead` | cost of fan-out: emulates N owners on one data node holding every partition and reports what the two-phase query adds over N = 1 (owners per query, duplicate PQ scoring, extra page reads, per-call and merge time); `-compare` sets two-phase against local re-ranking (recall with `-gt`), `-owners` shows how queries spread over owners |

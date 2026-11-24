@@ -33,10 +33,13 @@ type Table struct {
 	// locations of the first one. 0 is the deployed build; a later one names its index directory
 	// (fusion_build's output) and partition directory (rtier_segment's). Every node with a role
 	// in the epoch runs its generation; graph versions and created lists count within it.
-	Generation uint32          `json:"generation,omitempty"`
-	GenIndex   string          `json:"gen_index,omitempty"`
-	GenParts   string          `json:"gen_parts,omitempty"`
-	Placement  placement.Table `json:"placement"`
+	Generation uint32 `json:"generation,omitempty"`
+	GenIndex   string `json:"gen_index,omitempty"`
+	GenParts   string `json:"gen_parts,omitempty"`
+	// GenMaxCandidates: what the generation's lists need of a node's candidate buffers, as its
+	// rebuild was told (protocol.GenerationSource), for the nodes that switch to it later.
+	GenMaxCandidates uint32          `json:"gen_max_candidates,omitempty"`
+	Placement        placement.Table `json:"placement"`
 	// Versions[p] is the version of partition p's posting lists that queries of this epoch see:
 	// an update batch (U14) stages the next version on the owner while the current one serves,
 	// and both stay until the old epoch drains. Empty means every partition at version 0, which

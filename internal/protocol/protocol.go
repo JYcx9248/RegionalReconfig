@@ -245,6 +245,10 @@ type GenerationReq struct {
 	Generation uint32 `json:"generation"`
 	IndexDir   string `json:"index_dir"`
 	PartsDir   string `json:"parts_dir"`
+	// MaxCandidates: the postings the generation's max_nprobe longest lists hold (0: not given),
+	// which a data node whose candidate buffers are sized for its lists (rtier_node
+	// --max-candidates) needs to switch.
+	MaxCandidates uint32 `json:"max_candidates,omitempty"`
 }
 
 // RawBitmapReply: the raw vectors the node's data node holds, one bit per location
@@ -488,6 +492,10 @@ type GenerationSource struct {
 	Kind     string `json:"kind"`
 	IndexDir string `json:"index_dir"`
 	PartsDir string `json:"parts_dir"`
+	// MaxCandidates: the postings its max_nprobe longest lists hold (rtier-client
+	// max-candidates). Data nodes whose candidate buffers are sized for their lists (rtier_node
+	// --max-candidates) need it: each sees only its own partitions, once it has switched.
+	MaxCandidates uint32 `json:"max_candidates,omitempty"`
 }
 
 // RebuildReq asks for a full rebuild (U14). Idle nodes, the spares, take over every partition of

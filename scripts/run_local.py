@@ -156,7 +156,8 @@ nodes). "Placement": "affinity" (default) or "random", "Warmup": recent queries 
 the next generation goes online (0: every one the entries kept, QuerySample per entry, default
 1024; -1: none), "WarmupConcurrency", and "StopTheWorld": true for the baseline without spares.
 The data nodes need room for the next generation's lists (--max-list-len in NodeArgs, or
-Updates.MaxListLen). After update batches the generation must hold the data they made
+Updates.MaxListLen); without Updates the request carries what its lists need of the nodes'
+candidate buffers (below), which are sized for both generations. After update batches the generation must hold the data they made
 (fusion_build --from-index ... --exclude ... --insert FILE@FIRST_ID@FIRST_LOC: version.json): a
 rebuild whose generation does not hold exactly the batches before it -- their files, and the IDs
 and locations they got -- stops the run, before the deployment where the files tell.
@@ -196,6 +197,14 @@ them; pq-budget.json in the results has what it found). A number sets the budget
 every node room for the whole ID space (rtier_node's default), as does "auto" for a run with a
 rebuild, whose placement is made at run time, or for one whose fullest node names nearly every
 vector anyway. --pq-capacity in NodeArgs wins over all of them.
+
+Every data node's candidate buffers -- the postings one request may gather, allocated once per
+worker (the GPU backend's in device memory) -- are sized for the lists: the postings of the
+max_nprobe longest (rtier_node --max-candidates; bin/rtier-client max-candidates, which reads the
+segments' list tables), since a request names each of its lists once. Not with Updates, whose
+batches lengthen and add lists: each node then has room for max_nprobe lists of --max-list-len,
+as "--max-candidates 0" in NodeArgs gives without them. max-candidates.json in the results has
+what was found.
 
 "FetchCacheShare": 0.05 bounds each data node's fetch cache -- raw vectors fetched for queries,
 kept in memory until the writer has put them on the SSD; past the bound a fetching query installs
@@ -316,6 +325,63 @@ def update_args(cfg: dict, index: str, parts: str) -> list:
                  f"each with an ID and a raw-vector location after the index's: set it to at least {need:.3f}")
     return ["--max-vectors", str(math.ceil(n * head)), "--max-pages", str(math.ceil(pages * head)),
             "--max-list-len", str(int(max_len))]
+
+
+def flag_value(args: list, name: str):
+    """The value an rtier_node flag has in args (NAME V or NAME=V), or None."""
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a[len(name) + 1:]
+    return None
+
+
+def candidate_args(cfg: dict, parts: str, node_args: list, reconfigs: list, out_dir: str) -> list:
+    """--max-candidates, unless NodeArgs has it: the data nodes' candidate buffers sized for the
+    lists, the postings of the max_nprobe longest (bin/rtier-client max-candidates), since a request
+    names each of its lists once. That is the most of this generation's and of each generation a
+    rebuild of the run goes to, whose request carries its own: the nodes check it when they switch.
+    Not with Updates, whose batches lengthen and add lists: the nodes keep room for max_nprobe lists
+    of --max-list-len each, as "--max-candidates 0" in NodeArgs keeps without them. What it found
+    goes to max-candidates.json."""
+    given = flag_value(node_args, "--max-candidates")
+    if cfg.get("Updates") is not None:
+        if given not in (None, "0"):
+            sys.exit("NodeArgs --max-candidates sizes the candidate buffers for lists that never change, "
+                     "but the run has Updates, whose batches lengthen and add lists")
+        return []
+    if given == "0":
+        return []
+    nprobe = int(flag_value(node_args, "--max-nprobe") or 256)  # rtier_node's default
+    gbin = paths_of(cfg)[2]
+
+    def bound(d):
+        cmd = [f"{gbin}/rtier-client", "max-candidates", "-partitions", d, "-max-nprobe", str(nprobe)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"candidate buffers: {' '.join(cmd)}: {r.stderr.strip()}")
+        return json.loads(r.stdout)
+
+    gens = {parts: bound(parts)}
+    for rc in reconfigs:
+        if rc.get("rebuild"):
+            src = rc["request"]["source"]
+            if src["parts_dir"] not in gens:
+                gens[src["parts_dir"]] = bound(src["parts_dir"])
+            src["max_candidates"] = gens[src["parts_dir"]]["max_candidates"]
+    most = max(g["max_candidates"] for g in gens.values())
+    json.dump({"max_nprobe": nprobe, "max_candidates": int(given or most), "generations": gens},
+              open(os.path.join(out_dir, "max-candidates.json"), "w"), indent=2)
+    if given:
+        if int(given) < most:
+            sys.exit(f"NodeArgs --max-candidates {given}: a request may gather {most} postings "
+                     f"(the {nprobe} longest lists'), and would fail")
+        return []
+    g = gens[parts]
+    log(f"candidate buffers: {most} postings per request, the {nprobe} longest lists' "
+        f"({g['product']} for {min(nprobe, g['lists'])} lists as long as the longest, {g['longest']})")
+    return ["--max-candidates", str(most)]
 
 
 def pq_args(cfg: dict, index: str, parts: str, node_args: list, reconfigs: list, out_dir: str) -> list:
@@ -1080,6 +1146,7 @@ def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: st
             sys.exit(f"FetchCacheShare is {share!r}: a share of each data node's memory, in (0, 1]")
         args += ["--fetch-cache-share", repr(float(share))]
     args += update_args(cfg, index, parts)
+    args += candidate_args(cfg, parts, args, reconfigs, out_dir)
     return args + pq_args(cfg, index, parts, args, reconfigs, out_dir)
 
 

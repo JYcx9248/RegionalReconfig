@@ -66,9 +66,11 @@
 //                   (the received segment, whole, loaded as LOAD_PARTITION with pq_source 0
 //                   would; on failure it stays received)
 //   SWITCH_GENERATION u32 generation, str index_dir,         -> -
-//                   str partitions_dir
+//                   str partitions_dir, u32 max_candidates
 //                   (full rebuild, U14: the node, holding no partition, moves to that generation
-//                   of the index; its graph is dropped, its PQ codes and raw vectors stay)
+//                   of the index; its graph is dropped, its PQ codes and raw vectors stay.
+//                   max_candidates: the postings the generation's max_nprobe longest lists hold,
+//                   0 = not given, which a node with --max-candidates refuses)
 //   RAW_BITMAP      -                                         -> u64 locations, u64 words[]
 //                   (the raw vectors the node holds, one bit per location)
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every

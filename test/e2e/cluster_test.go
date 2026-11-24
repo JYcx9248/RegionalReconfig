@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ const (
 	numQueries    = 64
 	numPartitions = 8
 	maxRerank     = 4096
+	nodeMaxNProbe = 64 // every data node's --max-nprobe
 	testNProbe    = 16
 	testK         = 10
 )
@@ -227,6 +229,21 @@ func startNode(f *fixture, extra ...string) (string, func() error, error) {
 	return startNodeOn(f, f.index, extra...)
 }
 
+var candidates sync.Map // partition directory -> what rtier_node --max-candidates is for it
+
+// maxCandidates is the postings of the nodeMaxNProbe longest lists in parts.
+func maxCandidates(parts string) (uint64, error) {
+	if v, ok := candidates.Load(parts); ok {
+		return v.(uint64), nil
+	}
+	c, err := partitioning.MaxCandidates(parts, nodeMaxNProbe)
+	if err != nil {
+		return 0, err
+	}
+	candidates.Store(parts, c.Max)
+	return c.Max, nil
+}
+
 // startNodeOn is startNode on another index directory (f.indexNoBootstrap).
 func startNodeOn(f *fixture, index string, extra ...string) (string, func() error, error) {
 	return startNodeWith(f, index, f.parts, extra...)
@@ -237,8 +254,18 @@ func startNodeWith(f *fixture, index, parts string, extra ...string) (string, fu
 	// Listings stream in frames of 100 entries, so that every staging and drain here takes many
 	// (a frame holds 1M by default, more than this whole index).
 	args := append([]string{"--index", index, "--partitions", parts, "--listen", "127.0.0.1:0",
-		"--workers", "2", "--max-nprobe", "64", "--max-rerank", fmt.Sprint(maxRerank), "--no-direct",
-		"--stream-batch", "100"}, extra...)
+		"--workers", "2", "--max-nprobe", fmt.Sprint(nodeMaxNProbe), "--max-rerank", fmt.Sprint(maxRerank),
+		"--no-direct", "--stream-batch", "100"}, extra...)
+	// Candidate buffers sized for the lists, as the experiments without updates have them: the
+	// postings of the longest lists a request may name. Not where a test leaves room for longer
+	// lists (--max-list-len, for update batches) or sets its own.
+	if !slices.Contains(extra, "--max-list-len") && !slices.Contains(extra, "--max-candidates") {
+		c, err := maxCandidates(parts)
+		if err != nil {
+			return "", nil, err
+		}
+		args = append(args, "--max-candidates", fmt.Sprint(c))
+	}
 	cmd := exec.Command(filepath.Join(f.bin, "rtier_node"), args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

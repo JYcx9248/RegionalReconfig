@@ -256,8 +256,14 @@ class NodeEngineImpl : public NodeEngine {
     index_pages_path_ = path(files::LayoutVectors(man.layout));
     // Inserts make lists longer (U14): o.max_list_len leaves room for them.
     max_list_len_ = std::max<uint32_t>(std::max(o.max_list_len, man.max_list_len), 1);
-    const uint64_t max_cand =
+    // The candidate buffers, allocated once per worker (the GPU backend's in device memory); a
+    // query uses as many as it gathers. Room for max_nprobe lists of max_list_len_ each, or, for
+    // lists that never change, for the max_nprobe longest, since a request names each list once:
+    // with a few very long lists the first is many times the second (SPACEV-1B: ten times, more
+    // than a GPU's memory).
+    const uint64_t room =
         static_cast<uint64_t>(std::min<uint32_t>(o.max_nprobe, man.num_lists)) * max_list_len_;
+    const uint64_t max_cand = o.max_candidates ? std::min<uint64_t>(o.max_candidates, room) : room;
     FUSION_CHECK(max_cand < 0xFFFFFFFFull, "max_nprobe too large");
     max_candidates_ = static_cast<uint32_t>(max_cand);
 
@@ -435,8 +441,8 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // ----------------------------------------------------- generations (U14 full rebuild)
-  void SwitchGeneration(uint32_t generation, const std::string& index_dir,
-                        const std::string& partitions_dir) override {
+  void SwitchGeneration(uint32_t generation, const std::string& index_dir, const std::string& partitions_dir,
+                        uint32_t max_candidates) override {
     // Everything the generation brings is read and checked before anything changes.
     const IndexMeta meta = IndexMeta::Load(JoinPath(index_dir, files::kMeta));
     FUSION_CHECK(meta.GetU64("dim") == dim_ && ParseDType(meta.Get("dtype")) == DTypeOf<T>(),
@@ -460,11 +466,24 @@ class NodeEngineImpl : public NodeEngine {
                      man->raw.num_pages <= raw_->layout().num_pages,
                  "generation %u: %s refers to another page file than this node's (a full rebuild keeps "
                  "the vectors' locations)", generation, partitions_dir.c_str());
-    // A list longer than max_list_len_ is refused when its partition loads, as any other.
-    FUSION_CHECK(static_cast<uint64_t>(std::min<uint32_t>(opts_.max_nprobe, man->num_lists)) * max_list_len_ <=
-                     max_candidates_,
-                 "generation %u: %u lists of up to %u postings exceed the filter's candidate buffers", generation,
-                 man->num_lists, max_list_len_);
+    // A list longer than max_list_len_ is refused when its partition loads, as any other. Buffers
+    // sized for the lists hold what the caller says the generation's longest need: this node sees
+    // only its own partitions, after the switch.
+    if (opts_.max_candidates) {
+      FUSION_CHECK(max_candidates != 0,
+                   "generation %u: this node's candidate buffers hold %u postings, sized for its lists "
+                   "(--max-candidates): the switch must say how many the generation's %u longest lists hold",
+                   generation, max_candidates_, opts_.max_nprobe);
+      FUSION_CHECK(max_candidates <= max_candidates_,
+                   "generation %u: its %u longest lists hold %u postings, more than this node's candidate buffers "
+                   "(%u, --max-candidates)",
+                   generation, opts_.max_nprobe, max_candidates, max_candidates_);
+    } else {
+      FUSION_CHECK(static_cast<uint64_t>(std::min<uint32_t>(opts_.max_nprobe, man->num_lists)) * max_list_len_ <=
+                       max_candidates_,
+                   "generation %u: %u lists of up to %u postings exceed the filter's candidate buffers", generation,
+                   man->num_lists, max_list_len_);
+    }
     std::shared_ptr<ReadOnlyFile> pq = OpenPQFile(JoinPath(index_dir, files::kPQCodes), n, cb.m());
     std::unique_ptr<ListMap> lm = MakeLists(*man);
     std::shared_ptr<HnswIndex> old_graph;
@@ -926,6 +945,11 @@ class NodeEngineImpl : public NodeEngine {
 
   // ------------------------------------------------------------ update batches (U14)
   std::vector<StageResult> StageVersions(const std::vector<VersionStage>& parts, const VersionEdits& e) override {
+    // A batch lengthens and adds lists, which buffers sized for the lists have no room for.
+    FUSION_CHECK(!opts_.max_candidates,
+                 "this node's candidate buffers are sized for lists that never change (--max-candidates %u): "
+                 "it takes no update batch",
+                 opts_.max_candidates);
     std::unordered_map<uint32_t, size_t> which;  // partition -> index in parts
     for (size_t i = 0; i < parts.size(); ++i) {
       const VersionStage& vs = parts[i];
@@ -1855,8 +1879,8 @@ class NodeEngineImpl : public NodeEngine {
                                             : "");
     s += StrFormat("  fetch cache      : at most %.1f MB of fetched raw vectors waiting for the writer\n",
                    opts_.fetch_cache_bytes / mb);
-    s += StrFormat("  workers          : %d, max candidates/request %u\n", num_workers(),
-                   max_candidates_);
+    s += StrFormat("  workers          : %d, max candidates/request %u (%s)\n", num_workers(), max_candidates_,
+                   opts_.max_candidates ? "the lists' longest, --max-candidates" : "max_nprobe lists of max_list_len");
     return s;
   }
 

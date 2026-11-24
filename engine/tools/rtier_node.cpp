@@ -67,6 +67,10 @@ static void Usage() {
                          machine's (an experiment's "FetchCacheShare"; default: 2 GB)
   --max-list-len N       longest posting list a request may gather, with room for inserts
                          (default: the partitions' longest)
+  --max-candidates N     the filter's candidate buffers, in postings per request, for lists that
+                         never change: the postings of the max-nprobe longest lists (rtier-client
+                         max-candidates; default: max-nprobe x max-list-len). The node then takes
+                         no update batch, and a rebuild must say what its generation's lists need
   --graph-headroom F     room for the heads and lists major epochs add, as a fraction of the
                          build's (default 0.2)
   --gpu G                GPU device (default 0)
@@ -129,6 +133,10 @@ int main(int argc, char** argv) {
           memory / 1e9);
     }
     o.max_list_len = static_cast<uint32_t>(a.U64("max-list-len", 0));
+    const uint64_t max_cand = a.U64("max-candidates", 0);
+    FUSION_CHECK(max_cand < 0xFFFFFFFFull, "--max-candidates %llu: want fewer than 2^32 postings",
+                 static_cast<unsigned long long>(max_cand));
+    o.max_candidates = static_cast<uint32_t>(max_cand);
     o.graph_headroom = a.Has("graph-headroom") ? std::stod(a.Str("graph-headroom", "0.2")) : 0.2;
     o.gpu_device = static_cast<int>(a.U64("gpu", 0));
     const std::string listen = a.Str("listen", "127.0.0.1:0");

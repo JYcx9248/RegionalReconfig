@@ -6,14 +6,16 @@
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] -plan FILE  # the placement FILE names
 //	rtier-client [-api ADDR] design             # open design questions (placeholders)
 //	rtier-client [-api ADDR] rebuild -index DIR -partitions DIR [-spares N] [-placement affinity|random]
-//	             [-warmup N] [-warmup-concurrency C] [-stop-the-world] [-work-dir DIR]
+//	             [-warmup N] [-warmup-concurrency C] [-stop-the-world] [-work-dir DIR] [-max-candidates N]
 //
 // rebuild moves the cluster to the next index generation (U14 full rebuild): DIR holds
 // fusion_build's output, built with the current codebook and page layout (seed its output
 // directory with pq_codebook.bin, pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the
 // partitions rtier_segment made of it. Spares (idle nodes, as many as the data nodes by default)
 // serve the queries meanwhile; -warmup N replays the N most recent queries the entries kept
-// (0: all of them, -1: none) before the next generation goes online.
+// (0: all of them, -1: none) before the next generation goes online. Data nodes whose candidate
+// buffers are sized for their lists (rtier_node --max-candidates) switch only with
+// -max-candidates: what max-candidates prints for the new partitions.
 //
 // A plan file is a protocol.Plan: {"from_epoch": E, "owners": {"NODE": [partitions], ...}},
 // NODE a node ID or name; "from_epoch" is optional. -dry-run changes nothing and prints the
@@ -24,6 +26,7 @@
 //	rtier-client query -entry ADDR -queries Q.u8bin [-gt GT.ibin] [-k 10 -nprobe 64 -n 200]
 //	rtier-client search-local -node ADDR -queries Q.u8bin [...]   # single-node baseline
 //	rtier-client pq-share -partitions DIR -nodes K [-placement P] | -plan FILE
+//	rtier-client max-candidates -partitions DIR [-max-nprobe 256]
 //	rtier-client save-raw -node ADDR
 //	rtier-client save-pq -node ADDR -file PATH
 //
@@ -31,6 +34,11 @@
 // first epoch the placement policy gives K nodes (as the controller deploys them: IDs 1..K), or
 // of a plan, how many distinct vectors its partitions name -- the PQ codes the node keeps
 // resident (U1). The experiment runners size --pq-capacity from it.
+//
+// max-candidates reads the partitions' list tables too: the most postings one request may gather,
+// those of the max_nprobe longest lists, since a request names each of its lists once. The
+// experiment runners size the data nodes' candidate buffers by it (rtier_node --max-candidates),
+// and give a rebuild's request its generation's.
 //
 // save-raw talks to a data node, not the controller: it syncs the node's raw vectors and saves
 // their presence bits next to its raw file, for a warmup snapshot (scripts/run_local.py, "Type":
@@ -44,6 +52,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -64,7 +73,7 @@ import (
 func main() {
 	api := flag.String("api", "127.0.0.1:7101", "controller API address")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ... | save-raw -node ADDR | save-pq -node ADDR -file PATH")
+		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ... | max-candidates ... | save-raw -node ADDR | save-pq -node ADDR -file PATH")
 	}
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -129,10 +138,13 @@ func main() {
 		fs.IntVar(&req.WarmupConcurrency, "warmup-concurrency", 0, "replayed queries at once per node (0: 4)")
 		fs.BoolVar(&req.StopTheWorld, "stop-the-world", false, "baseline: no spares, admission paused while every node switches")
 		fs.StringVar(&req.WorkDir, "work-dir", "", "where the new segments are written with their holders")
+		maxCand := fs.Uint("max-candidates", 0, "the postings the new partitions' max_nprobe longest lists hold "+
+			"(max-candidates), for data nodes run with --max-candidates")
 		fs.Parse(args)
-		if req.Source.IndexDir == "" || req.Source.PartsDir == "" {
+		if req.Source.IndexDir == "" || req.Source.PartsDir == "" || *maxCand > math.MaxUint32 {
 			log.Fatal("usage: rebuild -index DIR -partitions DIR [...]")
 		}
+		req.Source.MaxCandidates = uint32(*maxCand)
 		var rep protocol.RebuildReply
 		call(ctx, *api, protocol.RebuildA, req, &rep, 24*time.Hour)
 		printJSON(rep)
@@ -191,6 +203,19 @@ func main() {
 			log.Fatal(err)
 		}
 		printJSON(share)
+	case "max-candidates":
+		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		parts := fs.String("partitions", "", "rtier_segment's output")
+		nprobe := fs.Int("max-nprobe", 256, "the data nodes' --max-nprobe")
+		fs.Parse(args)
+		if *parts == "" {
+			log.Fatal("usage: max-candidates -partitions DIR [-max-nprobe M]")
+		}
+		c, err := partitioning.MaxCandidates(*parts, *nprobe)
+		if err != nil {
+			log.Fatal(err)
+		}
+		printJSON(c)
 	default:
 		flag.Usage()
 		os.Exit(2)

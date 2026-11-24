@@ -317,13 +317,24 @@ func TestFullRebuild(t *testing.T) {
 
 // TestFullRebuildStopTheWorld is the baseline without spares: admission is paused on every entry
 // while the nodes switch to the second generation where they are. Queries wait (they are told
-// to retry) and every answer is still exact.
+// to retry) and every answer is still exact. The nodes' candidate buffers are sized for the
+// lists of both generations, as in a run without update batches, and the request says what the
+// second's need.
 func TestFullRebuildStopTheWorld(t *testing.T) {
 	f := getFixture(t)
 	g := getGeneration2(t, f)
+	c1, err := maxCandidates(f.parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := maxCandidates(g.parts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cl := newCluster(t, f, "lazy", 2)
-	n1 := cl.addNode("n1", query.TwoPhase{}, "--max-list-len", "4096")
-	n2 := cl.addNode("n2", query.TwoPhase{}, "--max-list-len", "4096")
+	sized := []string{"--max-list-len", "4096", "--max-candidates", fmt.Sprint(max(c1, c2))}
+	n1 := cl.addNode("n1", query.TwoPhase{}, sized...)
+	n2 := cl.addNode("n2", query.TwoPhase{}, sized...)
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
 		t.Fatalf("initial deployment: %v (%s)", err, cl.ctl.LastError())
 	}
@@ -331,7 +342,7 @@ func TestFullRebuildStopTheWorld(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	cl.ctl.BeforeGenerationFlip = func(e uint64) { cl.expect(e, g.oracle) }
 	reply, err := cl.ctl.Rebuild(cl.ctx, protocol.RebuildReq{StopTheWorld: true, WorkDir: t.TempDir(),
-		Source: protocol.GenerationSource{Kind: "dir", IndexDir: g.index, PartsDir: g.parts}})
+		Source: protocol.GenerationSource{Kind: "dir", IndexDir: g.index, PartsDir: g.parts, MaxCandidates: uint32(c2)}})
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
@@ -499,7 +510,7 @@ func TestFullRebuildAfterBatch(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := oracle.SwitchGeneration(ctx, 1, index, parts); err != nil {
+	if err := oracle.SwitchGeneration(ctx, 1, index, parts, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := oracle.LoadGraph(ctx, filepath.Join(index, "graph.hnsw")); err != nil {

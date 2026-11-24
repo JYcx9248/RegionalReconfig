@@ -492,7 +492,7 @@ func (u *Updater) syncRouter(ctx context.Context, t *epoch.Table) error {
 		if in.Generation > t.Generation {
 			return fmt.Errorf("update: the router runs index generation %d, epoch %d generation %d", in.Generation, t.Epoch, t.Generation)
 		}
-		if err := u.Router.SwitchGeneration(ctx, t.Generation, t.GenIndex, t.GenParts); err != nil {
+		if err := u.Router.SwitchGeneration(ctx, t.Generation, t.GenIndex, t.GenParts, t.GenMaxCandidates); err != nil {
 			return fmt.Errorf("update: moving the router to index generation %d: %w", t.Generation, err)
 		}
 		if err := u.Router.LoadGraph(ctx, graph); err != nil {

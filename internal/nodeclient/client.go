@@ -181,13 +181,16 @@ type RawStats struct {
 
 // Info is the node's INFO reply.
 type Info struct {
-	DType         string             `json:"dtype"`
-	Dim           int                `json:"dim"`
-	NumVectors    uint64             `json:"num_vectors"`
-	NumLists      int                `json:"num_lists"`
-	NumPartitions int                `json:"num_partitions"`
-	MaxNProbe     int                `json:"max_nprobe"`
-	MaxRerank     int                `json:"max_rerank"`
+	DType         string `json:"dtype"`
+	Dim           int    `json:"dim"`
+	NumVectors    uint64 `json:"num_vectors"`
+	NumLists      int    `json:"num_lists"`
+	NumPartitions int    `json:"num_partitions"`
+	MaxNProbe     int    `json:"max_nprobe"`
+	MaxRerank     int    `json:"max_rerank"`
+	// MaxCandidates: the candidate buffers when sized for the lists (rtier_node --max-candidates);
+	// 0: room for max_nprobe lists of max_list_len.
+	MaxCandidates uint32             `json:"max_candidates"`
 	Workers       int                `json:"workers"`
 	Filter        string             `json:"filter"`
 	Payload       string             `json:"payload"`
@@ -647,14 +650,18 @@ func (c *Client) LoadPartition(ctx context.Context, p int, v uint32, path string
 // SwitchGeneration moves the node to generation gen of the index (U14 full rebuild): the index
 // at indexDir (fusion_build's output), partitioned as in partitionsDir (rtier_segment's). The
 // node must hold no partition; its graph is dropped, its PQ codes and raw vectors stay. Refused
-// unless the generation has the node's codebook and page geometry.
-func (c *Client) SwitchGeneration(ctx context.Context, gen uint32, indexDir, partitionsDir string) error {
+// unless the generation has the node's codebook and page geometry, and its lists fit the
+// node's candidate buffers: maxCandidates is the postings the generation's max_nprobe longest
+// lists hold (0: not given), which a node whose buffers are sized for its lists needs.
+func (c *Client) SwitchGeneration(ctx context.Context, gen uint32, indexDir, partitionsDir string,
+	maxCandidates uint32) error {
 	var w frame.Writer
 	w.U32(gen)
 	for _, s := range []string{indexDir, partitionsDir} {
 		w.U32(uint32(len(s)))
 		w.Str(s)
 	}
+	w.U32(maxCandidates)
 	_, err := c.do(ctx, opSwitchGen, 0, w.B)
 	return err
 }

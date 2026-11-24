@@ -52,10 +52,11 @@ import (
 
 // generation is an index generation the cluster can run.
 type generation struct {
-	id       uint32
-	indexDir string
-	partsDir string
-	manifest *partitioning.Manifest
+	id            uint32
+	indexDir      string
+	partsDir      string
+	manifest      *partitioning.Manifest
+	maxCandidates uint32 // the request's, for the nodes to check (GenerationSource)
 }
 
 // genDirs are the directories of t's generation: the configured ones for the deployed build.
@@ -71,7 +72,8 @@ func (c *Controller) genDirs(t *epoch.Table) (index, parts string) {
 // what it held and runs t's lists and graph from then on. A node at that generation does nothing.
 func (c *Controller) toGeneration(ctx context.Context, nodes []*ManagedNode, t *epoch.Table) error {
 	index, parts := c.genDirs(t)
-	req := protocol.GenerationReq{Generation: t.Generation, IndexDir: index, PartsDir: parts}
+	req := protocol.GenerationReq{Generation: t.Generation, IndexDir: index, PartsDir: parts,
+		MaxCandidates: t.GenMaxCandidates}
 	return forEach(nodes, func(n *ManagedNode) error {
 		return n.call(ctx, c.stageTimeout(), protocol.SwitchGenerationM, req, nil)
 	})
@@ -87,7 +89,7 @@ func (c *Controller) openGeneration(t *epoch.Table, src protocol.GenerationSourc
 	if src.IndexDir == "" || src.PartsDir == "" {
 		return nil, errors.New("controller: a rebuild needs the next generation's index_dir and parts_dir")
 	}
-	g := &generation{id: t.Generation + 1}
+	g := &generation{id: t.Generation + 1, maxCandidates: src.MaxCandidates}
 	var err error
 	if g.indexDir, err = filepath.Abs(src.IndexDir); err != nil {
 		return nil, err
@@ -370,7 +372,8 @@ func (c *Controller) stageGeneration(ctx context.Context, t *epoch.Table, gen *g
 	// 3. SWITCH.
 	if err := forEach(nodes, func(n *ManagedNode) error {
 		return n.call(ctx, c.stageTimeout(), protocol.SwitchGenerationM,
-			protocol.GenerationReq{Generation: gen.id, IndexDir: gen.indexDir, PartsDir: gen.partsDir}, nil)
+			protocol.GenerationReq{Generation: gen.id, IndexDir: gen.indexDir, PartsDir: gen.partsDir,
+				MaxCandidates: gen.maxCandidates}, nil)
 	}); err != nil {
 		return nil, err
 	}
@@ -397,7 +400,8 @@ func (c *Controller) stageGeneration(ctx context.Context, t *epoch.Table, gen *g
 	}
 	reply.Vectors, reply.Local = vectors, local
 	draft := &epoch.Table{Epoch: t.Epoch + 1, Generation: gen.id, GenIndex: gen.indexDir, GenParts: gen.partsDir,
-		Placement: plan, Nodes: map[placement.NodeID]epoch.NodeInfo{}, Entries: ids(nodes), Aggregators: ids(nodes)}
+		GenMaxCandidates: gen.maxCandidates, Placement: plan, Nodes: map[placement.NodeID]epoch.NodeInfo{},
+		Entries: ids(nodes), Aggregators: ids(nodes)}
 	for _, n := range nodes {
 		draft.Nodes[n.ID] = n.Info
 	}
