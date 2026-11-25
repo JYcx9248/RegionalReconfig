@@ -250,6 +250,11 @@ class NodeEngineImpl : public NodeEngine {
     payload_ = man.payload;
     space_ = MakeL2Space(DTypeOf<T>(), dim_);
     segs_.resize(man.num_partitions);
+    pl_parts_ = man.num_partitions;
+    for (auto* a : {&pl_lists_, &pl_postings_, &pl_reranked_, &pl_pages_}) {
+      a->reset(new std::atomic<uint64_t>[pl_parts_]);
+      for (uint32_t p = 0; p < pl_parts_; ++p) (*a)[p].store(0, std::memory_order_relaxed);
+    }
     // Lists: the build's, then room for the ones major epochs add (U14), each registered as it
     // arrives -- created by StageVersions, or in a segment loaded from a peer.
     PublishLists(MakeLists(man));
@@ -1696,6 +1701,21 @@ class NodeEngineImpl : public NodeEngine {
     return f;
   }
 
+  PartitionLoad partition_load() const override {
+    PartitionLoad l;
+    auto copy = [&](const std::unique_ptr<std::atomic<uint64_t>[]>& a, std::vector<uint64_t>* out) {
+      out->resize(pl_parts_);
+      for (uint32_t p = 0; p < pl_parts_; ++p) (*out)[p] = a[p].load(std::memory_order_relaxed);
+    };
+    copy(pl_lists_, &l.lists);
+    copy(pl_postings_, &l.postings);
+    copy(pl_reranked_, &l.reranked);
+    copy(pl_pages_, &l.pages);
+    l.rerank_pages = pl_rerank_pages_.load(std::memory_order_relaxed);
+    l.unattributed = pl_unattributed_.load(std::memory_order_relaxed);
+    return l;
+  }
+
   ReadBudgetStats read_budget_stats() const override {
     return budget_ ? budget_->Stats() : ReadBudgetStats{};
   }
@@ -1728,6 +1748,10 @@ class NodeEngineImpl : public NodeEngine {
     st->lists = nlists;
     st->gathered = nc;
     const uint32_t nt = fw->Filter(nc, topn, &st->unique);
+    for (uint32_t i = 0; i < nlists; ++i) {  // partition_load
+      CountLoad(pl_lists_.get(), w.list_part[i], 1);
+      CountLoad(pl_postings_.get(), w.list_part[i], w.list_len[i]);
+    }
     std::memcpy(ids, fw->result_ids(), nt * sizeof(uint32_t));
     std::memcpy(dists, fw->result_dists(), nt * sizeof(float));
     return nt;
@@ -1766,6 +1790,7 @@ class NodeEngineImpl : public NodeEngine {
     const uint32_t vb = raw_->layout().vec_bytes;
     w.disk_ids.clear();
     w.disk_locs.clear();
+    w.disk_idx.clear();
     w.mem_ids.clear();
     w.mem_vecs.clear();
     {
@@ -1774,6 +1799,7 @@ class NodeEngineImpl : public NodeEngine {
         if (raw_->Present(locs[i])) {
           w.disk_ids.push_back(ids[i]);
           w.disk_locs.push_back(locs[i]);
+          w.disk_idx.push_back(i);
           continue;
         }
         const auto it = cache_.find(locs[i]);
@@ -1789,6 +1815,7 @@ class NodeEngineImpl : public NodeEngine {
     const uint32_t cnt = nd == 0 ? 0 : HeuristicRerank<T>(q, dim_, w.disk_ids.data(), w.disk_locs.data(), nd,
                                                           raw_->layout(), w.reader.get(), w.scratch.get(), rp,
                                                           out_ids, out_dists, st);
+    CountRerankLoad(w, ids, n, lists, versions, nlists, st->pages_read);
     if (w.mem_ids.empty()) return cnt;
     w.merged.clear();
     for (uint32_t i = 0; i < cnt; ++i) w.merged.emplace_back(out_dists[i], out_ids[i]);
@@ -1934,10 +1961,15 @@ class NodeEngineImpl : public NodeEngine {
     std::vector<uint32_t> lists;
     std::vector<uint32_t> locs;  // raw-vector locations of the candidates being re-ranked
     std::vector<std::shared_ptr<const ResidentSegment>> held;  // pinned by Gather
-    // Re-ranking split between the SSD and the fetch cache (see Rerank).
-    std::vector<uint32_t> disk_ids, disk_locs, mem_ids;
+    std::vector<uint32_t> list_part, list_len;  // per list Gather gathered: partition, postings
+    // Re-ranking split between the SSD and the fetch cache (see Rerank); disk_idx: the disk
+    // candidates' indices in the request.
+    std::vector<uint32_t> disk_ids, disk_locs, disk_idx, mem_ids;
     std::vector<uint8_t> mem_vecs;
     std::vector<std::pair<float, uint32_t>> merged;
+    // partition_load: each candidate's partition, the candidates by ID, the pages by first reader.
+    std::vector<uint32_t> cand_part;
+    std::vector<std::pair<uint32_t, uint32_t>> by_id, page_first;
   };
 
   // Unpins the segments a request gathered from when it finishes, normally or not.
@@ -2352,6 +2384,63 @@ class NodeEngineImpl : public NodeEngine {
       }
     }
     return FetchForQuery(miss, via, via_list);
+  }
+
+  // partition_load: adds v to partition `part`'s counter in a, if the node counts that partition
+  // (the generation it started with).
+  void CountLoad(std::atomic<uint64_t>* a, uint32_t part, uint64_t v) {
+    if (part < pl_parts_) a[part].fetch_add(v, std::memory_order_relaxed);
+  }
+
+  // partition_load, after a RERANK of ids[0..n) over the request's lists: each candidate counts for
+  // the partition of the first of those lists that names it -- the lists are in the order the entry
+  // navigated them, closest first, and named every candidate when FILTER gathered them -- and each
+  // page read (pages_read: one per distinct page of the candidates on the SSD) for its first
+  // candidate's partition. Unlike EnsureRawInLists this scans for every candidate, not only the
+  // missing ones: a cost on the query path that only this branch takes.
+  void CountRerankLoad(Worker& w, const uint32_t* ids, uint32_t n, const uint32_t* lists,
+                       const uint32_t* versions, uint32_t nlists, uint32_t pages_read) {
+    pl_rerank_pages_.fetch_add(pages_read, std::memory_order_relaxed);
+    w.cand_part.assign(n, kInvalidId);
+    w.by_id.resize(n);
+    for (uint32_t i = 0; i < n; ++i) w.by_id[i] = {ids[i], i};
+    std::sort(w.by_id.begin(), w.by_id.end());
+    std::vector<std::shared_ptr<const ResidentSegment>> segs(nlists);
+    std::vector<uint32_t> parts(nlists);
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (uint32_t i = 0; i < nlists; ++i) {
+        parts[i] = PartOf(lists[i]);
+        segs[i] = SegmentLocked(parts[i], versions ? &versions[i] : nullptr);
+      }
+    }
+    uint32_t left = n;
+    for (uint32_t i = 0; i < nlists && left; ++i) {
+      if (!segs[i]) continue;
+      uint32_t len = 0;
+      const uint32_t* v = segs[i]->seg.Find(lists[i], &len);
+      if (!v) continue;
+      for (uint32_t j = 0; j < len && left; ++j) {
+        auto it = std::lower_bound(w.by_id.begin(), w.by_id.end(), std::make_pair(v[j], 0u));
+        for (; it != w.by_id.end() && it->first == v[j]; ++it) {
+          if (w.cand_part[it->second] != kInvalidId) continue;
+          w.cand_part[it->second] = parts[i];
+          --left;
+        }
+      }
+    }
+    pl_unattributed_.fetch_add(left, std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i) CountLoad(pl_reranked_.get(), w.cand_part[i], 1);
+    // The pages, each for its first candidate on the SSD (in the request's order).
+    const RawLayout& L = raw_->layout();
+    w.page_first.clear();
+    for (size_t d = 0; d < w.disk_locs.size(); ++d)
+      w.page_first.emplace_back(L.page(w.disk_locs[d]), static_cast<uint32_t>(d));
+    std::sort(w.page_first.begin(), w.page_first.end());
+    for (size_t j = 0; j < w.page_first.size(); ++j) {
+      if (j > 0 && w.page_first[j].first == w.page_first[j - 1].first) continue;
+      CountLoad(pl_pages_.get(), w.cand_part[w.disk_idx[w.page_first[j].second]], 1);
+    }
   }
 
   // A fetch in flight -- a query's, or a stream's or a drain's (RawPull) -- that the others which
@@ -3010,10 +3099,13 @@ class NodeEngineImpl : public NodeEngine {
                  opts_.max_nprobe);
     w.held.clear();
     w.held.resize(nlists);
+    w.list_part.resize(nlists);
+    w.list_len.resize(nlists);
     {
       std::lock_guard<std::mutex> l(seg_mu_);
       for (uint32_t i = 0; i < nlists; ++i) {
-        w.held[i] = SegmentLocked(PartOf(lists[i]), versions ? &versions[i] : nullptr);
+        w.list_part[i] = PartOf(lists[i]);
+        w.held[i] = SegmentLocked(w.list_part[i], versions ? &versions[i] : nullptr);
       }
     }
     uint64_t nc = 0;
@@ -3029,6 +3121,7 @@ class NodeEngineImpl : public NodeEngine {
       uint32_t len = 0;
       const uint32_t* v = rs.seg.Find(c, &len);
       FUSION_CHECK(v != nullptr, "list %u missing from its segment", c);
+      w.list_len[i] = len;
       FUSION_CHECK(nc + len <= max_candidates_, "gathered IDs exceed max candidates %u",
                    max_candidates_);
       const size_t off = static_cast<size_t>(v - rs.seg.ids.data());
@@ -3145,6 +3238,11 @@ class NodeEngineImpl : public NodeEngine {
         extra_failed{0}, extra_fetched{0}, extra_us{0}, extra_refills{0}, extra_wait_us{0};
   };
   mutable FetchCounters fc_;
+  // partition_load: per partition ID, for the pl_parts_ partitions of the generation the node
+  // started with.
+  uint32_t pl_parts_ = 0;
+  std::unique_ptr<std::atomic<uint64_t>[]> pl_lists_, pl_postings_, pl_reranked_, pl_pages_;
+  std::atomic<uint64_t> pl_rerank_pages_{0}, pl_unattributed_{0};
   bool stop_writer_ = false;
   std::thread writer_;
   // FetchExtra (SetFetchExtra): the requests that follow queries' fetches, and their worker.

@@ -207,12 +207,30 @@ type Info struct {
 	Fetch         FetchStats         `json:"fetch"`
 	RawCache      RawCacheStats      `json:"raw_cache"`
 	Ops           map[string]OpStats `json:"ops"`
+	Partitions    PartitionLoad      `json:"partitions"`
+}
+
+// PartitionLoad is each partition's load on the node (fusion::PartitionLoad, branch
+// partition-load), cumulative and indexed by partition ID: the lists FILTER gathered and their
+// postings; the candidates RERANK re-ranked, each for the partition of the first of its request's
+// lists that names it; and the pages it read for them, each for its first candidate's partition.
+// Pages sum to RerankPages, every page re-ranking read; Unattributed: candidates no list of their
+// request named (0 unless a bug).
+type PartitionLoad struct {
+	Lists        []uint64 `json:"lists"`
+	Postings     []uint64 `json:"postings"`
+	Reranked     []uint64 `json:"reranked"`
+	Pages        []uint64 `json:"pages"`
+	RerankPages  uint64   `json:"rerank_pages"`
+	Unattributed uint64   `json:"unattributed"`
 }
 
 // FetchStats are the node's fetches on demand (fusion::FetchStats), of which only the extras
-// are read here.
+// and the candidates re-ranked from the SSD and from memory are read here.
 type FetchStats struct {
-	Extra FetchExtraStats `json:"extra"`
+	Extra      FetchExtraStats `json:"extra"`
+	RerankDisk uint64          `json:"rerank_disk"`
+	RerankMem  uint64          `json:"rerank_mem"`
 }
 
 // FetchExtraStats count FetchExtra's requests (U9): N, the vectors each may bring now (0: off);

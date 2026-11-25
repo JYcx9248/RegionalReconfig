@@ -78,9 +78,9 @@ class NodeServer {
   void SetStreamBatch(size_t entries) { stream_batch_ = std::max<size_t>(1, entries); }
 
   // One line of the node's stats log (rtier_node --stats-file): per-operation counters, the
-  // fetch path's (fusion::FetchStats), the read budget's and the raw-vector bytes sent and
-  // received (RAW_TRAFFIC), without INFO's raw-vector totals, which wait for the writer and
-  // rescan the resident postings.
+  // fetch path's (fusion::FetchStats), the read budget's, the raw-vector bytes sent and
+  // received (RAW_TRAFFIC) and each partition's load (fusion::PartitionLoad), without INFO's
+  // raw-vector totals, which wait for the writer and rescan the resident postings.
   std::string StatsJson() const;
 
  private:
@@ -97,6 +97,7 @@ class NodeServer {
   std::string OpsJson() const;
   std::string GraphJson() const;
   std::string FetchJson() const;
+  std::string PartitionsJson() const;
   std::string RawCacheJson() const;  // the read cache (fusion/raw_cache.h): INFO and the stats log
 
   fusion::NodeEngine* engine_;

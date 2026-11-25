@@ -249,6 +249,26 @@ struct FilterStats {
   uint32_t unique = 0;    // distinct IDs scored with PQ
 };
 
+// Each partition's load on this node (branch partition-load): the input of a placement plan that
+// moves load between nodes (skew mitigation). Cumulative, indexed by partition ID, for the
+// partitions of the generation the node started with. FILTER and RERANK count, and only they (not
+// SEARCH_LOCAL): a list FILTER gathers for its partition, a candidate RERANK re-ranks for the
+// partition of the first of the request's lists that names it (closest first, as the entry
+// navigated them), and a page re-ranking reads for the partition of its first such candidate. So
+// each counter sums to the node's total, as a placement adds up its partitions -- up to the
+// candidates several nodes report, which the lowest node ID re-ranks (internal/query): moving a
+// partition moves some of those reads to or from another node's partitions.
+struct PartitionLoad {
+  std::vector<uint64_t> lists;     // lists FILTER gathered
+  std::vector<uint64_t> postings;  // the postings those lists held
+  std::vector<uint64_t> reranked;  // candidates re-ranked, from the SSD or the fetch cache
+  std::vector<uint64_t> pages;     // pages re-ranking read for them, the read cache's hits included
+                                   // (reads.charged counts what reached the device)
+  uint64_t rerank_pages = 0;       // every page re-ranking read: pages sum to it
+  uint64_t unattributed = 0;       // candidates no list of their request named (0 unless a bug),
+                                   // whose pages no partition counts
+};
+
 // The on-demand fetch path (U9) as the node's stats log samples it: read without waiting for
 // the writer, so that a sample shows what queries and the writer are doing while it runs.
 // Cumulative, except the ones marked "now".
@@ -543,6 +563,7 @@ class NodeEngine {
   // the call are on the SSD: with no query fetching, cached is then 0.
   virtual RawStats raw_stats(bool settle) const = 0;
   virtual FetchStats fetch_stats() const = 0;
+  virtual PartitionLoad partition_load() const = 0;
   virtual ReadBudgetStats read_budget_stats() const = 0;  // zeros without --read-iops
   virtual RawCacheStats raw_cache_stats() const = 0;      // zeros without a read cache
   // How the node fetches raw vectors on demand (without one it cannot).

@@ -1143,7 +1143,8 @@ std::string NodeServer::InfoJson(bool settle) const {
       raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.cached), u(raw.pending), u(raw.from_index),
       u(raw.streamed), u(raw.fetched), u(raw.added), u(raw.fetches), u(raw.skipped), u(raw.served),
       u(raw.restored));
-  s += ",\"fetch\":" + FetchJson() + ",\"raw_cache\":" + RawCacheJson() + ",\"ops\":" + OpsJson() + "}";
+  s += ",\"fetch\":" + FetchJson() + ",\"raw_cache\":" + RawCacheJson() + ",\"ops\":" + OpsJson() +
+       ",\"partitions\":" + PartitionsJson() + "}";
   return s;
 }
 
@@ -1201,9 +1202,24 @@ std::string NodeServer::RawCacheJson() const {
       u(c.capacity), u(c.bytes), u(c.hits), u(c.misses), u(c.peer_hits), u(c.peer_misses), u(c.evicted), u(c.dropped));
 }
 
+std::string NodeServer::PartitionsJson() const {
+  const fusion::PartitionLoad l = engine_->partition_load();
+  auto arr = [](const std::vector<uint64_t>& v) {
+    std::string s = "[";
+    for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i]);
+    return s + "]";
+  };
+  return "{\"lists\":" + arr(l.lists) + ",\"postings\":" + arr(l.postings) + ",\"reranked\":" +
+         arr(l.reranked) + ",\"pages\":" + arr(l.pages) +
+         fusion::StrFormat(",\"rerank_pages\":%llu,\"unattributed\":%llu}",
+                           static_cast<unsigned long long>(l.rerank_pages),
+                           static_cast<unsigned long long>(l.unattributed));
+}
+
 std::string NodeServer::StatsJson() const {
   const fusion::ReadBudgetStats r = engine_->read_budget_stats();
   return "{\"fetch\":" + FetchJson() + ",\"raw_cache\":" + RawCacheJson() + ",\"ops\":" + OpsJson() +
+         ",\"partitions\":" + PartitionsJson() +
          fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"depth\":%u,\"charged\":%llu,\"peer\":%llu,\"wait_us\":%llu}"
                            ",\"raw_bytes\":{\"sent\":%llu,\"received\":%llu}}",
                            static_cast<unsigned long long>(r.reads_per_sec), r.depth,

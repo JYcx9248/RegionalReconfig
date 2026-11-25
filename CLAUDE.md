@@ -76,7 +76,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `test/e2e` | end-to-end tests |
 | `config.yaml` | the system configuration (defaults committed; the runners rewrite it before each run) |
 | `configs/` | experiments (JSON, one file each) |
-| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid; `--per-node`: a line per data node, for skew mitigation; `analysis/skew_figure.py` the paper's skew figure, as Koala's Fig. 11: throughput, each node's page reads and re-ranked candidates, backlog), `score_answers.py` (recall per data version of a run with update batches), `run_one.sh` (one run on a clean node state, on one machine or a cluster; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
+| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid; `--per-node`: a line per data node, for skew mitigation; `analysis/skew_figure.py` the paper's skew figure, as Koala's Fig. 11: throughput, each node's page reads and re-ranked candidates, backlog), `score_answers.py` (recall per data version of a run with update batches), `run_one.sh` (one run on a clean node state, on one machine or a cluster; `evict_cache.py`), `node_reads.py`, `partition_load.py` (each partition's load, branch `partition-load`), `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
 
 ## Conventions
 
@@ -260,6 +260,19 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   controller stamps every record and metrics report on arrival (`"t"`, on its monotonic clock;
   the node's own as `"node_t"`): one clock with `clock.json` and the load generator, without
   synchronizing the machines' clocks (Koala's metric collector).
+- **Per-partition load (branch `partition-load`, 2026-11-25)**: the input of a skew-mitigation
+  plan. Each data node counts, per partition, the lists FILTER gathered and their postings, the
+  candidates RERANK re-ranked (each for the partition of the first of its request's lists that
+  names it) and the pages read for them (each for its first candidate's), in INFO and its stats
+  lines (`"partitions"`, `fusion::PartitionLoad`); the pages sum to every page re-ranking read.
+  `scripts/partition_load.py RUN [--plan P --partitions DIR]` adds them up over a window, checks
+  them against each node's reads, and estimates a plan's share per node and its PQ codes (a node
+  that both gives and takes holds both sets until the reclaim). The attribution scans each
+  RERANK's postings for every candidate, a cost on the query path that only this branch takes:
+  measure on it, run the experiments on the others. What it measures depends only on the queries
+  and their order, the index and partitions, nprobe and N, the placement and the rule that a
+  candidate several owners report is re-ranked at the lowest node ID -- under which moving a
+  partition shifts some reads between partitions, so a plan's shares are an estimate.
 - **Without root** (shared servers): `"NodeResources"` pins CPUs with `taskset` and limits
   memory in user scopes (`systemd-run --user`); per-node read IOPS come from the data node's own
   read budget (`"ReadIOPSPerNode"` → `rtier_node --read-iops`, `fusion/read_budget.h`), since

@@ -4246,6 +4246,97 @@ std::pair<std::vector<uint32_t>, uint32_t> LongestLists(const std::string& index
   return {order, sum};
 }
 
+// Each partition's load (partition_load, branch partition-load), against counts made here from
+// the segment files: FILTER counts each list of a request for its partition, with its postings;
+// RERANK counts each candidate for the partition of the first of the request's lists that names
+// it, and each page it reads for the partition of the page's first candidate, so the pages add up
+// to what re-ranking read. The queries go to one node with every partition as two owners would
+// send them (partitions 0-1 and 2-3), so a request holds lists of two partitions. SEARCH_LOCAL
+// counts nothing.
+void TestPartitionLoad() {
+  Fixture& f = GetFixture();
+  auto node = OpenNode(f, {0, 1, 2, 3}, true);
+  const PartitionManifest man = PartitionManifest::Load(f.parts);
+  const uint32_t np = man.num_partitions, nprobe = 16, topn = 200;
+  std::vector<ListSegment> segs;
+  for (uint32_t p = 0; p < np; ++p) segs.push_back(ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(p))));
+  // A list's postings (IDs and locations) in its partition's segment.
+  auto postings = [&](uint32_t list) {
+    const ListSegment& s = segs[man.list_part[list]];
+    const size_t i = std::lower_bound(s.list_ids.begin(), s.list_ids.end(), list) - s.list_ids.begin();
+    CHECK(i < s.list_ids.size() && s.list_ids[i] == list);
+    return std::make_pair(s.offsets[i], s.offsets[i + 1]);
+  };
+  PartitionLoad want;
+  for (auto* v : {&want.lists, &want.postings, &want.reranked, &want.pages}) v->assign(np, 0);
+  for (uint32_t qi = 0; qi < f.nq; ++qi) {
+    const float* q = &f.queries[qi * f.dim];
+    std::vector<uint32_t> lists(nprobe);
+    const uint32_t nl = node->Navigate(q, nprobe, 0, lists.data());
+    std::map<uint32_t, std::vector<uint32_t>> by_owner;  // closest first within each
+    for (uint32_t i = 0; i < nl; ++i) by_owner[man.list_part[lists[i]] < 2 ? 0 : 1].push_back(lists[i]);
+    for (auto& [owner, ls] : by_owner) {
+      std::vector<uint32_t> cand(topn), rid(10);
+      std::vector<float> pqd(topn), rd(10);
+      FilterStats fs;
+      const uint32_t nc = node->Filter(0, q, ls.data(), nullptr, static_cast<uint32_t>(ls.size()), topn,
+                                       cand.data(), pqd.data(), &fs);
+      RerankStats rs;
+      node->Rerank(1, q, cand.data(), nc, 10, ls.data(), nullptr, static_cast<uint32_t>(ls.size()), rid.data(),
+                   rd.data(), &rs);
+      want.rerank_pages += rs.pages_read;
+      for (uint32_t l : ls) {
+        const auto [b, e] = postings(l);
+        ++want.lists[man.list_part[l]];
+        want.postings[man.list_part[l]] += e - b;
+      }
+      std::map<uint32_t, uint32_t> page_part;  // page -> its first candidate's partition
+      for (uint32_t c = 0; c < nc; ++c) {
+        uint32_t part = kInvalidId, loc = kInvalidId;
+        for (uint32_t l : ls) {
+          const auto [b, e] = postings(l);
+          const ListSegment& s = segs[man.list_part[l]];
+          const auto it = std::find(s.ids.begin() + b, s.ids.begin() + e, cand[c]);
+          if (it == s.ids.begin() + e) continue;
+          part = man.list_part[l];
+          loc = s.locs[it - s.ids.begin()];
+          break;
+        }
+        CHECK(part != kInvalidId);
+        if (part == kInvalidId) continue;
+        ++want.reranked[part];
+        page_part.emplace(man.raw.page(loc), part);  // keeps the first
+      }
+      for (const auto& [page, part] : page_part) ++want.pages[part];
+    }
+  }
+  const PartitionLoad got = node->partition_load();
+  CHECK(got.lists == want.lists);
+  CHECK(got.postings == want.postings);
+  CHECK(got.reranked == want.reranked);
+  CHECK(got.pages == want.pages);
+  CHECK(got.rerank_pages == want.rerank_pages);
+  CHECK(std::accumulate(got.pages.begin(), got.pages.end(), uint64_t{0}) == got.rerank_pages);
+  CHECK(got.unattributed == 0);
+  CHECK(std::count(got.reranked.begin(), got.reranked.end(), 0) == 0);  // every partition was met
+  std::printf("    per partition: lists %s, pages %s\n",
+              [&] { std::string s; for (auto v : got.lists) s += " " + std::to_string(v); return s; }().c_str(),
+              [&] { std::string s; for (auto v : got.pages) s += " " + std::to_string(v); return s; }().c_str());
+
+  // The single-node search does not count.
+  SearchParams sp;
+  sp.k = 10;
+  sp.nprobe = nprobe;
+  sp.rerank = topn;
+  std::vector<uint32_t> ids(10);
+  std::vector<float> d(10);
+  QueryStats qs;
+  node->SearchLocal(0, &f.queries[0], sp, ids.data(), d.data(), &qs);
+  const PartitionLoad after = node->partition_load();
+  CHECK(after.lists == got.lists && after.reranked == got.reranked && after.pages == got.pages &&
+        after.rerank_pages == got.rerank_pages);
+}
+
 // Candidate buffers sized for the lists (NodeOptions::max_candidates): a request of the
 // max_nprobe longest lists fits them exactly; one that names the longest list max_nprobe times
 // -- which no query does -- is refused before anything is gathered past them. A node so sized
@@ -4324,6 +4415,7 @@ int main() {
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
       {"candidate_buffers", TestCandidateBuffers},
+      {"partition_load", TestPartitionLoad},
       {"streamer", TestStreamer},
       {"wire", TestWire},
       {"fetch_holds_no_worker", TestFetchHoldsNoWorker},
