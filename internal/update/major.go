@@ -81,11 +81,13 @@ type Split struct {
 	Sizes     [2]int    // their postings
 }
 
-// Merge is a list removed, its postings sent to their nearest heads' lists.
+// Merge is a list removed, its postings sent to their nearest heads' lists -- or, under SPFresh's
+// policy, appended to the list Into (spfresh.go).
 type Merge struct {
 	List      uint32
 	Partition int
 	Postings  int
+	Into      uint32 // noList: each posting to its own nearest head's list
 }
 
 // PartEdits is what the next version of one partition changes (nodeclient.Edits, without the
@@ -128,8 +130,10 @@ type Major struct {
 	Codes map[placement.NodeID]*CodeSet
 	// Staged: by owner, the next version of each partition it staged (ExecuteMajor).
 	Staged map[placement.NodeID][]protocol.PartitionVersion
-	// Reassign: what SPFresh's reassign checked and changed (Policy "spfresh"; nil otherwise).
-	Reassign *ReassignStats
+	// Reassign: what SPFresh's reassign checked and changed (Policy "spfresh"; nil otherwise), and
+	// Reassigned the vectors it moved, each with the lists it is in after the epoch.
+	Reassign   *ReassignStats
+	Reassigned map[uint32][]uint32
 	// Quake: what Quake's maintenance found and did (PrepareQuake; nil otherwise).
 	Quake   *QuakeStats
 	patched []placement.NodeID                   // entries that staged the patch
@@ -361,16 +365,34 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 		mj.Splits = append(mj.Splits, sp)
 		dead = append(dead, l)
 	}
-	dead = append(dead, merges...)
+	// SPFresh's merges pair each list with the nearest one that has room, and the shorter of the
+	// two goes: decided before the graph edit, which removes its head.
+	var pairs []spMerge
+	if u.Policy == PolicySPFresh {
+		if pairs, err = u.spfreshMerges(ctx, t, mj, splits, merges, ml); err != nil {
+			return nil, err
+		}
+		for _, x := range pairs {
+			dead = append(dead, x.gone)
+		}
+	} else {
+		dead = append(dead, merges...)
+	}
 
 	// The graph: the new heads in, the removed ones marked deleted.
 	if mj.Patch, err = u.Router.EditGraph(ctx, mj.Graph, labels, vecs, dead, nil, nil); err != nil {
 		return nil, fmt.Errorf("update: editing the graph: %w", err)
 	}
 	edited = true
+	if u.Policy == PolicySPFresh {
+		u.planMerges(t, mj, pairs)
+		if err := u.reassign(ctx, t, mj, sl, sides, pairs); err != nil {
+			return nil, err
+		}
+		return mj, nil
+	}
 
-	// Merges: every posting to the list of its nearest live head on the edited graph, or by
-	// SPFresh's policy to every list the build's rule gives it there.
+	// Merges: every posting to the list of its nearest live head on the edited graph.
 	ef := u.MergeEF
 	if ef <= 0 {
 		ef = 64
@@ -379,38 +401,20 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 		s := ml[i]
 		pe := mj.part(s.p)
 		pe.Removed = append(pe.Removed, l)
-		mj.Merges = append(mj.Merges, Merge{List: l, Partition: s.p, Postings: len(s.IDs)})
+		mj.Merges = append(mj.Merges, Merge{List: l, Partition: s.p, Postings: len(s.IDs), Into: noList})
 		if len(s.IDs) == 0 {
 			continue
 		}
-		var targets [][]uint32
-		if u.Policy == PolicySPFresh {
-			if targets, err = u.assignCodes(ctx, s.codes, mj.M); err != nil {
-				return nil, fmt.Errorf("update: merging list %d: %w", l, err)
-			}
-		} else {
-			nearest, err := u.Router.NearestHeads(ctx, s.codes, mj.M, ef)
-			if err != nil {
-				return nil, fmt.Errorf("update: merging list %d: %w", l, err)
-			}
-			targets = make([][]uint32, len(nearest))
-			for k, tl := range nearest {
-				targets[k] = []uint32{tl}
-			}
+		nearest, err := u.Router.NearestHeads(ctx, s.codes, mj.M, ef)
+		if err != nil {
+			return nil, fmt.Errorf("update: merging list %d: %w", l, err)
 		}
-		for k := range s.IDs {
-			for _, tl := range targets[k] {
-				tp := mj.partitionOf(t, u.Manifest, tl)
-				mj.part(tp).add(tl, s.IDs[k], s.Locs[k], s.Holders[k])
-				if to := t.Owner(tp); to != t.Owner(s.p) {
-					mj.sendCode(to, s.IDs[k], s.code(k, mj.M))
-				}
+		for k, tl := range nearest {
+			tp := mj.partitionOf(t, u.Manifest, tl)
+			mj.part(tp).add(tl, s.IDs[k], s.Locs[k], s.Holders[k])
+			if to := t.Owner(tp); to != t.Owner(s.p) {
+				mj.sendCode(to, s.IDs[k], s.code(k, mj.M))
 			}
-		}
-	}
-	if u.Policy == PolicySPFresh {
-		if err := u.reassign(ctx, t, mj, sl, sides); err != nil {
-			return nil, err
 		}
 	}
 	return mj, nil

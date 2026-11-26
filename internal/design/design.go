@@ -405,12 +405,16 @@ var Open = map[string]Question{
 			"checks a child's member in the neighboring lists when the old head is no closer to it " +
 			"than its child's head, and by FusionANNS's rule such a member would often take the " +
 			"other child too (the RNG rule would prune it: on an RNG index, whether to follow the " +
-			"code there is open). A queued vector whose list is not among the lists the rule now gives it joins " +
-			"every list of that set and leaves every list read that lacks it (STAGE_VERSIONS drops " +
-			"single postings); a merged list's postings go " +
-			"into every list the rule gives them. Copies in lists not read stay (SPFresh's stale " +
-			"copies stay until their posting is next split or merged); it runs once per batch, " +
-			"not per insert (internal/update/spfresh.go). Decided (2026-11-23): or quake, a round " +
+			"code there is open). Decided (2026-11-24): a merge follows SPFresh's paper (§3.2): a " +
+			"list due to merge pairs with the nearest list that keeps both under the posting limit " +
+			"(-split-len; of its 64 nearest heads, as the code chooses), the shorter goes into the " +
+			"other, and its postings farther from the kept head than from their own are queued in " +
+			"the kept list. A queued vector whose list is not among the lists the rule now gives " +
+			"it joins every list of that set and leaves every other list that holds it, which the " +
+			"owners find under the lease (LISTS_OF; STAGE_VERSIONS drops single postings): its old " +
+			"copies go in the epoch, where SPFresh bumps the vector's version and drops them when " +
+			"their posting is next split or merged (§4.2.1). It runs once per batch, not per insert " +
+			"(internal/update/spfresh.go). Decided (2026-11-23): or quake, a round " +
 			"of Quake's maintenance as its code does it (MaintenancePolicy::perform_maintenance), " +
 			"on Quake's index (fusion_build --clustering kmeans: a flat k-means of round(sqrt(N)) " +
 			"lists whose means are the heads, every vector in one list, its nearest head's by a " +

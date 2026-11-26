@@ -53,6 +53,7 @@ const (
 	opRefineAssign   uint8 = 0x2D
 	opScanProfile    uint8 = 0x2E
 	opListLengths    uint8 = 0x2F
+	opListsOf        uint8 = 0x4A
 	opStageVersions  uint8 = 0x30
 	opDropVersion    uint8 = 0x31
 	opForget         uint8 = 0x32
@@ -1500,6 +1501,37 @@ func (c *Client) ScanProfile(ctx context.Context, ns, ks []uint32, trials int) (
 	}
 	r := frame.NewReader(b)
 	out := r.F32s(len(ns) * len(ks))
+	return out, r.Err
+}
+
+// Posting is a vector found in a list (ListsOf).
+type Posting struct {
+	ID, List uint32
+}
+
+// ListsOf returns every posting of the vectors ids in the resident version versions[i] of each
+// partition parts[i]: the lists that hold them.
+func (c *Client) ListsOf(ctx context.Context, parts []int, versions []uint32, ids []uint32) ([]Posting, error) {
+	if len(parts) != len(versions) {
+		return nil, fmt.Errorf("nodeclient: %d partitions, %d versions", len(parts), len(versions))
+	}
+	var w frame.Writer
+	w.U32(uint32(len(parts)))
+	for i, p := range parts {
+		w.U32(uint32(p))
+		w.U32(versions[i])
+	}
+	w.U32(uint32(len(ids)))
+	w.U32s(ids)
+	b, err := c.do(ctx, opListsOf, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	out := make([]Posting, r.U32())
+	for i := range out {
+		out[i] = Posting{ID: r.U32(), List: r.U32()}
+	}
 	return out, r.Err
 }
 

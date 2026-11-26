@@ -231,6 +231,10 @@
 //   LIST_LENGTHS    u32 nparts, (u32 partition,               -> u32 n, (u32 list, u32 postings)[n]
 //                   u32 version)[nparts]
 //                   (every list of those resident versions)
+//   LISTS_OF        u32 nparts, (u32 partition,               -> u32 n, (u32 id, u32 list)[n]
+//                   u32 version)[nparts], u32 nids, u32 ids[nids]
+//                   (every posting of those vectors in those resident versions: a major epoch
+//                   drops a reassigned vector's copies its new lists lack)
 //   DROP_VERSION    u32 partition, u32 version                -> u8 was_resident
 //   FORGET          u32 flags, u32 n, u32 ids[n]              -> u64 freed (PQ codes no version
 //                                                                names; flags bit 0: the vectors
@@ -319,6 +323,7 @@ enum Op : uint8_t {
   kSegmentPut = 0x46,
   kSegmentInstall = 0x47,
   kFetchExtra = 0x49,
+  kListsOf = 0x4A,
 };
 
 enum Status : uint16_t {

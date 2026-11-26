@@ -34,8 +34,9 @@
 // -policy spfresh adds SPFresh's reassign to the major epoch (internal/update/spfresh.go): the
 // members of each split's children and of the -reassign-range lists nearest its old head are
 // checked, a vector once (one in a child only there), and a vector that no longer belongs to the
-// list it was queued in is inserted again by the build's rule; a merged list's postings go into
-// every list the rule gives them.
+// list it was queued in is inserted again by the build's rule, its copies elsewhere dropped. A
+// merge pairs a list with its nearest list that keeps both under -split-len, the shorter going
+// into the other, and its postings that are now farther from their head are checked too.
 //
 // -policy quake runs a round of Quake's maintenance after the batch, or alone without one
 // (internal/update/quake.go), on Quake's index (fusion_build --clustering kmeans): it reads the
@@ -58,6 +59,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -270,7 +272,8 @@ func run(o options, rec *record) error {
 	major := len(splits)+len(merges) > 0 || o.splitLen > 0 || o.mergeLen > 0 || quake
 
 	u := &update.Updater{Controller: update.Remote{Conn: conn}, Manifest: m, Alloc: alloc,
-		GraphPath: o.graph, PatchDir: o.patches, Policy: o.policy, ReassignRange: o.reassign, Quake: o.quake}
+		GraphPath: o.graph, PatchDir: o.patches, Policy: o.policy, ReassignRange: o.reassign, PostingLimit: o.splitLen,
+		Quake: o.quake}
 	if u.PatchDir == "" {
 		u.PatchDir = filepath.Join(filepath.Dir(o.statePath), "graph-patches")
 	}
@@ -428,6 +431,10 @@ func execMajor(ctx context.Context, u *update.Updater, mj *update.Major, start t
 			q.Deletes, q.Rejected, q.Splits, q.Refined, q.Reassigned, q.Moved, q.Emptied)
 	}
 	for _, mg := range mj.Merges {
+		if mg.Into != math.MaxUint32 {
+			fmt.Printf("list %d (partition %d) merged into list %d: %d postings\n", mg.List, mg.Partition, mg.Into, mg.Postings)
+			continue
+		}
 		fmt.Printf("list %d (partition %d) merged: %d postings to their nearest heads' lists\n", mg.List, mg.Partition, mg.Postings)
 	}
 	moved := 0

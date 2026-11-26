@@ -133,6 +133,7 @@ const char* OpName(uint8_t op) {
     case kRefineAssign: return "refine_assign";
     case kScanProfile: return "scan_profile";
     case kListLengths: return "list_lengths";
+    case kListsOf: return "lists_of";
     case kStageVersions: return "stage_versions";
     case kDropVersion: return "drop_version";
     case kForget: return "forget";
@@ -1170,6 +1171,26 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         std::vector<float> out(static_cast<size_t>(nn) * nk);
         e.ScanProfile(ns.data(), nn, ks.data(), nk, trials, out.data());
         w.PutBytes(out.data(), out.size() * 4);
+        break;
+      }
+      case kListsOf: {
+        const uint32_t np = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(np) * 8 + 4 <= r.remaining(), "LISTS_OF: partitions and versions truncated");
+        std::vector<uint32_t> parts(np), versions(np);
+        for (uint32_t i = 0; i < np; ++i) {
+          parts[i] = r.Get<uint32_t>();
+          versions[i] = r.Get<uint32_t>();
+        }
+        const uint32_t n = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(n) * 4 == r.remaining(), "LISTS_OF: body is not the vector IDs");
+        const auto ids = TakeArray<uint32_t>(&r, n);
+        const auto found = e.ListsOf(parts.data(), versions.data(), np, ids.data(), n);
+        Require(found.size() * 8 + 4 <= kMaxFrameBytes, "LISTS_OF: too many postings for a frame");
+        w.Put<uint32_t>(static_cast<uint32_t>(found.size()));
+        for (const auto& x : found) {
+          w.Put<uint32_t>(x.first);
+          w.Put<uint32_t>(x.second);
+        }
         break;
       }
       case kListLengths: {

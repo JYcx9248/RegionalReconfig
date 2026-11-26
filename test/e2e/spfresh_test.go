@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,13 +23,16 @@ import (
 // TestSPFreshReassign applies a major epoch under SPFresh's policy (U14, internal/update/
 // spfresh.go) to a cluster under query load, and the same decisions to a single-node oracle. Two
 // lists that queries probe first split; each checks the members of its children and of the 64
-// lists nearest its old head by SPFresh's conditions, a vector once (one in a child only there),
-// and a vector that no longer belongs to the list it was queued in is inserted again by the
-// build's rule: into every list of its new set, on either owner (its PQ code sent along, its raw
-// vector fetched on demand), and out of the lists it was seen in -- postings dropped from the
-// base version, or taken out of a child's plan. A list at the owners' boundary merges into every
-// list the rule gives its postings. Every answer must equal the oracle's for its epoch, the lists
-// hold what the plan says, and no vector of one split list ends in both of its children. It runs
+// lists nearest its old head by SPFresh's conditions, a vector once (one in a child only there).
+// A list at the owners' boundary merges: with its nearest list that has room, the shorter going
+// into the other, whose head is then checked against the postings it took. A vector that no longer
+// belongs to the list it was queued in is inserted again by the build's rule: into every list of
+// its new set, on either owner (its PQ code sent along, its raw vector fetched on demand), and out
+// of every other list that holds it -- postings dropped from the base version wherever the owners
+// find them, or taken out of the plan. Every answer must equal the oracle's for its epoch, the
+// lists hold what the plan says, every moved vector is in exactly its new lists, a merge's
+// postings are in the list it went into or moved on, and no vector of one split list ends in both
+// of its children. It runs
 // on FusionANNS's index (the 8 nearest heads) and on the RNG-pruned one SPFresh's evaluation
 // builds, where the build's rule -- inserts' and the reassign's -- is SPANN's RNG selection.
 func TestSPFreshReassign(t *testing.T) {
@@ -95,7 +100,7 @@ func testSPFreshReassign(t *testing.T, f *fixture) {
 	defer router.Close()
 	u := &update.Updater{Controller: cl.ctl, Manifest: m, Alloc: alloc, Router: router,
 		GraphPath: filepath.Join(f.indexNoBootstrap, "graph.hnsw"), PatchDir: t.TempDir(),
-		Policy: update.PolicySPFresh, ReassignRange: 64}
+		Policy: update.PolicySPFresh, ReassignRange: 64, PostingLimit: m.MaxListLen + 200}
 	defer u.Close()
 	oracleVersions := make([]uint32, numPartitions)
 
@@ -122,8 +127,9 @@ func testSPFreshReassign(t *testing.T, f *fixture) {
 	}
 	nav.Close()
 
-	// Decided under the lease, given up and decided again with other lists until the reassign
-	// drops a posting of the base version and a posting goes to another owner.
+	// Decided under the lease, given up and decided again with other lists until the merge finds a
+	// partner, the reassign drops a posting of the base version and a posting goes to another
+	// owner.
 	dropped := func(mj *update.Major) int {
 		n := 0
 		for _, pe := range mj.Parts {
@@ -144,7 +150,7 @@ func testSPFreshReassign(t *testing.T, f *fixture) {
 		if mj, err = u.PrepareMajor(ctx, splits, merges); err != nil {
 			t.Fatal(err)
 		}
-		if dropped(mj) > 0 && len(mj.Codes) > 0 {
+		if dropped(mj) > 0 && len(mj.Codes) > 0 && len(mj.Merges) == 1 {
 			break
 		}
 		if err := u.AbortMajor(ctx, mj); err != nil {
@@ -153,7 +159,7 @@ func testSPFreshReassign(t *testing.T, f *fixture) {
 		mj = nil
 	}
 	if mj == nil {
-		t.Fatalf("no split of the lists %v drops a posting and sends one to another owner", firsts)
+		t.Fatalf("no split of the lists %v, with a merge, drops a posting and sends one to another owner", firsts)
 	}
 	rs := mj.Reassign
 	if rs == nil || rs.Lists == 0 || rs.Checked == 0 || rs.Candidates == 0 || rs.Moved == 0 || rs.Added == 0 || rs.Dropped == 0 {
@@ -183,7 +189,8 @@ func testSPFreshReassign(t *testing.T, f *fixture) {
 		}
 	}
 	for _, mg := range mj.Merges {
-		for _, id := range listIn(mj.Lease.Table, mg.List) {
+		members[mg.List] = listIn(mj.Lease.Table, mg.List)
+		for _, id := range members[mg.List] {
 			inLists[id]++
 		}
 	}
@@ -226,6 +233,42 @@ func testSPFreshReassign(t *testing.T, f *fixture) {
 		for c := 0; c < 2; c++ {
 			if n := len(list(s.Children[c])); n != s.Sizes[c] {
 				t.Errorf("list %d (split of %d) holds %d postings, the plan %d", s.Children[c], s.List, n, s.Sizes[c])
+			}
+		}
+	}
+	// Every vector the reassign moved is in exactly the lists of its new set, the copies it had
+	// elsewhere gone; the merged list is gone and its postings are in the list it went into, or
+	// moved on.
+	all := allLists(t, ctx, after, m)
+	holds := map[uint32][]uint32{}
+	for l, ids := range all {
+		for _, id := range ids {
+			holds[id] = append(holds[id], l)
+		}
+	}
+	sorted := func(x []uint32) []uint32 {
+		y := append([]uint32(nil), x...)
+		sort.Slice(y, func(i, j int) bool { return y[i] < y[j] })
+		return y
+	}
+	if len(mj.Reassigned) != rs.Moved {
+		t.Errorf("%d vectors reassigned, the stats say %d", len(mj.Reassigned), rs.Moved)
+	}
+	for id, set := range mj.Reassigned {
+		if got, want := sorted(holds[id]), sorted(set); !reflect.DeepEqual(got, want) {
+			t.Errorf("vector %d is in lists %v, its new set is %v", id, got, want)
+		}
+	}
+	for _, mg := range mj.Merges {
+		if _, ok := all[mg.List]; ok {
+			t.Errorf("merged list %d is still there", mg.List)
+		}
+		if _, ok := all[mg.Into]; !ok {
+			t.Errorf("list %d, which list %d merged into, is gone", mg.Into, mg.List)
+		}
+		for _, id := range members[mg.List] {
+			if _, moved := mj.Reassigned[id]; !moved && !containsU32(all[mg.Into], id) {
+				t.Errorf("vector %d of merged list %d is not in list %d", id, mg.List, mg.Into)
 			}
 		}
 	}

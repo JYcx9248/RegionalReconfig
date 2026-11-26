@@ -3,9 +3,11 @@ package update
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 
 	"rtier/internal/epoch"
+	"rtier/internal/nodeclient"
 	"rtier/internal/placement"
 )
 
@@ -14,17 +16,29 @@ import (
 //
 //   - threshold (the default): a merged list's postings go to the list of their nearest live head;
 //     nothing else moves.
-//   - spfresh: SPFresh's LIRE (SOSP '23) as its code does it (github.com/SPFresh/SPFresh,
-//     ExtraDynamicSearcher.h: Split's CollectReAssign, CheckIsNeedReassign, Reassign). After the
-//     splits, each split checks the vectors near it in SPFresh's order: the members of its
-//     children, then those of the ReassignRange lists whose heads are nearest the old head
+//   - spfresh: SPFresh's LIRE (SOSP '23), below.
+//
+// SPFresh's LIRE as its paper describes it (§3.2-3.3, §4.2.1) and, where the paper leaves a point
+// open, as its code does it (github.com/SPFresh/SPFresh, ExtraDynamicSearcher.h: Split's
+// CollectReAssign, CheckIsNeedReassign, MergePostings, Reassign):
+//
+//   - After the splits, each split checks the vectors near it in SPFresh's order: the members of
+//     its children, then those of the ReassignRange lists whose heads are nearest the old head
 //     (SPFresh's ReassignK), nearest first. A split queues a vector once, in the first list where
-//     one of SPFresh's conditions holds, and the vector is inserted again by the index's own rule
-//     (ASSIGN's, Assign in node_engine.cpp) if that list is no longer among the lists the rule
-//     gives it; then it joins every list of its new set and leaves every list it was seen in
-//     that is not in the set. A vector in a split's child is checked in that child only: one
-//     that stays there does not take the other child too. A merged list's postings go into
-//     every list the rule gives them.
+//     one of SPFresh's conditions holds. A vector in a split's child is checked in that child
+//     only: one that stays there does not take the other child too.
+//   - A merge (§3.2) pairs a list due to merge with its nearest list: the first of the 64 heads
+//     nearest its own (SPFresh's InternalResultNum) that keeps both under PostingLimit and is
+//     neither split nor in another merge of the epoch, as the code chooses. The shorter of the two
+//     goes (the one due to merge on a tie), its postings appended to the other. A posting of it
+//     that is farther from the kept head than from its own old one is queued in the kept list
+//     (the code's test of "the vectors of the deleted posting", §3.3). A list with no such partner
+//     does not merge.
+//   - A queued vector is inserted again by the index's own rule (ASSIGN's, Assign in
+//     node_engine.cpp) if a list it was queued in is no longer among the lists the rule gives it:
+//     it joins every list of its new set and leaves every other list that holds it, which the
+//     owners find (LISTS_OF). SPFresh bumps its version instead, so that its old copies are
+//     dropped when their postings are next split or merged (§4.2.1); here they go in the epoch.
 //
 // The rule is the index's build's. On an index built with RNG pruning (fusion_build --rng, as
 // SPFresh's evaluation builds SPANN's) it is SPANN's RNG selection, SPFresh's RNGSelection: the
@@ -36,11 +50,11 @@ import (
 // when the member is no closer to the old head than to its child's head -- by FusionANNS's rule
 // such a member would often take the other child as well (the two new heads are close to each
 // other, and nothing prunes the second), while the RNG rule would prune it, so whether to follow
-// the code there on an RNG index is open; a reassign there bumps the vector's version, so that every old
-// copy is dropped when its posting is next split or merged, here the copies outside the lists
-// read stay (still found by searches, as SPFresh's stale copies are until then); its merge
-// appends a short posting to its nearest neighbor, ours reassigns the postings by the rule; and
-// it acts on every insert, we once per batch.
+// the code there on an RNG index is open; its code splits by SPTAG's balanced k-means and then
+// gives every member to the nearer new head (keeping the old head when a new one is it), ours
+// keeps the balanced halves -- both the paper's even split by balanced clustering; it acts on
+// every insert and every search that meets a short posting, we once per batch; and here a list
+// takes part in one merge per epoch.
 const (
 	PolicyThreshold = "threshold"
 	PolicySPFresh   = "spfresh"
@@ -48,12 +62,16 @@ const (
 
 // ReassignStats is what SPFresh's reassign did in one major epoch.
 type ReassignStats struct {
-	Lists      int `json:"lists"`      // neighboring lists read, each once
-	Checked    int `json:"checked"`    // postings checked against SPFresh's conditions
-	Candidates int `json:"candidates"` // vectors queued: by each split, the first posting that met them
-	Moved      int `json:"moved"`      // vectors inserted again
-	Added      int `json:"added"`      // postings planned for them, in lists they were not seen in (a list not read may hold one already: staging keeps one)
-	Dropped    int `json:"dropped"`    // postings they left
+	Lists      int `json:"lists"`            // neighboring lists read, each once
+	Checked    int `json:"checked"`          // postings checked against SPFresh's conditions, splits' and merges'
+	Candidates int `json:"candidates"`       // vectors queued: by each split, the first posting that met them; by each merge
+	Moved      int `json:"moved"`            // vectors inserted again
+	Added      int `json:"added"`            // postings added for them
+	Dropped    int `json:"dropped"`          // postings they left, planned ones taken out of the plan too
+	Stale      int `json:"stale"`            // of those, in lists the epoch read nothing else from (SPFresh's stale copies)
+	StaleParts int `json:"stale_partitions"` // partitions staged only to drop those
+	Merged     int `json:"merged"`           // merges: a list appended to its nearest list with room
+	NoPartner  int `json:"no_partner"`       // lists due to merge that no list had room for, left as they are
 }
 
 // childCandidate and neighborCandidate are SPFresh's conditions (CheckIsNeedReassign), on squared
@@ -96,13 +114,16 @@ type check struct {
 }
 
 // reassign runs SPFresh's reassign for the splits mj decided (their members sl, each member's
-// side), on the router's edited graph: see PolicySPFresh. It adds to mj the postings the moved
-// vectors gain and drops the ones they leave -- in the children it takes them out of the plan --
-// and the PQ codes owners that lacked them need.
-func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []listMembers, sides [][]uint8) error {
-	st := &ReassignStats{}
-	mj.Reassign = st
-	if len(mj.Splits) == 0 {
+// side) and for its merges (pairs), on the router's edited graph: see PolicySPFresh. The moved
+// vectors go into their new sets and out of every other list (relocate).
+func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []listMembers, sides [][]uint8,
+	pairs []spMerge) error {
+	st := mj.Reassign
+	if st == nil {
+		st = &ReassignStats{}
+		mj.Reassign = st
+	}
+	if len(mj.Splits) == 0 && len(pairs) == 0 {
 		return nil
 	}
 	removed := map[uint32]bool{}
@@ -111,7 +132,7 @@ func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []
 			removed[l] = true
 		}
 	}
-	// The postings the plan adds so far: the children's, and the merged lists'.
+	// The postings the plan adds so far: the children's, and those a merge appends.
 	planned := map[uint32]map[uint32]bool{}
 	for _, pe := range mj.Parts {
 		for i, l := range pe.Lists {
@@ -126,7 +147,7 @@ func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []
 	// created nor removed by this epoch, each read once from its owner.
 	neighbors := make([][]uint32, len(mj.Splits))
 	read := map[uint32]*listMembers{}
-	if u.ReassignRange > 0 {
+	if u.ReassignRange > 0 && len(mj.Splits) > 0 {
 		parents := make([]uint32, len(mj.Splits))
 		for i, s := range mj.Splits {
 			parents[i] = s.List
@@ -262,11 +283,42 @@ func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []
 			cd.lists = append(cd.lists, c.list)
 		}
 	}
+	// A merge's checks (MergePostings): each posting of the list that went, if it is farther from
+	// the kept list's head than from its own old one, queued in the kept list.
+	for _, x := range pairs {
+		g := x.goneM
+		for i := 0; i < len(g.IDs); i += codesBatch {
+			j := min(len(g.IDs), i+codesBatch)
+			heads := make([]uint32, 0, 2*(j-i))
+			for k := i; k < j; k++ {
+				heads = append(heads, x.gone, x.kept)
+			}
+			d, err := u.Router.HeadDistances(ctx, g.codes[i*mj.M:j*mj.M], mj.M, heads, 2)
+			if err != nil {
+				return fmt.Errorf("update: distances to merged lists' heads: %w", err)
+			}
+			for k := i; k < j; k++ {
+				st.Checked++
+				if d[2*(k-i)+1] <= d[2*(k-i)] {
+					continue
+				}
+				id := g.IDs[k]
+				st.Candidates++
+				cd := cands[id]
+				if cd == nil {
+					cd = &cand{code: g.code(k, mj.M)}
+					cands[id] = cd
+					order = append(order, id)
+				}
+				cd.lists = append(cd.lists, x.kept)
+			}
+		}
+	}
 	if len(order) == 0 {
 		return nil
 	}
 
-	// Each candidate's lists by the rule; it moves if a list a split queued it in is not one.
+	// Each candidate's lists by the rule; it moves if a list it was queued in is not one.
 	codes := make([]byte, 0, len(order)*mj.M)
 	for _, id := range order {
 		codes = append(codes, cands[id].code...)
@@ -293,95 +345,151 @@ func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []
 		return nil
 	}
 
-	// Where each moved vector was seen -- the lists read (the base version) and the created lists
-	// the plan fills -- with its location, holder and code from one of its postings; and which
-	// owners have its code: those of the lists it was read in or planned for from its parent.
-	type copies struct {
-		loc    uint32
-		holder uint16
-		code   []byte
-		lists  []uint32
-		owners map[placement.NodeID]bool
-	}
-	where := map[uint32]*copies{}
-	note := func(lm *listMembers, k int, list uint32, p int) {
-		id := lm.IDs[k]
-		if _, ok := moved[id]; !ok {
-			return
-		}
-		w := where[id]
-		if w == nil {
-			w = &copies{loc: lm.Locs[k], holder: lm.Holders[k], code: lm.code(k, mj.M), owners: map[placement.NodeID]bool{}}
-			where[id] = w
-		}
-		w.lists = append(w.lists, list)
-		w.owners[t.Owner(p)] = true
-	}
-	for i, s := range mj.Splits {
-		for k := range sl[i].IDs {
-			note(&sl[i], k, s.Children[sides[i][k]], s.Partition)
-		}
-	}
-	lists := make([]uint32, 0, len(read))
-	for l := range read {
-		lists = append(lists, l)
-	}
-	sort.Slice(lists, func(i, j int) bool { return lists[i] < lists[j] })
-	for _, l := range lists {
-		lm := read[l]
-		for k := range lm.IDs {
-			note(lm, k, l, t.PartitionOf(l, u.Manifest))
-		}
-	}
+	return u.relocate(ctx, t, mj, moved, removed, planned, sl, read, pairs)
+}
 
-	// The edits: every list of the new set it was not seen in, and out of every list it was
-	// seen in that the set lacks. In a created list, out of the plan.
-	unplan := map[uint32]map[uint32]bool{} // created list -> vectors taken out of it
+// relocate moves every vector of moved into its new set (moved's value), adding to mj: into each
+// list of the set it is not in, out of each list the set lacks -- every list that holds it at the
+// epoch's versions, which the owners find (LISTS_OF), and every list the plan puts it in
+// (planned: those postings leave the plan). A list removed by the epoch takes its postings along.
+// The PQ codes go to owners that have none of the vector. sl, read and pairs are the lists the
+// epoch read (for a posting of each moved vector, and the stats).
+func (u *Updater) relocate(ctx context.Context, t *epoch.Table, mj *Major, moved map[uint32][]uint32,
+	removed map[uint32]bool, planned map[uint32]map[uint32]bool, sl []listMembers, read map[uint32]*listMembers,
+	pairs []spMerge) error {
+	st := mj.Reassign
 	ids := make([]uint32, 0, len(moved))
 	for id := range moved {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	// A posting the epoch read of each: its location, holder and PQ code.
+	type posting struct {
+		loc    uint32
+		holder uint16
+		code   []byte
+	}
+	src := map[uint32]posting{}
+	seen := map[uint32]bool{} // the lists the epoch read
+	take := func(l uint32, lm *listMembers) {
+		seen[l] = true
+		for k, id := range lm.IDs {
+			if _, ok := moved[id]; !ok {
+				continue
+			}
+			if _, ok := src[id]; !ok {
+				src[id] = posting{lm.Locs[k], lm.Holders[k], lm.code(k, mj.M)}
+			}
+		}
+	}
+	for i := range sl {
+		take(mj.Splits[i].List, &sl[i])
+	}
+	readLists := make([]uint32, 0, len(read))
+	for l := range read {
+		readLists = append(readLists, l)
+	}
+	sort.Slice(readLists, func(i, j int) bool { return readLists[i] < readLists[j] })
+	for _, l := range readLists {
+		take(l, read[l])
+	}
+	for _, x := range pairs {
+		take(x.gone, x.goneM)
+		take(x.kept, x.keptM)
+	}
+	held, err := u.listsOf(ctx, t, ids)
+	if err != nil {
+		return err
+	}
+	plannedIn := map[uint32][]uint32{} // moved vector -> the lists the plan puts it in
+	for l, in := range planned {
+		for id := range in {
+			if _, ok := moved[id]; ok {
+				plannedIn[id] = append(plannedIn[id], l)
+			}
+		}
+	}
+	before := map[int]bool{}
+	for p := range mj.Parts {
+		before[p] = true
+	}
+	touched, staleParts := map[int]bool{}, map[int]bool{}
+	unplan := map[uint32]map[uint32]bool{}
+	mj.Reassigned = map[uint32][]uint32{}
 	for _, id := range ids {
-		set, w := moved[id], where[id]
+		set, w := moved[id], src[id]
+		if w.code == nil && mj.M > 0 {
+			return fmt.Errorf("update: vector %d moves, but the epoch read no posting of it", id)
+		}
+		mj.Reassigned[id] = set
 		inSet := map[uint32]bool{}
 		for _, l := range set {
 			inSet[l] = true
 		}
-		seen := map[uint32]bool{}
-		for _, l := range w.lists {
-			seen[l] = true
+		owners := map[placement.NodeID]bool{} // the nodes that have its PQ code
+		var base []uint32                     // the lists that hold it and stay
+		for _, l := range held[id] {
+			owners[t.Owner(t.PartitionOf(l, u.Manifest))] = true
+			if !removed[l] {
+				base = append(base, l)
+			}
+		}
+		sort.Slice(base, func(i, j int) bool { return base[i] < base[j] })
+		inBase := map[uint32]bool{}
+		for _, l := range base {
+			inBase[l] = true
+		}
+		pl := plannedIn[id]
+		sort.Slice(pl, func(i, j int) bool { return pl[i] < pl[j] })
+		for _, l := range pl {
 			if inSet[l] {
 				continue
 			}
+			if unplan[l] == nil {
+				unplan[l] = map[uint32]bool{}
+			}
+			unplan[l][id] = true
+			delete(planned[l], id)
 			st.Dropped++
-			if _, created := mj.Lists[l]; created {
-				if unplan[l] == nil {
-					unplan[l] = map[uint32]bool{}
-				}
-				unplan[l][id] = true
-				delete(planned[l], id)
+		}
+		for _, l := range base {
+			if inSet[l] {
 				continue
 			}
-			mj.part(t.PartitionOf(l, u.Manifest)).drop(l, id)
+			p := t.PartitionOf(l, u.Manifest)
+			mj.part(p).drop(l, id)
+			st.Dropped++
+			if seen[l] {
+				touched[p] = true
+			} else {
+				st.Stale++
+				staleParts[p] = true
+			}
 		}
 		for _, l := range set {
-			if seen[l] || planned[l][id] {
+			if inBase[l] || planned[l][id] {
 				continue
 			}
 			p := mj.partitionOf(t, u.Manifest, l)
 			mj.part(p).add(l, id, w.loc, w.holder)
+			touched[p] = true
 			st.Added++
 			if planned[l] == nil {
 				planned[l] = map[uint32]bool{}
 			}
 			planned[l][id] = true
-			if o := t.Owner(p); !w.owners[o] {
+			if o := t.Owner(p); !owners[o] {
 				mj.sendCode(o, id, w.code)
+				owners[o] = true
 			}
 		}
 	}
-	// Out of the plan: the created lists' postings of vectors that left them.
+	for p := range staleParts {
+		if !before[p] && !touched[p] {
+			st.StaleParts++
+		}
+	}
+	// Out of the plan: the postings of vectors that left lists the plan put them in.
 	for _, pe := range mj.Parts {
 		n := 0
 		for i, l := range pe.Lists {
@@ -400,4 +508,142 @@ func (u *Updater) reassign(ctx context.Context, t *epoch.Table, mj *Major, sl []
 		}
 	}
 	return nil
+}
+
+// listsOf is every list that holds each of the vectors ids at t's versions, from the owners
+// (LISTS_OF), each over all its partitions.
+func (u *Updater) listsOf(ctx context.Context, t *epoch.Table, ids []uint32) (map[uint32][]uint32, error) {
+	byOwner := map[placement.NodeID][]int{}
+	for p := 0; p < u.Manifest.NumPartitions; p++ {
+		byOwner[t.Owner(p)] = append(byOwner[t.Owner(p)], p)
+	}
+	owners := make([]placement.NodeID, 0, len(byOwner))
+	for o := range byOwner {
+		owners = append(owners, o)
+	}
+	got := make([][]nodeclient.Posting, len(owners))
+	if err := parallel(ctx, len(owners), func(ctx context.Context, i int) error {
+		ps := byOwner[owners[i]]
+		vs := make([]uint32, len(ps))
+		for k, p := range ps {
+			vs[k] = t.Version(p)
+		}
+		x, err := u.client(t.Nodes[owners[i]].NodeAddr).ListsOf(ctx, ps, vs, ids)
+		if err != nil {
+			return fmt.Errorf("update: the lists of the moved vectors on node %d: %w", owners[i], err)
+		}
+		got[i] = x
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	out := map[uint32][]uint32{}
+	for _, x := range got {
+		for _, p := range x {
+			out[p.ID] = append(out[p.ID], p.List)
+		}
+	}
+	return out, nil
+}
+
+// spMerge is one of SPFresh's merges: of a list due to merge and its partner, the one that goes
+// and the one that takes its postings, with their members as read.
+type spMerge struct {
+	gone, kept   uint32
+	goneM, keptM *listMembers
+}
+
+// mergeNeighbors is how many of the heads nearest its own a list due to merge looks among for
+// its partner (SPFresh's InternalResultNum).
+const mergeNeighbors = 64
+
+// noList: no list (Merge.Into of the threshold policy's merges).
+const noList = math.MaxUint32
+
+// spfreshMerges pairs each list of merges (its members in ml) with its partner: the first of the
+// mergeNeighbors heads nearest its own on the router's graph whose list is not split, due to
+// merge or another merge's partner in the epoch, and keeps the two under PostingLimit (0: no
+// limit). The shorter of the two goes (the list due to merge on a tie).
+func (u *Updater) spfreshMerges(ctx context.Context, t *epoch.Table, mj *Major, splits, merges []uint32,
+	ml []listMembers) ([]spMerge, error) {
+	st := mj.Reassign
+	if st == nil {
+		st = &ReassignStats{}
+		mj.Reassign = st
+	}
+	if len(merges) == 0 {
+		return nil, nil
+	}
+	nb, err := u.Router.HeadNeighbors(ctx, merges, mergeNeighbors, 2*mergeNeighbors)
+	if err != nil {
+		return nil, fmt.Errorf("update: the lists near the ones to merge: %w", err)
+	}
+	var lengths map[uint32]int
+	if u.PostingLimit > 0 {
+		if lengths, err = u.listLengths(ctx, t); err != nil {
+			return nil, err
+		}
+	}
+	taken := map[uint32]bool{}
+	for _, l := range append(append([]uint32(nil), splits...), merges...) {
+		taken[l] = true
+	}
+	var out []spMerge
+	for i, l := range merges {
+		a := &ml[i]
+		partner := uint32(noList)
+		for _, b := range nb[i] {
+			if !taken[b] && (u.PostingLimit <= 0 || len(a.IDs)+lengths[b] < u.PostingLimit) {
+				partner = b
+				break
+			}
+		}
+		if partner == noList {
+			st.NoPartner++
+			continue
+		}
+		taken[partner] = true
+		bm, m, err := u.readList(ctx, t, partner)
+		if err != nil {
+			return nil, err
+		}
+		if m > 0 {
+			if mj.M > 0 && m != mj.M {
+				return nil, fmt.Errorf("update: list %d has %d-byte PQ codes, the others %d", partner, m, mj.M)
+			}
+			mj.M = m
+		}
+		if len(a.IDs) > len(bm.IDs) {
+			out = append(out, spMerge{gone: partner, kept: l, goneM: &bm, keptM: a})
+		} else {
+			out = append(out, spMerge{gone: l, kept: partner, goneM: a, keptM: &bm})
+		}
+	}
+	st.Merged = len(out)
+	return out, nil
+}
+
+// planMerges appends each merge's list that goes to the one kept: the postings the kept list
+// lacks (a vector in both keeps one), their PQ codes sent along where the kept list's owner is
+// another node; the list that goes is removed.
+func (u *Updater) planMerges(t *epoch.Table, mj *Major, pairs []spMerge) {
+	for _, x := range pairs {
+		g, k := x.goneM, x.keptM
+		pg := mj.part(g.p)
+		pg.Removed = append(pg.Removed, x.gone)
+		mj.Merges = append(mj.Merges, Merge{List: x.gone, Partition: g.p, Postings: len(g.IDs), Into: x.kept})
+		has := map[uint32]bool{}
+		for _, id := range k.IDs {
+			has[id] = true
+		}
+		for i, id := range g.IDs {
+			if has[id] {
+				continue
+			}
+			mj.part(k.p).add(x.kept, id, g.Locs[i], g.Holders[i])
+			if to := t.Owner(k.p); to != t.Owner(g.p) {
+				mj.sendCode(to, id, g.code(i, mj.M))
+			}
+		}
+	}
 }

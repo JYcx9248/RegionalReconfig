@@ -231,9 +231,13 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   and of the `"ReassignRange"` (64) lists
   nearest each old head are checked, each split queuing a vector once, in the first list where
   SPFresh's conditions hold (a vector in a child is checked there only, so one that keeps its
-  child does not take the other too), and a vector whose queued list left its new set joins
-  every list of the set and leaves the lists read that lack it (`STAGE_VERSIONS` drops postings;
-  the router's `ASSIGN_CODES`, `HEAD_DISTANCES`, `HEAD_NEIGHBORS`). With `"Policy": "quake"`
+  child does not take the other too); a merge follows the paper (2026-11-24): the list due to
+  merge pairs with its nearest list that keeps both under `"SplitLen"`, the shorter goes into the
+  other, and its postings farther from the kept head are queued there; a vector whose queued list
+  left its new set joins every list of the set and leaves every other list that holds it, which
+  the owners find under the lease (`LISTS_OF`), so its old copies go in the epoch
+  (`STAGE_VERSIONS` drops postings; the router's `ASSIGN_CODES`, `HEAD_DISTANCES`,
+  `HEAD_NEIGHBORS`). With `"Policy": "quake"`
   (`quake.go`, 2026-11-23) a round of Quake's maintenance runs as a major epoch, after a batch or
   alone, as Quake's code does it, on Quake's index (`fusion_build --clustering kmeans`: a flat
   k-means of round(sqrt(N)) lists whose means are the heads, every vector in its nearest head's

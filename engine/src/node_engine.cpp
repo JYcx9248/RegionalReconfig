@@ -1447,6 +1447,29 @@ class NodeEngineImpl : public NodeEngine {
     return out;
   }
 
+  std::vector<std::pair<uint32_t, uint32_t>> ListsOf(const uint32_t* parts, const uint32_t* versions, uint32_t nparts,
+                                                     const uint32_t* ids, uint32_t n) const override {
+    std::vector<std::shared_ptr<const ResidentSegment>> segs(nparts);
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      for (uint32_t i = 0; i < nparts; ++i) {
+        segs[i] = SegmentLocked(parts[i], &versions[i]);
+        if (!segs[i])
+          throw NotResidentError(StrFormat("partition %u is not resident at version %u", parts[i], versions[i]));
+      }
+    }
+    std::vector<uint32_t> want(ids, ids + n);
+    std::sort(want.begin(), want.end());
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    for (const auto& s : segs) {
+      const ListSegment& seg = s->seg;
+      for (size_t i = 0; i < seg.list_ids.size(); ++i)
+        for (uint64_t j = seg.offsets[i]; j < seg.offsets[i + 1]; ++j)
+          if (std::binary_search(want.begin(), want.end(), seg.ids[j])) out.emplace_back(seg.ids[j], seg.list_ids[i]);
+    }
+    return out;
+  }
+
   std::vector<std::pair<uint32_t, uint32_t>> ListLengths(uint32_t p, uint32_t version) const override {
     std::shared_ptr<const ResidentSegment> s;
     {

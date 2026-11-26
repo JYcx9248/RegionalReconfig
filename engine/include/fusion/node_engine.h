@@ -414,6 +414,12 @@ class NodeEngine {
   // The length of every list of partition p's resident version `version`, by list ID.
   // NotResidentError if that version is not here.
   virtual std::vector<std::pair<uint32_t, uint32_t>> ListLengths(uint32_t p, uint32_t version) const = 0;
+  // The lists that hold the vectors `ids` in the resident versions versions[i] of the partitions
+  // parts[i]: one (vector ID, list) pair per posting found, by partition, then list. A major epoch
+  // drops a reassigned vector's copies there that its new lists lack (SPFresh's reassign, U14).
+  // NotResidentError if one of those versions is not here.
+  virtual std::vector<std::pair<uint32_t, uint32_t>> ListsOf(const uint32_t* parts, const uint32_t* versions,
+                                                             uint32_t nparts, const uint32_t* ids, uint32_t n) const = 0;
   // Loads version `version` of partition p's posting lists from a segment file, replacing that
   // version if it is resident; the partition's other versions stay. Every vector they name must
   // end up with a PQ code on this node (see PQSource); the partition's postings then hold

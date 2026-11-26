@@ -80,9 +80,11 @@ type Updater struct {
 	// Policy: how a major epoch moves postings besides its splits (spfresh.go): PolicyThreshold
 	// ("" too) or PolicySPFresh. ReassignRange: under PolicySPFresh, how many lists nearest each
 	// split list's old head have their members checked (SPFresh's ReassignK; 0: only the split's
-	// own members).
+	// own members). PostingLimit: under PolicySPFresh, SPFresh's posting size limit, under which a
+	// merge keeps the two lists it joins (rtier-updater -split-len; 0: none).
 	Policy        string
 	ReassignRange int
+	PostingLimit  int
 	// Quake: the parameters of Quake's maintenance (PrepareQuake, quake.go); quakeLat, the
 	// router's scan profile, measured at the first round.
 	Quake    QuakeParams

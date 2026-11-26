@@ -182,7 +182,9 @@ queries let finish, reclaimed. Their paths are relative to the repository, as Ba
 shorter than that (at most "MajorMax" lists); "Split" and "Merge" name lists for one. "Policy":
 "spfresh" adds SPFresh's reassign to it (rtier-updater -policy: the members of the lists nearest
 each split one, "ReassignRange" of them, 64 by default, are checked and inserted again by the
-build's rule where they no longer belong); "threshold", the default, does not. "Policy": "quake"
+build's rule where they no longer belong, their other copies dropped; a merge goes into its nearest
+list that keeps both under SplitLen, as SPFresh's paper merges); "threshold", the default, does
+not. "Policy": "quake"
 runs a round of Quake's maintenance after the batch, or alone without Inserts and Deletes, on
 Quake's index (fusion_build --clustering kmeans): its cost model, on the hits of the entries' last
 client queries, decides which lists to delete and which to split, and the round deletes, splits,

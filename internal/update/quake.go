@@ -508,7 +508,7 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 	joined := map[uint32][]uint32{}
 	for _, l := range dec.deletes {
 		lm := members[l]
-		mj.Merges = append(mj.Merges, Merge{List: l, Partition: lm.p, Postings: len(lm.IDs)})
+		mj.Merges = append(mj.Merges, Merge{List: l, Partition: lm.p, Postings: len(lm.IDs), Into: noList})
 		if len(lm.IDs) == 0 {
 			continue
 		}
@@ -682,7 +682,7 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 		if lm, ok := members[l]; ok {
 			had = len(lm.IDs) // all reassigned by the refinement
 		}
-		mj.Merges = append(mj.Merges, Merge{List: l, Partition: t.PartitionOf(l, u.Manifest), Postings: had})
+		mj.Merges = append(mj.Merges, Merge{List: l, Partition: t.PartitionOf(l, u.Manifest), Postings: had, Into: noList})
 		deadAfter = append(deadAfter, l)
 	}
 	st.Emptied = len(emptied)

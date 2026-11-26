@@ -4046,6 +4046,37 @@ void TestQuakeOps() {
   CHECK(gp4.base_version == 0 && gp4.version == 1 && gp4.num_deleted == 1);
 }
 
+// LISTS_OF (U14, SPFresh's reassign): every posting of the given vectors in the given resident
+// versions, as the segments hold them; a version not here is refused.
+void TestListsOf() {
+  Fixture& f = GetFixture();
+  auto owner = OpenNode(f, {0, 1}, false);
+  std::vector<uint32_t> ids;
+  std::set<std::pair<uint32_t, uint32_t>> want;
+  std::mt19937_64 rng(11);
+  for (uint32_t part : {0u, 1u}) {
+    const ListSegment seg = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(part)));
+    for (size_t i = 0; i < seg.ids.size(); i += 1 + rng() % 97) ids.push_back(seg.ids[i]);
+  }
+  ids.push_back(static_cast<uint32_t>(f.base.size() / f.dim + 5));  // no such vector: nothing found
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  for (uint32_t part : {0u, 1u}) {
+    const ListSegment seg = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(part)));
+    for (size_t i = 0; i < seg.list_ids.size(); ++i)
+      for (uint64_t j = seg.offsets[i]; j < seg.offsets[i + 1]; ++j)
+        if (std::binary_search(ids.begin(), ids.end(), seg.ids[j])) want.insert({seg.ids[j], seg.list_ids[i]});
+  }
+  const uint32_t parts[2] = {0, 1}, versions[2] = {0, 0};
+  const auto got = owner->ListsOf(parts, versions, 2, ids.data(), static_cast<uint32_t>(ids.size()));
+  const std::set<std::pair<uint32_t, uint32_t>> gs(got.begin(), got.end());
+  CHECK(gs == want && got.size() == want.size() && !want.empty());
+  const uint32_t v1[2] = {0, 1};
+  CHECK(Throws([&] { owner->ListsOf(parts, v1, 2, ids.data(), 1); }));
+  const uint32_t other = 2;
+  CHECK(Throws([&] { owner->ListsOf(&other, versions, 1, ids.data(), 1); }));
+}
+
 // SPANN's RNG pruning of replicas (fusion_build --rng) is the build's rule too (U14), on the
 // router: ASSIGN on an RNG index's own vectors gives back what its build gave them, with fewer
 // replicas than the rule's cap, and ASSIGN_CODES (SPFresh's reassign) keeps the rule -- no list
@@ -4625,6 +4656,7 @@ int main() {
       {"graph_patches", TestGraphPatches},
       {"quake_ops", TestQuakeOps},
       {"rng_assign", TestRngAssign},
+      {"lists_of", TestListsOf},
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
       {"candidate_buffers", TestCandidateBuffers},

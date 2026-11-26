@@ -354,19 +354,25 @@ the update controller checks, for each split, the members of its children, then 
 lists whose heads are nearest the old head (`-reassign-range`, 64), nearest first. A posting is a
 candidate under SPFresh's conditions: in a child, if the old head is closer to it than the
 child's head; in a neighboring list, if a new head is closer than both the old head and that
-list's head. A split queues a vector once, in the first list where it is a candidate, and the
-vector is inserted again by the build's rule (`ASSIGN_CODES`: ASSIGN's rule on its PQ code) if
-that list is no longer among its lists. Then it joins every list of its new set and leaves every
-list it was seen in that the set lacks (`STAGE_VERSIONS` drops those postings). A vector in a
-child is checked in that child only, so a member that keeps its child does not take the other
-one too. A merged list's postings go into every list the rule gives them. The rule is the
+list's head. A split queues a vector once, in the first list where it is a candidate. A merge
+follows SPFresh's paper (§3.2): the list due to merge pairs with the nearest list that keeps both
+under the posting limit (`-split-len`; the first of its 64 nearest heads, as SPFresh's code
+chooses), the shorter of the two goes into the other, and each of its postings that is farther
+from the kept head than from its own is queued in the kept list. A queued vector is inserted again
+by the build's rule (`ASSIGN_CODES`: ASSIGN's rule on its PQ code) if a list it was queued in is no
+longer among its lists. Then it joins every list of its new set and leaves every other list that
+holds it, which the owners find under the lease (`LISTS_OF`; `STAGE_VERSIONS` drops those
+postings): its old copies go in the same epoch, where SPFresh bumps the vector's version and drops
+them when their posting is next split or merged. A vector in a child is checked in that child
+only, so a member that keeps its child does not take the other one too. The rule is the
 index's: on an index built with `--rng` (as SPFresh's evaluation builds SPANN's), SPANN's RNG
 selection, as SPFresh's `RNGSelection`; on FusionANNS's, its 8 nearest heads. Unlike SPFresh, the
 decisions use PQ codes; SPFresh's code also checks a child's member in the neighboring lists when
 the old head is no closer to it than its child's head, which by FusionANNS's rule would often put
 it in both children (the RNG rule would prune the second, so on an RNG index whether to follow the
-code there is open); copies in lists the reassign did not read stay, as SPFresh's stale copies stay
-until their posting is next split or merged; and the policy runs once per batch.
+code there is open); SPFresh's code splits by SPTAG's balanced k-means and gives every member to
+the nearer new head, ours keeps the balanced halves (both an even split, as the paper says); and
+the policy runs once per batch, a list taking part in one merge per epoch.
 
 With `-policy quake` (`"Policy": "quake"`, its parameters in `"Quake"`), the update controller
 runs a round of Quake's maintenance as one major epoch, after a batch or alone, as Quake's code
