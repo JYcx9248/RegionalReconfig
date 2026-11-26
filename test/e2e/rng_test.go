@@ -20,7 +20,8 @@ import (
 // TestRNGInsertRouting: on an index whose replicas the build pruned by SPANN's RNG rule
 // (fusion_build --rng, the index SPFresh runs on), a node routes inserts by that rule (U14): the
 // index's own vectors get back the lists and PQ codes the build gave them, fewer than the
-// replica cap.
+// replica cap. ASSIGN_CODES over every vector's code, its frames side by side, gives what one
+// frame at a time does.
 func TestRNGInsertRouting(t *testing.T) {
 	f := getRNGFixture(t)
 	meta, err := os.ReadFile(filepath.Join(f.index, "meta.txt"))
@@ -86,5 +87,31 @@ func TestRNGInsertRouting(t *testing.T) {
 	}
 	if total >= 8*k/2 {
 		t.Fatalf("%d lists for %d vectors: the RNG rule pruned nothing", total, k)
+	}
+
+	// ASSIGN_CODES (SPFresh's reassign) side by side: every vector's PQ code, in several frames at
+	// once, gives what one frame at a time gives, in order.
+	all := builtCodes(t, filepath.Join(f.index, "pq_codes.bin"), numVectors)
+	var every []byte
+	for _, c := range all {
+		every = append(every, c...)
+	}
+	cm := len(all[0])
+	wide := nodeclient.New(addr, 4)
+	defer wide.Close()
+	got, err := update.AssignCodes(ctx, wide, every, cm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want [][]uint32
+	for i := 0; i < len(every); i += 4096 * cm {
+		sets, err := nc.AssignCodes(ctx, every[i:min(len(every), i+4096*cm)], cm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, sets...)
+	}
+	if len(got) != numVectors || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ASSIGN_CODES side by side: %d sets, not those of one frame at a time", len(got))
 	}
 }

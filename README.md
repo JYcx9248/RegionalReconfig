@@ -359,8 +359,8 @@ follows SPFresh's paper (§3.2): the list due to merge pairs with the nearest li
 under the posting limit (`-split-len`; the first of its 64 nearest heads, as SPFresh's code
 chooses), the shorter of the two goes into the other, and each of its postings that is farther
 from the kept head than from its own is queued in the kept list. A queued vector is inserted again
-by the build's rule (`ASSIGN_CODES`: ASSIGN's rule on its PQ code) if a list it was queued in is no
-longer among its lists. Then it joins every list of its new set and leaves every other list that
+by the build's rule (`ASSIGN_CODES`: ASSIGN's rule on its PQ code, several calls in flight as in
+the routing) if a list it was queued in is no longer among its lists. Then it joins every list of its new set and leaves every other list that
 holds it, which the owners find under the lease (`LISTS_OF`; `STAGE_VERSIONS` drops those
 postings): its old copies go in the same epoch, where SPFresh bumps the vector's version and drops
 them when their posting is next split or merged. A vector in a child is checked in that child

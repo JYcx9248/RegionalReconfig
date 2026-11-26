@@ -88,16 +88,38 @@ func neighborCandidate(dOld, dNew0, dNew1, dOwn float32) bool {
 // codesBatch bounds one ASSIGN_CODES or HEAD_DISTANCES call (its frame).
 const codesBatch = 4096
 
-// assignCodes is ASSIGN_CODES over codes (m bytes each), in frames of codesBatch codes.
+// assignCodes is AssignCodes on the updater's router.
 func (u *Updater) assignCodes(ctx context.Context, codes []byte, m int) ([][]uint32, error) {
-	var out [][]uint32
-	for i := 0; i < len(codes); i += codesBatch * m {
-		j := min(len(codes), i+codesBatch*m)
-		sets, err := u.Router.AssignCodes(ctx, codes[i:j], m)
+	return AssignCodes(ctx, u.Router, codes, m)
+}
+
+// AssignCodes is the router's ASSIGN_CODES over codes (m bytes each): the lists the index's rule
+// gives each decoded code, in the codes' order. It sends frames of codesBatch codes, RouteStreams
+// of them at a time, as Route does ASSIGN: each code is the rule's search on the graph (with RNG
+// pruning, the heads' vectors too), several milliseconds of a core at Wikipedia's scale, and the
+// router runs each call on a connection thread of its own. The codes are independent, so the
+// result is the same as one frame at a time.
+func AssignCodes(ctx context.Context, router *nodeclient.Client, codes []byte, m int) ([][]uint32, error) {
+	if m <= 0 || len(codes)%m != 0 {
+		return nil, fmt.Errorf("update: %d bytes of %d-byte codes", len(codes), m)
+	}
+	n := len(codes) / m
+	out := make([][]uint32, n)
+	frames := (n + codesBatch - 1) / codesBatch
+	err := parallelN(ctx, frames, RouteStreams(), func(ctx context.Context, f int) error {
+		i, j := f*codesBatch, min(n, (f+1)*codesBatch)
+		sets, err := router.AssignCodes(ctx, codes[i*m:j*m], m)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, sets...)
+		if len(sets) != j-i {
+			return fmt.Errorf("update: ASSIGN_CODES gave %d sets for %d codes", len(sets), j-i)
+		}
+		copy(out[i:j], sets)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
