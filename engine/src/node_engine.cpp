@@ -17,6 +17,8 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
+#include <random>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -30,6 +32,7 @@
 #include "fusion/graph_patch.h"
 #include "fusion/hnsw_space.h"
 #include "fusion/index_meta.h"
+#include "fusion/kmeans.h"
 #include "fusion/layout.h"
 #include "fusion/partition.h"
 #include "fusion/pq.h"
@@ -594,36 +597,43 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   std::vector<uint8_t> EditGraph(uint32_t version, const uint32_t* labels, const void* vecs, uint32_t nnew,
-                                 const uint32_t* deleted, uint32_t ndeleted) override {
+                                 const uint32_t* deleted, uint32_t ndeleted, const uint32_t* moved,
+                                 const void* moved_vecs, uint32_t nmoved) override {
     std::shared_ptr<HnswIndex> g;
     uint32_t base = 0;
+    std::vector<uint32_t> changed;
     {
       std::lock_guard<std::mutex> l(graph_mu_);
       if (!graph_) throw NoGraphError("navigation graph is not loaded on this node");
       FUSION_CHECK(!patch_ && !graph_busy_, "the graph has a staged patch or is being changed");
-      FUSION_CHECK(version == graph_version_ + 1, "an edit to version %u of a graph at version %u", version,
+      const bool amend = edit_.version != 0 && version == edit_.version && version == graph_version_ &&
+                         edit_.stamp == graph_stamp_;
+      FUSION_CHECK(amend || version == graph_version_ + 1, "an edit to version %u of a graph at version %u", version,
                    graph_version_);
       g = graph_;
-      base = graph_version_;
+      base = amend ? edit_.base : graph_version_;
+      if (amend) changed = edit_.changed;
     }
     // Refused before anything changes.
     FUSION_CHECK(g->cur_element_count + nnew <= g->max_elements_,
                  "the graph has room for %zu heads, it holds %zu and the edit adds %u (rtier_node --graph-headroom)",
                  g->max_elements_, static_cast<size_t>(g->cur_element_count), nnew);
-    std::vector<hnswlib::tableint> dead(ndeleted);
+    std::vector<hnswlib::tableint> dead(ndeleted), move(nmoved);
     {
       std::lock_guard<std::mutex> l(g->label_lookup_lock);
       std::unordered_set<uint32_t> seen;
       for (uint32_t i = 0; i < nnew; ++i)
         FUSION_CHECK(g->label_lookup_.count(labels[i]) == 0 && seen.insert(labels[i]).second,
                      "head %u exists already", labels[i]);
-      for (uint32_t i = 0; i < ndeleted; ++i) {
-        const auto it = g->label_lookup_.find(deleted[i]);
-        FUSION_CHECK(it != g->label_lookup_.end(), "head %u is not in the graph", deleted[i]);
-        FUSION_CHECK(!g->isMarkedDeleted(it->second) && seen.insert(deleted[i]).second,
-                     "head %u is deleted already", deleted[i]);
-        dead[i] = it->second;
-      }
+      auto live = [&](uint32_t label, const char* what) {
+        const auto it = g->label_lookup_.find(label);
+        FUSION_CHECK(it != g->label_lookup_.end(), "head %u is not in the graph", label);
+        FUSION_CHECK(!g->isMarkedDeleted(it->second) && seen.insert(label).second,
+                     "head %u to be %s is deleted already or named twice", label, what);
+        return it->second;
+      };
+      for (uint32_t i = 0; i < nmoved; ++i) move[i] = live(moved[i], "moved");
+      for (uint32_t i = 0; i < ndeleted; ++i) dead[i] = live(deleted[i], "deleted");
     }
     {
       std::lock_guard<std::mutex> l(graph_mu_);
@@ -634,7 +644,6 @@ class NodeEngineImpl : public NodeEngine {
     // The elements an insert changes: the new one, and the neighbors it links to at every level
     // (hnswlib rewrites exactly those lists, in mutuallyConnectNewElement). If an insert fails
     // half way the graph stays busy (no search) until a LoadGraph.
-    std::vector<uint32_t> changed;
     const T* x = static_cast<const T*>(vecs);
     for (uint32_t i = 0; i < nnew; ++i) {
       g->addPoint(x + static_cast<size_t>(i) * dim_, labels[i]);
@@ -650,16 +659,34 @@ class NodeEngineImpl : public NodeEngine {
         for (unsigned short j = 0; j < k; ++j) changed.push_back(ll[1 + j]);
       }
     }
+    // The elements a move changes: the head (its vector and links), the neighbors it had at every
+    // level (updatePoint reselects their lists) and the ones it has after (its repair links them
+    // to it, as an insert does).
+    auto neighbors = [&](hnswlib::tableint id) {
+      for (int level = 0; level <= g->element_levels_[id]; ++level) {
+        hnswlib::linklistsizeint* ll = level == 0 ? g->get_linklist0(id) : g->get_linklist(id, level);
+        const unsigned short k = g->getListCount(ll);
+        for (unsigned short j = 0; j < k; ++j) changed.push_back(ll[1 + j]);
+      }
+    };
+    const T* mv = static_cast<const T*>(moved_vecs);
+    for (uint32_t i = 0; i < nmoved; ++i) {
+      neighbors(move[i]);
+      g->updatePoint(mv + static_cast<size_t>(i) * dim_, move[i], 1.0f);
+      neighbors(move[i]);
+      changed.push_back(move[i]);
+    }
     for (hnswlib::tableint id : dead) {
       g->markDeletedInternal(id);
       changed.push_back(id);
     }
-    GraphPatch p = CapturePatch(*g, std::move(changed), base, version);
+    GraphPatch p = CapturePatch(*g, changed, base, version);
     {
       std::lock_guard<std::mutex> l(graph_mu_);
       graph_version_ = version;
       graph_busy_ = false;
       ++graph_stamp_;
+      edit_ = LastEdit{base, version, graph_stamp_, std::move(changed)};
     }
     return p.Serialize();
   }
@@ -796,6 +823,168 @@ class NodeEngineImpl : public NodeEngine {
       id = it->second;
     }
     return reinterpret_cast<const T*>(g.getDataByInternalId(id));
+  }
+
+  // The k nearest live heads of v by a scan of every head of g (ascending distance, then label),
+  // the labels in skip left out: Quake's searches of its parent level, which scan every centroid.
+  void ScanHeads(const HnswIndex& g, const T* v, size_t k, const std::unordered_set<uint32_t>* skip,
+                 std::vector<std::pair<float, uint32_t>>* out) const {
+    out->clear();
+    const size_t count = g.cur_element_count;
+    for (size_t e = 0; e < count; ++e) {
+      const auto id = static_cast<hnswlib::tableint>(e);
+      if (g.isMarkedDeleted(id)) continue;
+      const auto label = static_cast<uint32_t>(g.getExternalLabel(id));
+      if (skip && skip->count(label)) continue;
+      out->emplace_back(L2Sqr(v, reinterpret_cast<const T*>(g.getDataByInternalId(id)), dim_), label);
+    }
+    const size_t keep = std::min(k, out->size());
+    std::partial_sort(out->begin(), out->begin() + static_cast<std::ptrdiff_t>(keep), out->end());
+    out->resize(keep);
+  }
+
+  void NearestLive(const uint8_t* codes, const uint32_t* heads, uint32_t n, uint32_t k, const uint32_t* excluded,
+                   uint32_t nexcluded, uint32_t* out) const override {
+    const GraphRef r = Graph(kNewestGraph);
+    FUSION_CHECK(!r.patch, "the graph has a staged patch: the nearest live heads are the router's");
+    FUSION_CHECK(k >= 1 && (codes != nullptr) != (heads != nullptr), "NearestLive: k >= 1 of codes or of heads");
+    const std::unordered_set<uint32_t> skip(excluded, excluded + nexcluded);
+    const uint32_t m = codebook_->m();
+#pragma omp parallel
+    {
+      std::vector<float> xf(dim_);
+      std::vector<T> q(dim_);
+      std::vector<std::pair<float, uint32_t>> found;
+#pragma omp for schedule(dynamic, 16)
+      for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
+        const T* v;
+        if (codes) {
+          codebook_->Decode(codes + static_cast<size_t>(i) * m, xf.data());
+          for (uint32_t d = 0; d < dim_; ++d) q[d] = FromFloat(xf[d]);
+          v = q.data();
+        } else {
+          v = HeadVector(*r.g, heads[i]);
+        }
+        ScanHeads(*r.g, v, k, &skip, &found);
+        uint32_t* o = out + static_cast<size_t>(i) * k;
+        std::fill(o, o + k, kInvalidId);
+        for (size_t j = 0; j < found.size(); ++j) o[j] = found[j].second;
+      }
+    }
+  }
+
+  void SplitMeans(const uint8_t* codes, uint32_t n, uint32_t iters, uint64_t seed, uint8_t* side,
+                  void* centroids) const override {
+    FUSION_CHECK(n >= 2, "a list of %u postings cannot split", n);
+    const uint32_t m = codebook_->m();
+    std::vector<float> x(static_cast<size_t>(n) * dim_);
+    for (uint32_t i = 0; i < n; ++i)
+      codebook_->Decode(codes + static_cast<size_t>(i) * m, x.data() + static_cast<size_t>(i) * dim_);
+    // Faiss trains on max_points_per_centroid = 256 points per centroid at most: 512 of the
+    // members, drawn without replacement.
+    const uint32_t s = std::min<uint32_t>(n, 512);
+    std::vector<float> sample;
+    const float* train = x.data();
+    if (s < n) {
+      std::vector<uint32_t> perm(n);
+      std::iota(perm.begin(), perm.end(), 0u);
+      std::mt19937_64 rng(seed);
+      sample.resize(static_cast<size_t>(s) * dim_);
+      for (uint32_t i = 0; i < s; ++i) {
+        std::uniform_int_distribution<uint32_t> pick(i, n - 1);
+        std::swap(perm[i], perm[pick(rng)]);
+        std::memcpy(&sample[static_cast<size_t>(i) * dim_], &x[static_cast<size_t>(perm[i]) * dim_],
+                    dim_ * sizeof(float));
+      }
+      train = sample.data();
+    }
+    KMeansParams kp;
+    kp.k = 2;
+    kp.iters = iters;
+    kp.seed = seed + 1;
+    kp.balance = 0.f;
+    kp.random_init = true;
+    const std::vector<float> c = KMeansTrain(train, s, dim_, kp);
+    for (uint32_t i = 0; i < n; ++i) {
+      const float* xi = x.data() + static_cast<size_t>(i) * dim_;
+      side[i] = L2Sqr(xi, c.data() + dim_, dim_) < L2Sqr(xi, c.data(), dim_) ? 1 : 0;
+    }
+    T* out = static_cast<T*>(centroids);
+    for (size_t j = 0; j < c.size(); ++j) out[j] = FromFloat(c[j]);
+  }
+
+  void RefineAssign(const uint8_t* codes, uint32_t n, const uint32_t* heads, const float* centroids, uint32_t c,
+                    uint32_t* nearest, float* sums, uint32_t* counts) const override {
+    FUSION_CHECK(c >= 1 && (heads != nullptr) != (centroids != nullptr), "RefineAssign: centroids or heads, one at least");
+    std::vector<float> cent(static_cast<size_t>(c) * dim_);
+    if (heads) {
+      const GraphRef r = Graph(kNewestGraph);
+      FUSION_CHECK(!r.patch, "the graph has a staged patch: refinement reads the router's heads");
+      for (uint32_t j = 0; j < c; ++j) ToFloat(HeadVector(*r.g, heads[j]), &cent[static_cast<size_t>(j) * dim_], dim_);
+    } else {
+      std::copy(centroids, centroids + cent.size(), cent.begin());
+    }
+    const uint32_t m = codebook_->m();
+    std::vector<float> x(static_cast<size_t>(n) * dim_);
+#pragma omp parallel for schedule(dynamic, 64)
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
+      float* xi = x.data() + static_cast<size_t>(i) * dim_;
+      codebook_->Decode(codes + static_cast<size_t>(i) * m, xi);
+      uint32_t best = 0;
+      float bd = L2Sqr(xi, cent.data(), dim_);
+      for (uint32_t j = 1; j < c; ++j) {
+        const float dd = L2Sqr(xi, cent.data() + static_cast<size_t>(j) * dim_, dim_);
+        if (dd < bd) {
+          bd = dd;
+          best = j;
+        }
+      }
+      nearest[i] = best;
+    }
+    std::fill(sums, sums + cent.size(), 0.f);
+    std::fill(counts, counts + c, 0u);
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t j = nearest[i];
+      ++counts[j];
+      float* sj = sums + static_cast<size_t>(j) * dim_;
+      const float* xi = x.data() + static_cast<size_t>(i) * dim_;
+      for (uint32_t d = 0; d < dim_; ++d) sj[d] += xi[d];
+    }
+  }
+
+  void ScanProfile(const uint32_t* ns, uint32_t nn, const uint32_t* ks, uint32_t nk, uint32_t trials,
+                   float* out) const override {
+    FUSION_CHECK(nn >= 1 && nk >= 1 && trials >= 1, "ScanProfile: no n, k or trial");
+    const uint32_t m = codebook_->m();
+    const uint32_t max_n = std::max<uint32_t>(*std::max_element(ns, ns + nn), 1);
+    const uint32_t max_k = std::max<uint32_t>(*std::max_element(ks, ks + nk), 1);
+    // Random codes and query, as Quake's profile scans random vectors.
+    std::mt19937_64 rng(2025);
+    std::vector<uint8_t> codes(static_cast<size_t>(max_n) * m);
+    for (uint8_t& b : codes) b = static_cast<uint8_t>(rng());
+    std::uniform_real_distribution<float> u(0.f, 1.f);
+    std::vector<float> q(dim_);
+    for (float& v : q) v = u(rng);
+    FilterConfig cfg;
+    cfg.max_candidates = max_n;
+    cfg.max_topn = max_k;
+    auto f = CreateCpuFilter(*codebook_, codes.data(), max_n, cfg);
+    FilterWorker* w = f->worker(0);
+    uint32_t* cand = w->candidate_buffer();
+    std::iota(cand, cand + max_n, 0u);
+    w->BeginQuery(q.data());
+    for (uint32_t i = 0; i < nn; ++i) {
+      for (uint32_t j = 0; j < nk; ++j) {
+        uint32_t unique = 0;
+        std::chrono::nanoseconds total{0};
+        for (uint32_t t = 0; t < trials; ++t) {
+          const auto t0 = std::chrono::steady_clock::now();
+          w->Filter(ns[i], ks[j], &unique);
+          total += std::chrono::steady_clock::now() - t0;
+        }
+        out[static_cast<size_t>(i) * nk + j] = static_cast<float>(static_cast<double>(total.count()) / trials);
+      }
+    }
   }
 
   void LoadPartition(uint32_t p, const std::string& seg_path, PQSource pq, uint32_t version,
@@ -1258,6 +1447,19 @@ class NodeEngineImpl : public NodeEngine {
     return out;
   }
 
+  std::vector<std::pair<uint32_t, uint32_t>> ListLengths(uint32_t p, uint32_t version) const override {
+    std::shared_ptr<const ResidentSegment> s;
+    {
+      std::lock_guard<std::mutex> l(seg_mu_);
+      s = SegmentLocked(p, &version);
+    }
+    if (!s) throw NotResidentError(StrFormat("partition %u is not resident at version %u", p, version));
+    std::vector<std::pair<uint32_t, uint32_t>> out(s->seg.list_ids.size());
+    for (size_t i = 0; i < out.size(); ++i)
+      out[i] = {s->seg.list_ids[i], static_cast<uint32_t>(s->seg.offsets[i + 1] - s->seg.offsets[i])};
+    return out;
+  }
+
   bool DropVersion(uint32_t p, uint32_t version) override {
     std::shared_ptr<const ResidentSegment> old;
     {
@@ -1634,14 +1836,19 @@ class NodeEngineImpl : public NodeEngine {
                  std::vector<std::pair<float, uint32_t>>* cand) const {
     const uint32_t r = ap.replicas;
     const float closure = (1.f + ap.closure_eps) * (1.f + ap.closure_eps);
-    auto res = g.Search(v, std::max(ap.ef, ap.candidates));
-    while (res.size() > ap.candidates) res.pop();
-    cand->clear();
-    while (!res.empty()) {
-      cand->emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
-      res.pop();
+    if (ap.exact) {  // every live head scanned, as the build did (Quake's index)
+      FUSION_CHECK(!g.patch, "the graph has a staged patch: an exact assignment scans the router's heads");
+      ScanHeads(*g.g, v, ap.candidates, nullptr, cand);
+    } else {
+      auto res = g.Search(v, std::max(ap.ef, ap.candidates));
+      while (res.size() > ap.candidates) res.pop();
+      cand->clear();
+      while (!res.empty()) {
+        cand->emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
+        res.pop();
+      }
+      std::reverse(cand->begin(), cand->end());  // ascending distance
     }
-    std::reverse(cand->begin(), cand->end());  // ascending distance
     std::fill(out, out + r, kInvalidId);
     if (cand->empty()) return;
     uint32_t cnt = 0;
@@ -2360,6 +2567,7 @@ class NodeEngineImpl : public NodeEngine {
     a.rng = meta.GetOr("rng", "0") != "0";
     a.candidates = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_candidates", "64")));
     a.ef = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_ef", "128")));
+    a.exact = meta.GetOr("assign_exact", "0") != "0";
     return a;
   }
   // The index's pq_codes.bin (a generation's, after a full rebuild), opened at the first read
@@ -3176,6 +3384,14 @@ class NodeEngineImpl : public NodeEngine {
   // Changes with every graph that replaces graph_ and every change of it in place: a transfer in
   // chunks (ReadGraph) checks that its bytes come from one graph, and image_ is made again.
   uint64_t graph_stamp_ = 0;
+  // The router's last edit (EditGraph), which the next may amend while graph_stamp_ is the one it
+  // left: the version it made from base, and every element it changed.
+  struct LastEdit {
+    uint32_t base = 0, version = 0;
+    uint64_t stamp = 0;
+    std::vector<uint32_t> changed;
+  };
+  LastEdit edit_;  // under graph_mu_
   mutable std::mutex image_mu_;
   mutable std::shared_ptr<const GraphImage> image_;  // the layout of graph_ for transfers
   mutable uint64_t image_stamp_ = 0;

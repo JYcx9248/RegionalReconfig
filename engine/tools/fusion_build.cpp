@@ -23,9 +23,15 @@ input
   --max-n N               use only the first N vectors
 
 clustering (posting lists)
+  --clustering C          balanced | kmeans                   (default balanced, the paper's)
   --centroid-ratio R      posting lists ~= R * N              (default 0.1, as in the paper)
   --branch B              max children per k-means split      (default 32)
   --balance F             k-means size-balance penalty        (default 0.5)
+  kmeans is Quake's index (OSDI '25; U14, internal/update/quake.go): a flat k-means whose means
+  are the heads, and every vector in one list, its nearest head's (every head scanned, in the
+  build and for inserts): one replica, no RNG pruning
+  --nlist N               lists                               (default round(sqrt(N)), Quake's)
+  --kmeans-iters I        Lloyd iterations                    (default 5, Quake's niter)
 
 navigation graph (HNSW over the heads)
   --hnsw-m M              graph degree parameter              (default 32 -> 64 on level 0)
@@ -191,6 +197,12 @@ void PrepareVersion(const Args& a, const std::string& from, const std::string& r
     return a.Has(flag) ? a.F64(flag, def) : fm.Has(key) ? std::stod(fm.Get(key)) : def;
   };
   p->clustering.centroid_ratio = num("centroid-ratio", "centroid_ratio", 0.1);
+  p->clustering.method = a.Has("clustering") ? a.Str("clustering") : fm.GetOr("clustering", "balanced");
+  if (p->clustering.method == "kmeans") {
+    // The version's own list count unless given: Quake sizes an index by its initial data.
+    p->clustering.nlist = static_cast<uint32_t>(a.U64("nlist", 0));
+    p->clustering.flat_iters = static_cast<uint32_t>(num("kmeans-iters", "kmeans_iters", 5));
+  }
   p->assign.replicas = static_cast<uint32_t>(num("replicas", "replicas", 8));
   p->assign.closure_eps = static_cast<float>(num("closure-eps", "closure_eps", 10.0));
   p->assign.rng_factor = static_cast<float>(num("rng-factor", "rng_factor", 1.0));
@@ -199,6 +211,10 @@ void PrepareVersion(const Args& a, const std::string& from, const std::string& r
   if (fm.Has("assign_ef")) p->assign.ef = static_cast<uint32_t>(std::stoul(fm.Get("assign_ef")));
   p->graph.m = static_cast<uint32_t>(num("hnsw-m", "hnsw_m", 32));
   p->graph.ef_construction = static_cast<uint32_t>(num("hnsw-efc", "hnsw_ef_construction", 200));
+  if (p->clustering.method == "kmeans" && !a.Has("replicas") && !a.Flag("rng")) {
+    p->assign.replicas = 1;  // from_index's, a FusionANNS one, would replicate
+    p->assign.rng = false;
+  }
 }
 
 std::string RowsExt(DType dt) {
@@ -241,6 +257,11 @@ int main(int argc, char** argv) {
     p.assign.rng = a.Flag("rng");
     p.assign.candidates = static_cast<uint32_t>(a.U64("assign-candidates", 64));
 
+    p.clustering.method = a.Str("clustering", "balanced");
+    p.clustering.nlist = static_cast<uint32_t>(a.U64("nlist", 0));
+    p.clustering.flat_iters = static_cast<uint32_t>(a.U64("kmeans-iters", 5));
+    if (p.clustering.method == "kmeans" && !a.Has("replicas")) p.assign.replicas = 1;
+
     p.pq_m = static_cast<uint32_t>(a.U64("pq-m", 0));
     p.pq_train_n = static_cast<uint32_t>(a.U64("pq-train", 100000));
     p.layout = a.Str("layout", "bucket");
@@ -257,6 +278,14 @@ int main(int argc, char** argv) {
       PrepareVersion(a, a.Required("from-index"), rows, &p);
       p.dtype.reset();  // the rows file's extension says it
       p.max_n = 0;
+    }
+    FUSION_CHECK(p.clustering.method == "balanced" || p.clustering.method == "kmeans",
+                 "--clustering %s: balanced or kmeans", p.clustering.method.c_str());
+    if (p.clustering.method == "kmeans") {
+      // Quake's assignment: one list per vector, its nearest head's.
+      FUSION_CHECK(p.assign.replicas == 1 && !p.assign.rng,
+                   "--clustering kmeans assigns every vector to one list: no --replicas but 1, no --rng");
+      p.assign.exact = true;
     }
     a.WarnUnused(flags);
 

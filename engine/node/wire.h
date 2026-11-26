@@ -203,9 +203,34 @@
 //   HEAD_NEIGHBORS  u32 n, u32 k, u32 ef, u32 heads[n]        -> u32 lists[n * k]
 //                   (the router: each head's k nearest live heads, itself left out, padded with
 //                   0xFFFFFFFF)
-//   EDIT_GRAPH      u32 version, u32 nnew, u32 labels[nnew],  -> patch (version - 1 -> version)
-//                   vectors[nnew], u32 ndel, u32 deleted[ndel]
-//                   (the router: heads inserted and marked deleted in its own graph)
+//   EDIT_GRAPH      u32 version, u32 nnew, u32 labels[nnew],  -> patch (to version)
+//                   vectors[nnew], u32 ndel, u32 deleted[ndel],
+//                   [u32 nmove, u32 moved[nmove], vectors[nmove]]
+//                   (the router: heads inserted, moved in place and marked deleted in its own
+//                   graph; the patch is from the version before, or, amending the router's last
+//                   edit to this version, from that edit's base)
+//   NEAREST_LIVE    u32 n, u32 k, u32 nex, u32 m,             -> u32 lists[n * k]
+//                   u32 excluded[nex], u8 codes[n * m]
+//                   (or with m = 0, u32 heads[n])
+//                   (the router: the k nearest live heads of each decoded code, or of each
+//                   head's vector, by a scan of every head; padded with 0xFFFFFFFF)
+//   SPLIT_MEANS     u32 n, u32 m, u32 iters, u32 seed,        -> vectors[2], u8 side[n]
+//                   u8 codes[n * m]
+//                   (the router: Quake's split, a k-means of 2 on the decoded codes, 512 at
+//                   most to train, every code to the nearer centroid; the centroids in the
+//                   element type)
+//   REFINE_ASSIGN   u32 n, u32 m, u32 c, u32 form,            -> u32 nearest[n], u32 counts[c],
+//                   (form 0: u32 heads[c]; 1: f32 cent[c*d]),    f32 sums[c * dim]
+//                   u8 codes[n * m]
+//                   (the router: one pass of Quake's refinement, each decoded code to its nearest
+//                   centroid)
+//   SCAN_PROFILE    u32 nn, u32 ns[nn], u32 nk, u32 ks[nk],   -> f32 nanoseconds[nn * nk]
+//                   u32 trials
+//                   (the router: the CPU filter's top-k of n random codes, mean time; Quake's
+//                   list-scan latency profile)
+//   LIST_LENGTHS    u32 nparts, (u32 partition,               -> u32 n, (u32 list, u32 postings)[n]
+//                   u32 version)[nparts]
+//                   (every list of those resident versions)
 //   DROP_VERSION    u32 partition, u32 version                -> u8 was_resident
 //   FORGET          u32 flags, u32 n, u32 ids[n]              -> u64 freed (PQ codes no version
 //                                                                names; flags bit 0: the vectors
@@ -262,6 +287,11 @@ enum Op : uint8_t {
   kAssignCodes = 0x28,
   kHeadDistances = 0x29,
   kHeadNeighbors = 0x2A,
+  kNearestLive = 0x2B,
+  kSplitMeans = 0x2C,
+  kRefineAssign = 0x2D,
+  kScanProfile = 0x2E,
+  kListLengths = 0x2F,
   kStageVersions = 0x30,
   kDropVersion = 0x31,
   kForget = 0x32,

@@ -578,6 +578,68 @@ void TestStreamedBuild() {
   }
 }
 
+// Quake's index (--clustering kmeans): the heads are k-means means, which no data vector is, and
+// every vector is in one list, its nearest head's by a scan of every head.
+void TestFlatKMeansBuild() {
+  const uint64_t n = 12000;
+  const uint32_t d = 16, nlist = 40;
+  std::vector<float> base, centers;
+  MakeMixture(n, d, 30, 77, &base, &centers);
+  std::string dir = TempDir();
+  SaveBin(dir + "/base.fbin", DType::kFloat, n, d, base.data());
+  BuildParams bp;
+  bp.base_path = dir + "/base.fbin";
+  bp.out_dir = dir + "/kmeans";
+  bp.pq_m = 8;
+  bp.pq_train_n = 4000;
+  bp.clustering.method = "kmeans";
+  bp.clustering.nlist = nlist;
+  bp.assign.replicas = 1;
+  bp.assign.exact = true;
+  BuildIndex(bp);
+  const std::vector<uint32_t> heads = LoadU32Array(JoinPath(bp.out_dir, files::kHeads));
+  CHECK(heads.size() == nlist);
+  for (uint32_t h : heads) CHECK(h == kNoHeadVector);
+  const VectorSet cent = LoadVectors(JoinPath(bp.out_dir, files::kCentroids), DType::kFloat);
+  CHECK(cent.n == nlist);
+  const PostingLists lists = PostingLists::Load(JoinPath(bp.out_dir, files::kPostings));
+  CHECK(lists.ids.size() == n && lists.offsets.size() == nlist + 1);
+  std::vector<uint32_t> list_of(n, kInvalidId);
+  for (uint32_t l = 0; l < nlist; ++l)
+    for (uint64_t j = lists.offsets[l]; j < lists.offsets[l + 1]; ++j) {
+      CHECK(list_of[lists.ids[j]] == kInvalidId);
+      list_of[lists.ids[j]] = l;
+    }
+  const float* c = reinterpret_cast<const float*>(cent.data.data());
+  uint64_t wrong = 0;
+  for (uint64_t i = 0; i < n; ++i) {
+    const uint32_t best = NearestCentroid(&base[i * d], c, nlist, d);
+    if (list_of[i] != best && L2Sqr(&base[i * d], c + static_cast<size_t>(list_of[i]) * d, d) >
+                                  L2Sqr(&base[i * d], c + static_cast<size_t>(best) * d, d))
+      ++wrong;
+  }
+  CHECK(wrong == 0);
+  const IndexMeta meta = IndexMeta::Load(JoinPath(bp.out_dir, files::kMeta));
+  CHECK(meta.Get("clustering") == "kmeans" && meta.Get("assign_exact") == "1" && meta.Get("replicas") == "1" &&
+        meta.GetU64("nlist") == nlist && meta.GetU64("num_heads") == nlist);
+  // The heads are near the means of their lists (trained on a sample, so not exactly them).
+  for (uint32_t l = 0; l < nlist; ++l) {
+    const uint64_t cnt = lists.offsets[l + 1] - lists.offsets[l];
+    CHECK(cnt > 0);
+    std::vector<double> mean(d, 0.0);
+    for (uint64_t j = lists.offsets[l]; j < lists.offsets[l + 1]; ++j)
+      for (uint32_t k = 0; k < d; ++k) mean[k] += base[static_cast<uint64_t>(lists.ids[j]) * d + k] / cnt;
+    double off = 0, spread = 0;
+    for (uint32_t k = 0; k < d; ++k) off += (mean[k] - c[l * d + k]) * (mean[k] - c[l * d + k]);
+    for (uint64_t j = lists.offsets[l]; j < lists.offsets[l + 1]; ++j)
+      for (uint32_t k = 0; k < d; ++k) {
+        const double t = base[static_cast<uint64_t>(lists.ids[j]) * d + k] - mean[k];
+        spread += t * t / cnt;
+      }
+    CHECK(off < 0.25 * spread);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -587,6 +649,7 @@ int main() {
       {"cpu_filter", TestCpuFilter}, {"rerank", TestRerank},    {"end_to_end", TestEndToEnd},
       {"vector_file", TestVectorFile}, {"streamed_clustering", TestStreamedClustering},
       {"page_file_windows", TestPageFileWindows}, {"streamed_build", TestStreamedBuild},
+      {"flat_kmeans_build", TestFlatKMeansBuild},
   };
   int failed = 0;
   for (const auto& t : tests) {

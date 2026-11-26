@@ -110,9 +110,9 @@ func partitionIDs(postings string, assign []uint32, parts int) ([][]uint32, erro
 }
 
 var (
-	fixOnce sync.Once
-	fix     *fixture
-	fixErr  error
+	fixOnce, quakeOnce sync.Once
+	fix, quakeFix      *fixture
+	fixErr, quakeErr   error
 )
 
 func getFixture(t *testing.T) *fixture {
@@ -128,6 +128,21 @@ func getFixture(t *testing.T) *fixture {
 	return fix
 }
 
+// getQuakeFixture is the fixture's data as Quake's index (U14, internal/update/quake.go): a flat
+// k-means of 80 lists whose means are the heads, every vector in one list.
+func getQuakeFixture(t *testing.T) *fixture {
+	t.Helper()
+	bin := os.Getenv("RTIER_ENGINE_BIN")
+	if bin == "" {
+		t.Skip("RTIER_ENGINE_BIN not set (run `make test`)")
+	}
+	quakeOnce.Do(func() { quakeFix, quakeErr = buildFixture(bin, "--clustering", "kmeans", "--nlist", "80") })
+	if quakeErr != nil {
+		t.Fatal(quakeErr)
+	}
+	return quakeFix
+}
+
 func mixture(rng *rand.Rand, centers [][]float32, n int) [][]float32 {
 	out := make([][]float32, n)
 	for i := range out {
@@ -141,7 +156,8 @@ func mixture(rng *rand.Rand, centers [][]float32, n int) [][]float32 {
 	return out
 }
 
-func buildFixture(bin string) (*fixture, error) {
+// buildFixture builds the fixture's index with fusion_build's defaults and the build arguments.
+func buildFixture(bin string, build ...string) (*fixture, error) {
 	dir, err := os.MkdirTemp("", "rtier-e2e-")
 	if err != nil {
 		return nil, err
@@ -160,8 +176,9 @@ func buildFixture(bin string) (*fixture, error) {
 	if err := vecio.WriteBin(filepath.Join(dir, "base.fbin"), base); err != nil {
 		return nil, err
 	}
-	if out, err := exec.Command(filepath.Join(bin, "fusion_build"), "--base", filepath.Join(dir, "base.fbin"),
-		"--out", f.index, "--pq-m", "8", "--pq-train", "4000", "--threads", "2").CombinedOutput(); err != nil {
+	args := append([]string{"--base", filepath.Join(dir, "base.fbin"), "--out", f.index, "--pq-m", "8",
+		"--pq-train", "4000", "--threads", "2"}, build...)
+	if out, err := exec.Command(filepath.Join(bin, "fusion_build"), args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("fusion_build: %v\n%s", err, out)
 	}
 	// Test-only list -> partition assignment (contiguous ranges); the real one is U2.

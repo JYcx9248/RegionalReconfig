@@ -48,6 +48,11 @@ const (
 	opAssignCodes    uint8 = 0x28
 	opHeadDistances  uint8 = 0x29
 	opHeadNeighbors  uint8 = 0x2A
+	opNearestLive    uint8 = 0x2B
+	opSplitMeans     uint8 = 0x2C
+	opRefineAssign   uint8 = 0x2D
+	opScanProfile    uint8 = 0x2E
+	opListLengths    uint8 = 0x2F
 	opStageVersions  uint8 = 0x30
 	opDropVersion    uint8 = 0x31
 	opForget         uint8 = 0x32
@@ -1348,9 +1353,12 @@ func (c *Client) HeadNeighbors(ctx context.Context, heads []uint32, k, ef int) (
 }
 
 // EditGraph has the router insert the heads labels (vecs: one vector each, in the index's
-// element type) and mark the heads deleted deleted, taking its graph to version v; it returns
-// the patch from v-1 to v.
-func (c *Client) EditGraph(ctx context.Context, v uint32, labels []uint32, vecs []byte, deleted []uint32) ([]byte, error) {
+// element type), move the heads moved to movedVecs in place, and mark the heads deleted deleted,
+// taking its graph to version v; it returns the patch from v-1 to v. An edit to the version the
+// router's last edit made amends that edit: the patch it returns has both edits' changes, from
+// the same version.
+func (c *Client) EditGraph(ctx context.Context, v uint32, labels []uint32, vecs []byte, deleted, moved []uint32,
+	movedVecs []byte) ([]byte, error) {
 	var w frame.Writer
 	w.U32(v)
 	w.U32(uint32(len(labels)))
@@ -1358,11 +1366,165 @@ func (c *Client) EditGraph(ctx context.Context, v uint32, labels []uint32, vecs 
 	w.Bytes(vecs)
 	w.U32(uint32(len(deleted)))
 	w.U32s(deleted)
+	if len(moved) > 0 {
+		w.U32(uint32(len(moved)))
+		w.U32s(moved)
+		w.Bytes(movedVecs)
+	}
 	b, err := c.do(ctx, opEditGraph, 0, w.B)
 	if err != nil {
 		return nil, err
 	}
 	return append([]byte(nil), b...), nil
+}
+
+// NearestLive asks the router for the k nearest live heads of each decoded PQ code (m bytes
+// each), or, with codes nil, of each of the heads' vectors (a head is then among its own
+// nearest): by a scan of every head, the heads excluded left out (Quake's maintenance).
+func (c *Client) NearestLive(ctx context.Context, codes []byte, m int, heads []uint32, k int, excluded []uint32) ([][]uint32, error) {
+	n := len(heads)
+	if codes != nil {
+		if m <= 0 || len(codes)%m != 0 {
+			return nil, fmt.Errorf("nodeclient: %d bytes of %d-byte codes", len(codes), m)
+		}
+		n = len(codes) / m
+	} else {
+		m = 0
+	}
+	if k <= 0 {
+		return nil, fmt.Errorf("nodeclient: %d nearest heads", k)
+	}
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(k))
+	w.U32(uint32(len(excluded)))
+	w.U32(uint32(m))
+	w.U32s(excluded)
+	if codes != nil {
+		w.Bytes(codes)
+	} else {
+		w.U32s(heads)
+	}
+	b, err := c.do(ctx, opNearestLive, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	lists := r.U32s(n * k)
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	out := make([][]uint32, n)
+	for i := range out {
+		for _, l := range lists[i*k : (i+1)*k] {
+			if l != noList {
+				out[i] = append(out[i], l)
+			}
+		}
+	}
+	return out, nil
+}
+
+// SplitMeans asks the router for Quake's split of a list by the PQ codes of its members (m bytes
+// each): a k-means of 2 (iters iterations, seeded by seed), every member to the nearer centroid;
+// it returns each member's side and the two centroids, in the index's element type, back to back.
+func (c *Client) SplitMeans(ctx context.Context, codes []byte, m, iters int, seed uint32) ([]uint8, []byte, error) {
+	if m <= 0 || len(codes)%m != 0 {
+		return nil, nil, fmt.Errorf("nodeclient: %d bytes of %d-byte codes", len(codes), m)
+	}
+	n := len(codes) / m
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(m))
+	w.U32(uint32(iters))
+	w.U32(seed)
+	w.Bytes(codes)
+	b, err := c.do(ctx, opSplitMeans, 0, w.B)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(b) < n || (len(b)-n)%2 != 0 {
+		return nil, nil, fmt.Errorf("nodeclient: SPLIT_MEANS reply of %d bytes for %d codes", len(b), n)
+	}
+	vb := (len(b) - n) / 2
+	return append([]uint8(nil), b[2*vb:]...), append([]byte(nil), b[:2*vb]...), nil
+}
+
+// RefineAssign asks the router for one pass of Quake's refinement: each decoded PQ code (m bytes
+// each) to the nearest of the c = len(heads) heads, or, with heads nil, of the c centroids in
+// cent (dim floats each). It returns each code's centroid, and the number and the sum (dim
+// floats each) of the codes each took.
+func (c *Client) RefineAssign(ctx context.Context, codes []byte, m int, heads []uint32, cent []float32,
+	nc, dim int) (nearest, counts []uint32, sums []float32, err error) {
+	if m <= 0 || len(codes)%m != 0 || nc <= 0 || (heads == nil && len(cent) != nc*dim) || (heads != nil && len(heads) != nc) {
+		return nil, nil, nil, fmt.Errorf("nodeclient: %d bytes of %d-byte codes, %d centroids", len(codes), m, nc)
+	}
+	n := len(codes) / m
+	var w frame.Writer
+	w.U32(uint32(n))
+	w.U32(uint32(m))
+	w.U32(uint32(nc))
+	if heads != nil {
+		w.U32(0)
+		w.U32s(heads)
+	} else {
+		w.U32(1)
+		w.F32s(cent)
+	}
+	w.Bytes(codes)
+	b, err := c.do(ctx, opRefineAssign, 0, w.B)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	r := frame.NewReader(b)
+	nearest, counts, sums = r.U32s(n), r.U32s(nc), r.F32s(nc*dim)
+	if r.Err == nil && r.Remaining() != 0 {
+		r.Err = fmt.Errorf("nodeclient: REFINE_ASSIGN reply of %d bytes for %d codes and %d %d-d centroids", len(b), n, nc, dim)
+	}
+	return nearest, counts, sums, r.Err
+}
+
+// ScanProfile asks the node for Quake's list-scan latency profile of its CPU filter: the mean
+// nanoseconds of a top-k filter of n random codes, over trials runs, for each n of ns and k of
+// ks (by n, then k).
+func (c *Client) ScanProfile(ctx context.Context, ns, ks []uint32, trials int) ([]float32, error) {
+	var w frame.Writer
+	w.U32(uint32(len(ns)))
+	w.U32s(ns)
+	w.U32(uint32(len(ks)))
+	w.U32s(ks)
+	w.U32(uint32(trials))
+	b, err := c.do(ctx, opScanProfile, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	out := r.F32s(len(ns) * len(ks))
+	return out, r.Err
+}
+
+// ListLengths returns the length of every list of the resident version versions[i] of each
+// partition parts[i].
+func (c *Client) ListLengths(ctx context.Context, parts []int, versions []uint32) ([]ListLength, error) {
+	if len(parts) != len(versions) {
+		return nil, fmt.Errorf("nodeclient: %d partitions, %d versions", len(parts), len(versions))
+	}
+	var w frame.Writer
+	w.U32(uint32(len(parts)))
+	for i, p := range parts {
+		w.U32(uint32(p))
+		w.U32(versions[i])
+	}
+	b, err := c.do(ctx, opListLengths, 0, w.B)
+	if err != nil {
+		return nil, err
+	}
+	r := frame.NewReader(b)
+	out := make([]ListLength, r.U32())
+	for i := range out {
+		out[i] = ListLength{List: r.U32(), Postings: r.U32()}
+	}
+	return out, r.Err
 }
 
 // DropVersion evicts version v of partition p (after the grace period of the epochs that saw

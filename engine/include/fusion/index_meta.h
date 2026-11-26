@@ -2,7 +2,8 @@
 //
 // An index directory contains
 //   meta.txt              key=value metadata
-//   heads.bin             uint32 data IDs of the posting-list centroids ("heads")
+//   heads.bin             uint32 data IDs of the posting-list centroids ("heads"); kNoHeadVector
+//                         for a head that is no data vector (a k-means mean, clustering=kmeans)
 //   centroids.bin         head vectors (bin format, native dtype)
 //   graph.hnsw            navigation graph over the heads (hnswlib)
 //   postings.bin          vector IDs of every posting list (CSR)       -> host memory tier
@@ -20,6 +21,9 @@
 #include "fusion/common.h"
 
 namespace fusion {
+
+// heads.bin's entry for a head that is the mean of its list (FlatKMeans), no data vector.
+constexpr uint32_t kNoHeadVector = 0xFFFFFFFFu;
 
 namespace files {
 constexpr const char* kMeta = "meta.txt";

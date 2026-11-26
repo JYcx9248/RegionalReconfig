@@ -12,11 +12,12 @@ import (
 
 // StartRouter starts the update controller's router: an rtier_node (bin) on the index with its
 // navigation graph and codebook, no partition and a PQ budget of one code -- all that ASSIGN
-// needs, and no raw vector (the index may lack its page file). Its log goes to logw. stop
-// interrupts it, waits, and returns how it exited.
-func StartRouter(bin, index, parts string, logw io.Writer) (addr string, stop func() error, err error) {
-	cmd := exec.Command(bin, "--index", index, "--partitions", parts, "--listen", "127.0.0.1:0",
-		"--graph", "index", "--pq-capacity", "1", "--workers", "1")
+// needs, and no raw vector (the index may lack its page file); extra are more rtier_node
+// arguments (--graph-headroom). Its log goes to logw. stop interrupts it, waits, and returns how
+// it exited.
+func StartRouter(bin, index, parts string, logw io.Writer, extra ...string) (addr string, stop func() error, err error) {
+	cmd := exec.Command(bin, append([]string{"--index", index, "--partitions", parts, "--listen", "127.0.0.1:0",
+		"--graph", "index", "--pq-capacity", "1", "--workers", "1"}, extra...)...)
 	cmd.Stderr = logw
 	out, err := cmd.StdoutPipe()
 	if err != nil {

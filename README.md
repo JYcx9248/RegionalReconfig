@@ -366,6 +366,35 @@ closer to it than its child's head, which by our rule would often put it in both
 in lists the reassign did not read stay, as SPFresh's stale copies stay until their posting is
 next split or merged; and the policy runs once per batch.
 
+With `-policy quake` (`"Policy": "quake"`, its parameters in `"Quake"`), the update controller
+runs a round of Quake's maintenance as one major epoch, after a batch or alone, as Quake's code
+does it (`internal/update/quake.go`; MaintenancePolicy::perform_maintenance). It runs on Quake's
+index: `fusion_build --clustering kmeans` makes a flat k-means of `--nlist` (round(sqrt(N)))
+lists whose means are the heads, and puts every vector in one list, its nearest head's, by a
+scan of every head; inserts follow the same rule. A round:
+
+1. reads the entries' last `-quake-window` (1000) client queries (`QuerySample`; the controller's
+   `QuerySamples`), navigates each on the router's graph as it ran, and counts each list's hits;
+2. decides on Quake's cost model: the latency of a list scan, profiled on the router's CPU filter
+   (Quake's grid of sizes and top-k, interpolated as Quake does), gives each list's delete and
+   split deltas from its length and hit rate. A list is deleted below `-quake-delete-threshold-ns`
+   (with the rejection on where its members would go), else split below
+   `-quake-split-threshold-ns` if longer than `-quake-min-size`. With `-quake-max-size`, the
+   lengths alone decide, as in Quake's size-bound mode;
+3. sends each member of a deleted list to the list of its nearest live head;
+4. splits a list by a k-means of 2 on its members, the two means heading the children;
+5. refines the lists of the `-quake-radius` (25) heads nearest each child: their members go to
+   the nearest of those heads, for `-quake-iterations` (3) passes, each after the first on the
+   means of the pass before. With two passes or more the heads move to those means, in place in
+   the graph (`EDIT_GRAPH` moves; the edit after the refinement amends the one after the splits,
+   so the epoch has one patch);
+6. removes every list left empty.
+
+Unlike Quake, the decisions use PQ codes; the window is read at the round instead of recorded as
+queries run; centroids do not drift with every insert and delete, and no list is deleted for the
+share of it deleted (nothing keeps per-list sums across batches); nprobe stays fixed (no APS);
+and the parent level is the graph.
+
 The graph changes without any node holding two versions of it. The update controller's router
 inserts the new heads and marks the removed ones deleted (routing points, never a result), and
 exports the bytes that changed: a patch (`engine/include/fusion/graph_patch.h`). Every entry
@@ -430,9 +459,9 @@ reconfigurations wait until the rebuild ends. Not there yet: the trigger (only t
 Not there yet for updates: growing the ID and location spaces, a response to a batch over budget
 (it fails before anything is sent), Quake's cost-driven maintenance, and a log to replay batches
 from. Deleted vectors' pages are kept (U1). `test/e2e/update_test.go`, `test/e2e/major_test.go`,
-`test/e2e/spfresh_test.go` and `test/e2e/rebuild_test.go` check every answer against an oracle
-that applies the same decisions, across batches, a failed batch, major epochs (SPFresh's
-reassign too), a full rebuild and rescales.
+`test/e2e/spfresh_test.go`, `test/e2e/quake_test.go` and `test/e2e/rebuild_test.go` check every
+answer against an oracle that applies the same decisions, across batches, a failed batch, major
+epochs (SPFresh's reassign and Quake's maintenance too), a full rebuild and rescales.
 
 ## Layout
 

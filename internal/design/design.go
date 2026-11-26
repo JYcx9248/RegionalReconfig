@@ -408,7 +408,22 @@ var Open = map[string]Question{
 			"single postings); a merged list's postings go " +
 			"into every list the rule gives them. Copies in lists not read stay (SPFresh's stale " +
 			"copies stay until their posting is next split or merged); it runs once per batch, " +
-			"not per insert (internal/update/spfresh.go). " +
+			"not per insert (internal/update/spfresh.go). Decided (2026-11-23): or quake, a round " +
+			"of Quake's maintenance as its code does it (MaintenancePolicy::perform_maintenance), " +
+			"on Quake's index (fusion_build --clustering kmeans: a flat k-means of round(sqrt(N)) " +
+			"lists whose means are the heads, every vector in one list, its nearest head's by a " +
+			"scan of every head, in the build and for inserts): the hits of the entries' last " +
+			"-quake-window client queries (QuerySample, navigated on the router's graph) and the " +
+			"lists' lengths decide on Quake's cost model -- the list-scan latency profiled on the " +
+			"router's CPU filter -- which lists are deleted (its rejection too) and which split; a " +
+			"deleted list's members join their nearest live heads' lists, a split is a k-means of " +
+			"2 whose means head the children, the lists around the children are refined (their " +
+			"members to the nearest of their heads; with two passes or more the heads move to the " +
+			"means, in place: EDIT_GRAPH moves, the second edit amending the first into one " +
+			"patch), and empty lists go: one major epoch after a batch, or alone. Kept out: raw " +
+			"vectors (PQ codes here), the drift of every changed centroid and the deletes by the " +
+			"share of a list deleted (no per-list sums across batches), adaptive nprobe, and a " +
+			"flat parent level (ours is the graph) (internal/update/quake.go). " +
 			"The update controller's router edits its graph (new heads in, removed heads marked " +
 			"deleted, routing points but never a result) and exports the bytes that changed as a " +
 			"patch (fusion/graph_patch.h). No node holds two versions of the graph: every entry " +
@@ -454,8 +469,7 @@ var Open = map[string]Question{
 			"(agreed 2026-10-13: a partition over about 1.5x the average size splits in two by a " +
 			"cut of the partition graph, both halves staying on its owner, and a scale-in below " +
 			"the size that fits is refused; whether to scale out first is open -- a batch over " +
-			"budget now fails before anything is sent); Quake's cost-driven policy (per-list " +
-			"access counts, which nothing collects yet); the full rebuild's trigger " +
+			"budget now fails before anything is sent); the full rebuild's trigger " +
 			"(manual only: rtier-client rebuild; the probe-set check is design only); a graph " +
 			"patch over one frame (256 MB); the decision log and " +
 			"replay (the pages of deleted vectors are kept: U1). An inserted vector stays with " +
@@ -466,7 +480,8 @@ var Open = map[string]Question{
 		"internal/epoch/table.go (Versions, Graph, Lists, Generation), " +
 			"engine/include/fusion/node_engine.h (partition versions, Assign, RawAdd, " +
 			"StageVersions, graph patches, SwitchGeneration), " +
-			"engine/include/fusion/graph_patch.h, internal/update (batch.go, major.go, spfresh.go), " +
+			"engine/include/fusion/graph_patch.h, engine/include/fusion/clustering.h (FlatKMeans), " +
+			"internal/update (batch.go, major.go, spfresh.go, quake.go), " +
 			"internal/controller/update.go, internal/controller/rebuild.go, " +
 			"internal/placement/affinity.go, internal/controller/reconfig.go (copyThenFlip, " +
 			"drainRaw), engine/include/fusion/pq_store.h (cached codes, Forget), " +

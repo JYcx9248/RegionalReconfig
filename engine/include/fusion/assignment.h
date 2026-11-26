@@ -33,6 +33,9 @@ struct AssignParams {
   float rng_factor = 1.0f;    //   chosen head than to v (rng_factor * Dist(C_i,C_j) <= Dist(v,C_i))
   uint32_t candidates = 64;   // nearest heads examined per vector
   uint32_t ef = 128;          // graph search width during assignment
+  // The candidates by a scan of every head instead of the graph search: Quake's assignment, in
+  // its build (a flat search of the centroids) and its inserts (the parent searched whole).
+  bool exact = false;
 };
 
 struct AssignStats {
@@ -43,8 +46,8 @@ struct AssignStats {
   uint32_t empty_lists = 0;
 };
 
-// Searches every vector's nearest heads on the graph and assigns it to up to `replicas`
-// posting lists. Also returns each vector's primary (nearest) head, which drives the SSD
+// Searches every vector's nearest heads on the graph (or, with p.exact, among all heads) and
+// assigns it to up to `replicas` posting lists. Also returns each vector's primary (nearest) head, which drives the SSD
 // layout. `heads` holds the head vectors (K x vec_bytes).
 void AssignVectors(const VectorFile& data, HnswIndex* graph, const uint8_t* heads,
                    uint32_t num_heads, const AssignParams& p, PostingLists* lists,

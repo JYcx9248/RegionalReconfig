@@ -385,4 +385,63 @@ std::vector<uint32_t> HierarchicalBalancedClustering(const VectorFile& data,
   });
 }
 
+uint32_t FlatKMeansLists(const ClusteringParams& p, uint64_t n) {
+  if (p.nlist > 0) return p.nlist;
+  return static_cast<uint32_t>(std::max<double>(1.0, std::round(std::sqrt(static_cast<double>(n)))));
+}
+
+std::vector<float> FlatKMeans(const VectorFile& data, const ClusteringParams& p, uint64_t memory_bytes,
+                              ClusteringStats* stats) {
+  const uint64_t n = data.size();
+  const uint32_t d = data.dim();
+  const uint32_t k = FlatKMeansLists(p, n);
+  FUSION_CHECK(n >= k, "%u lists of %llu vectors", k, (unsigned long long)n);
+  FUSION_CHECK(p.flat_iters >= 1, "k-means needs an iteration");
+  // Faiss's sample: 256 points per centroid, drawn without replacement (rand_perm's first ones);
+  // here sorted, so that the file is read in one pass.
+  uint64_t s = std::min<uint64_t>(n, uint64_t{256} * k);
+  const uint64_t fit = std::max<uint64_t>(k, memory_bytes / (static_cast<uint64_t>(d) * sizeof(float)));
+  if (s > fit) {
+    Log("  k-means: %llu sample vectors (%llu per list) to fit --memory-gb, not %llu", (unsigned long long)fit,
+        (unsigned long long)(fit / k), (unsigned long long)s);
+    s = fit;
+  }
+  std::vector<uint64_t> pick;
+  if (s == n) {
+    pick.resize(n);
+    std::iota(pick.begin(), pick.end(), uint64_t{0});
+  } else {  // Floyd's algorithm
+    std::mt19937_64 rng(p.seed + 3);
+    std::unordered_set<uint64_t> chosen;
+    chosen.reserve(s * 2);
+    for (uint64_t j = n - s; j < n; ++j) {
+      std::uniform_int_distribution<uint64_t> u(0, j);
+      const uint64_t t = u(rng);
+      if (!chosen.insert(t).second) chosen.insert(j);
+    }
+    pick.assign(chosen.begin(), chosen.end());
+    std::sort(pick.begin(), pick.end());
+  }
+  std::vector<float> sample(s * d);
+  DispatchDType(data.dtype(), [&](auto tag) {
+    using T = decltype(tag);
+    data.ForEachRow(pick.data(), pick.size(), [&](size_t i, const uint8_t* row) {
+      ToFloat(reinterpret_cast<const T*>(row), &sample[i * d], d);
+    });
+  });
+  KMeansParams kp;
+  kp.k = k;
+  kp.iters = p.flat_iters;
+  kp.seed = p.seed;
+  kp.balance = 0.f;
+  kp.random_init = true;
+  std::vector<float> cent = KMeansTrain(sample.data(), s, d, kp);
+  if (stats) {
+    *stats = ClusteringStats{};
+    stats->num_leaves = static_cast<uint32_t>(cent.size() / d);
+    stats->levels = 1;
+  }
+  return cent;
+}
+
 }  // namespace fusion

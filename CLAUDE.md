@@ -68,7 +68,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
 | `internal/controller` | registration, placement, reconfiguration (`reconfig.go`), update leases (`update.go`), full rebuild (`rebuild.go`); collects metrics and the nodes' diagnostics |
 | `internal/agent` | staging, epoch install, entry and aggregator roles (`serve.go`), generations (`generation.go`), diagnostics forwarding (`diag.go`), the graph's yield to data (`yield.go`) |
-| `internal/update` | update batches (`batch.go`) and major epochs (`major.go`; SPFresh's reassign, `spfresh.go`), with their router |
+| `internal/update` | update batches (`batch.go`) and major epochs (`major.go`; SPFresh's reassign, `spfresh.go`; Quake's maintenance, `quake.go`), with their router |
 | `internal/query` | selectors (aggregator choice), strategies (`TwoPhase`), wire format |
 | `internal/placement`, `internal/transfer` | placement policies, plans, the rebuild's placement (`affinity.go`); bulk transfer + token bucket |
 | `internal/design` | registry of open design questions (U1–U17) |
@@ -231,7 +231,17 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   SPFresh's conditions hold (a vector in a child is checked there only, so one that keeps its
   child does not take the other too), and a vector whose queued list left its new set joins
   every list of the set and leaves the lists read that lack it (`STAGE_VERSIONS` drops postings;
-  the router's `ASSIGN_CODES`, `HEAD_DISTANCES`, `HEAD_NEIGHBORS`). Only with the controller's
+  the router's `ASSIGN_CODES`, `HEAD_DISTANCES`, `HEAD_NEIGHBORS`). With `"Policy": "quake"`
+  (`quake.go`, 2026-11-23) a round of Quake's maintenance runs as a major epoch, after a batch or
+  alone, as Quake's code does it, on Quake's index (`fusion_build --clustering kmeans`: a flat
+  k-means of round(sqrt(N)) lists whose means are the heads, every vector in its nearest head's
+  list by a scan of every head, inserts too): the hits of the entries' last client queries
+  (`QuerySamples`) and the lists' lengths decide on Quake's cost model (the router's CPU filter
+  profiled, `SCAN_PROFILE`) which lists are deleted and which split; the deleted lists' members
+  go to their nearest live heads (`NEAREST_LIVE`), a split is a k-means of 2 whose means head
+  the children (`SPLIT_MEANS`), the lists around the children are refined (`REFINE_ASSIGN`;
+  after two passes or more their heads move in place, `EDIT_GRAPH` moves, the edit amended into
+  one patch), and empty lists go (`LIST_LENGTHS` on the owners). Only with the controller's
   `AllowUpdates` (`"Updates"` in an experiment). An experiment triggers batches as
   `"Reconfigurations"` entries with `"Update"` (inserts, deletes, a major epoch after them),
   each run to its end in the same timeline as the rescales; `run_local.py` and `run_cluster.py`

@@ -357,13 +357,18 @@ class NodeEngine {
   // Unstages the patch of `version`; false if it was not staged.
   virtual bool DropGraphPatch(uint32_t version) = 0;
   // The router's side (the update controller's own node, which holds the authoritative graph and
-  // stages no patch): inserts the heads `labels` (list IDs; vecs: dim() elements of dtype() each)
-  // and marks the heads `deleted` deleted -- they stay as routing points, never a result -- then
-  // returns the patch from the graph's version to `version` (the next one). Refused, with
-  // nothing changed, if the graph has no room left (graph_headroom), a label exists, or a
-  // deleted head is unknown or deleted already.
+  // stages no patch): inserts the heads `labels` (list IDs; vecs: dim() elements of dtype() each),
+  // moves the live heads `moved` to moved_vecs in place (hnswlib's updatePoint: Quake's
+  // refinement moves centroids), and marks the heads `deleted` deleted -- they stay as routing
+  // points, never a result -- then returns the patch from the graph's version to `version` (the
+  // next one). An edit to the version this router's last edit made, while the graph is as that
+  // left it, amends it: the patch makes the version from the same base, with both edits' changes
+  // (Quake's maintenance edits the graph after its splits and again after its refinement).
+  // Refused, with nothing changed, if the graph has no room left (graph_headroom), a label exists,
+  // or a moved or deleted head is unknown, deleted already, or named twice.
   virtual std::vector<uint8_t> EditGraph(uint32_t version, const uint32_t* labels, const void* vecs,
-                                         uint32_t nnew, const uint32_t* deleted, uint32_t ndeleted) = 0;
+                                         uint32_t nnew, const uint32_t* deleted, uint32_t ndeleted,
+                                         const uint32_t* moved, const void* moved_vecs, uint32_t nmoved) = 0;
   // The router's decisions for a major epoch, on PQ codes (pq_m() bytes each), so that no raw
   // vector is read. SplitCodes: a balanced 2-means of n codes (n >= 2); side[i] is 0 or 1, and
   // heads[s] the index of the member closest to side s's mean, the child's head as the build
@@ -383,6 +388,32 @@ class NodeEngine {
   virtual void HeadDistances(const uint8_t* codes, uint32_t n, const uint32_t* heads, uint32_t k,
                              float* out) const = 0;
   virtual void HeadNeighbors(const uint32_t* heads, uint32_t n, uint32_t k, uint32_t ef, uint32_t* out) const = 0;
+  // The router's decisions for Quake's maintenance (U14, internal/update/quake.go), on PQ codes
+  // too, and by scans of every live head where Quake scans every centroid (its parent level is
+  // flat; ours is the graph). The router stages no patch, so they read heads from its graph.
+  // NearestLive: the k nearest live heads (ascending distance, padded with kInvalidId), the heads
+  // `excluded` left out, of each decoded code (codes) or of each head's vector (heads, which is
+  // then among its own nearest) -- n of either.
+  virtual void NearestLive(const uint8_t* codes, const uint32_t* heads, uint32_t n, uint32_t k,
+                           const uint32_t* excluded, uint32_t nexcluded, uint32_t* out) const = 0;
+  // SplitMeans: Quake's split (split_partitions: Faiss's k-means with k = 2 and `iters`
+  // iterations, on 512 of the n >= 2 decoded codes at most, seeded with two of them), then every
+  // code to the nearer centroid: side[i], and the centroids as two vectors of dtype() (centroids).
+  virtual void SplitMeans(const uint8_t* codes, uint32_t n, uint32_t iters, uint64_t seed, uint8_t* side,
+                          void* centroids) const = 0;
+  // RefineAssign: one pass of Quake's refinement (kmeans_refine_partitions): each decoded code to
+  // the nearest of c centroids -- the heads `heads`, or c x dim() floats (centroids) -- and the sum
+  // of the codes each centroid took (c x dim() floats) with their number, for the next means.
+  virtual void RefineAssign(const uint8_t* codes, uint32_t n, const uint32_t* heads, const float* centroids,
+                            uint32_t c, uint32_t* nearest, float* sums, uint32_t* counts) const = 0;
+  // ScanProfile: Quake's profile of a list scan (ListScanLatencyEstimator), of this node's CPU
+  // filter: the mean time in ns, over `trials`, of a top-k filter of n random codes, for every n
+  // of ns and k of ks (out: nn x nk, by n).
+  virtual void ScanProfile(const uint32_t* ns, uint32_t nn, const uint32_t* ks, uint32_t nk, uint32_t trials,
+                           float* out) const = 0;
+  // The length of every list of partition p's resident version `version`, by list ID.
+  // NotResidentError if that version is not here.
+  virtual std::vector<std::pair<uint32_t, uint32_t>> ListLengths(uint32_t p, uint32_t version) const = 0;
   // Loads version `version` of partition p's posting lists from a segment file, replacing that
   // version if it is resident; the partition's other versions stay. Every vector they name must
   // end up with a PQ code on this node (see PQSource); the partition's postings then hold

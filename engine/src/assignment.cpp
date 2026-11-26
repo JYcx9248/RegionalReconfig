@@ -56,13 +56,20 @@ void AssignImpl(const VectorFile& data, HnswIndex* graph, const uint8_t* heads, 
 #pragma omp for schedule(dynamic, 256)
       for (int64_t i = static_cast<int64_t>(b0); i < static_cast<int64_t>(b1); ++i) {
         const T* x = reinterpret_cast<const T*>(rows + (static_cast<uint64_t>(i) - b0) * vb);
-        auto res = graph->searchKnn(x, p.candidates);
         cand.clear();
-        while (!res.empty()) {
-          cand.emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
-          res.pop();
+        if (p.exact) {
+          for (uint32_t c = 0; c < num_heads; ++c) cand.emplace_back(L2Sqr(x, head(c), d), c);
+          const size_t keep = std::min<size_t>(p.candidates, cand.size());
+          std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(keep), cand.end());
+          cand.resize(keep);
+        } else {
+          auto res = graph->searchKnn(x, p.candidates);
+          while (!res.empty()) {
+            cand.emplace_back(res.top().first, static_cast<uint32_t>(res.top().second));
+            res.pop();
+          }
+          std::reverse(cand.begin(), cand.end());  // ascending distance
         }
-        std::reverse(cand.begin(), cand.end());  // ascending distance
         if (cand.empty()) continue;
 
         uint32_t* out = &assign[static_cast<uint64_t>(i) * r];

@@ -130,8 +130,10 @@ type Major struct {
 	Staged map[placement.NodeID][]protocol.PartitionVersion
 	// Reassign: what SPFresh's reassign checked and changed (Policy "spfresh"; nil otherwise).
 	Reassign *ReassignStats
-	patched  []placement.NodeID                   // entries that staged the patch
-	sent     map[placement.NodeID]map[uint32]bool // the codes in Codes, by node
+	// Quake: what Quake's maintenance found and did (PrepareQuake; nil otherwise).
+	Quake   *QuakeStats
+	patched []placement.NodeID                   // entries that staged the patch
+	sent    map[placement.NodeID]map[uint32]bool // the codes in Codes, by node
 }
 
 // partitionOf is list l's partition after the epoch: a list it creates is in its parent's.
@@ -273,8 +275,10 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 	}
 	switch u.Policy {
 	case "", PolicyThreshold, PolicySPFresh:
+	case PolicyQuake:
+		return nil, errors.New("update: Quake's maintenance decides its own lists (PrepareQuake)")
 	default:
-		return nil, fmt.Errorf("update: unknown policy %q (%s or %s)", u.Policy, PolicyThreshold, PolicySPFresh)
+		return nil, fmt.Errorf("update: unknown policy %q (%s, %s or %s)", u.Policy, PolicyThreshold, PolicySPFresh, PolicyQuake)
 	}
 	lease, err := u.Controller.BeginUpdate(ctx, protocol.BeginUpdateReq{})
 	if err != nil {
@@ -360,7 +364,7 @@ func (u *Updater) PrepareMajor(ctx context.Context, splits, merges []uint32) (mj
 	dead = append(dead, merges...)
 
 	// The graph: the new heads in, the removed ones marked deleted.
-	if mj.Patch, err = u.Router.EditGraph(ctx, mj.Graph, labels, vecs, dead); err != nil {
+	if mj.Patch, err = u.Router.EditGraph(ctx, mj.Graph, labels, vecs, dead, nil, nil); err != nil {
 		return nil, fmt.Errorf("update: editing the graph: %w", err)
 	}
 	edited = true

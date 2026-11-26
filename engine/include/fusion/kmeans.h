@@ -18,6 +18,9 @@ struct KMeansParams {
   // where |C_c| is the size of cluster c in the previous iteration. It pushes points away
   // from over-full clusters (in the spirit of SPTAG's balanced k-means). 0 = plain k-means.
   float balance = 0.f;
+  // Seeding: k-means++ (false), or k distinct points drawn at random (true), as Faiss's
+  // Clustering seeds -- and with it Quake's k-means (clustering.h, FlatKMeans).
+  bool random_init = false;
 };
 
 // Trains centroids on x (n x d, row-major). Returns k' x d centroids where k' = min(k, n).

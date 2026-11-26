@@ -72,6 +72,12 @@ type QuerySampleReply struct {
 	Queries []SampledQuery `json:"queries"`
 }
 
+// QuerySamplesReq: the most recent client queries the current epoch's entries kept, at most Max
+// (0: all of them), taken from every entry in turn.
+type QuerySamplesReq struct {
+	Max int `json:"max,omitempty"`
+}
+
 // Methods served by the controller, called by agents.
 const (
 	RegisterM    = "Register"
@@ -100,6 +106,9 @@ const (
 	AbortUpdateA  = "AbortUpdate"
 	// Full rebuild (U14): the cluster moves to an index generation built outside the system.
 	RebuildA = "Rebuild"
+	// QuerySamples: the recent client queries the entries kept (QuerySample), the window of
+	// Quake's maintenance (U14, internal/update/quake.go).
+	QuerySamplesA = "QuerySamples"
 )
 
 // Register is an agent's first message (Koala's Registration: data-plane and state-comm

@@ -322,6 +322,13 @@ func (c *Controller) setupAPIConn(conn *ctrl.Conn) {
 		}
 		return struct{}{}, c.AbortUpdate(ctx, req)
 	})
+	conn.Handle(protocol.QuerySamplesA, func(ctx context.Context, body json.RawMessage) (any, error) {
+		req, err := ctrl.Decode[protocol.QuerySamplesReq](body)
+		if err != nil {
+			return nil, err
+		}
+		return c.QuerySamples(ctx, req)
+	})
 	conn.Handle(protocol.RebuildA, func(ctx context.Context, body json.RawMessage) (any, error) {
 		req, err := ctrl.Decode[protocol.RebuildReq](body)
 		if err != nil {

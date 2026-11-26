@@ -21,9 +21,18 @@ std::vector<float> KMeansTrain(const float* x, size_t n, size_t d, const KMeansP
     std::memcpy(cent.data(), x, n * d * sizeof(float));
     return cent;
   }
-  // k-means++ seeding: each new center is drawn with probability proportional to the squared
-  // distance to the nearest center chosen so far. Costs about one Lloyd iteration.
-  {
+  if (p.random_init) {
+    // Faiss's seeding: k distinct points, drawn uniformly.
+    std::vector<size_t> perm(n);
+    std::iota(perm.begin(), perm.end(), size_t{0});
+    for (uint32_t c = 0; c < k; ++c) {
+      std::uniform_int_distribution<size_t> pick(c, n - 1);
+      std::swap(perm[c], perm[pick(rng)]);
+      std::memcpy(&cent[static_cast<size_t>(c) * d], x + perm[c] * d, d * sizeof(float));
+    }
+  } else {
+    // k-means++ seeding: each new center is drawn with probability proportional to the squared
+    // distance to the nearest center chosen so far. Costs about one Lloyd iteration.
     std::vector<float> mind(n, std::numeric_limits<float>::max());
     std::uniform_int_distribution<size_t> first(0, n - 1);
     size_t chosen = first(rng);

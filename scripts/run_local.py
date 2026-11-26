@@ -182,7 +182,16 @@ queries let finish, reclaimed. Their paths are relative to the repository, as Ba
 shorter than that (at most "MajorMax" lists); "Split" and "Merge" name lists for one. "Policy":
 "spfresh" adds SPFresh's reassign to it (rtier-updater -policy: the members of the lists nearest
 each split one, "ReassignRange" of them, 64 by default, are checked and inserted again by the
-build's rule where they no longer belong); "threshold", the default, does not. Like a
+build's rule where they no longer belong); "threshold", the default, does not. "Policy": "quake"
+runs a round of Quake's maintenance after the batch, or alone without Inserts and Deletes, on
+Quake's index (fusion_build --clustering kmeans): its cost model, on the hits of the entries' last
+client queries, decides which lists to delete and which to split, and the round deletes, splits,
+refines and removes empty lists as one major epoch (internal/update/quake.go). "Quake" holds its
+parameters, Quake's own names and defaults: {"Window": 1000, "RefineRadius": 25,
+"RefineIterations": 3, "MinSize": 32, "MaxSize": 0, "Alpha": 0.9, "DeleteRejection": true,
+"SplitIterations": 5, "DeleteThresholdNS": 100, "SplitThresholdNS": 100} ("MaxSize" > 0: by the
+lists' lengths alone). The window needs that many queries kept: QuerySample (per entry) times the
+entries at least. Like a
 rescale, an entry runs to its end before the next one starts, whatever its trigger time: a batch
 and a rescale never overlap. The update controller's router (an rtier_node on the index's graph)
 runs on this machine from the start; its state -- where the next batch's IDs and locations
@@ -617,7 +626,8 @@ def update_request(cfg: dict, rc: dict) -> dict:
         if up.get(key):
             args += [flag, ",".join(str(int(x)) for x in up[key])]
             parts.append(f"{key.lower()} lists {up[key]}")
-    if not args:
+    quake = up.get("Policy") == "quake"
+    if not args and not quake:
         sys.exit(f"Reconfigurations: {rc}: an update needs Inserts, Deletes, Split or Merge")
     for key, flag in (("SplitLen", "-split-len"), ("MergeLen", "-merge-len"), ("MajorMax", "-major-max")):
         if up.get(key):
@@ -625,7 +635,28 @@ def update_request(cfg: dict, rc: dict) -> dict:
                 sys.exit(f"Reconfigurations: {rc}: {key} acts after a batch: give Inserts or Deletes too")
             args += [flag, str(int(up[key]))]
     major = any(up.get(k) for k in ("Split", "Merge", "SplitLen", "MergeLen"))
-    if up.get("Policy") is not None or up.get("ReassignRange") is not None:
+    if quake:
+        if major or up.get("ReassignRange") is not None:
+            sys.exit(f"Reconfigurations: {rc}: Policy quake decides its own lists: no Split, Merge, SplitLen, "
+                     "MergeLen or ReassignRange")
+        args += ["-policy", "quake"]
+        flags = {"Window": "-quake-window", "RefineRadius": "-quake-radius", "RefineIterations": "-quake-iterations",
+                 "MinSize": "-quake-min-size", "MaxSize": "-quake-max-size", "Alpha": "-quake-alpha",
+                 "DeleteRejection": "-quake-delete-rejection", "SplitIterations": "-quake-split-iterations",
+                 "DeleteThresholdNS": "-quake-delete-threshold-ns", "SplitThresholdNS": "-quake-split-threshold-ns"}
+        for key, value in (up.get("Quake") or {}).items():
+            if key not in flags:
+                sys.exit(f"Reconfigurations: {rc}: Quake.{key}: not one of {', '.join(flags)}")
+            if key == "DeleteRejection":
+                if not isinstance(value, bool):
+                    sys.exit(f"Reconfigurations: {rc}: Quake.DeleteRejection is true or false")
+                args.append(f"{flags[key]}={'true' if value else 'false'}")
+            else:
+                args += [flags[key], str(value)]
+        parts.append("Quake's maintenance")
+    elif up.get("Quake") is not None:
+        sys.exit(f'Reconfigurations: {rc}: "Quake" is the quake policy\'s')
+    elif up.get("Policy") is not None or up.get("ReassignRange") is not None:
         policy = up.get("Policy", "threshold")
         if policy not in ("threshold", "spfresh") or not major:
             sys.exit(f"Reconfigurations: {rc}: Policy is threshold or spfresh, for a major epoch (Split, Merge, "
@@ -1618,6 +1649,7 @@ class Updater:
             + (f"; major epoch {m.get('from_epoch')} -> {m.get('to_epoch')}, splits {rec.get('splits')}, "
                f"merges {rec.get('merges')}" if m else "")
             + (f", reassign {rec['reassign']}" if rec.get("reassign") else "")
+            + (f", Quake {rec['quake']}" if rec.get("quake") else "")
             + f"; {self.results[-1]['elapsed_seconds']:.1f} s in all")
         if done.returncode != 0:
             raise RuntimeError(f"update batch {k} failed: {rec.get('error') or f'exit {done.returncode}'} "

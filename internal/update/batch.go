@@ -22,6 +22,8 @@ type Controller interface {
 	BeginUpdate(ctx context.Context, req protocol.BeginUpdateReq) (*protocol.UpdateLease, error)
 	CommitUpdate(ctx context.Context, req protocol.CommitUpdateReq) (*protocol.UpdateReply, error)
 	AbortUpdate(ctx context.Context, req protocol.AbortUpdateReq) error
+	// QuerySamples: the entries' recent client queries (Quake's window, quake.go).
+	QuerySamples(ctx context.Context, req protocol.QuerySamplesReq) (*protocol.QuerySampleReply, error)
 }
 
 // Remote is Controller over the controller's API port.
@@ -45,6 +47,14 @@ func (r Remote) CommitUpdate(ctx context.Context, req protocol.CommitUpdateReq) 
 
 func (r Remote) AbortUpdate(ctx context.Context, req protocol.AbortUpdateReq) error {
 	return r.Conn.Call(ctx, protocol.AbortUpdateA, req, nil)
+}
+
+func (r Remote) QuerySamples(ctx context.Context, req protocol.QuerySamplesReq) (*protocol.QuerySampleReply, error) {
+	var out protocol.QuerySampleReply
+	if err := r.Conn.Call(ctx, protocol.QuerySamplesA, req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Updater runs update batches: the update controller's side (docs/drafts/
@@ -73,6 +83,10 @@ type Updater struct {
 	// own members).
 	Policy        string
 	ReassignRange int
+	// Quake: the parameters of Quake's maintenance (PrepareQuake, quake.go); quakeLat, the
+	// router's scan profile, measured at the first round.
+	Quake    QuakeParams
+	quakeLat *scanLatency
 	// gen is the index generation Manifest belongs to (U14 full rebuild): the updater follows
 	// the lease's epoch to the next one (follow).
 	gen uint32

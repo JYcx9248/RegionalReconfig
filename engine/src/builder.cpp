@@ -1,8 +1,11 @@
 #include "fusion/builder.h"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <limits>
 #include <random>
+#include <type_traits>
 #include <unordered_set>
 
 #include "fusion/dataset.h"
@@ -39,6 +42,18 @@ std::vector<uint64_t> SampleIndices(uint64_t n, uint64_t s, uint64_t seed) {
 std::vector<uint32_t> ToIDs(std::vector<uint32_t> rows, const std::vector<uint32_t>& ids) {
   for (uint32_t& r : rows) r = ids[r];
   return rows;
+}
+
+// v as an element of T: rounded and clamped for an integer type (a mean head, FlatKMeans).
+template <class T>
+T ElementOf(float v) {
+  if constexpr (std::is_floating_point<T>::value) {
+    return v;
+  } else {
+    const float lo = static_cast<float>(std::numeric_limits<T>::min());
+    const float hi = static_cast<float>(std::numeric_limits<T>::max());
+    return static_cast<T>(std::min(hi, std::max(lo, std::nearbyint(v))));
+  }
 }
 
 std::vector<std::string> LayoutNames(const std::string& spec) {
@@ -85,21 +100,43 @@ void BuildIndex(const BuildParams& p) {
   Timer total;
 
   // ---- Stage 1: hierarchical balanced clustering -> heads ------------------------------
+  const bool flat = p.clustering.method == "kmeans";
+  FUSION_CHECK(flat || p.clustering.method == "balanced", "unknown clustering '%s' (balanced or kmeans)",
+               p.clustering.method.c_str());
   std::vector<uint32_t> heads;
   if (need(files::kHeads) || need(files::kCentroids)) {
     Timer t;
-    Log("[1/5] hierarchical balanced clustering (target ratio %.3f)",
-        p.clustering.centroid_ratio);
-    ClusteringStats cs;
-    heads = HierarchicalBalancedClustering(*data, p.clustering, p.memory_bytes, &cs);
-    Log("      %u posting lists (%.2f%% of vectors), leaf size min/mean/max = %u/%.1f/%u, "
-        "%u levels, %.1fs",
-        cs.num_leaves, 100.0 * cs.num_leaves / static_cast<double>(n), cs.min_leaf, cs.mean_leaf,
-        cs.max_leaf, cs.levels, t.Sec());
-    SaveU32Array(path(files::kHeads), ver ? ToIDs(heads, ver->ids) : heads);
-    std::vector<uint8_t> hv(heads.size() * vb);
-    data->Gather(heads.data(), heads.size(), hv.data());
-    SaveBin(path(files::kCentroids), dt, heads.size(), d, hv.data());
+    if (flat) {
+      // Quake's index: the heads are the k-means centroids, the means of their clusters, which no
+      // data vector is (heads.bin names none).
+      Log("[1/5] k-means: %u lists, %u iterations", FlatKMeansLists(p.clustering, n), p.clustering.flat_iters);
+      ClusteringStats cs;
+      const std::vector<float> cent = FlatKMeans(*data, p.clustering, p.memory_bytes, &cs);
+      heads.assign(cs.num_leaves, kNoHeadVector);
+      std::vector<uint8_t> hv(heads.size() * vb);
+      DispatchDType(dt, [&](auto tag) {
+        using T = decltype(tag);
+        T* out = reinterpret_cast<T*>(hv.data());
+        for (size_t i = 0; i < cent.size(); ++i) out[i] = ElementOf<T>(cent[i]);
+      });
+      Log("      %u posting lists (%.0f vectors each on average), %.1fs", cs.num_leaves,
+          static_cast<double>(n) / cs.num_leaves, t.Sec());
+      SaveU32Array(path(files::kHeads), heads);
+      SaveBin(path(files::kCentroids), dt, heads.size(), d, hv.data());
+    } else {
+      Log("[1/5] hierarchical balanced clustering (target ratio %.3f)",
+          p.clustering.centroid_ratio);
+      ClusteringStats cs;
+      heads = HierarchicalBalancedClustering(*data, p.clustering, p.memory_bytes, &cs);
+      Log("      %u posting lists (%.2f%% of vectors), leaf size min/mean/max = %u/%.1f/%u, "
+          "%u levels, %.1fs",
+          cs.num_leaves, 100.0 * cs.num_leaves / static_cast<double>(n), cs.min_leaf, cs.mean_leaf,
+          cs.max_leaf, cs.levels, t.Sec());
+      SaveU32Array(path(files::kHeads), ver ? ToIDs(heads, ver->ids) : heads);
+      std::vector<uint8_t> hv(heads.size() * vb);
+      data->Gather(heads.data(), heads.size(), hv.data());
+      SaveBin(path(files::kCentroids), dt, heads.size(), d, hv.data());
+    }
   } else {
     heads = LoadU32Array(path(files::kHeads));
     Log("[1/5] clustering: reusing %zu heads", heads.size());
@@ -129,8 +166,9 @@ void BuildIndex(const BuildParams& p) {
   AssignStats as;
   if (need(files::kPostings) || need(files::kPrimary)) {
     Timer t;
-    Log("[3/5] assigning vectors (replicas<=%u, eps=%.3f, rng=%s x%.2f)", p.assign.replicas,
-        p.assign.closure_eps, p.assign.rng ? "on" : "off", p.assign.rng_factor);
+    Log("[3/5] assigning vectors (replicas<=%u, eps=%.3f, rng=%s x%.2f, %s)", p.assign.replicas,
+        p.assign.closure_eps, p.assign.rng ? "on" : "off", p.assign.rng_factor,
+        p.assign.exact ? "every head scanned" : "on the graph");
     AssignVectors(*data, graph.get(), head_vecs.data.data(), num_heads, p.assign, &lists, &primary,
                   &as);
     Log("      %.2f replicas/vector, list size mean/max = %.1f/%u, %u empty lists, %.1fs",
@@ -291,6 +329,12 @@ void BuildIndex(const BuildParams& p) {
   meta.Set("layouts", layouts);
   if (!meta.Has("centroid_ratio") || p.overwrite) {
     meta.Set("centroid_ratio", p.clustering.centroid_ratio);
+    meta.Set("clustering", p.clustering.method);
+    if (flat) {
+      meta.Set("nlist", num_heads);
+      meta.Set("kmeans_iters", p.clustering.flat_iters);
+    }
+    meta.Set("assign_exact", p.assign.exact ? 1 : 0);
     meta.Set("replicas", p.assign.replicas);
     meta.Set("closure_eps", p.assign.closure_eps);
     meta.Set("rng", p.assign.rng ? 1 : 0);

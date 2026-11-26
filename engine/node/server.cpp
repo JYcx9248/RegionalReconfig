@@ -128,6 +128,11 @@ const char* OpName(uint8_t op) {
     case kAssignCodes: return "assign_codes";
     case kHeadDistances: return "head_distances";
     case kHeadNeighbors: return "head_neighbors";
+    case kNearestLive: return "nearest_live";
+    case kSplitMeans: return "split_means";
+    case kRefineAssign: return "refine_assign";
+    case kScanProfile: return "scan_profile";
+    case kListLengths: return "list_lengths";
     case kStageVersions: return "stage_versions";
     case kDropVersion: return "drop_version";
     case kForget: return "forget";
@@ -1077,11 +1082,112 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
         std::vector<uint64_t> vecs((static_cast<size_t>(nn) * qb + 7) / 8);
         if (nn) std::memcpy(vecs.data(), r.Bytes(static_cast<size_t>(nn) * qb), static_cast<size_t>(nn) * qb);
         const uint32_t nd = r.Get<uint32_t>();
-        Require(static_cast<uint64_t>(nd) * 4 == r.remaining(), "EDIT_GRAPH: deleted heads do not match");
+        Require(static_cast<uint64_t>(nd) * 4 <= r.remaining(), "EDIT_GRAPH: deleted heads truncated");
         const auto del = TakeArray<uint32_t>(&r, nd);
-        const std::vector<uint8_t> patch = e.EditGraph(version, labels.data(), vecs.data(), nn, del.data(), nd);
+        const uint32_t nm = r.remaining() == 0 ? 0 : r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(nm) * (4 + qb) == r.remaining(), "EDIT_GRAPH: moved heads do not match");
+        const auto moved = TakeArray<uint32_t>(&r, nm);
+        std::vector<uint64_t> mvecs((static_cast<size_t>(nm) * qb + 7) / 8);
+        if (nm) std::memcpy(mvecs.data(), r.Bytes(static_cast<size_t>(nm) * qb), static_cast<size_t>(nm) * qb);
+        const std::vector<uint8_t> patch =
+            e.EditGraph(version, labels.data(), vecs.data(), nn, del.data(), nd, moved.data(), mvecs.data(), nm);
         Require(patch.size() <= kMaxFrameBytes - 64, "EDIT_GRAPH: the patch does not fit in a frame");
         w.PutBytes(patch.data(), patch.size());
+        break;
+      }
+      case kNearestLive: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t k = r.Get<uint32_t>();
+        const uint32_t nex = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        Require(k >= 1 && static_cast<uint64_t>(n) * 4 * k <= kMaxFrameBytes / 2, "NEAREST_LIVE: too many heads");
+        Require(m == 0 || m == e.pq_m(), "NEAREST_LIVE: codes of the wrong size");
+        Require(static_cast<uint64_t>(nex) * 4 + static_cast<uint64_t>(n) * (m ? m : 4) == r.remaining(),
+                "NEAREST_LIVE: body is not the excluded heads and n queries");
+        const auto ex = TakeArray<uint32_t>(&r, nex);
+        std::vector<uint32_t> lists(static_cast<size_t>(n) * k);
+        if (m) {
+          e.NearestLive(r.Bytes(static_cast<size_t>(n) * m), nullptr, n, k, ex.data(), nex, lists.data());
+        } else {
+          const auto heads = TakeArray<uint32_t>(&r, n);
+          e.NearestLive(nullptr, heads.data(), n, k, ex.data(), nex, lists.data());
+        }
+        w.PutBytes(lists.data(), lists.size() * 4);
+        break;
+      }
+      case kSplitMeans: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        const uint32_t iters = r.Get<uint32_t>();
+        const uint32_t seed = r.Get<uint32_t>();
+        Require(m == e.pq_m(), "SPLIT_MEANS: codes of the wrong size");
+        Require(static_cast<uint64_t>(n) * m == r.remaining(), "SPLIT_MEANS: body is not n codes");
+        const size_t qb = static_cast<size_t>(e.dim()) * fusion::DTypeSize(e.dtype());
+        std::vector<uint64_t> cent((2 * qb + 7) / 8);
+        std::vector<uint8_t> side(n);
+        e.SplitMeans(r.Bytes(static_cast<size_t>(n) * m), n, iters, seed, side.data(), cent.data());
+        w.PutBytes(cent.data(), 2 * qb);
+        w.PutBytes(side.data(), side.size());
+        break;
+      }
+      case kRefineAssign: {
+        const uint32_t n = r.Get<uint32_t>();
+        const uint32_t m = r.Get<uint32_t>();
+        const uint32_t c = r.Get<uint32_t>();
+        const uint32_t form = r.Get<uint32_t>();
+        const uint64_t cb = form == 0 ? uint64_t{4} * c : uint64_t{4} * c * e.dim();
+        Require(m == e.pq_m() && form <= 1 && c >= 1, "REFINE_ASSIGN: codes of the wrong size, or no centroid");
+        Require(cb + static_cast<uint64_t>(n) * m == r.remaining(), "REFINE_ASSIGN: body is not the centroids and n codes");
+        Require(static_cast<uint64_t>(c) * e.dim() * 4 + uint64_t{8} * (n + c) <= kMaxFrameBytes / 2,
+                "REFINE_ASSIGN: too many centroids");
+        std::vector<uint32_t> heads;
+        std::vector<float> cent;
+        if (form == 0) {
+          heads = TakeArray<uint32_t>(&r, c);
+        } else {
+          cent = TakeArray<float>(&r, static_cast<size_t>(c) * e.dim());
+        }
+        std::vector<uint32_t> nearest(n), counts(c);
+        std::vector<float> sums(static_cast<size_t>(c) * e.dim());
+        e.RefineAssign(r.Bytes(static_cast<size_t>(n) * m), n, form == 0 ? heads.data() : nullptr,
+                       form == 0 ? nullptr : cent.data(), c, nearest.data(), sums.data(), counts.data());
+        w.PutBytes(nearest.data(), nearest.size() * 4);
+        w.PutBytes(counts.data(), counts.size() * 4);
+        w.PutBytes(sums.data(), sums.size() * 4);
+        break;
+      }
+      case kScanProfile: {
+        const uint32_t nn = r.Get<uint32_t>();
+        Require(nn >= 1 && nn <= 64 && static_cast<uint64_t>(nn) * 4 <= r.remaining(), "SCAN_PROFILE: list sizes");
+        const auto ns = TakeArray<uint32_t>(&r, nn);
+        const uint32_t nk = r.Get<uint32_t>();
+        Require(nk >= 1 && nk <= 64 && static_cast<uint64_t>(nk) * 4 + 4 == r.remaining(), "SCAN_PROFILE: top-k sizes");
+        const auto ks = TakeArray<uint32_t>(&r, nk);
+        const uint32_t trials = r.Get<uint32_t>();
+        Require(trials >= 1 && *std::max_element(ns.begin(), ns.end()) <= (1u << 24) &&
+                    *std::max_element(ks.begin(), ks.end()) <= (1u << 16),
+                "SCAN_PROFILE: no trial, or a scan too large");
+        std::vector<float> out(static_cast<size_t>(nn) * nk);
+        e.ScanProfile(ns.data(), nn, ks.data(), nk, trials, out.data());
+        w.PutBytes(out.data(), out.size() * 4);
+        break;
+      }
+      case kListLengths: {
+        const uint32_t np = r.Get<uint32_t>();
+        Require(static_cast<uint64_t>(np) * 8 == r.remaining(), "LIST_LENGTHS: body is not partitions and versions");
+        std::vector<std::pair<uint32_t, uint32_t>> all;
+        for (uint32_t i = 0; i < np; ++i) {
+          const uint32_t p = r.Get<uint32_t>();
+          const uint32_t v = r.Get<uint32_t>();
+          const auto lens = e.ListLengths(p, v);
+          all.insert(all.end(), lens.begin(), lens.end());
+        }
+        Require(all.size() * 8 + 4 <= kMaxFrameBytes, "LIST_LENGTHS: too many lists for a frame");
+        w.Put<uint32_t>(static_cast<uint32_t>(all.size()));
+        for (const auto& l : all) {
+          w.Put<uint32_t>(l.first);
+          w.Put<uint32_t>(l.second);
+        }
         break;
       }
       case kDropVersion: {

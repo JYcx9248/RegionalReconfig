@@ -51,6 +51,29 @@ type updateLease struct {
 	timer *time.Timer
 }
 
+// QuerySamples returns the most recent client queries the current epoch's entries kept
+// (QuerySample), at most req.Max, from every entry in turn: the window in which Quake's
+// maintenance counts each list's hits (U14, internal/update/quake.go). It takes no lease: the
+// update controller reads them under its own.
+func (c *Controller) QuerySamples(ctx context.Context, req protocol.QuerySamplesReq) (*protocol.QuerySampleReply, error) {
+	if req.Max < 0 {
+		return nil, fmt.Errorf("controller: %d query samples", req.Max)
+	}
+	cur, err := c.store.Current()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := c.managed(cur.Entries)
+	if err != nil {
+		return nil, err
+	}
+	qs, err := c.querySample(ctx, entries, req.Max)
+	if err != nil {
+		return nil, err
+	}
+	return &protocol.QuerySampleReply{Queries: qs}, nil
+}
+
 // BeginUpdate starts an update batch: it takes the reconfiguration slot under a lease and
 // returns the epoch the batch is for.
 func (c *Controller) BeginUpdate(ctx context.Context, req protocol.BeginUpdateReq) (*protocol.UpdateLease, error) {

@@ -17,6 +17,7 @@
 #include <functional>
 #include <future>
 #include <map>
+#include <numeric>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -29,6 +30,7 @@
 #include "fusion/dataset.h"
 #include "fusion/filter.h"
 #include "fusion/graph_image.h"
+#include "fusion/graph_patch.h"
 #include "fusion/hnsw_space.h"
 #include "fusion/index_meta.h"
 #include "fusion/layout.h"
@@ -3768,7 +3770,7 @@ void TestGraphPatches() {
   const std::vector<float> vecs(f.queries.begin(), f.queries.begin() + 3 * f.dim);
   std::vector<uint32_t> dead = {before[5][0], before[7][0]};
   if (dead[0] == dead[1]) dead[1] = before[7][1];
-  const std::vector<uint8_t> patch = router->EditGraph(1, labels.data(), vecs.data(), 3, dead.data(), 2);
+  const std::vector<uint8_t> patch = router->EditGraph(1, labels.data(), vecs.data(), 3, dead.data(), 2, nullptr, nullptr, 0);
   const GraphState g1 = router->graph_state();
   CHECK(g1.version == 1 && g1.count == nl + 3 && g1.deleted == 2 && g1.patch == 0);
   const auto want = NavigateAll(f, *router, kNewestGraph);
@@ -3835,15 +3837,15 @@ void TestGraphPatches() {
   std::vector<uint32_t> many(g1.capacity - g1.count + 1);
   for (size_t i = 0; i < many.size(); ++i) many[i] = nl + 3 + static_cast<uint32_t>(i);
   const std::vector<float> mv(many.size() * f.dim, 0.5f);
-  CHECK(Throws([&] { router->EditGraph(2, many.data(), mv.data(), static_cast<uint32_t>(many.size()), nullptr, 0); }));
-  CHECK(Throws([&] { router->EditGraph(2, nullptr, nullptr, 0, dead.data(), 1); }));
-  CHECK(Throws([&] { router->EditGraph(3, nullptr, nullptr, 0, &before[9][0], 1); }));  // not the next version
+  CHECK(Throws([&] { router->EditGraph(2, many.data(), mv.data(), static_cast<uint32_t>(many.size()), nullptr, 0, nullptr, nullptr, 0); }));
+  CHECK(Throws([&] { router->EditGraph(2, nullptr, nullptr, 0, dead.data(), 1, nullptr, nullptr, 0); }));
+  CHECK(Throws([&] { router->EditGraph(3, nullptr, nullptr, 0, &before[9][0], 1, nullptr, nullptr, 0); }));  // not the next version
   CHECK(router->graph_state().count == g1.count && router->graph_state().version == 1);
 
   // A second edit on top of the first; a patch staged and dropped.
   const std::vector<uint32_t> l2 = {nl + 3};
   const std::vector<float> v2(f.queries.begin() + 10 * f.dim, f.queries.begin() + 11 * f.dim);
-  const std::vector<uint8_t> p2 = router->EditGraph(2, l2.data(), v2.data(), 1, nullptr, 0);
+  const std::vector<uint8_t> p2 = router->EditGraph(2, l2.data(), v2.data(), 1, nullptr, 0, nullptr, nullptr, 0);
   entry->StageGraphPatch(p2.data(), p2.size());
   CHECK(entry->DropGraphPatch(2) && !entry->DropGraphPatch(2) && entry->graph_state().patch == 0);
   entry->StageGraphPatch(p2.data(), p2.size());
@@ -3913,6 +3915,134 @@ void TestGraphPatches() {
   other->StageGraphPatch(patch.data(), patch.size());
   CHECK(Throws([&] { other->HeadDistances(codes.data(), 1, &nl, 1, dd); }));
   CHECK(Throws([&] { other->HeadNeighbors(&nl, 1, 4, 32, nb.data()); }));
+}
+
+// Quake's maintenance on the router (U14, internal/update/quake.go): the nearest live heads by a
+// scan of every head, the 2-means split and its means, a refinement pass, the scan profile and
+// the lists' lengths; and heads moved in place by an edit that another amends, the patch of
+// both from the same base, which an entry's search through it follows.
+void TestQuakeOps() {
+  Fixture& f = GetFixture();
+  auto router = OpenNode(f, {}, true);
+  auto entry = OpenNode(f, {}, true);
+  auto owner = OpenNode(f, {0}, false);
+  owner->SetNodes(1, {});
+  const uint32_t nl = router->num_lists();
+  const uint32_t m = router->pq_m();
+  const ListSegment s0 = ListSegment::Load(JoinPath(f.parts, partfiles::SegmentName(0)));
+  size_t longest = 0;
+  for (size_t i = 1; i < s0.list_ids.size(); ++i)
+    if (s0.offsets[i + 1] - s0.offsets[i] > s0.offsets[longest + 1] - s0.offsets[longest]) longest = i;
+  const ListPostings lp = owner->GetList(s0.list_ids[longest], 0);
+  const uint32_t n = static_cast<uint32_t>(lp.ids.size());
+  CHECK(n >= 8);
+  std::vector<uint8_t> codes(static_cast<size_t>(n) * m);
+  owner->PQGet(lp.ids.data(), n, codes.data());
+
+  // The lengths of a resident version's lists: the segment's.
+  const auto lens = owner->ListLengths(0, 0);
+  CHECK(lens.size() == s0.list_ids.size());
+  for (size_t i = 0; i < lens.size() && i < s0.list_ids.size(); ++i)
+    CHECK(lens[i].first == s0.list_ids[i] && lens[i].second == s0.offsets[i + 1] - s0.offsets[i]);
+  CHECK(Throws([&] { owner->ListLengths(0, 3); }));
+
+  // The nearest live heads: the k closest of every head by HEAD_DISTANCES, the excluded ones left
+  // out; a head is its own nearest.
+  std::vector<uint32_t> all(nl);
+  std::iota(all.begin(), all.end(), 0u);
+  const uint32_t k = 5;
+  std::vector<uint32_t> ex = {3, 11};
+  std::vector<uint32_t> near(static_cast<size_t>(n) * k);
+  router->NearestLive(codes.data(), nullptr, n, k, ex.data(), static_cast<uint32_t>(ex.size()), near.data());
+  for (uint32_t i = 0; i < n; i += 3) {
+    std::vector<float> d(nl);
+    router->HeadDistances(&codes[static_cast<size_t>(i) * m], 1, all.data(), nl, d.data());
+    std::vector<std::pair<float, uint32_t>> by;
+    for (uint32_t h = 0; h < nl; ++h)
+      if (h != ex[0] && h != ex[1]) by.emplace_back(d[h], h);
+    std::sort(by.begin(), by.end());
+    for (uint32_t j = 0; j < k; ++j) CHECK(near[static_cast<size_t>(i) * k + j] == by[j].second);
+  }
+  const uint32_t probe[2] = {7, 20};
+  std::vector<uint32_t> self(2 * 3);
+  router->NearestLive(nullptr, probe, 2, 3, nullptr, 0, self.data());
+  CHECK(self[0] == 7 && self[3] == 20 && self[1] != 7 && self[4] != 20);
+
+  // The split: deterministic for a seed, both sides taken, each code on its nearer centroid --
+  // the centroids inserted as heads, the distances to them by HEAD_DISTANCES.
+  std::vector<uint8_t> side(n), side2(n);
+  std::vector<float> cent(2 * f.dim), cent2(2 * f.dim);
+  router->SplitMeans(codes.data(), n, 5, 1234, side.data(), cent.data());
+  router->SplitMeans(codes.data(), n, 5, 1234, side2.data(), cent2.data());
+  CHECK(side == side2 && cent == cent2);
+  const uint32_t ones = static_cast<uint32_t>(std::count(side.begin(), side.end(), 1));
+  CHECK(ones > 0 && ones < n);
+  const uint32_t kids[2] = {nl, nl + 1};
+  const std::vector<uint8_t> p1 = router->EditGraph(1, kids, cent.data(), 2, nullptr, 0, nullptr, nullptr, 0);
+  for (uint32_t i = 0; i < n; ++i) {
+    float dd[2];
+    router->HeadDistances(&codes[static_cast<size_t>(i) * m], 1, kids, 2, dd);
+    CHECK(side[i] == (dd[1] < dd[0] ? 1 : 0));
+  }
+
+  // A refinement pass: each code to the nearest of the heads, or of float centroids, with the sums
+  // and counts of what each took.
+  std::vector<uint32_t> nearest(n), counts(2);
+  std::vector<float> sums(2 * f.dim);
+  router->RefineAssign(codes.data(), n, kids, nullptr, 2, nearest.data(), sums.data(), counts.data());
+  for (uint32_t i = 0; i < n; ++i) CHECK(nearest[i] == side[i]);
+  CHECK(counts[0] + counts[1] == n && counts[1] == ones);
+  std::vector<uint32_t> nearest2(n), counts2(2);
+  std::vector<float> sums2(2 * f.dim);
+  router->RefineAssign(codes.data(), n, nullptr, cent.data(), 2, nearest2.data(), sums2.data(), counts2.data());
+  CHECK(nearest2 == nearest && counts2 == counts && sums2 == sums);
+
+  // The scan profile: a longer list takes longer.
+  const uint32_t ns[3] = {16, 1024, 65536}, ks[2] = {1, 10};
+  float prof[6];
+  router->ScanProfile(ns, 3, ks, 2, 5, prof);
+  for (float v : prof) CHECK(v > 0);
+  CHECK(prof[4] > prof[0] && prof[5] > prof[1]);
+
+  // Moved in place, then amended: head 7 to a query, the split's first child to the other query;
+  // the amendment deletes head 20 and moves 7 again. The patch makes version 2 from version 1.
+  entry->StageGraphPatch(p1.data(), p1.size());
+  entry->MergeGraphPatch(1);
+  const uint32_t mv[2] = {7, nl};
+  std::vector<float> to(f.queries.begin(), f.queries.begin() + 2 * f.dim);
+  const std::vector<uint8_t> p2 = router->EditGraph(2, nullptr, nullptr, 0, nullptr, 0, mv, to.data(), 2);
+  CHECK(router->graph_state().version == 2 && router->graph_state().count == nl + 2);
+  uint32_t first = kInvalidId;
+  CHECK(router->Navigate(&f.queries[0], 1, 40, &first, kNewestGraph) == 1 && first == 7);
+  const uint32_t dead20 = 20;
+  const std::vector<float> again(f.queries.begin() + 5 * f.dim, f.queries.begin() + 6 * f.dim);
+  const std::vector<uint8_t> p3 = router->EditGraph(2, nullptr, nullptr, 0, &dead20, 1, mv, again.data(), 1);
+  CHECK(router->graph_state().version == 2 && router->graph_state().deleted == 1);
+  CHECK(router->Navigate(&f.queries[5 * f.dim], 1, 40, &first, kNewestGraph) == 1 && first == 7);
+  CHECK(Throws([&] { entry->StageGraphPatch(p2.data(), p2.size() / 2); }));
+  entry->StageGraphPatch(p3.data(), p3.size());
+  const auto want = NavigateAll(f, *router, kNewestGraph);
+  CHECK(NavigateAll(f, *entry, 2) == want);
+  for (const auto& ls : want)
+    for (uint32_t c : ls) CHECK(c != 20);
+  entry->MergeGraphPatch(2);
+  CHECK(NavigateAll(f, *entry, 2) == want);
+  // Refused: a moved head that is deleted or unknown, named twice; an amendment after the graph
+  // changed otherwise (a reload).
+  CHECK(Throws([&] { router->EditGraph(3, nullptr, nullptr, 0, nullptr, 0, &dead20, to.data(), 1); }));
+  const uint32_t twice[2] = {9, 9};
+  CHECK(Throws([&] { router->EditGraph(3, nullptr, nullptr, 0, nullptr, 0, twice, to.data(), 2); }));
+  const uint32_t unknown = nl + 100;
+  CHECK(Throws([&] { router->EditGraph(3, nullptr, nullptr, 0, nullptr, 0, &unknown, to.data(), 1); }));
+  const GraphPatch gp3 = GraphPatch::Parse(p3.data(), p3.size());
+  CHECK(gp3.base_version == 1 && gp3.version == 2);
+  // After a reload the next edit starts from the reloaded graph, and amending it keeps that base.
+  router->LoadGraph(JoinPath(f.index, files::kGraph));
+  CHECK(Throws([&] { router->EditGraph(2, nullptr, nullptr, 0, &dead20, 1, nullptr, nullptr, 0); }));
+  router->EditGraph(1, nullptr, nullptr, 0, &dead20, 1, nullptr, nullptr, 0);
+  const std::vector<uint8_t> p4 = router->EditGraph(1, nullptr, nullptr, 0, nullptr, 0, mv, to.data(), 1);
+  const GraphPatch gp4 = GraphPatch::Parse(p4.data(), p4.size());
+  CHECK(gp4.base_version == 0 && gp4.version == 1 && gp4.num_deleted == 1);
 }
 
 // List edits (U14 major epochs): a list split inside its partition, a list merged into a list
@@ -4414,6 +4544,7 @@ int main() {
       {"read_budget", TestReadBudget},
       {"graph_transfer", TestGraphTransfer},
       {"graph_patches", TestGraphPatches},
+      {"quake_ops", TestQuakeOps},
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
       {"candidate_buffers", TestCandidateBuffers},
