@@ -1803,7 +1803,6 @@ class NodeEngineImpl : public NodeEngine {
   void Assign(const void* vecs, uint32_t n, uint32_t* lists, uint8_t* codes) override {
     const GraphRef g = Graph(kNewestGraph);
     const AssignParams ap = AssignNow();
-    FUSION_CHECK(!ap.rng, "the index was built with RNG pruning, which Assign does not reproduce");
     const T* x = static_cast<const T*>(vecs);
     std::vector<std::pair<float, uint32_t>> cand;
     for (uint32_t i = 0; i < n; ++i) {
@@ -1816,7 +1815,6 @@ class NodeEngineImpl : public NodeEngine {
   void AssignCodes(const uint8_t* codes, uint32_t n, uint32_t* lists) const override {
     const GraphRef g = Graph(kNewestGraph);
     const AssignParams ap = AssignNow();
-    FUSION_CHECK(!ap.rng, "the index was built with RNG pruning, which Assign does not reproduce");
     const uint32_t m = codebook_->m();
     std::vector<float> xf(dim_);
     std::vector<T> q(dim_);
@@ -1829,13 +1827,19 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   // One vector by the build's rule: its nearest head, then the next ones in order of distance
-  // within the closure, up to ap.replicas lists in out (padded with kInvalidId). G is GraphRef,
-  // declared further down.
+  // within the closure, up to ap.replicas lists in out (padded with kInvalidId). With RNG pruning
+  // (SPANN's rule; SPFresh's RNGSelection), a head is skipped when it is closer to a head already
+  // taken than to the vector, by rng_factor, on squared distances as the build compares them. G
+  // is GraphRef, declared further down.
   template <class G>
   void AssignOne(const G& g, const AssignParams& ap, const T* v, uint32_t* out,
                  std::vector<std::pair<float, uint32_t>>* cand) const {
     const uint32_t r = ap.replicas;
     const float closure = (1.f + ap.closure_eps) * (1.f + ap.closure_eps);
+    const float rng2 = ap.rng_factor * ap.rng_factor;
+    // The pruning reads the heads' vectors from the graph, where a staged patch's new heads are
+    // not: the router stages none.
+    FUSION_CHECK(!ap.rng || !g.patch, "the graph has a staged patch: RNG pruning reads the router's heads");
     if (ap.exact) {  // every live head scanned, as the build did (Quake's index)
       FUSION_CHECK(!g.patch, "the graph has a staged patch: an exact assignment scans the router's heads");
       ScanHeads(*g.g, v, ap.candidates, nullptr, cand);
@@ -1853,9 +1857,19 @@ class NodeEngineImpl : public NodeEngine {
     if (cand->empty()) return;
     uint32_t cnt = 0;
     const float d1 = (*cand)[0].first;
+    std::vector<const T*> taken;  // the heads taken so far, for the pruning
+    if (ap.rng) taken.push_back(HeadVector(*g.g, (*cand)[0].second));
     out[cnt++] = (*cand)[0].second;
     for (size_t j = 1; j < cand->size() && cnt < r; ++j) {
-      if ((*cand)[j].first > closure * d1) break;  // Eq. 2 closure rule (candidates are sorted)
+      const float dj = (*cand)[j].first;
+      if (dj > closure * d1) break;  // Eq. 2 closure rule (candidates are sorted)
+      if (ap.rng) {
+        const T* c = HeadVector(*g.g, (*cand)[j].second);
+        bool skip = false;
+        for (uint32_t a = 0; a < cnt && !skip; ++a) skip = rng2 * L2Sqr(c, taken[a], dim_) <= dj;
+        if (skip) continue;
+        taken.push_back(c);
+      }
       out[cnt++] = (*cand)[j].second;
     }
   }
@@ -2565,6 +2579,7 @@ class NodeEngineImpl : public NodeEngine {
     a.replicas = static_cast<uint32_t>(std::stoul(meta.GetOr("replicas", "8")));
     a.closure_eps = std::stof(meta.GetOr("closure_eps", "10"));
     a.rng = meta.GetOr("rng", "0") != "0";
+    a.rng_factor = std::stof(meta.GetOr("rng_factor", "1"));
     a.candidates = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_candidates", "64")));
     a.ef = static_cast<uint32_t>(std::stoul(meta.GetOr("assign_ef", "128")));
     a.exact = meta.GetOr("assign_exact", "0") != "0";

@@ -110,9 +110,9 @@ func partitionIDs(postings string, assign []uint32, parts int) ([][]uint32, erro
 }
 
 var (
-	fixOnce, quakeOnce sync.Once
-	fix, quakeFix      *fixture
-	fixErr, quakeErr   error
+	fixOnce, quakeOnce, rngOnce sync.Once
+	fix, quakeFix, rngFix       *fixture
+	fixErr, quakeErr, rngErr    error
 )
 
 func getFixture(t *testing.T) *fixture {
@@ -126,6 +126,21 @@ func getFixture(t *testing.T) *fixture {
 		t.Fatal(fixErr)
 	}
 	return fix
+}
+
+// getRNGFixture is the fixture's data as the index SPFresh runs on (U14, internal/update/
+// spfresh.go): its replicas pruned by SPANN's RNG rule (fusion_build --rng).
+func getRNGFixture(t *testing.T) *fixture {
+	t.Helper()
+	bin := os.Getenv("RTIER_ENGINE_BIN")
+	if bin == "" {
+		t.Skip("RTIER_ENGINE_BIN not set (run `make test`)")
+	}
+	rngOnce.Do(func() { rngFix, rngErr = buildFixture(bin, "--rng") })
+	if rngErr != nil {
+		t.Fatal(rngErr)
+	}
+	return rngFix
 }
 
 // getQuakeFixture is the fixture's data as Quake's index (U14, internal/update/quake.go): a flat

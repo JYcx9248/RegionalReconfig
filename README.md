@@ -359,12 +359,14 @@ vector is inserted again by the build's rule (`ASSIGN_CODES`: ASSIGN's rule on i
 that list is no longer among its lists. Then it joins every list of its new set and leaves every
 list it was seen in that the set lacks (`STAGE_VERSIONS` drops those postings). A vector in a
 child is checked in that child only, so a member that keeps its child does not take the other
-one too. A merged list's postings go into every list the rule gives them. Unlike SPFresh, the
-decisions use PQ codes; replicas follow this index's rule (its 8 nearest heads, no RNG pruning);
-SPFresh's code also checks a child's member in the neighboring lists when the old head is no
-closer to it than its child's head, which by our rule would often put it in both children; copies
-in lists the reassign did not read stay, as SPFresh's stale copies stay until their posting is
-next split or merged; and the policy runs once per batch.
+one too. A merged list's postings go into every list the rule gives them. The rule is the
+index's: on an index built with `--rng` (as SPFresh's evaluation builds SPANN's), SPANN's RNG
+selection, as SPFresh's `RNGSelection`; on FusionANNS's, its 8 nearest heads. Unlike SPFresh, the
+decisions use PQ codes; SPFresh's code also checks a child's member in the neighboring lists when
+the old head is no closer to it than its child's head, which by FusionANNS's rule would often put
+it in both children (the RNG rule would prune the second, so on an RNG index whether to follow the
+code there is open); copies in lists the reassign did not read stay, as SPFresh's stale copies stay
+until their posting is next split or merged; and the policy runs once per batch.
 
 With `-policy quake` (`"Policy": "quake"`, its parameters in `"Quake"`), the update controller
 runs a round of Quake's maintenance as one major epoch, after a batch or alone, as Quake's code

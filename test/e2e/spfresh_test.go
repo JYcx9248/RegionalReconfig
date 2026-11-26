@@ -27,9 +27,19 @@ import (
 // vector fetched on demand), and out of the lists it was seen in -- postings dropped from the
 // base version, or taken out of a child's plan. A list at the owners' boundary merges into every
 // list the rule gives its postings. Every answer must equal the oracle's for its epoch, the lists
-// hold what the plan says, and no vector of one split list ends in both of its children.
+// hold what the plan says, and no vector of one split list ends in both of its children. It runs
+// on FusionANNS's index (the 8 nearest heads) and on the RNG-pruned one SPFresh's evaluation
+// builds, where the build's rule -- inserts' and the reassign's -- is SPANN's RNG selection.
 func TestSPFreshReassign(t *testing.T) {
-	f := getFixture(t)
+	for _, c := range []struct {
+		name string
+		get  func(*testing.T) *fixture
+	}{{"fusionanns", getFixture}, {"rng", getRNGFixture}} {
+		t.Run(c.name, func(t *testing.T) { testSPFreshReassign(t, c.get(t)) })
+	}
+}
+
+func testSPFreshReassign(t *testing.T, f *fixture) {
 	m, err := partitioning.LoadManifest(f.parts)
 	if err != nil {
 		t.Fatal(err)

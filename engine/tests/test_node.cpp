@@ -36,6 +36,7 @@
 #include "fusion/layout.h"
 #include "fusion/node_engine.h"
 #include "fusion/partition.h"
+#include "fusion/pq.h"
 #include "fusion/raw_store.h"
 
 using namespace fusion;
@@ -4045,6 +4046,84 @@ void TestQuakeOps() {
   CHECK(gp4.base_version == 0 && gp4.version == 1 && gp4.num_deleted == 1);
 }
 
+// SPANN's RNG pruning of replicas (fusion_build --rng) is the build's rule too (U14), on the
+// router: ASSIGN on an RNG index's own vectors gives back what its build gave them, with fewer
+// replicas than the rule's cap, and ASSIGN_CODES (SPFresh's reassign) keeps the rule -- no list
+// after the first has a head closer to an earlier one's than to the vector.
+void TestRngAssign() {
+  Fixture& f = GetFixture();
+  const std::string dir = TempDir();
+  const uint64_t n = f.base.size() / f.dim;
+  SaveBin(dir + "/base.fbin", DType::kFloat, n, f.dim, f.base.data());
+  BuildParams bp;
+  bp.base_path = dir + "/base.fbin";
+  bp.out_dir = dir + "/index";
+  bp.pq_m = 8;
+  bp.pq_train_n = 4000;
+  bp.assign.rng = true;
+  BuildIndex(bp);
+  const PostingLists pl = PostingLists::Load(JoinPath(bp.out_dir, files::kPostings));
+  std::vector<uint32_t> assign(pl.num_lists());
+  for (uint32_t c = 0; c < pl.num_lists(); ++c)
+    assign[c] = static_cast<uint32_t>(uint64_t(c) * f.num_parts / pl.num_lists());
+  const std::string parts = dir + "/parts";
+  WritePartitions(pl, assign, f.num_parts, parts, LayoutMap::Load(JoinPath(bp.out_dir, files::LayoutMap("bucket"))),
+                  "bucket");
+  NodeOptions o;
+  o.index_dir = bp.out_dir;
+  o.partitions_dir = parts;
+  o.num_workers = 1;
+  o.max_nprobe = 64;
+  o.max_rerank = 64;
+  o.direct_io = false;
+  auto router = NodeEngine::Open(o);
+  router->LoadGraph(JoinPath(bp.out_dir, files::kGraph));
+  const uint32_t r = router->assign_replicas(), m = router->pq_m(), k = 400;
+  CHECK(r == 8);
+
+  // The build's lists for the index's own vectors.
+  std::vector<uint32_t> lists(static_cast<size_t>(k) * r);
+  std::vector<uint8_t> codes(static_cast<size_t>(k) * m);
+  router->Assign(f.base.data(), k, lists.data(), codes.data());
+  std::vector<std::vector<uint32_t>> built(k);
+  for (uint32_t c = 0; c < pl.num_lists(); ++c)
+    for (uint32_t j = 0; j < pl.Size(c); ++j)
+      if (pl.List(c)[j] < k) built[pl.List(c)[j]].push_back(c);
+  const VectorSet hv = LoadVectors(JoinPath(bp.out_dir, files::kCentroids), DType::kFloat);
+  auto head = [&](uint32_t c) { return reinterpret_cast<const float*>(hv.data.data()) + static_cast<size_t>(c) * f.dim; };
+  // The rule: in the order taken, no head is closer to an earlier one than to the vector.
+  auto keeps_rule = [&](const float* v, const uint32_t* set) {
+    for (uint32_t j = 1; j < r && set[j] != kInvalidId; ++j)
+      for (uint32_t a = 0; a < j; ++a)
+        if (L2Sqr(head(set[j]), head(set[a]), f.dim) <= L2Sqr(v, head(set[j]), f.dim)) return false;
+    return true;
+  };
+  uint32_t same = 0, total = 0;
+  for (uint32_t i = 0; i < k; ++i) {
+    const uint32_t* set = &lists[static_cast<size_t>(i) * r];
+    std::vector<uint32_t> got;
+    for (uint32_t j = 0; j < r && set[j] != kInvalidId; ++j) got.push_back(set[j]);
+    total += static_cast<uint32_t>(got.size());
+    CHECK(keeps_rule(&f.base[static_cast<size_t>(i) * f.dim], set));
+    std::sort(got.begin(), got.end());
+    if (got == built[i]) ++same;
+  }
+  std::printf("    ASSIGN with RNG pruning: %u of %u vectors get the build's lists, %.2f replicas each\n", same, k,
+              static_cast<double>(total) / k);
+  CHECK(same == k);
+  CHECK(total < k * r / 2);
+
+  // SPFresh's reassign asks for the lists of decoded PQ codes: the same rule.
+  std::vector<uint32_t> sets(static_cast<size_t>(k) * r);
+  router->AssignCodes(codes.data(), k, sets.data());
+  const PQCodebook cb = PQCodebook::Load(JoinPath(bp.out_dir, files::kPQCodebook));
+  std::vector<float> x(f.dim);
+  for (uint32_t i = 0; i < k; ++i) {
+    cb.Decode(&codes[static_cast<size_t>(i) * m], x.data());
+    CHECK(sets[static_cast<size_t>(i) * r] != kInvalidId && keeps_rule(x.data(), &sets[static_cast<size_t>(i) * r]));
+  }
+}
+
 // List edits (U14 major epochs): a list split inside its partition, a list merged into a list
 // another node owns -- its postings name the node that holds their vectors, fetched from there
 // when a query needs them -- and a later owner that learns the new lists from the segment.
@@ -4545,6 +4624,7 @@ int main() {
       {"graph_transfer", TestGraphTransfer},
       {"graph_patches", TestGraphPatches},
       {"quake_ops", TestQuakeOps},
+      {"rng_assign", TestRngAssign},
       {"list_edits", TestListEdits},
       {"generations", TestGenerations},
       {"candidate_buffers", TestCandidateBuffers},

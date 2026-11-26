@@ -629,9 +629,9 @@ class NodeEngine {
                                   const uint32_t* versions, uint32_t nlists, double* fetch_us) = 0;
   // The posting lists the index's build would have given each of n vectors (`vecs`, dim()
   // elements of dtype() each), and their PQ codes: the routing of inserted vectors (U14), by
-  // the build's own rule and parameters (index meta: replicas, closure_eps, the assignment's
-  // candidates and search width) on this node's navigation graph, so that an insert lands
-  // where the build would have put it. lists gets assign_replicas() entries per vector, padded
+  // the build's own rule and parameters (index meta: replicas, closure_eps, SPANN's RNG pruning
+  // and its factor, the assignment's candidates and search width) on this node's navigation
+  // graph, so that an insert lands where the build would have put it. lists gets assign_replicas() entries per vector, padded
   // with kInvalidId; codes gets pq_m() bytes per vector. Needs the graph (NoGraphError).
   virtual void Assign(const void* vecs, uint32_t n, uint32_t* lists, uint8_t* codes) = 0;
   virtual uint32_t assign_replicas() const = 0;

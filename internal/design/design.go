@@ -135,7 +135,7 @@ var Open = map[string]Question{
 			"differs from dataset to dataset: the posting imbalance itself -- a list's length is " +
 			"about how many vectors count its head among their 8 nearest (90% of the vectors reach " +
 			"the cap of 8 replicas), which varies with the data's geometry (hubness), and the levers " +
-			"are the build's (SPANN's RNG pruning of replicas, which Assign does not reproduce yet; a " +
+			"are the build's (SPANN's RNG pruning of replicas, fusion_build --rng, which Assign follows; a " +
 			"length cap at the build; the replica count), not the partitioning",
 		"internal/partitioning/partitioner.go, engine/tools/rtier_segment.cpp, scripts/testing/ " +
 			"(make_range_assignment.py, make_spatial_assignment.py, make_gp_assignment.py, " +
@@ -396,14 +396,16 @@ var Open = map[string]Question{
 			"the above, or spfresh: SPFresh's reassign as its code does it (CollectReAssign, " +
 			"CheckIsNeedReassign, Reassign; its paper writes LIRE per nearest posting and leaves " +
 			"how a vector's replicas are chosen to the code), on PQ " +
-			"codes, with the build's own assignment rule (the 8 nearest heads, no RNG pruning: the " +
-			"build follows FusionANNS) in place of SPANN's RNG-pruned one. Each split checks the " +
+			"codes, with the build's own assignment rule: on an index built with --rng, SPANN's " +
+			"RNG selection, as SPFresh's (RNGSelection; the router's ASSIGN and ASSIGN_CODES too, " +
+			"2026-11-23), on FusionANNS's the 8 nearest heads. Each split checks the " +
 			"members of its children, then those of the -reassign-range (64) lists nearest its old " +
 			"head, nearest first, by SPFresh's conditions, and queues a vector once, in the first " +
 			"list where they hold. A vector in a child is checked there only: SPFresh's code also " +
 			"checks a child's member in the neighboring lists when the old head is no closer to it " +
-			"than its child's head, and by our rule such a member would often take the other child " +
-			"too. A queued vector whose list is not among the lists the rule now gives it joins " +
+			"than its child's head, and by FusionANNS's rule such a member would often take the " +
+			"other child too (the RNG rule would prune it: on an RNG index, whether to follow the " +
+			"code there is open). A queued vector whose list is not among the lists the rule now gives it joins " +
 			"every list of that set and leaves every list read that lacks it (STAGE_VERSIONS drops " +
 			"single postings); a merged list's postings go " +
 			"into every list the rule gives them. Copies in lists not read stay (SPFresh's stale " +

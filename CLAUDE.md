@@ -225,8 +225,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   merges posting lists and ships the graph change as a patch every entry stages, searches
   through after the flip and merges after the grace period. With `"Policy": "spfresh"`
   (`rtier-updater -policy`, `spfresh.go`, 2026-11-18) it also runs SPFresh's reassign as
-  SPFresh's code does it, on PQ codes and with the build's own rule (8 nearest heads, no RNG
-  pruning): the members of the split lists' children and of the `"ReassignRange"` (64) lists
+  SPFresh's code does it, on PQ codes and with the build's own rule (on an index built with
+  `--rng`, SPANN's RNG selection as SPFresh's, which the router's `ASSIGN` follows since
+  2026-11-23; on FusionANNS's, the 8 nearest heads): the members of the split lists' children
+  and of the `"ReassignRange"` (64) lists
   nearest each old head are checked, each split queuing a vector once, in the first list where
   SPFresh's conditions hold (a vector in a child is checked there only, so one that keeps its
   child does not take the other too), and a vector whose queued list left its new set joins

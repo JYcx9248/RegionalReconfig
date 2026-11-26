@@ -26,12 +26,17 @@ import (
 //     that stays there does not take the other child too. A merged list's postings go into
 //     every list the rule gives them.
 //
+// The rule is the index's build's. On an index built with RNG pruning (fusion_build --rng, as
+// SPFresh's evaluation builds SPANN's) it is SPANN's RNG selection, SPFresh's RNGSelection: the
+// nearest heads in order, each skipped if it is closer to one already taken than to the vector,
+// up to the replica count. On FusionANNS's index it is the 8 nearest heads within the closure.
+//
 // SPFresh's own differences, kept out: it decides on raw vectors, we on PQ codes (the router's,
-// so that no data node computes); its index prunes replicas by the RNG rule, ours does not (the
-// build's rule, FusionANNS's); its code checks a child's member in the neighboring lists too
-// when the member is no closer to the old head than to its child's head, and by our rule such a
-// member would often take the other child as well (the two new heads are close to each other,
-// and nothing prunes the second); a reassign there bumps the vector's version, so that every old
+// so that no data node computes); its code checks a child's member in the neighboring lists too
+// when the member is no closer to the old head than to its child's head -- by FusionANNS's rule
+// such a member would often take the other child as well (the two new heads are close to each
+// other, and nothing prunes the second), while the RNG rule would prune it, so whether to follow
+// the code there on an RNG index is open; a reassign there bumps the vector's version, so that every old
 // copy is dropped when its posting is next split or merged, here the copies outside the lists
 // read stay (still found by searches, as SPFresh's stale copies are until then); its merge
 // appends a short posting to its nearest neighbor, ours reassigns the postings by the rule; and
@@ -47,7 +52,7 @@ type ReassignStats struct {
 	Checked    int `json:"checked"`    // postings checked against SPFresh's conditions
 	Candidates int `json:"candidates"` // vectors queued: by each split, the first posting that met them
 	Moved      int `json:"moved"`      // vectors inserted again
-	Added      int `json:"added"`      // postings added for them
+	Added      int `json:"added"`      // postings planned for them, in lists they were not seen in (a list not read may hold one already: staging keeps one)
 	Dropped    int `json:"dropped"`    // postings they left
 }
 
