@@ -548,17 +548,21 @@ var Open = map[string]Question{
 		"internal/epoch/table.go (Table.Entries), internal/agent/serve.go (entry), " +
 			"internal/controller/reconfig.go (promoteEntries), cmd/rtier-loadgen/main.go " +
 			"(entries.catchUp)"},
-	"U15": {"U15", "The host copy of the PQ codes next to the GPU's",
+	"U15": {"U15", "The host copy of the PQ codes next to the GPU's (decided: none on the GPU backend)",
 		"with the GPU backend a node held every code twice: PQStore the authoritative copy in " +
 			"host memory (capacity x m) and the filter a second one in device memory. The host " +
-			"copy answers a peer's PQ_GET without touching the GPU; dropping it saves that DRAM " +
-			"but makes a migration source read its codes back over D2H, next to its own query " +
-			"kernels. Under test on branch no-host-pq (2026-11-19), against clusterExperiment, " +
-			"which keeps both: with the GPU backend PQStore keeps the bookkeeping but no code " +
-			"bytes; a Put hands its codes, in slot order, to the filter (StoreCodes), and a Get " +
-			"(PQ_GET) or a Save (PQ_SAVE) reads them back (LoadCodes: a gather kernel and a D2H " +
-			"copy, under the store's lock so that no slot is reused meanwhile). The CPU backend " +
-			"keeps the host copy it filters from",
+			"copy answered a peer's PQ_GET without touching the GPU, so that a migration source " +
+			"would not read its codes back over D2H next to its own query kernels. Decided " +
+			"(2026-11-23): the GPU backend keeps its codes in device memory only. On CloudLab " +
+			"(4 -> 8, Wikipedia and Amazon 300M, two runs each, 2026-11-20 to 22) the sources' " +
+			"GPUs were 6-22% busy during the staging, the runs without the copy answered as many " +
+			"queries with the same recall, and a source's PQ_GET was faster from the device; the " +
+			"copy cost capacity x m of DRAM (5-6 GB per initial node on Amazon 300M). PQStore " +
+			"keeps the bookkeeping but no code bytes; a Put hands its codes, in slot order, to " +
+			"the filter (StoreCodes), and a Get (PQ_GET) or a Save (PQ_SAVE) reads them back " +
+			"(LoadCodes: a gather kernel and a D2H copy, under the store's lock so that no slot " +
+			"is reused meanwhile). The CPU backend keeps the host copy it filters from. Nothing " +
+			"open",
 		"engine/include/fusion/pq_store.h (codes_, Mirror, Reader), engine/src/node_engine.cpp " +
 			"(filter creation), engine/src/gpu_filter.cu (d_codes_, StoreCodes, LoadCodes)"},
 }

@@ -8,8 +8,8 @@ C++ data nodes built on the FusionANNS reimplementation.
 Open design questions (U1–U17, without U4) are placeholders: on a code path they fail with
 `design decision pending [Un ...]`; the few without a code path yet (U12, and U17's list
 outside the epoch) are recorded in the registry with what the code does meanwhile. U15 (the
-host copy of the PQ codes) is under test on this branch, no-host-pq: the GPU backend keeps
-its codes in device memory only (engine/README.md, "Known limits of the PQ path"). U4
+host copy of the PQ codes) is decided (2026-11-23): the GPU backend keeps its codes in device
+memory only (engine/README.md, "Known limits of the PQ path"). U4
 (replicas of hot partitions) is out of scope: rtier keeps one owner per partition and handles
 skew by placement -- a plan reassigns partitions, at the same node count if need be (U3).
 Serverless-style read capacity, how streaming systems serve a hot key, would not relieve a

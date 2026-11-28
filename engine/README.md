@@ -198,8 +198,8 @@ dropped: the vectors of partitions that move away stay, like cached PQ codes, so
 can serve the peers whose postings name it, and a partition that comes back needs no transfer.
 
 Known limits of the PQ path:
-- On this branch (no-host-pq, U15 under test) the GPU backend keeps no host copy of the node's
-  codes, which saves capacity × m bytes of DRAM: a Put hands its codes to the filter
+- The GPU backend keeps no host copy of the node's codes (U15, decided 2026-11-23), which saves
+  capacity × m bytes of DRAM: a Put hands its codes to the filter
   (`StoreCodes`), and a peer's PQ_GET or a snapshot's PQ_SAVE reads them back from the device
   (`LoadCodes`: a gather kernel and a D2H copy, in batches of 64K codes, under the store's lock).
   A migration source thus serves its peers over the PCIe link its queries use. The CPU backend
