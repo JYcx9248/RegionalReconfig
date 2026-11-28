@@ -9,8 +9,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"rtier/internal/epoch"
@@ -512,10 +514,10 @@ func (c *Controller) placeGeneration(ctx context.Context, gen *generation, nodes
 	segs := make([]*partitioning.Segment, np)
 	weights := make([][]int64, np)
 	totals := make([]int64, np)
-	for p := 0; p < np; p++ {
+	if err := eachPartition(np, func(p int) error {
 		s, err := partitioning.ReadSegment(filepath.Join(gen.partsDir, partitioning.SegmentName(p)))
 		if err != nil {
-			return placement.Table{}, 0, 0, err
+			return err
 		}
 		segs[p] = s
 		locs := append([]uint32(nil), s.Locs...)
@@ -532,6 +534,9 @@ func (c *Controller) placeGeneration(ctx context.Context, gen *generation, nodes
 				}
 			}
 		}
+		return nil
+	}); err != nil {
+		return placement.Table{}, 0, 0, err
 	}
 	var plan placement.Table
 	var err error
@@ -551,12 +556,14 @@ func (c *Controller) placeGeneration(ctx context.Context, gen *generation, nodes
 		index[n.ID] = i
 	}
 	var vectors, local int64
-	var cand []int
-	for p, s := range segs {
-		o := index[plan.Owners[p]]
+	for p := range segs {
 		vectors += totals[p]
-		local += weights[p][o]
+		local += weights[p][index[plan.Owners[p]]]
+	}
+	if err := eachPartition(np, func(p int) error {
+		s, o := segs[p], index[plan.Owners[p]]
 		s.Holders = make([]uint16, len(s.IDs))
+		cand := make([]int, 0, len(nodes))
 		for j, loc := range s.Locs {
 			if has(o, loc) {
 				continue // the owner holds it
@@ -569,16 +576,40 @@ func (c *Controller) placeGeneration(ctx context.Context, gen *generation, nodes
 				}
 			}
 			if len(cand) == 0 {
-				return placement.Table{}, 0, 0, fmt.Errorf("partition %d: the vector at location %d (ID %d) is on no node",
-					p, loc, s.IDs[j])
+				return fmt.Errorf("partition %d: the vector at location %d (ID %d) is on no node", p, loc, s.IDs[j])
 			}
 			s.Holders[j] = uint16(nodes[cand[int(loc)%len(cand)]].ID)
 		}
-		if err := s.Write(filepath.Join(workDir, partitioning.SegmentName(p))); err != nil {
-			return placement.Table{}, 0, 0, err
-		}
+		return s.Write(filepath.Join(workDir, partitioning.SegmentName(p)))
+	}); err != nil {
+		return placement.Table{}, 0, 0, err
 	}
 	return plan, vectors, local, nil
+}
+
+// eachPartition runs f on partitions 0..np-1, several at once, and returns their errors; after
+// one fails, no other starts. placeGeneration's work per partition is the controller's CPU,
+// mostly a sort of its locations: one after another, the 64 partitions of Wikipedia's next
+// generation took 81 s of a rebuild on CloudLab (2026-11-22). Half the cores, since the control
+// node also runs the load generator.
+func eachPartition(np int, f func(p int) error) error {
+	var next atomic.Int64
+	errs := make([]error, min(np, max(1, runtime.NumCPU()/2)))
+	var wg sync.WaitGroup
+	for w := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := int(next.Add(1) - 1); p < np; p = int(next.Add(1) - 1) {
+				if errs[w] = f(p); errs[w] != nil {
+					next.Store(int64(np))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // querySample collects the client queries the nodes kept as entries: at most max of them (0:
