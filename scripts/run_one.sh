@@ -19,7 +19,8 @@
 #
 # An experiment with "Hosts" runs on its cluster (scripts/run_cluster.py), which makes the same
 # clean state on every host: it removes the nodes' directories there, and where sudo asks no
-# password (CloudLab) drops the page cache, sets swappiness and stops fstrim.timer. This machine, which runs the
+# password (CloudLab) drops the page cache -- again after its copies, so that what a run copies is
+# not cached in it either -- sets swappiness and stops fstrim.timer. This machine, which runs the
 # controller and the load, is cleaned as above, and its memory is what mem-<protocol>.log logs.
 set -u
 cd "$(dirname "$0")/.."

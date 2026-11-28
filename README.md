@@ -447,10 +447,13 @@ PROTOCOL OUT ['{...}']` runs one experiment with the protocol and any other key 
 (JSON: `'{"Load": {"Rate": 200}}'` changes the rate alone), on a clean node state. An
 experiment with `"Hosts"` runs on its cluster (`run_cluster.py`), which makes that state on
 every host: no node directory of an earlier run, and where sudo asks no password, an empty page
-cache, swappiness 1 and no periodic TRIM. Ubuntu's `fstrim.timer` trims every file system weekly
-(Monday 00:00 and up to 100 min later), and a TRIM on a SATA SSD is not queued: on 2026-11-09 it
-held a CloudLab host's disk for 8.6 min of a run, each read taking 3.5 times as long, so the
-runners stop the timer.
+cache, swappiness 1 and no periodic TRIM. The page cache is emptied again after the copies, right
+before the nodes start: what a run copies would otherwise be cached in that run only (a rebuild's
+next generation, copied to the hosts for the first time, was staged from memory in 12 s, and in
+the next run from the disk in 50 s, 2026-11-23). Ubuntu's `fstrim.timer` trims every file system
+weekly (Monday 00:00 and up to 100 min later), and a TRIM on a SATA SSD is not queued: on
+2026-11-09 it held a CloudLab host's disk for 8.6 min of a run, each read taking 3.5 times as
+long, so the runners stop the timer.
 
 The initial deployment copies each initial node's share of the raw vectors from the index's page
 file: minutes at scale (371 s for Wikipedia's two nodes on the lab server). A warmup run does it

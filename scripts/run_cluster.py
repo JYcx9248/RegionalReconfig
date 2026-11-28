@@ -18,7 +18,8 @@ load (run_local.py is the single-machine case):
      of each rebuild's next generation, its meta, codebook, PQ codes, graph and manifest. The
      rest of an index is the build's own (postings, centroids, layout maps). A host that sees a
      directory at its path already (this machine, a shared file system) gets no copy of it.
-     Before that, each initial node's warmup snapshot is restored on its host.
+     Before that, each initial node's warmup snapshot is restored on its host; after it, the
+     hosts' page caches are emptied again, as in step 1: what a run copied is not cached in it.
   4. start the controller here, then each node in order over SSH -- its rtier_node, then its
      agent -- and wait for the agent's registration before the next: nodes n1, n2, ... get IDs
      1, 2, ..., and the first InitialNodes form the deployment (Koala starts its workers in
@@ -287,9 +288,10 @@ def preflight(hosts: list, nodes: int, dirs: list, work: str, ebin: str, cfg: di
         script = "\n".join([
             f"pkill -TERM -f -- {shlex.quote(stale)} && sleep 2; pkill -KILL -f -- {shlex.quote(stale)}",
             # The clean node state scripts/run_one.sh makes on one machine: no node directory an
-            # earlier run left, and where sudo asks no password (CloudLab) an empty page cache,
-            # with swap on, swappiness 1 -- at 60 the kernel swaps node memory out under page-cache
-            # pressure, and a run that swaps in is not comparable -- and no TRIM of the disks:
+            # earlier run left, and where sudo asks no password (CloudLab) an empty page cache
+            # (emptied again after the copies: drop_caches), with swap on, swappiness 1 -- at 60
+            # the kernel swaps node memory out under page-cache pressure, and a run that swaps in
+            # is not comparable -- and no TRIM of the disks:
             # Ubuntu's fstrim.timer trims every file system weekly (Monday 00:00 and up to 100 min
             # later), and on 2026-11-09 it held a c240g5's SSD for 8.6 min of a run, each read
             # taking 3.5 times as long (a SATA TRIM is not queued: the reads wait behind it).
@@ -486,6 +488,26 @@ def check_libraries(hosts: list, bins: list) -> None:
                  "the libraries they link are not):\n  " + "\n  ".join(lack))
 
 
+def drop_caches(hosts: list) -> None:
+    """After the copies, before any node starts: where sudo asks no password, each host's page
+    cache is emptied once more (step 1 empties it before the copies). What this run copied there
+    or restored from a warmup snapshot would otherwise be cached in this run only, and not in the
+    next one, which copies nothing: a rebuild's next generation, copied to the hosts for the
+    first time on 2026-11-22, was staged from memory in 12 s, and from the disk in the next run in
+    50 s (its 7 GB graph read at 180 MB/s). The sync before writes back what the copies left
+    dirty, which can take minutes."""
+    script = ("if sudo -n true 2>/dev/null; then sync && echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null "
+              "&& echo dropped=yes; fi; true")
+    distinct = list(dict.fromkeys(hosts))
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(distinct))) as ex:
+        out = list(ex.map(lambda h: h.run(script, f"{h.dest}: emptying the page cache", timeout=1800), distinct))
+    kept = [h.dest for h, o in zip(distinct, out) if "dropped=yes" not in o.split()]
+    note = f"; kept on {', '.join(kept)}: sudo asks a password there" if kept else ""
+    log(f"page cache emptied on {len(distinct) - len(kept)} of {len(distinct)} hosts after the copies, "
+        f"in {time.monotonic() - started:.0f} s{note}")
+
+
 # ------------------------------------------------------------------- 4. processes
 
 class Procs(rl.Procs):
@@ -583,6 +605,7 @@ def main(cfg_path: str, out_dir: str) -> None:
     sync(hosts, initial, bins + [rl.experiment_config.SYSTEM_CONFIG], index, parts, gens, graph, out_dir, restored,
          with_pq)
     check_libraries(hosts, bins)
+    drop_caches(hosts)
 
     procs = Procs(out_dir)
     results = []

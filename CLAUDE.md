@@ -262,7 +262,10 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   segments, and the PQ codes and the page file unless the host's initial nodes start on a
   warmup snapshot of them; a next generation's meta, codebook, PQ codes, graph and manifest),
   checks with `ldd` that the
-  binaries find their shared libraries there, and starts the nodes in order
+  binaries find their shared libraries there, empties the hosts' page caches again (what a run
+  copies is not cached in it: a rebuild's next generation, copied for the first time, staged in
+  12 s from memory and in 50 s from the disk in the next run, 2026-11-23), and starts the
+  nodes in order
   over SSH, each after the previous one registered. A remote process stops when its SSH session
   closes. `"NodeResources"` (except `"ReadIOPSPerNode"`) and `"Emulation"` are for one machine
   and are refused. On CloudLab, `scripts/cloudlab/`: a profile (a control node and N hosts on
