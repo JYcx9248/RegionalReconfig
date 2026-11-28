@@ -1,0 +1,44 @@
+{
+  "Comment": "The warmup of every run that starts on 4 nodes on the Wikipedia c1024 index with RNG-pruned replicas (the SPFresh example: fusion_build --from-index the base index --rng, 6.71 replicas a vector against the base's 7.27; the base's IDs, raw-vector locations, codebook and page file), its 64 GP partitions made as the base's (results/rng-index-2026-11-23/after-build.sh): deploys them and saves the snapshot of their raw vectors and PQ codes those runs then start on (scripts/run_local.py, type: warmup), on the lab server, from the page file, on the CPU backend; as experiment.wiki-c1024-warmup-4.json otherwise. A cluster's hosts get the index and partition files copied, and each initial node's part of the snapshot under the same SnapshotDir.",
+  "Type": "warmup",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024-rng",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-rng/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-rng-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "MemoryMax": "24G"
+  },
+  "InitialNodes": 4,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson"
+  }
+}

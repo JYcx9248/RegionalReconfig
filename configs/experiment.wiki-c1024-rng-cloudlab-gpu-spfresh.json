@@ -1,0 +1,124 @@
+{
+  "Comment": "CloudLab c240g5 (scripts/cloudlab/profile.py: node0 the control node, node1 to node4 the hosts of n1 to n4): the SPFresh example of the update strategies -- SPFresh's maintenance planned per batch and run as major epochs -- on Wikipedia c1024, 4 data nodes, the load constant. The update experiment's four minor batches of the 2026-02 diff (b4x5: 775K inserts and about 744K deletes each, 400 s apart: experiment.wiki-c1024-cloudlab-gpu-updates.json), each followed by an SPFresh epoch: lists longer than 400 split, SPFresh's reassign of the members of the 64 nearest lists, lists shorter than 5 merged into their nearest list with room (SPFresh's paper), every old copy of a moved vector dropped, at most 1300 lists an epoch; no full rebuild and no spare. The index is the one with RNG-pruned replicas (SPFresh builds on SPANN, which picks replicas by the RNG rule; fusion_build --from-index the base index --rng: the base's IDs, raw-vector locations, codebook and page file), inserts and reassigned vectors routed by the same rule, its 64 GP partitions made as the base's, the nodes started on its 4-node warmup snapshot (experiment.wiki-c1024-rng-cloudlab-gpu-warmup-4.json). nprobe 64, N 200 as the update experiment: recall 0.903 on this index against the base's 0.889 (results/rng-index-2026-11-23/summary.txt). Rate = 0.6 x C4 of this index, floored to tens: 540, from C4 909 q/s on the reservation of 2026-11-20 (experiment.wiki-c1024-rng-cloudlab-gpu-calibrate-4.json, 2026-11-26; the base's was 938). SplitLen 400, MergeLen 5 and MajorMax 1300 are the update experiment's: on this index 22 lists are longer than 400 (930 on the base), and a trial of two batches on the lab server (experiment.wiki-c1024-rng-spfresh-trial.json, 2026-11-26) gave 20 and 7 splits, 121 and 107 merges, 2,438 and 1,253 vectors reassigned, 4.6 and 2.1 MB of graph patch, 5-8 s an epoch, so a batch with its epoch takes about as long as the update experiment's batches alone (272-302 s): 400 s apart still leaves time with no update running. The load runs 1800 s, past the fourth batch's epoch (about 1640 s). Answers are scored per data version (scripts/score_answers.py) against <GroundTruth>.versions/ (2026-11-22: the same batches, IDs and locations). UpdateLease 60m and StageTimeout 60m, as the update experiment.",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024-rng",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-rng/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-rng-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200,
+    "Rate": "540",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 1800,
+    "WarmupSeconds": 30
+  },
+  "Updates": {
+    "Headroom": 1.25,
+    "ListHeadroom": 2.0
+  },
+  "UpdateLease": "60m",
+  "StageTimeout": "60m",
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 120,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 1300,
+        "Policy": "spfresh",
+        "ReassignRange": 64
+      }
+    },
+    {
+      "TriggerTimeSeconds": 520,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 1300,
+        "Policy": "spfresh",
+        "ReassignRange": 64
+      }
+    },
+    {
+      "TriggerTimeSeconds": 920,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-3.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-3-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 1300,
+        "Policy": "spfresh",
+        "ReassignRange": 64
+      }
+    },
+    {
+      "TriggerTimeSeconds": 1320,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-4.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-4-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 1300,
+        "Policy": "spfresh",
+        "ReassignRange": 64
+      }
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

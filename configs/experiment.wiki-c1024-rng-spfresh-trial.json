@@ -1,0 +1,86 @@
+{
+  "Comment": "A trial of the SPFresh example at Wikipedia scale on the lab server, before the CloudLab runs: the first two minor batches of the 2026-02 diff (b4x5: 775K inserts and about 744K deletes each), each followed by SPFresh's maintenance as a major epoch (split, merge as SPFresh's paper, reassign of the 64 nearest lists, old copies dropped), on the index with RNG-pruned replicas and its 4-node warmup snapshot (experiment.wiki-c1024-rng-warmup-4.json), inserts routed by the RNG rule. It checks that the epochs run at this scale and measures them (updates.json: decide and apply times, splits, merges, reassigned vectors, the graph patch), so that the CloudLab runs' spacing and SplitLen can be set; its timings are the lab's, not CloudLab's. SplitLen 400, MergeLen 5 and MajorMax 1300 are the update experiment's (experiment.wiki-c1024-cloudlab-gpu-updates.json): on this index only 22 lists are longer than 400 (930 on the base), so its epochs split what the batches grow. CPU backend (the GPUs are other users'), 8 CPUs and 24 GB a node, no read limit, a low load of 200 q/s. No version ground truth on the lab: recall holds until the first batch flips. The work directory is on /netsys, which has room for the nodes' copies of the snapshot's raw files (78 GiB; /data-ssd had 109 GB free after the warmup): it holds copies of the index's assignment and partitions (assign-gp-64.bin and partitions/ from /data-ssd/chenxu/work/wiki-c1024-rng, with their stage records), so the snapshot, keyed by content, is found.",
+  "WorkDir": "/netsys/chenxu/work/wiki-c1024-rng-trial",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-rng/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-rng-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "MemoryMax": "24G",
+    "CPUsPerNode": 8
+  },
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200,
+    "Rate": "200",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 1000,
+    "WarmupSeconds": 30
+  },
+  "Updates": {
+    "Headroom": 1.25,
+    "ListHeadroom": 2.0
+  },
+  "UpdateLease": "60m",
+  "StageTimeout": "60m",
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 120,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 1300,
+        "Policy": "spfresh",
+        "ReassignRange": 64
+      }
+    },
+    {
+      "TriggerTimeSeconds": 520,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 1300,
+        "Policy": "spfresh",
+        "ReassignRange": 64
+      }
+    }
+  ],
+  "RequireSnapshot": true
+}

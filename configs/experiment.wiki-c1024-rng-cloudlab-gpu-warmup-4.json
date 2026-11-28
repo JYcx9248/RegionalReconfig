@@ -1,0 +1,55 @@
+{
+  "Comment": "CloudLab c240g5 (scripts/cloudlab/profile.py: node0 the control node, node1 to node4 the hosts of n1 to n4): the 4-node warmup snapshot of the Wikipedia c1024 index with RNG-pruned replicas (the SPFresh example), made on the cluster by scripts/run_cluster.py: each initial node bootstraps from the page file on its host and saves its raw vectors and PQ codes there. The control node has the index's page file (the base's, which the RNG index links to), so its 78 GiB snapshot need not cross from the lab server, which made the same snapshot (experiment.wiki-c1024-rng-warmup-4.json, 2026-11-26, 4n-258d4fdd5bb8: a snapshot is keyed by content). CPU backend: a warmup sends no query. StageTimeout 60m: the copies of the page file to the hosts and the bootstraps from it on their SATA SSDs take longer than on the lab server's NVMe (5.5 min).",
+  "Type": "warmup",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024-rng",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-rng/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-rng-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "InitialNodes": 4,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson"
+  },
+  "StageTimeout": "60m",
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}
