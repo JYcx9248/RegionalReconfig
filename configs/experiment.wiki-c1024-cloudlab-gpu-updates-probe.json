@@ -1,0 +1,86 @@
+{
+  "Comment": "CloudLab c240g5, calibration for experiment.wiki-c1024-cloudlab-gpu-updates.json: one minor batch of Wikipedia c1024 (b4x5 batch 1: 775,671 inserts, 744,469 deletes) at 120 s and the major epoch after it at the full experiment's thresholds (lists longer than 400 split, shorter than 5 merge, at most 2000), under the same constant 560 q/s on the 4 initial data nodes (no spares: no rebuild). updates.json has what it measures: the batch's phases from the staging to the reclaim and its flip, the major epoch's splits, merges, moved postings, graph patch bytes (one frame holds 256 MB) and phases, from which the three minutes between batches and the thresholds are set. The answers are scored against data version 1 (scripts/score_answers.py). Every setting the full experiment has, so the nodes are the same: Updates headroom, UpdateLease 60m, StageTimeout 60m (rtier-updater's -timeout: at its default 30m the first run, routing one ASSIGN at a time, gave up with nothing inserted).",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200,
+    "Rate": "560",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 1200,
+    "WarmupSeconds": 30
+  },
+  "Updates": {
+    "Headroom": 1.25,
+    "ListHeadroom": 2.0
+  },
+  "UpdateLease": "60m",
+  "StageTimeout": "60m",
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 120,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1-deletes.bin",
+        "SplitLen": 400,
+        "MergeLen": 5,
+        "MajorMax": 2000
+      }
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

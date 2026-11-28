@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the control node, from the index's page file and its layout map rebuilt from the partitions (sample_queries.py map); their ground truth covers every 1000th of the first 1M (fusion_gt --index). Set the rates from the two worst-case capacities: Rate about 0.6 x C4 (4to8-worst-calibrate-4), RateSteps 60:exactly twice Rate, below C8 (4to8-worst-calibrate-8), the same in every protocol's file. Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-lazy.json: 4 -> 8 at 90 s under lazy.",
+  "Comment": "CloudLab c240g5, U11's worst case on Amazon 300M: the queries are 2M of the base's own vectors, drawn without repetition (scripts/data/sample_queries.py, seed 1), so no run repeats a query and none has any locality. They are drawn on the control node, from the index's page file and its layout map rebuilt from the partitions (sample_queries.py map); their ground truth covers every 1000th of the first 1M (fusion_gt --index). Set the rates from the two worst-case capacities: Rate about 0.6 x C4 (4to8-worst-calibrate-4), RateSteps 60:exactly twice Rate, below C8 (4to8-worst-calibrate-8), the same in every protocol's file. Otherwise experiment.amazon-300m-cloudlab-gpu-4to8-lazy.json: 4 -> 8 at 90 s under lazy. The rates here are this reservation's, from its capacities of 2026-11-21, C4 1239 and C8 2483, set by hand: Rate 900, 0.73 x C4, and at 60 s 1800, exactly twice that and 0.72 x C8, about the share of C8 the 4 -> 8 runs' step takes (0.76 on Amazon, 0.71 on Wikipedia). Without locality the reads spread evenly, so C8 is twice C4 here, and 0.6 x C4 would leave the scale-out 40% of C8 free.",
   "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
   "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
   "EngineBin": "engine/build",
@@ -47,8 +47,8 @@
     "Arrivals": "poisson",
     "NProbe": 128,
     "N": 200,
-    "Rate": "SET_ME",
-    "RateSteps": "60:SET_ME",
+    "Rate": "900",
+    "RateSteps": "60:1800",
     "RetryForSeconds": 30,
     "DurationSeconds": 360,
     "WarmupSeconds": 30
