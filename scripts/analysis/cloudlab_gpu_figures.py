@@ -1716,7 +1716,7 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     exp = load_json(os.path.join(rs[0], "experiment.json"))
     queries, name = exp.get("Queries", ""), dataset(exp)
     text = ("%s, %.0f q/s, then %.0f from %.0f s; 4 → 8 at %.0f s. "
-            % ("Queries drawn from the base without repetition (U11's worst case)" if "worst" in os.path.basename(queries)
+            % ("Queries drawn from the base without repetition (lazy's worst case)" if "worst" in os.path.basename(queries)
                else "The Wikipedia queries (the file is shorter than a run: they repeat)" if name == "Wikipedia"
                else "The %s queries" % name,
                rate0, rate1, s1, first["trig"]))
@@ -1747,7 +1747,7 @@ def lazy_keepup(runs, out, runset, calibrations, lo=30.0, step=5.0):
     online = [e - q["trig"] for q in per for e in q["entries"]]  # the first new entry to the last
     if online:
         text += " The new entries come online %s s after the trigger%s." % (
-            span_of(online), " (U16's strict yield: data moves until then)" if min(online) > hi - first["trig"] else "")
+            span_of(online), " (the graph waits until no data moves)" if min(online) > hi - first["trig"] else "")
     notes = textwrap.wrap(text, 108)
     yb = ys[3] + 140 + 62
     for i, s in enumerate(notes):
