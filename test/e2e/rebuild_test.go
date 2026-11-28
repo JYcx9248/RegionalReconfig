@@ -100,13 +100,13 @@ func buildGeneration2(f *fixture) (*generation2, error) {
 // TestFullRebuild moves a cluster under query load to the second generation of its index (U14):
 // two spares take over every partition lazily, the two old nodes switch to the new generation
 // while they serve raw vectors only, get the new partitions where most of their raw vectors
-// are, warm up with the queries the entries kept, and take over in one flip; the spares leave.
-// Every answer is exact for its epoch's generation: the first generation's oracle before the
-// flip, the second's from it on. FetchExtra is on: the old nodes' fetches in the new generation
-// bring more vectors until the rebuild returns, the spares' never. Then the cluster lives on in the
-// new generation: a minor batch (the update controller's router follows to the new generation),
-// and a scale-out to a node that registered with the first generation's configuration, which
-// fetches without extras.
+// are, and take over in one flip; the spares leave. Every answer is exact for its epoch's
+// generation: the first generation's oracle before the flip, the second's from it on. FetchExtra
+// is on: the old nodes' fetches in the new generation bring more vectors until the rebuild
+// returns, the spares' never, so at the flip it is set on the old nodes only. Then the cluster
+// lives on in the new generation: a minor batch (the update controller's router follows to the
+// new generation), and a scale-out to a node that registered with the first generation's
+// configuration, which fetches without extras.
 func TestFullRebuild(t *testing.T) {
 	f := getFixture(t)
 	g := getGeneration2(t, f)
@@ -117,11 +117,12 @@ func TestFullRebuild(t *testing.T) {
 	extraIDs := 1024
 	room := []string{"--max-vectors", strconv.Itoa(numVectors + extraIDs),
 		"--max-pages", strconv.FormatUint(m.NumPages+uint64(extraIDs)/m.VectorsPerPage+2, 10), "--max-list-len", "4096"}
+	const extra = 4
 	// The rebuild's segments with holders come from the controller's bulk port, as on a cluster.
 	cl := newCluster(t, f, "lazy", 2, func(c *config.Controller) {
 		c.AllowUpdates = true
 		c.WorkDir, c.BulkListen = t.TempDir(), "127.0.0.1:0"
-		c.FetchExtra = 4
+		c.FetchExtra = extra
 	})
 	extras := func(a *agent.Agent) nodeclient.FetchExtraStats {
 		nc := nodeclient.New(a.Info().NodeAddr, 1)
@@ -142,20 +143,29 @@ func TestFullRebuild(t *testing.T) {
 	ctx := cl.ctx
 
 	stop := startLoad(cl, 4)
-	time.Sleep(300 * time.Millisecond) // the entries keep the queries the warm-up replays
+	time.Sleep(300 * time.Millisecond)
 	var flipAt uint64
+	extraAtFlip := map[*agent.Agent]uint64{}
 	cl.ctl.BeforeGenerationFlip = func(e uint64) {
 		flipAt = e
 		cl.expect(e, g.oracle)
+		for _, a := range []*agent.Agent{n1, n2, s1, s2} {
+			nc := nodeclient.New(a.Info().NodeAddr, 1)
+			in, err := nc.Info(ctx)
+			nc.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			extraAtFlip[a] = in.Fetch.Extra.N
+		}
 	}
 	reply, err := cl.ctl.Rebuild(ctx, protocol.RebuildReq{
 		Source: protocol.GenerationSource{Kind: "dir", IndexDir: g.index, PartsDir: g.parts}})
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	t.Logf("rebuild: epoch %d -> %d, spares %v, %d of %d vectors local, warm-up %d queries fetched %d vectors, "+
-		"%d fetched in all, phases %v", reply.FromEpoch, reply.ToEpoch, reply.Spares, reply.Local, reply.Vectors,
-		reply.WarmupQueries, reply.WarmupFetched, reply.RawFetched, reply.Phases)
+	t.Logf("rebuild: epoch %d -> %d, spares %v, %d of %d vectors local, %d fetched in all, phases %v",
+		reply.FromEpoch, reply.ToEpoch, reply.Spares, reply.Local, reply.Vectors, reply.RawFetched, reply.Phases)
 	time.Sleep(300 * time.Millisecond)
 	st := stop()
 	t.Logf("%d queries, %d retries (unavailable: %v), max latency %v, per epoch %v",
@@ -202,10 +212,18 @@ func TestFullRebuild(t *testing.T) {
 			t.Errorf("spare %s: generation %d, partitions %v, graph %v (%v)", s, in.Generation, in.Resident, in.GraphLoaded, err)
 		}
 	}
-	if reply.Local <= 0 || reply.Local > reply.Vectors || reply.WarmupQueries == 0 {
-		t.Errorf("reply: %d of %d vectors local, %d warm-up queries", reply.Local, reply.Vectors, reply.WarmupQueries)
+	if reply.Local <= 0 || reply.Local > reply.Vectors {
+		t.Errorf("reply: %d of %d vectors local", reply.Local, reply.Vectors)
 	}
-	var queued uint64
+	for a, n := range extraAtFlip {
+		want := uint64(extra)
+		if a == s1 || a == s2 {
+			want = 0
+		}
+		if n != want {
+			t.Errorf("%s at the flip to the new generation: FetchExtra %d, want %d", a.Info().Name, n, want)
+		}
+	}
 	for _, a := range []*agent.Agent{n1, n2, s1, s2} {
 		e := extras(a)
 		switch {
@@ -215,12 +233,8 @@ func TestFullRebuild(t *testing.T) {
 			t.Errorf("spare %s: extras %+v, want none", a.Info().Name, e)
 		}
 		if a == n1 || a == n2 {
-			queued += e.Queued
 			t.Logf("%s: extras %+v", a.Info().Name, e)
 		}
-	}
-	if reply.WarmupFetched > 0 && queued == 0 {
-		t.Errorf("the old nodes' warm-up fetched %d vectors, none with extras", reply.WarmupFetched)
 	}
 	exactPass(t, cl, nil)
 

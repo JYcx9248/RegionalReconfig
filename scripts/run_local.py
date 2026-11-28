@@ -164,9 +164,8 @@ fusion_build's output, built with this index's codebook and page layout (its out
 seeded with pq_codebook.bin, pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the
 partitions rtier_segment made of it; relative paths are relative to the experiment file. The
 nodes beyond InitialNodes are the spares ("Spares": how many, default as many as the data
-nodes). "Placement": "affinity" (default) or "random", "Warmup": recent queries replayed before
-the next generation goes online (0: every one the entries kept, QuerySample per entry, default
-1024; -1: none), "WarmupConcurrency", and "StopTheWorld": true for the baseline without spares.
+nodes). "Placement": "affinity" (default) or "random", and "StopTheWorld": true for the baseline
+without spares.
 The data nodes need room for the next generation's lists (--max-list-len in NodeArgs, or
 Updates.MaxListLen); without Updates the request carries what its lists need of the nodes'
 candidate buffers (below), which are sized for both generations. After update batches the generation must hold the data they made
@@ -563,7 +562,6 @@ def reconfig_requests(cfg: dict) -> list:
             src = {k: rb[key] for k, key in (("index_dir", "Index"), ("parts_dir", "Partitions"))}
             req = {"source": {"kind": "dir", **src}, "spares": rb.get("Spares", 0),
                    "placement": rb.get("Placement", "affinity"), "seed": rb.get("Seed", 0),
-                   "warmup": rb.get("Warmup", 0), "warmup_concurrency": rb.get("WarmupConcurrency", 0),
                    "stop_the_world": rb.get("StopTheWorld", False)}
             out.append({"at": rc["TriggerTimeSeconds"], "method": "Rebuild", "request": req, "rebuild": True,
                         "what": f"full rebuild to {src['parts_dir']}" + (" (stop-the-world)" if req["stop_the_world"] else "")})

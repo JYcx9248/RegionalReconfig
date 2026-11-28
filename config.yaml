@@ -40,5 +40,5 @@ RawStreams: 2
 RawBatchBytes: 1048576
 RawPath: ""
 MetricsInterval: 5s
-QuerySample: 1024
+QuerySample: 0
 SampleInterval: 0s

@@ -384,19 +384,25 @@ when it is due. With N data nodes and N spares (idle nodes; `-spares`):
    total under the even policies' balance (`placement.Affinity`; `-placement random` is the
    baseline). Every posting whose vector its owner lacks names an old node that holds it, so a
    missing vector is one hop away.
-4. The old nodes load the new partitions (PQ codes from the generation's index) and graph. They
-   then replay the recent client queries the entries kept (`QuerySample`, 1024 per entry) under
-   the new generation's draft epoch, so the raw vectors those queries need are on their owners
-   before any client query arrives (`-warmup`).
-5. One flip puts the new generation online on the old nodes. After the grace period the spares,
-   which hold only copies, move to the new generation too and are idle again.
+4. The old nodes load the new partitions (PQ codes from the generation's index) and graph.
+5. One flip puts the new generation online on the old nodes, which then fetch a vector they lack
+   when a query first needs it. After the grace period the spares, which hold only copies, move
+   to the new generation too and are idle again.
+
+There is no warm-up before the flip (2026-11-24). Replaying the recent queries the entries kept
+under the new generation's draft epoch helps only as far as the next queries resemble them. On
+Wikipedia c1024 (CloudLab, 2026-11-23) it brought half of the old nodes' fetches forward and
+saved 2-5 ms of mean latency in the 10 s after the flip. The placement is what keeps the flip
+unnoticed: with random placement 30% of the vectors are local instead of 90%, and the p99
+latency reaches 340-390 ms in the 5 s after the flip. The entries keep no client queries unless
+`QuerySample` (config.yaml, 0 by default) asks them to, for a planner that needs a window of
+recent queries (Quake's maintenance, branch update-strategies).
 
 Queries get exact answers throughout: an epoch's generation decides which lists and graph they
 read. A node that joins later moves to the table's generation before it stages anything, and the
 update controller's router follows the lease's generation. `-stop-the-world` is the baseline
 without spares: admission is paused while every node switches where it is. Updates and other
-reconfigurations wait until the rebuild ends. Not there yet: the trigger (only the manual one),
-and a priority between the warm-up's fetches and the spares' (only the warm-up's pace is set).
+reconfigurations wait until the rebuild ends. Not there yet: the trigger (only the manual one).
 
 Not there yet for updates: growing the ID and location spaces, a response to a batch over budget
 (it fails before anything is sent), reassigning the vectors of neighboring lists in a split

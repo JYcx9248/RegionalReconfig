@@ -71,7 +71,7 @@ SCHEMA = {
     "Reconfigurations": {
         "TriggerTimeSeconds": None, "DataNodes": None, "Plan": "opaque", "Migrate": {"From": None, "To": None},
         "Rebuild": {"Index": None, "Partitions": None, "Spares": None, "Placement": None, "Seed": None,
-                    "Warmup": None, "WarmupConcurrency": None, "StopTheWorld": None},
+                    "StopTheWorld": None},
         "Update": {"Inserts": None, "Deletes": None, "Split": None, "Merge": None, "SplitLen": None,
                    "MergeLen": None, "MajorMax": None}},
 }

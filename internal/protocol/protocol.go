@@ -23,7 +23,7 @@
 //	                                                   DropVersions)
 //	  (none)                                           full rebuild (U14): spares take every partition,
 //	                                                   the old nodes SwitchGeneration and stage the new
-//	                                                   one, Warmup, flip, the spares leave
+//	                                                   one, flip, the spares leave
 package protocol
 
 import (
@@ -54,10 +54,23 @@ const (
 	SwitchGenerationM = "SwitchGeneration" // drop every partition and the graph, run another index generation
 	RawBitmapM        = "RawBitmap"        // the raw vectors the data node holds
 	QuerySampleM      = "QuerySample"      // recent client queries an entry kept
-	WarmupM           = "Warmup"           // run queries under a draft epoch, answers dropped
 	NodeStatusM       = "Status"
 	ShutdownM         = "Shutdown"
 )
+
+// SampledQuery is a client query an entry kept (the agent's QuerySample, 0 by default: none), for
+// a planner that needs a window of recent queries (Quake's maintenance, branch update-strategies).
+type SampledQuery struct {
+	Vec    []byte `json:"vec"`
+	K      int    `json:"k"`
+	NProbe int    `json:"nprobe"`
+	N      int    `json:"n"`
+	EF     int    `json:"ef,omitempty"`
+}
+
+type QuerySampleReply struct {
+	Queries []SampledQuery `json:"queries"`
+}
 
 // Methods served by the controller, called by agents.
 const (
@@ -260,35 +273,6 @@ type GenerationReq struct {
 type RawBitmapReply struct {
 	Locations uint64 `json:"locations"`
 	Bits      []byte `json:"bits"`
-}
-
-// SampledQuery is a client query an entry kept, for a warm-up to replay.
-type SampledQuery struct {
-	Vec    []byte `json:"vec"`
-	K      int    `json:"k"`
-	NProbe int    `json:"nprobe"`
-	N      int    `json:"n"`
-	EF     int    `json:"ef,omitempty"`
-}
-
-type QuerySampleReply struct {
-	Queries []SampledQuery `json:"queries"`
-}
-
-// WarmupReq: run Queries under Table, a draft epoch no client routes with yet, and drop the
-// answers. What re-ranking fetches on the way stays: the raw vectors those queries need are then
-// on their owners (U14 full rebuild, before the new generation goes online).
-type WarmupReq struct {
-	Table       *epoch.Table   `json:"table"`
-	Queries     []SampledQuery `json:"queries"`
-	Concurrency int            `json:"concurrency,omitempty"`
-}
-
-type WarmupReply struct {
-	Queries    int     `json:"queries"`
-	Failed     int     `json:"failed"`
-	FirstError string  `json:"first_error,omitempty"`
-	Seconds    float64 `json:"seconds"`
 }
 
 // NodeStatus is an agent's view of itself.
@@ -534,9 +518,9 @@ type GenerationSource struct {
 
 // RebuildReq asks for a full rebuild (U14). Idle nodes, the spares, take over every partition of
 // the current generation (a lazy reconfiguration); the old nodes, holding raw vectors only, move
-// to the next generation, are given its partitions where their raw vectors are, warm up, and
-// take over in one flip; the spares leave after the grace period. No node holds two
-// generations' lists or graphs at any time.
+// to the next generation, are given its partitions where their raw vectors are, and take over in
+// one flip; the spares leave after the grace period. No node holds two generations' lists or
+// graphs at any time.
 type RebuildReq struct {
 	Source GenerationSource `json:"source"`
 	// Spares: how many idle nodes carry the queries meanwhile (0: as many as the data nodes).
@@ -545,11 +529,6 @@ type RebuildReq struct {
 	// where most of their raw vectors are already, count-balanced) or "random" (a baseline).
 	Placement string `json:"placement,omitempty"`
 	Seed      int64  `json:"seed,omitempty"` // for "random"
-	// Warmup: how many recent client queries (kept by the entries) the old nodes replay under the
-	// next generation before it goes online (0: every query kept; -1: no warm-up, a baseline), at
-	// most WarmupConcurrency at once on each old node (0: 4).
-	Warmup            int `json:"warmup,omitempty"`
-	WarmupConcurrency int `json:"warmup_concurrency,omitempty"`
 	// StopTheWorld: the baseline without spares -- admission paused on every entry while all
 	// nodes switch to the next generation in place.
 	StopTheWorld bool `json:"stop_the_world,omitempty"`
@@ -571,16 +550,12 @@ type RebuildReply struct {
 	Plan *Plan `json:"plan,omitempty"`
 	// Vectors: the distinct vectors of each new partition, summed; Local: of those, the ones its
 	// owner held already. The others are fetched from the old nodes that hold them, when a query
-	// (or the warm-up) needs them.
+	// needs them.
 	Vectors int64 `json:"vectors"`
 	Local   int64 `json:"local"`
 	// SegmentBytes: the next generation's segments the old nodes loaded; GraphBytes: its graph.
 	SegmentBytes int64 `json:"segment_bytes"`
 	GraphBytes   int64 `json:"graph_bytes"`
-	// WarmupQueries replayed; WarmupFetched: the raw vectors that fetched on the old nodes.
-	WarmupQueries      int   `json:"warmup_queries"`
-	WarmupFetched      int64 `json:"warmup_fetched"`
-	WarmupFetchedBytes int64 `json:"warmup_fetched_bytes"`
 	// RawFetched: raw vectors fetched on demand anywhere while the rebuild ran (the spares'
 	// included).
 	RawFetched      int64              `json:"raw_fetched"`

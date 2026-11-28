@@ -48,7 +48,6 @@ func (a *Agent) registerHandlers(c *ctrl.Conn) {
 	c.Handle(protocol.SwitchGenerationM, a.handleSwitchGeneration)
 	c.Handle(protocol.RawBitmapM, a.handleRawBitmap)
 	c.Handle(protocol.QuerySampleM, a.handleQuerySample)
-	c.Handle(protocol.WarmupM, a.handleWarmup)
 	c.Handle(protocol.NodeStatusM, a.handleStatus)
 	c.Handle(protocol.ShutdownM, func(context.Context, json.RawMessage) (any, error) {
 		time.AfterFunc(100*time.Millisecond, a.Stop)

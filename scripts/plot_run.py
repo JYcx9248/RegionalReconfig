@@ -541,10 +541,9 @@ def main():
         print("flip: %s at %.3f s" % (e, t))
     for t0, dur, label, reply in rcs:
         if "generation" in reply:  # a full rebuild: what its placement found in place, and fetched
-            print("%s: triggered at %.3f s, took %.3f s, %s of %s vectors local, %s segment bytes, warm-up %s "
-                  "queries fetched %s vectors, phases %s"
+            print("%s: triggered at %.3f s, took %.3f s, %s of %s vectors local, %s segment bytes, phases %s"
                   % (label, t0, dur, reply.get("local"), reply.get("vectors"), reply.get("segment_bytes"),
-                     reply.get("warmup_queries"), reply.get("warmup_fetched"), reply.get("phases")))
+                     reply.get("phases")))
             continue
         print("%s: triggered at %.3f s, took %.3f s, %s bytes, %s PQ codes, phases %s"
               % (label, t0, dur, reply.get("bytes"), reply.get("pq_codes"), reply.get("phases")))

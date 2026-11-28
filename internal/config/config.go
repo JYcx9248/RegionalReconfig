@@ -152,12 +152,13 @@ type Agent struct {
 	RawPath         string   `yaml:"RawPath"`       // "node" | "agent" | "" (node unless TransferRate paces the agents)
 	MetricsInterval Duration `yaml:"MetricsInterval"`
 	// StepTimeout: the longest a long step may take inside the agent -- staging, the graph, a raw
-	// stream or drain, a grace period, a reclaim, the warm-up. It grows with the dataset and the
-	// transfer rate (a billion vectors: a 32-71 GB graph per new entry), so an experiment sets it;
-	// one key sets it and the controller's StageTimeout.
+	// stream or drain, a grace period, a reclaim. It grows with the dataset and the transfer rate
+	// (a billion vectors: a 32-71 GB graph per new entry), so an experiment sets it; one key sets
+	// it and the controller's StageTimeout.
 	StepTimeout Duration `yaml:"StageTimeout"`
-	// QuerySample: how many recent client queries an entry keeps, for a full rebuild's warm-up to
-	// replay under the next generation (U14; 0: none).
+	// QuerySample: how many recent client queries an entry keeps, for a planner that needs a
+	// window of them (Quake's maintenance, branch update-strategies); 0, the default, keeps none.
+	// The full rebuild replayed them as a warm-up until 2026-11-24.
 	QuerySample int `yaml:"QuerySample"`
 	// NodeStatsFile: the data node's stats log (rtier_node --stats-file), which the agent
 	// forwards line by line to the controller (its StatsDir), stamped there on arrival -- one
@@ -184,7 +185,6 @@ func DefaultAgent() Agent {
 		RawBatchBytes:   1 << 20,
 		MetricsInterval: Duration{5 * time.Second},
 		StepTimeout:     Duration{30 * time.Minute},
-		QuerySample:     1024,
 	}
 }
 

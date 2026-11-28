@@ -419,13 +419,18 @@ var Open = map[string]Question{
 			"bitmaps, a min-cost flow under the even policies' balance: placement.Affinity), " +
 			"every posting whose vector its owner lacks naming an old node that holds it (one " +
 			"hop); the old nodes load the partitions (PQ codes from the generation's index) and " +
-			"graph, replay the recent queries the entries kept under the draft epoch (what " +
-			"re-ranking fetches stays: the warm-up), and take over in one flip; after the grace " +
-			"period the spares, holding copies only, move to the next generation too and are " +
-			"idle. The epoch table names its generation (and its directories); a node that joins " +
-			"later and the update controller's router follow it. No update batch or " +
-			"reconfiguration runs meanwhile (assumed). Baselines: random placement, no warm-up, " +
-			"stop-the-world (admission paused while every node switches in place). Not " +
+			"graph and take over in one flip, then fetch a vector they lack when a query first " +
+			"needs it; after the grace period the spares, holding copies only, move to the next " +
+			"generation too and are idle. No warm-up (decided 2026-11-24): replaying the recent " +
+			"queries the entries kept under the draft epoch, before the flip, helps only as far " +
+			"as the next queries resemble them, and it measured little -- on Wikipedia c1024 " +
+			"(CloudLab, 2026-11-23) it brought half of the old nodes' fetches forward and saved " +
+			"2-5 ms of mean latency in the 10 s after the flip; the placement by affinity is what " +
+			"keeps the flip unnoticed (random placement: 30% of the vectors local instead of " +
+			"90%, p99 340-390 ms after the flip). The epoch table names its generation (and its " +
+			"directories); a node that joins later and the update controller's router follow it. " +
+			"No update batch or reconfiguration runs meanwhile (assumed). Baselines: random " +
+			"placement, stop-the-world (admission paused while every node switches in place). Not " +
 			"implemented: growing the ID and location spaces at an epoch boundary (agreed " +
 			"2026-10-13: preallocated with headroom and grown at an epoch boundary, on the " +
 			"update controller's order before a batch); the response to a batch over budget " +
@@ -436,8 +441,7 @@ var Open = map[string]Question{
 			"lists in a split (SPFresh's LIRE, a recall matter); the full rebuild's trigger " +
 			"(manual only: rtier-client rebuild; the probe-set check is design only), a " +
 			"generation that includes inserted vectors (the builder would need their IDs and " +
-			"locations), a priority between the warm-up's fetches and the spares' (only the " +
-			"warm-up's pace is set); a graph patch over one frame (256 MB); the decision log and " +
+			"locations); a graph patch over one frame (256 MB); the decision log and " +
 			"replay (the pages of deleted vectors are kept: U1). An inserted vector stays with " +
 			"the owner that added it when its partition moves on (the postings name that node as " +
 			"its holder), and a node that leaves is drained first (U9). Open: versions staged " +

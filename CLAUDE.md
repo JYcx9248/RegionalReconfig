@@ -67,7 +67,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `cmd/rtier-overhead` | fan-out cost analysis: one data node emulates N owners (`-owners`, `-compare`) |
 | `internal/epoch` | epoch table, CAS store, `Tracker` (pins, grace period) |
 | `internal/controller` | registration, placement, reconfiguration (`reconfig.go`), update leases (`update.go`), full rebuild (`rebuild.go`); collects metrics and the nodes' diagnostics |
-| `internal/agent` | staging, epoch install, entry and aggregator roles (`serve.go`), generations and the rebuild's warm-up (`generation.go`), diagnostics forwarding (`diag.go`), the graph's yield to data (`yield.go`) |
+| `internal/agent` | staging, epoch install, entry and aggregator roles (`serve.go`), generations (`generation.go`), diagnostics forwarding (`diag.go`), the graph's yield to data (`yield.go`) |
 | `internal/update` | update batches (`batch.go`) and major epochs (`major.go`), with their router |
 | `internal/query` | selectors (aggregator choice), strategies (`TwoPhase`), wire format |
 | `internal/placement`, `internal/transfer` | placement policies, plans, the rebuild's placement (`affinity.go`); bulk transfer + token bucket |
@@ -237,10 +237,12 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   outside with the same codebook, vector IDs and raw-vector locations. Spares take every
   partition by a lazy reconfiguration; the old nodes lose their roles and switch generations
   (`SWITCH_GENERATION`, keeping PQ codes and raw vectors); the new partitions go where their raw
-  vectors are (presence bitmaps, `placement.Affinity`); the old nodes load them, replay recent
-  queries to warm up, and take over in one flip; the spares are released. Manual trigger only
+  vectors are (presence bitmaps, `placement.Affinity`); the old nodes load them and take over in
+  one flip, then fetch what they lack on demand; the spares are released. No warm-up since
+  2026-11-24: replaying the queries the entries kept before the flip saved 2-5 ms for 10 s on
+  Wikipedia (CloudLab, 2026-11-23), and fits no real workload. Manual trigger only
   (`rtier-client rebuild`, `"Reconfigurations": [{"Rebuild": ...}]`); baselines: random placement,
-  no warm-up, stop-the-world. After update batches the next generation holds their data:
+  stop-the-world. After update batches the next generation holds their data:
   `fusion_build --from-index` re-clusters the version (deletes out, inserts in, with the IDs and
   locations they got; `version.json`), and `run_local.py` refuses a rebuild whose generation
   does not hold exactly the batches before it.
@@ -597,13 +599,12 @@ Next:
 3. Server experiments: copy-then-flip with the new raw stream at the other budgets and loads;
    repeats near capacity; a CCD per node before calibrating the CPU-bound regime; a full-replica
    baseline to argue for partitioning (each node's PQ budget is now its share by default).
-4. Full rebuild and updates, measured: affinity against random placement, warm-up on and off,
-   stop-the-world; updates from the difference of two Wikipedia snapshots. The rebuild's
+4. Full rebuild and updates, measured: affinity against random placement, stop-the-world;
+   updates from the difference of two Wikipedia snapshots. The rebuild's
    figures still need an in-place baseline that holds both generations' graph and lists on
    every node (or memory accounting in its place: `timeline.svg` draws each node's memory, and
    compare_runs.py counts a rebuild's transfers, 2026-10-28). Not implemented: the rebuild's probe-set
-   trigger, a priority between the warm-up's fetches and the spares' (a generation of the data
-   batches made: `fusion_build --from-index`, 2026-11-17).
+   trigger (a generation of the data batches made: `fusion_build --from-index`, 2026-11-17).
 5. More data and scale: GP on real datasets (U2: the number of partitions), non-repeating real
    query streams (MS MARCO), BIGANN-100M, SPACEV-100M.
 6. Skew mitigation, the last experiment: once the workload is final, each partition's load is

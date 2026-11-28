@@ -41,16 +41,19 @@ import (
 //     vector its owner lacks names an old node that holds it: one hop.
 //  5. STAGE     the old nodes load their new partitions (PQ codes from the generation's index)
 //     and the new graph.
-//  6. WARM-UP   they replay the queries the entries kept, under the new generation's draft
-//     epoch: what re-ranking fetches stays, so the vectors those queries need are on their owners
-//     before any client query arrives.
-//  7. FLIP      the new generation goes online on the old nodes; the spares lose every role.
-//  8. GRACE     the old generation's queries finish on the spares.
-//  9. RELEASE   the spares move to the new generation too, which drops what they held, and are
+//  6. FLIP      the new generation goes online on the old nodes; the spares lose every role.
+//  7. GRACE     the old generation's queries finish on the spares.
+//  8. RELEASE   the spares move to the new generation too, which drops what they held, and are
 //     idle again: nothing has to be drained from them, since they only hold copies.
 //
+// After the flip an old node fetches a vector its new partitions lack when a query first needs
+// it, as a new node does after a lazy scale-out. No warm-up before the flip (2026-11-24):
+// replaying the queries the entries kept under the draft epoch only brought forward the fetches
+// of queries like them, and on Wikipedia c1024 (CloudLab, 2026-11-23) it saved 2-5 ms of mean
+// latency in the 10 s after the flip.
+//
 // Failures (U13, out of scope): before 1's flip the old epoch stays; after it, the protocol stops
-// where it is -- before 7 the spares serve the old generation, with the old nodes as holders.
+// where it is -- before 6 the spares serve the old generation, with the old nodes as holders.
 
 // generation is an index generation the cluster can run.
 type generation struct {
@@ -245,28 +248,22 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	}
 	phase("demote")
 
-	// 3-6 on the old nodes, which nothing but the spares' raw-vector fetches reaches now. The
-	// warm-up replays the queries every node kept as an entry: the old nodes' from before the
-	// spares took over, the spares' since.
-	sample, err := c.querySample(ctx, all, req.Warmup)
-	if err != nil {
-		return reply, err
-	}
-	// The old nodes' fetches in the next generation, from the warm-up on, bring FetchExtra more
-	// until the spares go (fetchExtra); the spares' own fetches never do. The next generation's
-	// postings name old nodes only.
+	// 3-5 on the old nodes, which nothing but the spares' raw-vector fetches reaches now. Their
+	// fetches in the next generation, from the flip on, bring FetchExtra more until the spares go
+	// (fetchExtra); the spares' own fetches never do. The next generation's postings name old
+	// nodes only.
 	extraOff, err := c.fetchExtra(ctx, old, nil, 0)
 	if err != nil {
 		return reply, err
 	}
 	defer extraOff()
-	draft, err := c.stageGeneration(ctx, t2, gen, old, sample, req, reply, phase)
+	draft, err := c.stageGeneration(ctx, t2, gen, old, req, reply, phase)
 	if err != nil {
 		return reply, fmt.Errorf("controller: rebuild stopped before the flip to generation %d (the spares serve generation "+
 			"%d): %w", gen.id, t2.Generation, err)
 	}
 
-	// 7. FLIP: the new generation goes online on the old nodes.
+	// 6. FLIP: the new generation goes online on the old nodes.
 	if c.BeforeGenerationFlip != nil {
 		c.BeforeGenerationFlip(draft.Epoch)
 	}
@@ -276,13 +273,13 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	reply.ToEpoch = draft.Epoch
 	phase("flip")
 
-	// 8. GRACE: the old generation's queries finish on the spares.
+	// 7. GRACE: the old generation's queries finish on the spares.
 	if err := c.waitDrained(ctx, all, t2.Epoch); err != nil {
 		return reply, err
 	}
 	phase("drain")
 
-	// 9. RELEASE: the spares hold copies only -- nothing to drain. Moving them to the new
+	// 8. RELEASE: the spares hold copies only -- nothing to drain. Moving them to the new
 	// generation drops the old lists and graph, and readies them for a later scale-out.
 	if err := c.toGeneration(ctx, spares, draft); err != nil {
 		return reply, err
@@ -293,9 +290,8 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	phase("release")
 	fetched, fetchedBytes := c.rawFetched(ctx, all)
 	reply.RawFetched, reply.RawFetchedBytes = fetched-fetchedBefore, fetchedBytes-fetchedBytesBefore
-	log.Printf("controller: full rebuild done: epoch %d -> %d, generation %d on %v, %d of %d vectors local, warm-up "+
-		"%d queries fetched %d vectors, phases %v", reply.FromEpoch, reply.ToEpoch, gen.id, reply.Nodes, reply.Local,
-		reply.Vectors, reply.WarmupQueries, reply.WarmupFetched, reply.Phases)
+	log.Printf("controller: full rebuild done: epoch %d -> %d, generation %d on %v, %d of %d vectors local, phases %v",
+		reply.FromEpoch, reply.ToEpoch, gen.id, reply.Nodes, reply.Local, reply.Vectors, reply.Phases)
 	return reply, nil
 }
 
@@ -304,10 +300,6 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 func (c *Controller) rebuildInPlace(ctx context.Context, cur *epoch.Table, gen *generation, nodes []*ManagedNode,
 	req protocol.RebuildReq, reply *protocol.RebuildReply, phase func(string)) (*protocol.RebuildReply, error) {
 	fetchedBefore, fetchedBytesBefore := c.rawFetched(ctx, nodes)
-	sample, err := c.querySample(ctx, nodes, req.Warmup)
-	if err != nil {
-		return reply, err
-	}
 	entries, err := c.managed(cur.Entries)
 	if err != nil {
 		return reply, err
@@ -334,7 +326,7 @@ func (c *Controller) rebuildInPlace(ctx context.Context, cur *epoch.Table, gen *
 		return reply, err
 	}
 	phase("pause")
-	draft, err := c.stageGeneration(ctx, cur, gen, nodes, sample, req, reply, phase)
+	draft, err := c.stageGeneration(ctx, cur, gen, nodes, req, reply, phase)
 	if err != nil {
 		return reply, fmt.Errorf("controller: rebuild stopped before the flip to generation %d: %w", gen.id, err)
 	}
@@ -366,10 +358,9 @@ func (c *Controller) rebuildInPlace(ctx context.Context, cur *epoch.Table, gen *
 
 // stageGeneration readies the new generation on nodes, which hold no role in t (or, stopped,
 // serve nothing): they switch to it (3), its partitions are placed by where their raw vectors
-// are (4), they load them and its graph (5), and replay sample under its draft epoch (6). It
-// returns the draft epoch, to flip to from t.
+// are (4), and they load them and its graph (5). It returns the draft epoch, to flip to from t.
 func (c *Controller) stageGeneration(ctx context.Context, t *epoch.Table, gen *generation, nodes []*ManagedNode,
-	sample []protocol.SampledQuery, req protocol.RebuildReq, reply *protocol.RebuildReply, phase func(string)) (*epoch.Table, error) {
+	req protocol.RebuildReq, reply *protocol.RebuildReply, phase func(string)) (*epoch.Table, error) {
 
 	// 3. SWITCH.
 	if err := forEach(nodes, func(n *ManagedNode) error {
@@ -436,43 +427,6 @@ func (c *Controller) stageGeneration(ctx context.Context, t *epoch.Table, gen *g
 		return nil, err
 	}
 	phase("stage")
-
-	// 6. WARM-UP: the sample, spread over the nodes, under the draft epoch.
-	if len(sample) > 0 {
-		before, beforeBytes := c.rawFetched(ctx, nodes)
-		shares := make([][]protocol.SampledQuery, len(nodes))
-		for i, q := range sample {
-			shares[i%len(nodes)] = append(shares[i%len(nodes)], q)
-		}
-		var failed []string
-		if err := forEach(nodes, func(n *ManagedNode) error {
-			i := 0
-			for i < len(nodes) && nodes[i] != n {
-				i++
-			}
-			var wr protocol.WarmupReply
-			if err := n.call(ctx, c.stageTimeout(), protocol.WarmupM, protocol.WarmupReq{Table: draft, Queries: shares[i],
-				Concurrency: req.WarmupConcurrency}, &wr); err != nil {
-				return err
-			}
-			if wr.Failed > 0 {
-				mu.Lock()
-				failed = append(failed, fmt.Sprintf("node %d: %d of %d queries failed (%s)", n.ID, wr.Failed, wr.Queries, wr.FirstError))
-				mu.Unlock()
-			}
-			return nil
-		}); err != nil {
-			return nil, err
-		}
-		if len(failed) > 0 {
-			sort.Strings(failed)
-			return nil, fmt.Errorf("warm-up under generation %d: %v", gen.id, failed)
-		}
-		after, afterBytes := c.rawFetched(ctx, nodes)
-		reply.WarmupQueries = len(sample)
-		reply.WarmupFetched, reply.WarmupFetchedBytes = after-before, afterBytes-beforeBytes
-		phase("warmup")
-	}
 	return draft, nil
 }
 
@@ -612,8 +566,10 @@ func eachPartition(np int, f func(p int) error) error {
 	return errors.Join(errs...)
 }
 
-// querySample collects the client queries the nodes kept as entries: at most max of them (0:
-// all; negative: none, no warm-up).
+// querySample collects the client queries the nodes kept as entries (the agents' QuerySample,
+// 0 by default: none): at most max of them (0: all; negative: none). A window of recent queries
+// for a planner that needs one (Quake's maintenance on branch update-strategies); the full
+// rebuild no longer replays them (2026-11-24).
 func (c *Controller) querySample(ctx context.Context, entries []*ManagedNode, max int) ([]protocol.SampledQuery, error) {
 	if max < 0 {
 		return nil, nil

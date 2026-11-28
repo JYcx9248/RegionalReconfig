@@ -110,7 +110,7 @@ type Agent struct {
 	aggs     map[string]*query.Client      // remote aggregators by query address
 	stagings map[*stagingRun]struct{}      // StagePartitions calls in flight
 
-	sampleMu   sync.Mutex // recent client queries, for a full rebuild's warm-up (keep)
+	sampleMu   sync.Mutex // recent client queries (keep), for a planner's window
 	sample     []protocol.SampledQuery
 	sampleNext int
 }

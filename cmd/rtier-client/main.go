@@ -7,16 +7,15 @@
 //	rtier-client [-api ADDR] rescale [-dry-run] -migrate FROM:TO [-request-max N]  # a task migration
 //	rtier-client [-api ADDR] design             # open design questions (placeholders)
 //	rtier-client [-api ADDR] rebuild -index DIR -partitions DIR [-spares N] [-placement affinity|random]
-//	             [-warmup N] [-warmup-concurrency C] [-stop-the-world] [-work-dir DIR] [-max-candidates N]
+//	             [-stop-the-world] [-work-dir DIR] [-max-candidates N]
 //
 // rebuild moves the cluster to the next index generation (U14 full rebuild): DIR holds
 // fusion_build's output, built with the current codebook and page layout (seed its output
 // directory with pq_codebook.bin, pq_codes.bin, layout_<L>.map and vectors_<L>.bin), and the
 // partitions rtier_segment made of it. Spares (idle nodes, as many as the data nodes by default)
-// serve the queries meanwhile; -warmup N replays the N most recent queries the entries kept
-// (0: all of them, -1: none) before the next generation goes online. Data nodes whose candidate
-// buffers are sized for their lists (rtier_node --max-candidates) switch only with
-// -max-candidates: what max-candidates prints for the new partitions.
+// serve the queries meanwhile. Data nodes whose candidate buffers are sized for their lists
+// (rtier_node --max-candidates) switch only with -max-candidates: what max-candidates prints for
+// the new partitions.
 //
 // A plan file is a protocol.Plan: {"from_epoch": E, "owners": {"NODE": [partitions], ...}},
 // NODE a node ID or name; "from_epoch" is optional. -dry-run changes nothing and prints the
@@ -146,8 +145,6 @@ func main() {
 		fs.IntVar(&req.Spares, "spares", 0, "idle nodes that serve the queries meanwhile (0: as many as the data nodes)")
 		fs.StringVar(&req.Placement, "placement", "affinity", "where the new partitions go: affinity | random")
 		fs.Int64Var(&req.Seed, "seed", 0, "seed of the random placement")
-		fs.IntVar(&req.Warmup, "warmup", 0, "recent queries replayed before going online (0: all kept, -1: none)")
-		fs.IntVar(&req.WarmupConcurrency, "warmup-concurrency", 0, "replayed queries at once per node (0: 4)")
 		fs.BoolVar(&req.StopTheWorld, "stop-the-world", false, "baseline: no spares, admission paused while every node switches")
 		fs.StringVar(&req.WorkDir, "work-dir", "", "where the new segments are written with their holders")
 		maxCand := fs.Uint("max-candidates", 0, "the postings the new partitions' max_nprobe longest lists hold "+
