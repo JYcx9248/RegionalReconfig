@@ -302,6 +302,15 @@ struct FetchStats {
   uint64_t extra_refills = 0;
   uint64_t extra_wait_us = 0;
   uint64_t extra_done = 0;
+  // Raw vectors that came from each peer, by what asked for them: a query's fetch (RERANK,
+  // SEARCH_LOCAL), a pull (RawPull: a stream's or a drain's) or an extra request (FetchExtra). A
+  // transfer between data nodes is counted once, here at the node that receives it, so the nodes'
+  // counts together give who sent how much to whom (a scale-out's old -> new nodes).
+  struct From {
+    uint16_t node = 0;  // the peer's node ID
+    uint64_t query = 0, pull = 0, extra = 0;
+  };
+  std::vector<From> from;  // ascending node IDs
 };
 
 class NodeEngine {

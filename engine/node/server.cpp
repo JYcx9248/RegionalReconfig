@@ -1208,7 +1208,7 @@ std::string NodeServer::OpsJson() const {
 std::string NodeServer::FetchJson() const {
   const fusion::FetchStats f = engine_->fetch_stats();
   auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
-  return fusion::StrFormat(
+  std::string s = fusion::StrFormat(
       "{\"present\":%llu,\"cached\":%llu,\"queued\":%llu,\"queued_peak\":%llu,\"fetched\":%llu,"
       "\"fetch_calls\":%llu,\"coalesced\":%llu,\"fetch_us\":%llu,\"rerouted\":%llu,\"holder_bitmaps\":%llu,"
       "\"written\":%llu,\"write_batches\":%llu,"
@@ -1217,7 +1217,7 @@ std::string NodeServer::FetchJson() const {
       "\"pending_recounts\":%llu,\"pending_us\":%llu,\"added\":%llu,\"added_queued\":%llu,"
       "\"added_written\":%llu,\"added_wait_us\":%llu,\"cache_bound\":%llu,"
       "\"extra\":{\"n\":%llu,\"queued\":%llu,\"dropped\":%llu,\"requests\":%llu,\"failed\":%llu,"
-      "\"fetched\":%llu,\"us\":%llu,\"refill\":%llu,\"refills\":%llu,\"wait_us\":%llu,\"done\":%s}}",
+      "\"fetched\":%llu,\"us\":%llu,\"refill\":%llu,\"refills\":%llu,\"wait_us\":%llu,\"done\":%s},\"from\":{",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
       u(f.coalesced), u(f.fetch_us), u(f.rerouted), u(f.holder_bitmaps), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
@@ -1225,6 +1225,11 @@ std::string NodeServer::FetchJson() const {
       u(f.added_written), u(f.added_wait_us), u(f.cache_bound), u(f.extra), u(f.extra_queued),
       u(f.extra_dropped), u(f.extra_requests), u(f.extra_failed), u(f.extra_fetched), u(f.extra_us),
       u(f.extra_refill), u(f.extra_refills), u(f.extra_wait_us), f.extra_done ? "true" : "false");
+  for (size_t i = 0; i < f.from.size(); ++i)  // by peer: "node": {query, pull, extra}
+    s += fusion::StrFormat("%s\"%u\":{\"query\":%llu,\"pull\":%llu,\"extra\":%llu}", i ? "," : "",
+                           static_cast<unsigned>(f.from[i].node), u(f.from[i].query), u(f.from[i].pull),
+                           u(f.from[i].extra));
+  return s + "}}";
 }
 
 std::string NodeServer::RawCacheJson() const {

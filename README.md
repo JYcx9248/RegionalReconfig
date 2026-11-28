@@ -546,7 +546,10 @@ The controller and the load generator get the CPUs after the nodes'. `"MemoryMax
 once a second into `cgroups.jsonl` (CPU time, reads and writes on the data disk, dirty and
 writeback page cache, pressure stall times). Every run also collects each data node's stats log,
 `stats-<node>.jsonl` (`rtier_node --stats-file`: operation counts and times, time spent waiting
-for an engine worker, the fetch cache and its writer, the raw-vector bytes sent and received),
+for an engine worker, the fetch cache and its writer, the raw-vector bytes sent and received,
+and the raw vectors received from each peer: `fetch.from`, by node ID, split into queries'
+fetches, pulls and extras, so that the logs together give who sent how much to whom;
+`scripts/node_reads.py` tabulates them),
 which its agent forwards to the controller
 and the controller stamps on arrival (`"t"`; the node's own time stays as `"node_t"`). Both are on
 the monotonic clock of `clock.json`, whose `load_start` is the load's time 0.

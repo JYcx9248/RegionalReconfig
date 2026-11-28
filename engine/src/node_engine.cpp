@@ -1601,7 +1601,7 @@ class NodeEngineImpl : public NodeEngine {
       for (const Posting& q : ps) ls.push_back(q.seg->seg.locs[q.j]);
       std::sort(ls.begin(), ls.end());
       ls.erase(std::unique(ls.begin(), ls.end()), ls.end());
-      FetchFrom(holder, ls, &buf);
+      FetchFrom(holder, ls, &buf, FetchKind::kPull);
       r.installed += raw_->Put(ls.data(), ls.size(), buf.data(), RawOrigin::kStreamed);
       for (const Posting& q : ps) q.seg->SetHolder(q.j, kSelfHolder);
       return ls;
@@ -1713,6 +1713,8 @@ class NodeEngineImpl : public NodeEngine {
     f.extra_refills = get(fc_.extra_refills);
     f.extra_wait_us = get(fc_.extra_wait_us);
     f.extra_done = f.extra_refill && extra_done_.load(std::memory_order_relaxed) ? 1 : 0;
+    std::lock_guard<std::mutex> l(from_mu_);
+    for (const auto& kv : from_) f.from.push_back(kv.second);
     return f;
   }
 
@@ -2341,9 +2343,14 @@ class NodeEngineImpl : public NodeEngine {
     return f;
   }
 
-  // Fetches the vectors at locs (sorted, unique) from the data node `holder` into *buf.
-  // RawMissingError if the node does not know where that holder is, or the fetch fails.
-  void FetchFrom(uint16_t holder, const std::vector<uint32_t>& locs, std::vector<uint8_t>* buf) {
+  // What a transfer from a peer is for (FetchStats::from).
+  enum class FetchKind { kQuery, kPull, kExtra };
+
+  // Fetches the vectors at locs (sorted, unique) from the data node `holder` into *buf, and counts
+  // them as come from it. RawMissingError if the node does not know where that holder is, or the
+  // fetch fails.
+  void FetchFrom(uint16_t holder, const std::vector<uint32_t>& locs, std::vector<uint8_t>* buf,
+                 FetchKind kind) {
     std::string addr;
     RawFetcher fetch;
     {
@@ -2366,6 +2373,10 @@ class NodeEngineImpl : public NodeEngine {
       throw RawMissingError(StrFormat("fetching %zu raw vectors from node %u (%s): %s", locs.size(),
                                       holder, addr.c_str(), e.what()));
     }
+    std::lock_guard<std::mutex> l(from_mu_);
+    FetchStats::From& c = from_[holder];
+    c.node = holder;
+    (kind == FetchKind::kQuery ? c.query : kind == FetchKind::kPull ? c.pull : c.extra) += locs.size();
   }
 
   // Checks a re-ranking's candidates and writes their raw-vector locations to locs. A candidate
@@ -2566,7 +2577,7 @@ class NodeEngineImpl : public NodeEngine {
         std::vector<uint32_t> ls;
         for (size_t i : jobs[k].second) ls.push_back(miss[i]);  // ascending, as miss
         std::vector<uint8_t> buf;
-        FetchFrom(jobs[k].first, ls, &buf);
+        FetchFrom(jobs[k].first, ls, &buf, FetchKind::kQuery);
         raw_->CountFetch();
         got[k] = Cache(ls.data(), ls.size(), buf.data());
         for (size_t i : jobs[k].second) via[i].seg->SetHolder(via[i].j, kSelfHolder);
@@ -2790,7 +2801,7 @@ class NodeEngineImpl : public NodeEngine {
     std::sort(ls.begin(), ls.end());  // unique: one claim each
     fc_.extra_requests.fetch_add(1, std::memory_order_relaxed);
     std::vector<uint8_t> buf;
-    FetchFrom(r.holder, ls, &buf);
+    FetchFrom(r.holder, ls, &buf, FetchKind::kExtra);
     fc_.extra_fetched.fetch_add(Cache(ls.data(), ls.size(), buf.data(), true), std::memory_order_relaxed);
     for (const Posting& q : mine) q.seg->SetHolder(q.j, kSelfHolder);
     claims.Settle(ls, true);
@@ -3312,6 +3323,8 @@ class NodeEngineImpl : public NodeEngine {
   mutable uint64_t named_version_ = 0;
   mutable std::vector<uint64_t> named_;  // locations the resident partitions name (a bit each)
   RawFetcher fetcher_;
+  mutable std::mutex from_mu_;
+  std::map<uint16_t, FetchStats::From> from_;  // FetchFrom: what came from each peer
   std::vector<std::unique_ptr<Worker>> workers_;
 };
 

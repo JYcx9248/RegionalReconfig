@@ -10,6 +10,11 @@ reads stay flat at the budget and its wait climbs; on a saturated disk, no node 
 budget and the disk's total stops growing. Ends with each node's share of the reads (the busiest
 one sets the cluster's capacity) and, with GPUs, the GPUs' peak utilization and memory.
 
+Then who sent raw vectors to whom (each node's "fetch.from", counted where they arrived, since
+2026-11-19): per window and over the run, by what asked for them -- queries' fetches, pulls
+(streams, drains) and FetchExtra. An old node's reads for its peers are about these vectors (at
+most one read each: a page read for several of them, or found in the page cache, is one or none).
+
     python3 scripts/node_reads.py results/wiki-gpu/calibrate-4 [--window 20] [--last 320]
 
 Times are seconds from the load's start (clock.json) when the run has one, else from the end
@@ -122,6 +127,40 @@ def main() -> None:
     if gpus:
         print("GPUs, peak over the run: " + ", ".join(f"{g}: {u}% util, {m} MiB"
                                                       for g, (u, m) in sorted(gpus.items())))
+    transfers(st, names, lo, end, zero, args.window)
+
+
+KINDS = ("query", "pull", "extra")
+
+
+def transfers(st, names, lo, end, zero, window) -> None:
+    """Raw vectors each node received from each peer. Peers are node IDs, which the runners give
+    in start order, as they name the nodes: node i is n<i>."""
+    got = {n: [x for x in st[n] if "from" in x.get("fetch", {})] for n in names}
+    got = {n: v for n, v in got.items() if v}
+    if not got:
+        return
+    def count(x, peer, kinds=KINDS):
+        c = x["fetch"]["from"].get(peer, {})
+        return sum(c.get(k, 0) for k in kinds)
+    pairs = sorted({(peer, n) for n, v in got.items() for peer in v[-1]["fetch"]["from"]},
+                   key=lambda p: (int(p[0]), len(p[1]), p[1]))
+    if not pairs:
+        print("\nno raw vector moved between data nodes")
+        return
+    label = {p: f"n{p[0]}>{p[1]}" for p in pairs}
+    print(f"\nraw vectors/s that went from one data node to another (sender>receiver, counted at the "
+          f"receiver; queries' fetches, pulls and extras together):")
+    print(f"{'t':>7s} " + " ".join(f"{label[p]:>9s}" for p in pairs))
+    a = lo
+    while a < end:
+        b = a + window
+        print(f"{a - zero:7.0f} " + " ".join(
+            f"{per_s(got[p[1]], a, b, lambda x, p=p: count(x, p[0])):9.0f}" for p in pairs))
+        a = b
+    print("over the run: " + ", ".join(
+        f"{label[p]} {count(got[p[1]][-1], p[0]):,} (" +
+        ", ".join(f"{k} {count(got[p[1]][-1], p[0], (k,)):,}" for k in KINDS) + ")" for p in pairs))
 
 
 if __name__ == "__main__":

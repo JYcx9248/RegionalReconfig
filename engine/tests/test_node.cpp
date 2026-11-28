@@ -2259,10 +2259,18 @@ void TestRawMigration() {
   RawStats ps = pulled->raw_stats(true);
   CHECK(got == locs23.size() && ps.present == got && ps.streamed == got && ps.fetched == 0 &&
         ps.fetches == 0 && ps.pending == 0);
+  // Counted as pulled from node 1, the holder the postings name; the second pull adds nothing.
+  auto pulled_from_1 = [&] {
+    const FetchStats fs = pulled->fetch_stats();
+    return fs.from.size() == 1 && fs.from[0].node == 1 && fs.from[0].pull == got && fs.from[0].query == 0 &&
+           fs.from[0].extra == 0;
+  };
+  CHECK(pulled_from_1());
   for (const auto& m : want) {
     const RawPutResult r = pulled->RawPull(m.locs.data(), m.lists.data(), m.locs.size());
     CHECK(r.installed == 0 && r.skipped == m.locs.size());
   }
+  CHECK(pulled_from_1());
   same = true;
   for (uint32_t qi = 0; qi < f.nq; ++qi) same = SameRerank(f, qi, pulled.get(), src.get(), {2, 3}) && same;
   CHECK(same && pulled->raw_stats(true).fetched == 0);
@@ -2283,6 +2291,12 @@ void TestRawMigration() {
   }
   CHECK(holders.count(3) && holders.count(1) && got3 == need3 && fourth->RawMissing({3}).empty() &&
         third->raw_stats(true).fetched == third_fetched);
+  uint64_t pulled3 = 0;  // by peer: each vector from the holder its posting names
+  for (const FetchStats::From& from : fourth->fetch_stats().from) {
+    CHECK(holders.count(from.node) && from.pull > 0 && from.query == 0 && from.extra == 0);
+    pulled3 += from.pull;
+  }
+  CHECK(pulled3 == got3);
 
   // Before a node leaves, the nodes whose postings name it drain it. `after` takes partition 3
   // from third without fetching anything, so its postings name third for what third holds.
@@ -2450,6 +2464,11 @@ void TestRawMigration() {
   // One request per holder: more requests than fetching calls.
   const RawStats ss = split->raw_stats(true);
   CHECK(same && both && met && ss.fetched > 0 && ss.fetches > split->fetch_stats().fetch_calls);
+  // By peer: some from each holder, all by queries' fetches.
+  const FetchStats sf = split->fetch_stats();
+  CHECK(sf.from.size() == 2 && sf.from[0].node == 1 && sf.from[1].node == 9 && sf.from[0].query > 0 &&
+        sf.from[1].query > 0 && sf.from[0].query + sf.from[1].query == sf.fetched &&
+        sf.from[0].pull + sf.from[1].pull + sf.from[0].extra + sf.from[1].extra == 0);
 }
 
 // The choice of holder (protocol lazy-balanced): `bal` takes partition 2 from src (node 1), so its
@@ -2767,6 +2786,14 @@ void TestFetchExtra() {
   CHECK(wait_stats([](const FetchStats& fs) { return fs.extra_fetched == 8; }));
   FetchStats fs = dst->fetch_stats();
   CHECK(fs.extra_queued == 1 && fs.extra_requests == 1 && fs.extra_dropped == 0 && fs.extra_failed == 0);
+  // By peer: the extra request's 8 from node 9, every other vector by a query's fetch.
+  uint64_t by_query = 0, by_extra = 0;
+  for (const FetchStats::From& from : fs.from) {
+    CHECK(from.pull == 0 && (from.node == 9 || from.extra == 0));
+    by_query += from.query;
+    by_extra += from.extra;
+  }
+  CHECK(by_extra == 8 && by_query + by_extra == fs.fetched);
   // The others came with it: no fetch for them.
   const uint64_t fetches = dst->raw_stats(true).fetches;
   std::vector<uint32_t> rest;

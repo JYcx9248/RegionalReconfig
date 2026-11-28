@@ -254,9 +254,11 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   own epoch (paused admission) reads nothing.
 - **Diagnosing a run**: `metrics.jsonl` (the agents' counters too, e.g. `graph.yield_ms`, how
   long the graph waited for data), `stats-<node>.jsonl` (per-node counters, `rtier_node
-  --stats-file`; `raw_bytes` sent and received) and `cgroups.jsonl` (CPU, disk, dirty pages,
+  --stats-file`; `raw_bytes` sent and received; `fetch.from`, the raw vectors received from each
+  peer, by queries' fetches, pulls and extras, so who sent how much to whom) and `cgroups.jsonl` (CPU, disk, dirty pages,
   pressure; a host record with the whole disk's I/O and how busy each node's CPUs were; on a
-  cluster one per node's host, `<node>-host`, with its CPU count; `scripts/node_reads.py`). The
+  cluster one per node's host, `<node>-host`, with its CPU count; `scripts/node_reads.py`, which
+  also tabulates `fetch.from`). The
   agents forward the stats logs (`rtier-agent -node-stats`) and, on a cluster, their samples
   (`SampleInterval`; `run_local.py` samples itself with `"NodeResources"`), and the
   controller stamps every record and metrics report on arrival (`"t"`, on its monotonic clock;
