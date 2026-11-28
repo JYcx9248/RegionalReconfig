@@ -193,7 +193,11 @@ parameters, Quake's own names and defaults: {"Window": 1000, "RefineRadius": 25,
 "RefineIterations": 3, "MinSize": 32, "MaxSize": 0, "Alpha": 0.9, "DeleteRejection": true,
 "SplitIterations": 5, "DeleteThresholdNS": 100, "SplitThresholdNS": 100} ("MaxSize" > 0: by the
 lists' lengths alone). The window needs that many queries kept: QuerySample (per entry) times the
-entries at least. Like a
+entries at least. Every round a run decides is saved in its results (quake-plan-<k>.json.gz, k
+the update's number in the run), and "Plan": FILE runs a round saved so instead of deciding one
+(rtier-updater -quake-plan), on the state it was decided on -- the same index and partitions, the
+same batches and rounds before it -- which it checks: Quake runs its maintenance apart from its
+queries and reports its time apart, so a run can measure the epochs alone. Like a
 rescale, an entry runs to its end before the next one starts, whatever its trigger time: a batch
 and a rescale never overlap. The update controller's router (an rtier_node on the index's graph)
 runs on this machine from the start; its state -- where the next batch's IDs and locations
@@ -210,8 +214,10 @@ version its epoch read.
 (bin/rtier-updater; config.yaml's AllowUpdates). Every data node leaves room for 1.5 times the
 index's vectors and raw-vector locations (rtier_node --max-vectors, --max-pages) and for lists
 twice as long as the longest ("ListHeadroom": 2.0, or "MaxListLen": N; --max-list-len), and its
-PQ budget grows by the same factor (PQCapacity). Without Updates the dataset is static: no room,
-and the controller refuses update batches.
+PQ budget grows by the same factor (PQCapacity). "GraphHeadroom": F leaves room for F times the
+build's heads and lists more (rtier_node --graph-headroom, 0.2 without it), on the data nodes and on
+the update controller's router: a round of Quake's maintenance may split thousands of lists at once.
+Without Updates the dataset is static: no room, and the controller refuses update batches.
 
 "PQCapacity": "auto" (the default) gives every data node a PQ budget (rtier_node --pq-capacity:
 its GPU memory, in codes) of the most distinct vectors one node's partitions name at the
@@ -355,7 +361,18 @@ def update_args(cfg: dict, index: str, parts: str) -> list:
         sys.exit(f"Updates.Headroom {head:g} leaves too little room: the run's batches insert {ins} vectors, "
                  f"each with an ID and a raw-vector location after the index's: set it to at least {need:.3f}")
     return ["--max-vectors", str(math.ceil(n * head)), "--max-pages", str(math.ceil(pages * head)),
-            "--max-list-len", str(int(max_len))]
+            "--max-list-len", str(int(max_len))] + graph_headroom_args(cfg)
+
+
+def graph_headroom_args(cfg: dict) -> list:
+    """rtier_node --graph-headroom from Updates.GraphHeadroom: room for the heads and lists major
+    epochs add, on the data nodes and the update controller's router alike (0.2 without it)."""
+    gh = (cfg.get("Updates") or {}).get("GraphHeadroom")
+    if gh is None:
+        return []
+    if float(gh) < 0:
+        sys.exit("Updates.GraphHeadroom must be 0 or more")
+    return ["--graph-headroom", "%g" % float(gh)]
 
 
 def flag_value(args: list, name: str):
@@ -647,6 +664,11 @@ def update_request(cfg: dict, rc: dict) -> dict:
                  "DeleteRejection": "-quake-delete-rejection", "SplitIterations": "-quake-split-iterations",
                  "DeleteThresholdNS": "-quake-delete-threshold-ns", "SplitThresholdNS": "-quake-split-threshold-ns"}
         for key, value in (up.get("Quake") or {}).items():
+            if key == "Plan":  # a round decided before: its file must be there now
+                if not os.path.isfile(value):
+                    sys.exit(f"Reconfigurations: {rc}: Quake.Plan {value}: no such file")
+                args += ["-quake-plan", os.path.abspath(value)]
+                continue
             if key not in flags:
                 sys.exit(f"Reconfigurations: {rc}: Quake.{key}: not one of {', '.join(flags)}")
             if key == "DeleteRejection":
@@ -655,7 +677,7 @@ def update_request(cfg: dict, rc: dict) -> dict:
                 args.append(f"{flags[key]}={'true' if value else 'false'}")
             else:
                 args += [flags[key], str(value)]
-        parts.append("Quake's maintenance")
+        parts.append("Quake's maintenance" + (", a saved plan" if (up.get("Quake") or {}).get("Plan") else ""))
     elif up.get("Quake") is not None:
         sys.exit(f'Reconfigurations: {rc}: "Quake" is the quake policy\'s')
     elif up.get("Policy") is not None or up.get("ReassignRange") is not None:
@@ -1618,7 +1640,8 @@ class Updater:
         # of the controller and the load generator: the batches' routing is no node's work.
         line = procs.start("router", [f"{ebin}/rtier_node", "--index", index, "--partitions", parts,
                                       "--listen", "127.0.0.1:0", "--graph", "index", "--pq-capacity", "1",
-                                      "--workers", "1"], prefix=prefix, wait_line="READY tcp=")
+                                      "--workers", "1"] + graph_headroom_args(cfg), prefix=prefix,
+                           wait_line="READY tcp=")
         self.cmd = list(prefix) + [f"{gbin}/rtier-updater", "-api", api_addr, "-partitions", parts,
                                    "-state", os.path.join(self.dir, "state.json"),
                                    "-router", "127.0.0.1:" + line.split("=")[1],
@@ -1631,6 +1654,12 @@ class Updater:
         k = len(self.results) + 1
         path = os.path.join(self.dir, f"record-{k}.json")
         cmd = self.cmd + ["-record", path] + rc["updater_args"]
+        # A Quake round it decides is saved, to run again (Quake.Plan) in later runs.
+        args = rc["updater_args"]
+        plan = ""
+        if "-policy" in args and args[args.index("-policy") + 1] == "quake" and "-quake-plan" not in args:
+            plan = os.path.join(self.dir, f"quake-plan-{k}.json.gz")
+            cmd += ["-quake-save-plan", plan]
         log(rc["what"])
         started = time.monotonic()
         with open(os.path.join(self.out_dir, "updater.log"), "a") as f:
@@ -1641,6 +1670,8 @@ class Updater:
         if os.path.exists(path):
             with open(path) as f:
                 rec = json.load(f)
+        if plan and os.path.exists(plan):
+            shutil.copy2(plan, os.path.join(self.out_dir, os.path.basename(plan)))
         self.results.append({"update": rc["update"], "trigger_seconds": round(started - t0, 3),
                              "elapsed_seconds": round(time.monotonic() - started, 3), **rec})
         # After each one, as reconfigurations.json: a later one that fails ends the run.

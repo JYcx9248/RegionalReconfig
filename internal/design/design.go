@@ -429,7 +429,11 @@ var Open = map[string]Question{
 			"patch), and empty lists go: one major epoch after a batch, or alone. Kept out: raw " +
 			"vectors (PQ codes here), the drift of every changed centroid and the deletes by the " +
 			"share of a list deleted (no per-list sums across batches), adaptive nprobe, and a " +
-			"flat parent level (ours is the graph) (internal/update/quake.go). " +
+			"flat parent level (ours is the graph) (internal/update/quake.go). A round can be " +
+			"saved as it was decided and run again on the same state, deciding nothing (2026-11-27, " +
+			"internal/update/quakeplan.go: -quake-save-plan, -quake-plan; the state checked by the " +
+			"lists' digests and the list IDs), so that a run measures the epochs and not the " +
+			"policy, which Quake too runs apart from its queries (its paper, §7.2, §8.2). " +
 			"The update controller's router edits its graph (new heads in, removed heads marked " +
 			"deleted, routing points but never a result) and exports the bytes that changed as a " +
 			"patch (fusion/graph_patch.h). No node holds two versions of the graph: every entry " +

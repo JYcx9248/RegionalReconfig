@@ -1,0 +1,123 @@
+{
+  "Comment": "CloudLab c240g5 (scripts/cloudlab/profile.py: node0 the control node, node1 to node4 the hosts of n1 to n4): the Quake example of the update strategies -- a round of Quake's maintenance planned after each batch and run as a major epoch (internal/update/quake.go: its cost model, on the hits of the entries' last 10,000 client queries, decides which lists to delete and split; the splits' neighbourhoods are refined; empty lists are removed) -- on Wikipedia c1024, 4 data nodes, the load constant. The update experiment's four minor batches of the 2026-02 diff (b4x5: 775K inserts and about 744K deletes each, 400 s apart: experiment.wiki-c1024-cloudlab-gpu-updates.json), each followed by its round of Quake's maintenance, decided once on this cluster and saved (experiment.wiki-c1024-kmeans-cloudlab-gpu-quake-plans.json: a plan runs only on the state it was decided on, and the batches' routing is this control node's; \"Quake\": {\"Plan\": FILE}, rtier-updater -quake-plan, internal/update/quakeplan.go): each epoch reads its lists, checks that they hold what they held when the round was decided, and runs the round's edits, deciding nothing; no full rebuild and no spare. On Quake's index of Wikipedia c1024: a flat k-means of round(sqrt(N)) = 3,939 lists, one replica a vector (fusion_build --from-index the base index --clustering kmeans; the base's IDs, raw-vector locations, codebook and page file; results/kmeans-index-2026-11-26), its 64 GP partitions with each head weighing its list's postings, the nodes started on its 4-node warmup snapshot (experiment.wiki-c1024-kmeans-cloudlab-gpu-warmup-4.json); inserts go to their nearest head. Quake's parameters are its Wikipedia configuration's (Quake's repository, test/experiments/osdi2025/wiki_workload/configs/wiki.yaml, the configurations with maintenance: window_size 10000, refinement_radius 50, split_threshold_ns 250, delete_threshold_ns 500000, enable_delete_rejection false), one refinement iteration, as its paper runs it (\u00a77.2), the rest its defaults; its nc 1000 is not taken (the paper sizes its indexes at sqrt(|X0|)), nor its metric (ip; ours is L2). QuerySample 2500: the 4 entries keep the window's 10,000 queries. Rate 520 = 0.6 x C4 of this index, floored to tens (C4 867 q/s at nprobe 96 on the reservation of 2026-11-20: experiment.wiki-c1024-kmeans-cloudlab-gpu-calibrate-4.json, results/cloudlab-gpu/2026-11-26-quake/calibrate-4). NProbe, with --max-nprobe the same (the GPU's candidate buffers), is the smallest that reaches the base index's recall at nprobe 64, N 200 (0.8891), from the lab server's recall table (results/kmeans-index-2026-11-26/summary.txt): 96 (recall 0.9108). Answers are scored per data version (scripts/score_answers.py) against <GroundTruth>.versions/ (2026-11-22: the same batches, IDs and locations). UpdateLease 60m and StageTimeout 60m. GraphHeadroom 10: the rounds split thousands of lists (2,743 of 3,939 in the first: Quake's cost model, on our scan profile, wants lists several times shorter than sqrt(N)'s; the default room of 0.2 stopped the lab server's first trial), and a deleted head keeps its place in the graph.",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-kmeans-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32,
+    "Weights": "postings"
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "96",
+    "--max-rerank",
+    "1000"
+  ],
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 96,
+    "N": 200,
+    "Rate": "520",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 1800,
+    "WarmupSeconds": 30
+  },
+  "Updates": {
+    "Headroom": 1.25,
+    "ListHeadroom": 2.0,
+    "GraphHeadroom": 10
+  },
+  "UpdateLease": "60m",
+  "StageTimeout": "60m",
+  "QuerySample": 2500,
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 120,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Plan": "/data-ssd/chenxu/work/wiki-c1024-kmeans/plans/quake-plan-1.json.gz"
+        }
+      }
+    },
+    {
+      "TriggerTimeSeconds": 520,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Plan": "/data-ssd/chenxu/work/wiki-c1024-kmeans/plans/quake-plan-2.json.gz"
+        }
+      }
+    },
+    {
+      "TriggerTimeSeconds": 920,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-3.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-3-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Plan": "/data-ssd/chenxu/work/wiki-c1024-kmeans/plans/quake-plan-3.json.gz"
+        }
+      }
+    },
+    {
+      "TriggerTimeSeconds": 1320,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-4.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-4-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Plan": "/data-ssd/chenxu/work/wiki-c1024-kmeans/plans/quake-plan-4.json.gz"
+        }
+      }
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

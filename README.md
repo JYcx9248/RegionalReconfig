@@ -401,7 +401,25 @@ scan of every head; inserts follow the same rule. A round:
 Unlike Quake, the decisions use PQ codes; the window is read at the round instead of recorded as
 queries run; centroids do not drift with every insert and delete, and no list is deleted for the
 share of it deleted (nothing keeps per-list sums across batches); nprobe stays fixed (no APS);
-and the parent level is the graph.
+and the parent level is the graph. Quake's paper (§7.2) refines with one iteration, which in its
+code and here reassigns the members to the nearest head and moves no head; its code defaults to
+three.
+
+A round can be decided once and run again (`internal/update/quakeplan.go`): `-quake-save-plan FILE`
+saves what a round decided -- the deleted lists, each split's children and their heads, every other
+changed list's members after the round, the lists left empty, the heads moved -- with a digest of
+every list it read and the list allocator's position, and `-quake-plan FILE` runs such a round
+instead of deciding one (`"Quake": {"Plan": FILE}`; the runner saves every round a run decides in
+its results, `quake-plan-<k>.json.gz`). It reads the lists, checks that each holds what it held when
+the round was decided and that the children get the same list IDs, edits the router's graph as the
+round did and builds the same edits; on another state it gives the lease up and changes nothing
+(`TestQuakePlanReplay`). The state includes the batches' routing: an insert goes to its nearest head
+by float distances, which builds for different CPUs compute differently in the last bits, so a plan
+runs on the machines whose update controller routed the batches it followed (decided on the lab
+server, the Quake plans met one posting more in a list on CloudLab, 2026-11-27). Quake runs its
+maintenance serially with its queries and reports its time apart ("as maintenance can be conducted
+in the background in online systems", §7.2; §8.2): with saved plans a run measures what the epochs
+cost, and every repetition runs the same rounds.
 
 The graph changes without any node holding two versions of it. The update controller's router
 inserts the new heads and marks the removed ones deleted (routing points, never a result), and
@@ -412,7 +430,9 @@ patched graph's, step by step -- and those of the epoch before it search the gra
 the grace period every entry merges the patch in place without a pause, and the lease ends after
 that; a later entry's graph transfer takes the merged graph from an entry's memory. The epoch table names the
 graph version and the lists major epochs created; data nodes leave room for heads and lists
-(`rtier_node --graph-headroom`, 20% by default).
+(`rtier_node --graph-headroom`, 20% by default; an experiment's `"Updates":
+{"GraphHeadroom": F}` sets it on the data nodes and the update controller's router, since a round
+of Quake's maintenance may split thousands of lists).
 
 **Full rebuild** (`internal/controller/rebuild.go`, `rtier-client rebuild`) moves the cluster to
 another generation of the index: all heads, the graph, every list and partition. The next

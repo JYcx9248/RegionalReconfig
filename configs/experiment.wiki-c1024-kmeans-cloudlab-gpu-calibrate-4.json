@@ -1,0 +1,82 @@
+{
+  "Comment": "CloudLab c240g5 (scripts/cloudlab/profile.py: node0 the control node, node1 to node4 the hosts of n1 to n4): the 4-node capacity (C4) of Quake's index of Wikipedia c1024: a flat k-means of round(sqrt(N)) = 3,939 lists, one replica a vector (fusion_build --from-index the base index --clustering kmeans; the base's IDs, raw-vector locations, codebook and page file; results/kmeans-index-2026-11-26), its 64 GP partitions with each head weighing its list's postings, the nodes started on its 4-node warmup snapshot (experiment.wiki-c1024-kmeans-cloudlab-gpu-warmup-4.json). From 100 q/s: a query scans far more postings here than on the base index, so C4 may lie below the base's rates. The Quake runs (experiment.wiki-c1024-kmeans-cloudlab-gpu-quake.json) take Rate = 0.6 x C4, floored to tens. NProbe, with --max-nprobe the same (the GPU's candidate buffers), is the smallest that reaches the base index's recall at nprobe 64, N 200 (0.8891), from the lab server's recall table (results/kmeans-index-2026-11-26/summary.txt): 96 (recall 0.9108; nprobe 64 gives 0.8863), as the trial there (experiment.wiki-c1024-kmeans-quake-trial.json) chose it. C4 was 867 q/s on the reservation of 2026-11-20 (2026-11-27, results/cloudlab-gpu/2026-11-26-quake/calibrate-4: 865-867 answered a second from 900 offered on).",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-kmeans-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32,
+    "Weights": "postings"
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "96",
+    "--max-rerank",
+    "1000"
+  ],
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 96,
+    "N": 200
+  },
+  "Calibrate": {
+    "Rates": [
+      100,
+      200,
+      300,
+      400,
+      500,
+      600,
+      700,
+      800,
+      900,
+      1000,
+      1200,
+      1400
+    ],
+    "SecondsPerRate": 30
+  },
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

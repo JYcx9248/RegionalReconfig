@@ -43,7 +43,11 @@
 // entries' last -quake-window client queries, decides on its cost model which lists to delete and
 // which to split, deletes, splits and refines them, and removes the lists left empty, as one
 // major epoch. The -quake-* flags are Quake's maintenance parameters, with its defaults; with
-// -quake-max-size the lists' lengths decide instead (Quake's size-bound mode).
+// -quake-max-size the lists' lengths decide instead (Quake's size-bound mode). -quake-save-plan
+// FILE saves what the round decided (internal/update/quakeplan.go), and -quake-plan FILE runs a
+// round saved so, deciding nothing, on the state it was decided on (the same lists, checked, and
+// the same list IDs for the children): Quake runs its maintenance apart from its queries and
+// reports its time apart, and a run that executes saved plans measures the epochs alone.
 //
 // -record FILE writes, as JSON, what the batch and the major epoch did: their replies (epochs,
 // partitions, and the phases from the staging to the reclaim), the inserted IDs and locations,
@@ -86,6 +90,7 @@ type options struct {
 	api, parts, statePath, inserts, deletes string
 	router, index, nodeBin, graph, patches  string
 	split, merge, record, policy            string
+	quakePlan, quakeSavePlan                string
 	splitLen, mergeLen, majorMax, reassign  int
 	quake                                   update.QuakeParams
 	timeout                                 time.Duration
@@ -151,10 +156,18 @@ func main() {
 	flag.IntVar(&o.quake.SplitIterations, "quake-split-iterations", o.quake.SplitIterations, "-policy quake: the 2-means' iterations (split_knn_iterations)")
 	flag.Float64Var(&o.quake.DeleteThresholdNS, "quake-delete-threshold-ns", o.quake.DeleteThresholdNS, "-policy quake: delete_threshold_ns")
 	flag.Float64Var(&o.quake.SplitThresholdNS, "quake-split-threshold-ns", o.quake.SplitThresholdNS, "-policy quake: split_threshold_ns")
+	flag.StringVar(&o.quakePlan, "quake-plan", "", "-policy quake: run the round decided before and saved in FILE "+
+		"(-quake-save-plan) instead of deciding one, on the state it was decided on")
+	flag.StringVar(&o.quakeSavePlan, "quake-save-plan", "", "-policy quake: save the round decided here in FILE "+
+		"(gzip'd JSON), for -quake-plan")
 	flag.StringVar(&o.record, "record", "", "write what the batch and the major epoch did here, as JSON")
 	flag.DurationVar(&o.timeout, "timeout", 30*time.Minute, "")
 	flag.Parse()
 	quake := o.policy == update.PolicyQuake
+	if (o.quakePlan != "" || o.quakeSavePlan != "") && !quake {
+		fmt.Fprintln(os.Stderr, "-quake-plan and -quake-save-plan are -policy quake's")
+		os.Exit(2)
+	}
 	if o.parts == "" || (o.inserts == "" && o.deletes == "" && o.split == "" && o.merge == "" && !quake) {
 		flag.Usage()
 		os.Exit(2)
@@ -349,7 +362,7 @@ func run(o options, rec *record) error {
 		}
 	}
 	if quake {
-		return runQuake(ctx, u, o.statePath, alloc, rec)
+		return runQuake(ctx, u, o.statePath, alloc, rec, o.quakePlan, o.quakeSavePlan)
 	}
 	if len(splits)+len(merges) == 0 {
 		return nil
@@ -358,9 +371,21 @@ func run(o options, rec *record) error {
 }
 
 // runQuake runs one round of Quake's maintenance as a major epoch, if it finds anything to do.
-func runQuake(ctx context.Context, u *update.Updater, statePath string, alloc *update.Allocator, rec *record) error {
+func runQuake(ctx context.Context, u *update.Updater, statePath string, alloc *update.Allocator, rec *record,
+	planPath, savePath string) error {
 	start := time.Now()
-	mj, st, err := u.PrepareQuake(ctx)
+	var mj *update.Major
+	var st *update.QuakeStats
+	var err error
+	if planPath != "" { // a round decided before: nothing to decide
+		plan, perr := update.ReadQuakePlan(planPath)
+		if perr != nil {
+			return perr
+		}
+		mj, st, err = u.PrepareQuakePlan(ctx, plan)
+	} else {
+		mj, st, err = u.PrepareQuake(ctx)
+	}
 	if serr := saveState(statePath, alloc); serr != nil {
 		return errors.Join(err, serr)
 	}
@@ -371,6 +396,13 @@ func runQuake(ctx context.Context, u *update.Updater, statePath string, alloc *u
 	if mj == nil {
 		fmt.Printf("Quake's maintenance: no round (%s)\n", st.Skipped)
 		return nil
+	}
+	if savePath != "" && mj.QuakePlan != nil {
+		if err := update.WriteQuakePlan(savePath, mj.QuakePlan); err != nil {
+			return errors.Join(err, u.DiscardMajor(ctx, mj))
+		}
+		fmt.Printf("Quake's maintenance: the round's plan saved in %s (decided in %.2f s)\n", savePath,
+			time.Since(start).Seconds())
 	}
 	for _, sp := range mj.Splits {
 		rec.Splits = append(rec.Splits, sp.List)

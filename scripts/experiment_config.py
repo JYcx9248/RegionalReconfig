@@ -21,7 +21,7 @@ all but RUNNER_KEYS, which the runners set from the run itself.
       "Hosts": {"Nodes": [HOST, {"SSH": DEST, "Addr": ADDRESS}, ...], ...},   # run_cluster.py only
       "Load": {"Rate", "RateSteps", "Users", "DurationSeconds", ...},
       "Calibrate": {"Rates", "SecondsPerRate"},
-      "Updates": {"Headroom", "ListHeadroom", "MaxListLen"},
+      "Updates": {"Headroom", "ListHeadroom", "MaxListLen", "GraphHeadroom"},
       "Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}, {..., "Plan": P},
                            {..., "Migrate": {"From": "n4", "To": "n5"}},
                            {..., "Rebuild": {"Index": DIR, "Partitions": DIR}},
@@ -67,7 +67,7 @@ SCHEMA = {
              "Users": None, "UserSteps": None, "RetryForSeconds": None, "DurationSeconds": None,
              "WarmupSeconds": None, "DrainSeconds": None},
     "Calibrate": {"Rates": None, "SecondsPerRate": None},
-    "Updates": {"Headroom": None, "ListHeadroom": None, "MaxListLen": None},
+    "Updates": {"Headroom": None, "ListHeadroom": None, "MaxListLen": None, "GraphHeadroom": None},
     "Reconfigurations": {
         "TriggerTimeSeconds": None, "DataNodes": None, "Plan": "opaque", "Migrate": {"From": None, "To": None},
         "Rebuild": {"Index": None, "Partitions": None, "Spares": None, "Placement": None, "Seed": None,
@@ -76,7 +76,7 @@ SCHEMA = {
                    "MergeLen": None, "MajorMax": None, "Policy": None, "ReassignRange": None,
                    "Quake": {"Window": None, "RefineRadius": None, "RefineIterations": None, "MinSize": None,
                              "MaxSize": None, "Alpha": None, "DeleteRejection": None, "SplitIterations": None,
-                             "DeleteThresholdNS": None, "SplitThresholdNS": None}}},
+                             "DeleteThresholdNS": None, "SplitThresholdNS": None, "Plan": None}}},
 }
 
 

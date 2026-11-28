@@ -247,7 +247,14 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   go to their nearest live heads (`NEAREST_LIVE`), a split is a k-means of 2 whose means head
   the children (`SPLIT_MEANS`), the lists around the children are refined (`REFINE_ASSIGN`;
   after two passes or more their heads move in place, `EDIT_GRAPH` moves, the edit amended into
-  one patch), and empty lists go (`LIST_LENGTHS` on the owners). Only with the controller's
+  one patch), and empty lists go (`LIST_LENGTHS` on the owners). A round can be saved as
+  decided and run again on the same state, deciding nothing (`quakeplan.go`, 2026-11-27:
+  `-quake-save-plan`, `-quake-plan`, `"Quake": {"Plan": FILE}`; the lists' digests and the
+  children's list IDs checked), so that runs measure the epochs, not the policy, which Quake too
+  runs apart from its queries; a plan replays only where the batches before it were routed, since
+  an insert's nearest head is a float comparison (the lab server's plans failed on CloudLab).
+  `"Updates": {"GraphHeadroom": F}` (`--graph-headroom`) leaves room for the heads a round adds,
+  thousands with Quake's (a deleted head keeps its slot). Only with the controller's
   `AllowUpdates` (`"Updates"` in an experiment). An experiment triggers batches as
   `"Reconfigurations"` entries with `"Update"` (inserts, deletes, a major epoch after them),
   each run to its end in the same timeline as the rescales; `run_local.py` and `run_cluster.py`

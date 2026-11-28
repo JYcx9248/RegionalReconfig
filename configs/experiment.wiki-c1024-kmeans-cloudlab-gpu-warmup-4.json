@@ -1,0 +1,56 @@
+{
+  "Comment": "CloudLab c240g5 (scripts/cloudlab/profile.py: node0 the control node, node1 to node4 the hosts of n1 to n4): the 4-node warmup snapshot of Quake's index of Wikipedia c1024: a flat k-means of round(sqrt(N)) = 3,939 lists, one replica a vector (fusion_build --from-index the base index --clustering kmeans; the base's IDs, raw-vector locations, codebook and page file; results/kmeans-index-2026-11-26), its 64 GP partitions with each head weighing its list's postings, made on the cluster by scripts/run_cluster.py from the control node's page file (the base's, which this index links to). CPU backend: a warmup sends no query. NProbe, with --max-nprobe the same (the GPU's candidate buffers), is the smallest that reaches the base index's recall at nprobe 64, N 200 (0.8891), from the lab server's recall table (results/kmeans-index-2026-11-26/summary.txt): 96 (recall 0.9108; nprobe 64 gives 0.8863), as the trial there (experiment.wiki-c1024-kmeans-quake-trial.json) chose it. Made on 2026-11-27 (results/cloudlab-gpu/2026-11-26-quake/warmup-4).",
+  "Type": "warmup",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-kmeans-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32,
+    "Weights": "postings"
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "96",
+    "--max-rerank",
+    "1000"
+  ],
+  "InitialNodes": 4,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson"
+  },
+  "StageTimeout": "60m",
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

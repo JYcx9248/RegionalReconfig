@@ -99,6 +99,9 @@ type QuakeStats struct {
 	Moved        int     `json:"moved_heads"`       // heads it moved
 	Emptied      int     `json:"removed_empty"`     // lists removed empty
 	Skipped      string  `json:"skipped,omitempty"` // why no round ran
+	// Replayed: the round ran a plan decided before (PrepareQuakePlan); the rest is what it found
+	// and did when it was decided.
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // Quake's scan-latency grid (common.h: DEFAULT_LATENCY_ESTIMATOR_RANGE_N, _K, _NTRIALS) and the
@@ -528,10 +531,12 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 	}
 
 	// 4. Splits: a k-means of 2 on the members, those that joined included.
+	nextList, listGen := u.Alloc.NextList() // where the round's plan takes its list IDs from
 	var children []uint32
 	if len(dec.splits) > 0 {
 		children = u.Alloc.TakeLists(2*len(dec.splits), listFloor(t, u.Manifest))
 	}
+	var planSplits []QuakePlanSplit
 	vb := in.Dim * dtypeSize(in.DType)
 	var labels, dead []uint32
 	var heads []byte
@@ -560,6 +565,7 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 		}
 		labels, heads = append(labels, sp.Children[:]...), append(heads, cent...)
 		mj.Splits = append(mj.Splits, sp)
+		planSplits = append(planSplits, QuakePlanSplit{List: l, Children: sp.Children, Heads: append([]byte(nil), cent...)})
 		final[l] = nil
 		delete(joined, l)
 	}
@@ -644,22 +650,37 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 		}
 	}
 
-	// Receivers of deleted lists' members that no refinement read: they only gain.
-	for l, ids := range joined {
-		for _, id := range ids {
-			v := vecs[id]
-			tp := mj.partitionOf(t, u.Manifest, l)
-			mj.part(tp).add(l, id, v.loc, v.holder)
-			if to := t.Owner(tp); to != t.Owner(mj.partitionOf(t, u.Manifest, v.base)) {
-				mj.sendCode(to, id, v.code)
-			}
+	// 6. Lists left empty go: the ones the round emptied, and those that were.
+	emptied := quakeEmptied(final, empty, isDel, dec.splits, joined)
+
+	// What the round decided, to run again later (PrepareQuakePlan), and its end.
+	plan := &QuakePlan{Format: quakePlanFormat, Deletes: dec.deletes, Splits: planSplits, Final: map[uint32][]uint32{},
+		Gains: joined, Emptied: emptied, Moved: moved, MovedVecs: movedVecs, Read: map[uint32]ListDigest{},
+		NextList: nextList, ListGen: listGen}
+	for l, ids := range final {
+		if !isDel[l] && !containsList(dec.splits, l) {
+			plan.Final[l] = ids
 		}
 	}
+	for l, lm := range members {
+		plan.Read[l] = digestOf(lm.IDs)
+	}
+	if err := u.finishQuake(ctx, mj, t, st, members, vecs, dec.deletes, dec.splits, final, joined, emptied, moved,
+		movedVecs, &edited); err != nil {
+		return nil, nil, err
+	}
+	plan.Stats = *st
+	mj.QuakePlan = plan
+	return mj, st, nil
+}
 
-	// 6. Lists left empty go: the ones the round emptied, and those that were.
+// quakeEmptied is the lists a round removes, left empty: the ones it emptied (final) but the
+// deleted and split ones, and those that were empty (empty) and that it did not change.
+func quakeEmptied(final map[uint32][]uint32, empty []uint32, isDel map[uint32]bool, splits []uint32,
+	joined map[uint32][]uint32) []uint32 {
 	var emptied []uint32
 	for l, ids := range final {
-		if len(ids) == 0 && !isDel[l] && !containsList(dec.splits, l) {
+		if len(ids) == 0 && !isDel[l] && !containsList(splits, l) {
 			emptied = append(emptied, l)
 		}
 	}
@@ -669,6 +690,50 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 		}
 	}
 	sort.Slice(emptied, func(i, j int) bool { return emptied[i] < emptied[j] })
+	return emptied
+}
+
+// finishQuake ends a round's major epoch from what it decided, whether just now (PrepareQuake) or
+// before (PrepareQuakePlan): the deleted lists' members that no refinement read join their
+// receivers (gains), the lists left empty go (emptied), the graph edit is amended (their heads
+// out, the moved heads moved), and every list the round changed (final) gains and loses the
+// difference, the postings that change owners with their PQ codes. members and vecs are the lists
+// the round read at the lease's epoch and their members.
+func (u *Updater) finishQuake(ctx context.Context, mj *Major, t *epoch.Table, st *QuakeStats,
+	members map[uint32]*listMembers, vecs map[uint32]*qvec, deletes, splits []uint32, final, gains map[uint32][]uint32,
+	emptied, moved []uint32, movedVecs []byte, edited *bool) error {
+	isDel := map[uint32]bool{}
+	for _, l := range deletes {
+		isDel[l] = true
+	}
+	vecOf := func(id uint32) (*qvec, error) {
+		v, ok := vecs[id]
+		if !ok {
+			return nil, fmt.Errorf("update: the round moves vector %d, which no list it read holds", id)
+		}
+		return v, nil
+	}
+	// Receivers of deleted lists' members that no refinement read: they only gain.
+	receivers := make([]uint32, 0, len(gains))
+	for l := range gains {
+		receivers = append(receivers, l)
+	}
+	sort.Slice(receivers, func(i, j int) bool { return receivers[i] < receivers[j] })
+	for _, l := range receivers {
+		for _, id := range gains[l] {
+			v, err := vecOf(id)
+			if err != nil {
+				return err
+			}
+			tp := mj.partitionOf(t, u.Manifest, l)
+			mj.part(tp).add(l, id, v.loc, v.holder)
+			if to := t.Owner(tp); to != t.Owner(mj.partitionOf(t, u.Manifest, v.base)) {
+				mj.sendCode(to, id, v.code)
+			}
+		}
+	}
+
+	// Lists left empty go.
 	var deadAfter []uint32
 	for _, l := range emptied {
 		if _, created := mj.Lists[l]; created {
@@ -688,15 +753,16 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 	st.Emptied = len(emptied)
 	if len(moved)+len(deadAfter) > 0 {
 		// The edit amended: one patch from the epoch's graph.
+		var err error
 		if mj.Patch, err = u.Router.EditGraph(ctx, mj.Graph, nil, nil, deadAfter, moved, movedVecs); err != nil {
-			return nil, nil, fmt.Errorf("update: editing the graph after the refinement: %w", err)
+			return fmt.Errorf("update: editing the graph after the refinement: %w", err)
 		}
-		edited = true
+		*edited = true
 	}
 
 	// The edits: the deleted and split lists go, the children come, and every other list the
 	// round changed gains and loses the difference.
-	for _, l := range dec.deletes {
+	for _, l := range deletes {
 		pe := mj.part(members[l].p)
 		pe.Removed = append(pe.Removed, l)
 	}
@@ -720,14 +786,18 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 	}
 	sort.Slice(changed, func(i, j int) bool { return changed[i] < changed[j] })
 	for _, l := range changed {
-		if isDel[l] || containsList(dec.splits, l) || containsList(emptied, l) {
+		if isDel[l] || containsList(splits, l) || containsList(emptied, l) {
 			continue
 		}
 		tp := mj.partitionOf(t, u.Manifest, l)
 		pe := mj.part(tp)
 		had := map[uint32]bool{}
 		if _, created := mj.Lists[l]; !created {
-			for _, id := range members[l].IDs {
+			lm, ok := members[l]
+			if !ok {
+				return fmt.Errorf("update: the round changes list %d, which it did not read", l)
+			}
+			for _, id := range lm.IDs {
 				had[id] = true
 			}
 		}
@@ -737,7 +807,10 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 			if had[id] {
 				continue
 			}
-			v := vecs[id]
+			v, err := vecOf(id)
+			if err != nil {
+				return err
+			}
 			pe.add(l, id, v.loc, v.holder)
 			if to := t.Owner(tp); to != t.Owner(mj.partitionOf(t, u.Manifest, v.base)) {
 				mj.sendCode(to, id, v.code)
@@ -751,7 +824,7 @@ func (u *Updater) PrepareQuake(ctx context.Context) (mj *Major, st *QuakeStats, 
 			}
 		}
 	}
-	return mj, st, nil
+	return nil
 }
 
 // noHead is a split child's head vector ID under Quake: a mean, no data vector.

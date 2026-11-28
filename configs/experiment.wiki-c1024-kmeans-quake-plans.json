@@ -1,0 +1,127 @@
+{
+  "Comment": "The plans of the Quake example, decided once on the lab server: the update experiment's four minor batches of the 2026-02 diff (b4x5), each followed by a round of Quake's maintenance as a major epoch (internal/update/quake.go), on Quake's index of Wikipedia c1024 (3,939 k-means lists, one replica a vector; results/kmeans-index-2026-11-26), every round saved by the runner as quake-plan-<k>.json.gz in the results, for the CloudLab runs to run again (\"Quake\": {\"Plan\": FILE}; internal/update/quakeplan.go). The cluster refused them (2026-11-27: list 428 held one posting more there: a batch's inserts go to their nearest head by float distances, which the two machines' builds compute differently in the last bits), so its runs (experiment.wiki-c1024-kmeans-cloudlab-gpu-quake.json) run the plans decided there (experiment.wiki-c1024-kmeans-cloudlab-gpu-quake-plans.json); this run keeps the lab server's decisions and timings. Plans are decided once since Quake runs its maintenance apart from its queries and reports its time apart (its paper, \u00a77.2, \u00a78.2), so the cluster runs measure the epochs, and every repetition runs the same rounds. Quake's parameters: its Wikipedia configuration's (wiki.yaml: window_size 10000, refinement_radius 50, split_threshold_ns 250, delete_threshold_ns 500000, enable_delete_rejection false) and one refinement iteration, as its paper runs it (\u00a77.2: in its code and here, the members to the nearest head, no head moved); the rest its defaults. The rounds' windows: the entries' last 2,500 client queries each (QuerySample), 10,000 in all. The load (100 q/s, CPU backend: the GPUs are other users') serves the windows; the entries chain at once (TriggerTimeSeconds 120-123: each runs to its end before the next), and the rounds may end after it. The nodes bootstrap from the page file into a work directory on /netsys (copies of the assignment and partitions, with their stage records). nprobe 96 (--max-nprobe the same): the smallest that reaches the base index's recall at nprobe 64, N 200. GraphHeadroom 10: each round splits thousands of lists (1,994-2,696 in the trials), and a deleted head keeps its place in the graph. UpdateLease and StageTimeout 120m: a round is decided under the lease.",
+  "WorkDir": "/netsys/chenxu/work/wiki-c1024-kmeans-trial",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024-kmeans/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32,
+    "Weights": "postings"
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "96",
+    "--max-rerank",
+    "1000"
+  ],
+  "NodeResources": {
+    "MemoryMax": "24G",
+    "CPUsPerNode": 8
+  },
+  "Nodes": 4,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 96,
+    "N": 200,
+    "Rate": "100",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 600,
+    "WarmupSeconds": 30
+  },
+  "Updates": {
+    "Headroom": 1.25,
+    "ListHeadroom": 2.0,
+    "GraphHeadroom": 10
+  },
+  "UpdateLease": "120m",
+  "StageTimeout": "120m",
+  "QuerySample": 2500,
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 120,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-1-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Window": 10000,
+          "RefineRadius": 50,
+          "RefineIterations": 1,
+          "SplitThresholdNS": 250,
+          "DeleteThresholdNS": 500000,
+          "DeleteRejection": false
+        }
+      }
+    },
+    {
+      "TriggerTimeSeconds": 121,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-2-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Window": 10000,
+          "RefineRadius": 50,
+          "RefineIterations": 1,
+          "SplitThresholdNS": 250,
+          "DeleteThresholdNS": 500000,
+          "DeleteRejection": false
+        }
+      }
+    },
+    {
+      "TriggerTimeSeconds": 122,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-3.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-3-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Window": 10000,
+          "RefineRadius": 50,
+          "RefineIterations": 1,
+          "SplitThresholdNS": 250,
+          "DeleteThresholdNS": 500000,
+          "DeleteRejection": false
+        }
+      }
+    },
+    {
+      "TriggerTimeSeconds": 123,
+      "Update": {
+        "Inserts": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-4.fbin",
+        "Deletes": "/data-ssd/chenxu/data/wiki-diff-2026-02/b4x5/batch-4-deletes.bin",
+        "Policy": "quake",
+        "Quake": {
+          "Window": 10000,
+          "RefineRadius": 50,
+          "RefineIterations": 1,
+          "SplitThresholdNS": 250,
+          "DeleteThresholdNS": 500000,
+          "DeleteRejection": false
+        }
+      }
+    }
+  ]
+}

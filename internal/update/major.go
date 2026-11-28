@@ -135,9 +135,11 @@ type Major struct {
 	Reassign   *ReassignStats
 	Reassigned map[uint32][]uint32
 	// Quake: what Quake's maintenance found and did (PrepareQuake; nil otherwise).
-	Quake   *QuakeStats
-	patched []placement.NodeID                   // entries that staged the patch
-	sent    map[placement.NodeID]map[uint32]bool // the codes in Codes, by node
+	Quake *QuakeStats
+	// QuakePlan: what PrepareQuake decided, to run again later (PrepareQuakePlan; WriteQuakePlan).
+	QuakePlan *QuakePlan
+	patched   []placement.NodeID                   // entries that staged the patch
+	sent      map[placement.NodeID]map[uint32]bool // the codes in Codes, by node
 }
 
 // partitionOf is list l's partition after the epoch: a list it creates is in its parent's.
