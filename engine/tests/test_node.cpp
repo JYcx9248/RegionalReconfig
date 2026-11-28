@@ -2569,6 +2569,38 @@ void TestHolderChoice() {
         bal->fetch_stats().rerouted == b.size() + d.size());
 }
 
+// lazy-balanced's bitmaps come from all the holders at once: each read here waits until the
+// three have started, which reads one after another would never see. A read that fails throws,
+// and the bitmaps read before stay.
+void TestHolderBitmapsAtOnce() {
+  Fixture& f = GetFixture();
+  auto bal = OpenNode(f, {}, false, f.index_nopages, 0, 4);
+  bal->SetNodes(13, {{1, "node-1"}, {9, "node-9"}, {10, "node-10"}});
+  const size_t words = (bal->raw_stats(false).locations + 63) / 64;
+  std::mutex mu;
+  std::condition_variable cv;
+  size_t started = 0;
+  bool apart = false;   // a read gave up waiting for the others
+  std::string failing;  // the peer whose read fails
+  bal->SetBitmapFetcher([&](const std::string& peer) {
+    std::unique_lock<std::mutex> l(mu);
+    ++started;
+    cv.notify_all();
+    if (!cv.wait_for(l, std::chrono::seconds(10), [&] { return started % 3 == 0; })) apart = true;
+    if (peer == failing) throw std::runtime_error("RAW_BITMAP to " + peer + ": refused");
+    return std::vector<uint64_t>(words, peer == "node-1" ? 1 : 2);
+  });
+  CHECK(bal->LoadHolderBitmaps({1, 9, 10}) == 3 * words * 8 && !apart && bal->fetch_stats().holder_bitmaps == 3);
+  failing = "node-9";
+  bool threw = false;
+  try {
+    bal->LoadHolderBitmaps({1, 9, 10});
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CHECK(threw && !apart && bal->fetch_stats().holder_bitmaps == 3);
+}
+
 // FetchExtra (U9): with n on for a holder, each request a query's fetch sends to it is followed,
 // in the background, by one of up to n more vectors of the lists the query fetched through whose
 // postings name that holder -- the first ones in list order that are not here. The query does not
@@ -4452,6 +4484,7 @@ int main() {
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"holder_choice", TestHolderChoice},
+      {"holder_bitmaps_at_once", TestHolderBitmapsAtOnce},
       {"fetch_extra", TestFetchExtra},
       {"fetch_extra_migrate", TestFetchExtraMigrate},
       {"read_budget", TestReadBudget},

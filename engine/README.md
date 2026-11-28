@@ -320,7 +320,8 @@ Known limits of the raw-vector path:
 - lazy-balanced keeps other nodes' bitmaps whole: a bit per location each, so a destination holds
   (nodes that stay) × locations / 8 bytes, read before the flip -- 150 MB per new node for Amazon
   300M from 4 to 8, but 2 GB for a billion vectors on 16 nodes. The bits of its own partitions'
-  vectors would be enough.
+  vectors would be enough. It reads them from all the holders at once: one after another, Amazon
+  300M's four took 1.2-1.4 s of each new node's staging, which the flip waited for.
 
 `fusion_tests`, `rtier_node_tests` and the rtier end-to-end tests (run against an ASan/UBSan
 build of `rtier_node`, including a shutdown under load) are clean under the sanitizers.

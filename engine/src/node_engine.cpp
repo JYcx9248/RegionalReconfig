@@ -13,6 +13,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -1746,14 +1747,22 @@ class NodeEngineImpl : public NodeEngine {
     }
     FUSION_CHECK(where.empty() || fetch, "this node has no way to read other nodes' bitmaps");
     const size_t words = (raw_->layout().locations() + 63) / 64;
+    // From every holder at once, a thread each (PeerPool gives each call a connection of its own):
+    // the staging replies only after them, and the flip waits for the last destination. One after
+    // another, Amazon 300M's four 37.5 MB bitmaps took 1.2-1.4 s of each new node's staging
+    // (2026-11-22). A failed read throws from its get(); the futures' destructors wait for the rest.
+    std::vector<std::future<std::vector<uint64_t>>> reads;
+    reads.reserve(where.size());
+    for (const auto& [id, addr] : where)
+      reads.push_back(std::async(std::launch::async, [fetch, addr = addr] { return fetch(addr); }));
     std::vector<std::pair<uint16_t, std::shared_ptr<const std::vector<uint64_t>>>> got;
     uint64_t bytes = 0;
-    for (const auto& [id, addr] : where) {
-      auto bits = std::make_shared<const std::vector<uint64_t>>(fetch(addr));
+    for (size_t i = 0; i < where.size(); ++i) {
+      auto bits = std::make_shared<const std::vector<uint64_t>>(reads[i].get());
       FUSION_CHECK(bits->size() == words, "node %u's bitmap has %zu words, this index's locations %zu",
-                   id, bits->size(), words);
+                   where[i].first, bits->size(), words);
       bytes += bits->size() * sizeof(uint64_t);
-      got.emplace_back(id, std::move(bits));
+      got.emplace_back(where[i].first, std::move(bits));
     }
     std::lock_guard<std::mutex> l(raw_mu_);
     for (auto& [id, bits] : got) holder_bits_[id] = std::move(bits);
