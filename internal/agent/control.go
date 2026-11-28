@@ -843,7 +843,10 @@ func (a *Agent) handleFetchExtra(ctx context.Context, body json.RawMessage) (any
 	}
 	ctx, cancel := context.WithTimeout(ctx, a.stepTimeout()) // off waits for the request in flight
 	defer cancel()
-	return struct{}{}, a.localBulk.FetchExtra(ctx, uint32(req.Extra), from)
+	if req.Refill < 0 || req.Refill > math.MaxUint32 {
+		return nil, fmt.Errorf("FetchExtra refill %d out of range", req.Refill)
+	}
+	return struct{}{}, a.localBulk.FetchExtra(ctx, uint32(req.Extra), uint32(req.Refill), from)
 }
 
 // rawPuller brings raw vectors into the data node as their listing streams in (RAW_MISSING,
@@ -1240,6 +1243,7 @@ func (a *Agent) handleStatus(ctx context.Context, _ json.RawMessage) (any, error
 		st.Generation = info.Generation
 		st.RawFetched = info.Raw.FetchedOnDemand()
 		st.RawFetchedBytes = st.RawFetched * uint64(info.Raw.VecBytes)
+		st.ExtraDone, st.ExtraFetched = info.Fetch.Extra.Done, info.Fetch.Extra.Fetched
 		for _, pv := range info.Versions {
 			st.Versions = append(st.Versions, protocol.PartitionVersion{Partition: int(pv[0]), Version: pv[1]})
 		}

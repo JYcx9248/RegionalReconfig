@@ -78,8 +78,11 @@ type Controller struct {
 	// FetchExtra (U9): how many more raw vectors may follow each on-demand fetch, in the
 	// background -- vectors of the lists the query fetched through, from the same holder -- where
 	// nodes go away: in a scale-in, the fetches from the nodes that leave, until the drain ends;
-	// in a full rebuild, the old nodes' fetches in the next generation, until it returns. Never in
-	// a scale-out. Default 0: a fetch brings only what its query needs.
+	// in a full rebuild, the old nodes' fetches in the next generation, until it returns; in a
+	// task migration, which drains nothing, every vector still at the source, until no posting
+	// names it (with requests of the re-rank depth + FetchExtra of the new owner's own while the
+	// queries' queue none). Never in a scale-out. Default 0: a fetch brings only what its query
+	// needs, and a task migration's source stays the holder.
 	FetchExtra int `yaml:"FetchExtra"`
 	// EntryFlipInterval: while new nodes are fetching the navigation graph, every interval one
 	// flip makes entries of all those whose graph loaded since the previous flip (and when the

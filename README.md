@@ -117,12 +117,28 @@ is followed, in the background, by one of up to N more vectors of the lists the 
 through, from the same holder -- the first in list order that are not here. The query does not
 wait for it. In a scale-in it applies to the fetches of the nodes that stay from the nodes that
 leave, until the drain ends; in a full rebuild to the old nodes' fetches in the next generation,
-until the rebuild returns and the spares go; never in a scale-out, nor at the nodes a plan adds
-while others leave. The extra requests queue up to a bound, past which they are dropped, and one
-runs only while the fetch cache is less than half full, so that they never put a query's fetch
-past it; each claims what it asks for, as a query's fetch does, so no vector comes twice. The
-nodes' stats count them (`fetch.extra`). Whether a scale-out ablation goes into the evaluation is
-open.
+until the rebuild returns and the spares go; in a task migration (below) at every data node, for
+what its postings name the source for; never in a scale-out, nor at the nodes a plan adds while
+others leave. The extra requests queue up to a bound, past which they are dropped, and one runs
+only while the fetch cache is less than half full, so that they never put a query's fetch past
+it; each claims what it asks for, as a query's fetch does, so no vector comes twice. The nodes'
+stats count them (`fetch.extra`). Whether a scale-out ablation goes into the evaluation is open.
+A task migration (decided 2026-11-26; `rtier-client rescale -migrate FROM:TO`, `"Migrate"` in an
+experiment) gives every partition of one data node to another node -- one that joins, or a data
+node -- and the source leaves the placement, but is not drained: it stays the holder of its raw
+vectors, which the new owner fetches on demand. With FetchExtra 0 that is all (Koala's
+fetch-on-demand): the migration returns after the flip, and the source must stay up (the
+reply's `holding`). With FetchExtra N > 0 every vector still at the source comes in the
+background (Koala's eventual migration, its Fig. 12): a request short of N in the query's lists
+takes the source's other postings, in partition and posting order; while no query's fetch has
+queued one, the new owner sends requests of its own, of the queries' re-rank depth (`request_max`,
+an experiment's Load.N) + N vectors, so that they keep coming once the queries need nothing more
+from the source; at the fetch cache's half the worker waits for the writer instead of dropping a
+request. The queries' fetches go first, straight to the source, and wait for none of it. Once no
+posting names the source, the migration returns (`migrate_seconds` after the flip,
+`migrate_vectors`; a last `DrainRaw` checks it and pulls nothing): the source is offline as far as
+the system is concerned. With the other protocols, which move every raw vector themselves, a
+migration is just its plan.
 Holders stay valid because no node drops a raw vector it has held; a disk budget would need the
 same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
 (`StageRaw`; the rescale waits for it and reports `raw_vectors` / `raw_seconds`),

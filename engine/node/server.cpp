@@ -639,14 +639,16 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
       }
       case kFetchExtra: {
         const uint32_t n = r.Get<uint32_t>();
+        const uint32_t refill = r.Get<uint32_t>();
         const uint32_t m = r.Get<uint32_t>();
         Require(r.remaining() == static_cast<size_t>(m) * 4, "FETCH_EXTRA: a node ID and a pad each");
+        Require(n == 0 || refill == 0 || m > 0, "FETCH_EXTRA: a refill needs the holders whose vectors are to come");
         std::vector<uint16_t> from(m);
         for (uint32_t i = 0; i < m; ++i) {
           from[i] = r.Get<uint16_t>();
           r.Get<uint16_t>();  // pad
         }
-        e.SetFetchExtra(n, from);
+        e.SetFetchExtra(n, from, refill);
         break;
       }
       case kEvictPartition:
@@ -1180,13 +1182,14 @@ std::string NodeServer::FetchJson() const {
       "\"pending_recounts\":%llu,\"pending_us\":%llu,\"added\":%llu,\"added_queued\":%llu,"
       "\"added_written\":%llu,\"added_wait_us\":%llu,\"cache_bound\":%llu,"
       "\"extra\":{\"n\":%llu,\"queued\":%llu,\"dropped\":%llu,\"requests\":%llu,\"failed\":%llu,"
-      "\"fetched\":%llu,\"us\":%llu}}",
+      "\"fetched\":%llu,\"us\":%llu,\"refill\":%llu,\"refills\":%llu,\"wait_us\":%llu,\"done\":%s}}",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
       u(f.coalesced), u(f.fetch_us), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
       u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us), u(f.added), u(f.added_queued),
       u(f.added_written), u(f.added_wait_us), u(f.cache_bound), u(f.extra), u(f.extra_queued),
-      u(f.extra_dropped), u(f.extra_requests), u(f.extra_failed), u(f.extra_fetched), u(f.extra_us));
+      u(f.extra_dropped), u(f.extra_requests), u(f.extra_failed), u(f.extra_fetched), u(f.extra_us),
+      u(f.extra_refill), u(f.extra_refills), u(f.extra_wait_us), f.extra_done ? "true" : "false");
 }
 
 std::string NodeServer::StatsJson() const {

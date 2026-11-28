@@ -275,6 +275,8 @@ def reconfigurations(path):
             label += " (plan)"
         if e.get("rebuild"):  # a full rebuild (U14): the next index generation
             label = "full rebuild"
+        if e.get("migrate"):  # a task migration: one node's partitions to another
+            label = "migrate %s \u2192 %s" % (e["migrate"].get("From", "?"), e["migrate"].get("To", "?"))
         out.append((float(e["trigger_seconds"]), float(e.get("elapsed_seconds", 0)), label, reply))
     return out
 

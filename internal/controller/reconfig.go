@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -138,20 +139,30 @@ type target struct {
 	next           placement.Table
 	changes        placement.Changes
 	added, removed []*ManagedNode
+	migrate        *protocol.Migrate // a task migration: the removed node is not drained
 }
 
 func (c *Controller) reconfigure(ctx context.Context, req protocol.RescaleReq, triggered time.Time) (*protocol.RescaleReply, error) {
-	if (req.Plan == nil) == (req.DataNodes == 0) {
-		return nil, fmt.Errorf("controller: a reconfiguration takes a number of data nodes or a plan (one of them)")
+	forms := 0
+	for _, given := range []bool{req.DataNodes != 0, req.Plan != nil, req.Migrate != nil} {
+		if given {
+			forms++
+		}
+	}
+	if forms != 1 {
+		return nil, fmt.Errorf("controller: a reconfiguration takes a number of data nodes, a plan or a migration (one of them)")
 	}
 	cur, err := c.store.Current()
 	if err != nil {
 		return nil, err
 	}
 	var t target
-	if req.Plan != nil {
+	switch {
+	case req.Migrate != nil:
+		t, err = c.migrateTarget(cur, req.Migrate)
+	case req.Plan != nil:
 		t, err = c.planTarget(cur, req.Plan)
-	} else {
+	default:
 		t, err = c.policyTarget(cur, req.DataNodes)
 	}
 	if err != nil {
@@ -264,18 +275,61 @@ func (c *Controller) planTarget(cur *epoch.Table, p *protocol.Plan) (target, err
 	return t, nil
 }
 
+// migrateTarget resolves a task migration against the current epoch: the plan that gives every
+// partition of From to To and leaves everything else where it is. From then leaves the
+// placement, but, unlike a node a scale-in removes, it is not drained (copyThenFlip, migrateRaw).
+func (c *Controller) migrateTarget(cur *epoch.Table, m *protocol.Migrate) (target, error) {
+	from, err := c.nodes.Resolve(m.From)
+	if err != nil {
+		return target{}, err
+	}
+	to, err := c.nodes.Resolve(m.To)
+	if err != nil {
+		return target{}, err
+	}
+	if from.ID == to.ID {
+		return target{}, fmt.Errorf("controller: a migration from node %d to itself", from.ID)
+	}
+	if c.cfg.FetchExtra > 0 && m.RequestMax <= 0 {
+		return target{}, fmt.Errorf("controller: a migration with FetchExtra %d needs request_max, the most vectors one "+
+			"fetch of a query brings (the queries' re-rank depth), got %d", c.cfg.FetchExtra, m.RequestMax)
+	}
+	owners := cur.Placement.ByNode()
+	parts, ok := owners[from.ID]
+	if !ok {
+		return target{}, fmt.Errorf("controller: node %d (%s) owns no partition, there is nothing to migrate", from.ID, from.Name)
+	}
+	plan := &protocol.Plan{FromEpoch: cur.Epoch, Owners: map[string][]int{}}
+	for id, ps := range owners {
+		if id != from.ID {
+			plan.Owners[strconv.Itoa(int(id))] = ps
+		}
+	}
+	key := strconv.Itoa(int(to.ID))
+	plan.Owners[key] = append(append([]int(nil), plan.Owners[key]...), parts...)
+	sort.Ints(plan.Owners[key])
+	t, err := c.planTarget(cur, plan)
+	if err != nil {
+		return target{}, err
+	}
+	t.migrate = m
+	return t, nil
+}
+
 // run carries out a reconfiguration to t with the configured protocol, triggered when the
 // controller received its request.
 func (c *Controller) run(ctx context.Context, cur *epoch.Table, t target, triggered time.Time) (*protocol.RescaleReply, error) {
 	switch c.cfg.Protocol {
 	case "lazy":
-		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemand)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemand, t.migrate)
+	// The other protocols move every raw vector of the moved partitions themselves, so a migration
+	// is its plan: what the removed node held is all at the new owner, and its drain pulls nothing.
 	case "lazy-stream":
-		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawStreamAfterFlip)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawStreamAfterFlip, nil)
 	case "copy-then-flip":
-		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawBeforeFlip)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawBeforeFlip, nil)
 	case "stop-and-copy":
-		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, true, rawBeforeFlip)
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, true, rawBeforeFlip, nil)
 	}
 	return nil, fmt.Errorf("controller: unknown protocol %q", c.cfg.Protocol)
 }
@@ -323,13 +377,16 @@ const (
 //     postings say only they hold, and its postings then name it (DrainRaw). That holders stay
 //     rests on one invariant (U9): no node drops a raw vector it has held -- and a node that
 //     leaves is drained first, so it can go offline once the rescale returns, whatever placement
-//     the reconfiguration went to.
+//     the reconfiguration went to. A task migration (migrate, lazy only) is not drained: its
+//     source stays the holder, and its vectors come on demand and, with FetchExtra, in the
+//     background, until no posting names it (migrateRaw).
 //
 // Failures: before the flip, partitions already copied to destinations are dropped again and
 // the old epoch stays in force. After the flip, the protocol stops and keeps every old copy
 // (always safe, possibly wasteful); retrying or rolling back is open question U13.
 func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur *epoch.Table, next placement.Table,
-	changes placement.Changes, added, removed []*ManagedNode, stopTheWorld bool, raw rawMode) (*protocol.RescaleReply, error) {
+	changes placement.Changes, added, removed []*ManagedNode, stopTheWorld bool, raw rawMode,
+	migrate *protocol.Migrate) (*protocol.RescaleReply, error) {
 
 	reply := &protocol.RescaleReply{Protocol: c.cfg.Protocol, FromEpoch: cur.Epoch, ToEpoch: cur.Epoch,
 		Added: ids(added), Removed: ids(removed), Moved: changes.Moved(), Phases: map[string]float64{}}
@@ -597,10 +654,17 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 	defer func() { <-rawDone }()
 
 	// 7. DRAIN: the data nodes of e+1 take over what only the nodes that leave hold, so that
-	// they can go offline once the rescale returns; every return waits for it.
+	// they can go offline once the rescale returns; every return waits for it. A task migration's
+	// source is not drained: its vectors move on demand and with FetchExtra (migrateRaw).
 	drainDone := make(chan struct{})
 	var drainErr error
-	if len(removed) > 0 {
+	switch {
+	case len(removed) > 0 && migrate != nil:
+		go func() {
+			defer close(drainDone)
+			drainErr = c.migrateRaw(ctx, draft, removed, book, migrate, flipDone, reply)
+		}()
+	case len(removed) > 0:
 		go func() {
 			defer close(drainDone)
 			var st protocol.StageReply
@@ -609,7 +673,7 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 			reply.DrainSeconds = time.Since(flipDone).Seconds()
 			c.event("reconfig.drain_s", reply.DrainSeconds)
 		}()
-	} else {
+	default:
 		close(drainDone)
 	}
 	defer func() { <-drainDone }()
@@ -759,14 +823,21 @@ func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, added, remove
 			stay = append(stay, n)
 		}
 	}
-	off, err := c.fetchExtra(ctx, stay, ids(removed))
+	off, err := c.fetchExtra(ctx, stay, ids(removed), 0)
 	if err != nil {
 		return protocol.StageReply{}, err
 	}
 	defer off()
+	return c.pullHeldBy(ctx, nodes, removed, book)
+}
+
+// pullHeldBy has every node of nodes pull the raw vectors its postings say only the removed
+// nodes hold (DrainRaw, at RawPriority), and adds up what moved.
+func (c *Controller) pullHeldBy(ctx context.Context, nodes, removed []*ManagedNode,
+	book map[placement.NodeID]epoch.NodeInfo) (protocol.StageReply, error) {
 	req := protocol.DrainRawReq{From: ids(removed), Nodes: book, Priority: c.cfg.RawPriority}
 	var vectors, bytes atomic.Int64
-	err = forEach(nodes, func(n *ManagedNode) error {
+	err := forEach(nodes, func(n *ManagedNode) error {
 		var st protocol.StageReply
 		err := n.call(ctx, c.stageTimeout(), protocol.DrainRawM, req, &st)
 		vectors.Add(st.RawVectors)
@@ -776,6 +847,87 @@ func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, added, remove
 	return protocol.StageReply{RawVectors: vectors.Load(), RawBytes: bytes.Load()}, err
 }
 
+// migrateRaw is a task migration's step 7, in place of the drain (U9). The removed node stays
+// the holder of its raw vectors: the data nodes of t fetch what their queries need from it on
+// demand, ahead of anything else. With FetchExtra N > 0 they also bring the rest in the
+// background (FetchExtra with a refill of RequestMax + N, so that requests keep coming once the
+// queries need nothing more from it), until no posting of theirs names it -- then it holds
+// nothing they lack, and it is offline as far as the system is concerned: the migration returns.
+// A last DrainRaw at each of them checks that, and pulls whatever a posting might still name it
+// for (DrainVectors; none expected). With FetchExtra 0 it returns at once, and the node stays a
+// holder for good (Holding): Koala's fetch-on-demand.
+func (c *Controller) migrateRaw(ctx context.Context, t *epoch.Table, removed []*ManagedNode,
+	book map[placement.NodeID]epoch.NodeInfo, m *protocol.Migrate, flipDone time.Time,
+	reply *protocol.RescaleReply) error {
+	if c.cfg.FetchExtra == 0 {
+		reply.Holding = ids(removed)
+		log.Printf("controller: task migration without FetchExtra: nodes %v stay the holders of their raw vectors",
+			reply.Holding)
+		return nil
+	}
+	nodes, err := c.managed(t.Placement.Nodes())
+	if err != nil {
+		return err
+	}
+	status := func(n *ManagedNode) (protocol.NodeStatus, error) {
+		var st protocol.NodeStatus
+		err := n.call(ctx, c.callTimeout(), protocol.NodeStatusM, struct{}{}, &st)
+		return st, err
+	}
+	var before uint64
+	for _, n := range nodes {
+		st, err := status(n)
+		if err != nil {
+			return err
+		}
+		before += st.ExtraFetched
+	}
+	off, err := c.fetchExtra(ctx, nodes, ids(removed), m.RequestMax+c.cfg.FetchExtra)
+	if err != nil {
+		return err
+	}
+	defer off()
+	deadline := time.Now().Add(c.stageTimeout())
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var fetched uint64
+		done := true
+		for _, n := range nodes {
+			st, err := status(n)
+			if err != nil {
+				return err
+			}
+			fetched += st.ExtraFetched
+			done = done && st.ExtraDone
+		}
+		reply.MigrateVectors = int64(fetched - before)
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("controller: task migration: postings still name nodes %v %v after the flip",
+				ids(removed), c.stageTimeout())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+	reply.MigrateSeconds = time.Since(flipDone).Seconds()
+	c.event("reconfig.migrate_s", reply.MigrateSeconds)
+	log.Printf("controller: task migration: no posting names nodes %v %.1f s after the flip (%d raw vectors in the "+
+		"background)", ids(removed), reply.MigrateSeconds, reply.MigrateVectors)
+	st, err := c.pullHeldBy(ctx, nodes, removed, book)
+	reply.DrainVectors, reply.DrainBytes = st.RawVectors, st.RawBytes
+	if st.RawVectors > 0 {
+		log.Printf("controller: task migration: the last look pulled %d raw vectors that postings still named nodes %v for",
+			st.RawVectors, ids(removed))
+	}
+	return err
+}
+
 // fetchExtra turns FetchExtra on at nodes, for their fetches from the holders `from` (every
 // holder if empty), and returns what turns it off again. It is the one place that decides where
 // extra raw vectors move (U9): a fetch brings only what its query needs, except where nodes go
@@ -783,28 +935,33 @@ func (c *Controller) drainRaw(ctx context.Context, t *epoch.Table, added, remove
 //   - in a scale-in, at the nodes that stay, for their fetches from the nodes that leave, until
 //     the drain has taken over what only those hold (drainRaw);
 //   - in a full rebuild, at the old nodes, for their fetches in the next generation, until the
-//     rebuild returns and the spares go (rebuild).
+//     rebuild returns and the spares go (rebuild);
+//   - in a task migration, at every data node, for the vectors its postings name the source for,
+//     until none does (migrateRaw): with refill > 0 they all come, the node sending requests of
+//     its own while the queries' fetches queue none.
 //
 // Never in a scale-out, nor at the nodes a plan adds while others leave: a new node fetches only
 // what its queries need. Whether a scale-out ablation goes into the evaluation is open
 // (2026-11-17); it would get its own setting here. With FetchExtra 0 this does nothing. Turning
 // it off is best effort, logged: by then no answer depends on it.
-func (c *Controller) fetchExtra(ctx context.Context, nodes []*ManagedNode, from []placement.NodeID) (off func(), err error) {
+func (c *Controller) fetchExtra(ctx context.Context, nodes []*ManagedNode, from []placement.NodeID,
+	refill int) (off func(), err error) {
 	off = func() {}
 	if c.cfg.FetchExtra == 0 || len(nodes) == 0 {
 		return off, nil
 	}
-	set := func(ctx context.Context, n int) error {
+	set := func(ctx context.Context, n, refill int) error {
 		return forEach(nodes, func(m *ManagedNode) error {
-			return m.call(ctx, c.stageTimeout(), protocol.FetchExtraM, protocol.FetchExtraReq{Extra: n, From: from}, nil)
+			return m.call(ctx, c.stageTimeout(), protocol.FetchExtraM,
+				protocol.FetchExtraReq{Extra: n, From: from, Refill: refill}, nil)
 		})
 	}
 	off = func() {
-		if err := set(context.WithoutCancel(ctx), 0); err != nil {
+		if err := set(context.WithoutCancel(ctx), 0, 0); err != nil {
 			log.Printf("controller: turning FetchExtra off: %v", err)
 		}
 	}
-	if err := set(ctx, c.cfg.FetchExtra); err != nil {
+	if err := set(ctx, c.cfg.FetchExtra, refill); err != nil {
 		off()
 		return func() {}, fmt.Errorf("controller: FetchExtra: %w", err)
 	}

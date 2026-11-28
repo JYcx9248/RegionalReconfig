@@ -109,11 +109,16 @@
 //                   (the node fetches what it lacks from the holders its postings in those
 //                   lists record, with RAW_GET, and installs it: a stream that does not pass
 //                   through the agents; those postings then name this node)
-//   FETCH_EXTRA     u32 n, u32 m, (u16 id, u16 pad)[m]        -> -
+//   FETCH_EXTRA     u32 n, u32 refill, u32 m,                 -> -
+//                   (u16 id, u16 pad)[m]
 //                   (FetchExtra, U9: each request a query's fetch sends to one of those holders
 //                   -- every holder if m = 0 -- is followed, in the background, by one of up to n
 //                   more vectors of the lists it fetched through; n = 0 turns it off, and returns
-//                   once the extra request in flight has ended)
+//                   once the extra request in flight has ended. refill > 0, a task migration
+//                   (m > 0): every vector still only at those holders comes -- a request short of
+//                   n takes the holder's other postings, the worker sends requests of up to refill
+//                   on its own while none is queued, and waits for room in the fetch cache rather
+//                   than drop one -- until no posting here names them: INFO's fetch.extra.done)
 //   RAW_TRAFFIC     -                                         -> u64 sent, u64 received
 //                   (raw-vector bytes since startup: served by RAW_GET, and brought here --
 //                   fetched from peers, on demand or by RAW_PULL, or put with RAW_PUT; an

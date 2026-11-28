@@ -283,6 +283,13 @@ struct FetchStats {
   uint64_t extra_failed = 0;     // of those, failed
   uint64_t extra_fetched = 0;    // vectors they brought (in fetched too)
   uint64_t extra_us = 0;         // time the extras' worker spent on them
+  // A task migration's (SetFetchExtra with refill): the vectors a request the worker sends on its
+  // own may bring (now; 0: none), those requests, the time the worker waited for room in the fetch
+  // cache, and whether no posting here names a holder of `from` any more (now: 1 = done).
+  uint64_t extra_refill = 0;
+  uint64_t extra_refills = 0;
+  uint64_t extra_wait_us = 0;
+  uint64_t extra_done = 0;
 };
 
 class NodeEngine {
@@ -505,7 +512,18 @@ class NodeEngine {
   // put a query's fetch past the bound. It claims what it asks for, as a query's fetch does, and
   // waits for no other fetch. n = 0 turns it off: the queue is emptied, and the call returns
   // once the request in flight has ended.
-  virtual void SetFetchExtra(uint32_t n, const std::vector<uint16_t>& from) = 0;
+  //
+  // With refill > 0 -- a task migration, whose source stays until it holds nothing this node
+  // lacks, and is not drained -- the vectors still at the holders `from` (not empty) all come,
+  // in the background: a request that finds fewer than n in its lists takes the rest from the
+  // other postings naming that holder, in partition and posting order; when no request is
+  // queued, the worker sends one of up to refill vectors on its own, so that the queue never
+  // runs dry before they are all here; and at the fetch cache's half it waits for the writer
+  // instead of dropping the request. Postings naming those holders whose vector is here come to
+  // name this node on the way. Once a whole pass over the resident postings finds none naming
+  // them whose vector is missing, the worker stops (fetch_stats().extra_done). Queries never wait
+  // for any of it: their own fetches go first, straight to the holders.
+  virtual void SetFetchExtra(uint32_t n, const std::vector<uint16_t>& from, uint32_t refill) = 0;
   // Which raw vectors the node holds (on the SSD, or fetched and not written yet): one bit per
   // location, 64 per word -- what a full rebuild places the new partitions by (U14).
   virtual std::vector<uint64_t> RawBitmap() const = 0;

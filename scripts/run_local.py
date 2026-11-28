@@ -146,6 +146,18 @@ from_epoch is optional (protocol.Plan). P is the plan itself or the path of a JS
 one, relative to the experiment file. `bin/rtier-client rescale -dry-run -save-plan plan.json N`
 writes the plan the policy would carry out, to start from.
 
+{"TriggerTimeSeconds": 90, "Migrate": {"From": "n4", "To": "n5"}} is a task migration: every
+partition of n4 goes to n5 (an idle node, which joins, or another data node), and n4 leaves the
+placement without being drained -- it stays the holder of its raw vectors, which n5 fetches on
+demand. With "FetchExtra" N > 0, n5 also brings the rest in the background: N more vectors after
+each of its fetches from n4 (the query's lists first, then the other postings naming n4), and,
+while none of those is queued, requests of Load.N + N of its own (Load.N: the most one fetch
+brings), until no posting names n4; the migration returns then (reply: migrate_seconds after the
+flip, migrate_vectors), and n4 is offline as far as the system is concerned (its process runs on).
+With FetchExtra 0 it returns after the flip, and n4 stays the holder (reply: holding) -- Koala's
+fetch-on-demand; the rest, Koala's eventual migration (Fig. 12). Lazy only: the other protocols
+move every raw vector themselves, and a migration is then its plan.
+
 {"TriggerTimeSeconds": 90, "Rebuild": {"Index": DIR, "Partitions": DIR}} moves the cluster to the
 next index generation at 90 s (U14 full rebuild, bin/rtier-client rebuild): DIR holds
 fusion_build's output, built with this index's codebook and page layout (its output directory
@@ -532,9 +544,9 @@ def reconfig_requests(cfg: dict) -> list:
     absolute by now (experiment_config.load)."""
     out = []
     for rc in sorted(cfg.get("Reconfigurations", []), key=lambda r: r["TriggerTimeSeconds"]):
-        kinds = [k for k in ("DataNodes", "Plan", "Rebuild", "Update") if k in rc]
+        kinds = [k for k in ("DataNodes", "Plan", "Migrate", "Rebuild", "Update") if k in rc]
         if len(kinds) != 1:
-            sys.exit(f"Reconfigurations: {rc}: give DataNodes, Plan, Rebuild or Update, one of them")
+            sys.exit(f"Reconfigurations: {rc}: give DataNodes, Plan, Migrate, Rebuild or Update, one of them")
         if "Update" in rc:
             out.append(update_request(cfg, rc))
             continue
@@ -553,6 +565,16 @@ def reconfig_requests(cfg: dict) -> list:
         if "DataNodes" in rc:
             out.append({"at": rc["TriggerTimeSeconds"], "request": {"data_nodes": rc["DataNodes"]},
                         "data_nodes": rc["DataNodes"], "what": f"rescale to {rc['DataNodes']} data nodes"})
+            continue
+        if "Migrate" in rc:
+            m = rc["Migrate"]
+            if not isinstance(m, dict) or not m.get("From") or not m.get("To"):
+                sys.exit(f'Reconfigurations: {rc}: a migration is {{"Migrate": {{"From": NODE, "To": NODE}}}}')
+            # The most vectors one fetch of a query brings: the queries' re-rank depth.
+            req = {"from": str(m["From"]), "to": str(m["To"]), "request_max": int(cfg.get("Load", {}).get("N", 200))}
+            out.append({"at": rc["TriggerTimeSeconds"], "request": {"migrate": req},
+                        "migrate": {"From": req["from"], "To": req["to"]},
+                        "what": f"task migration {req['from']} -> {req['to']}"})
             continue
         plan, name = rc["Plan"], "inline"
         if isinstance(plan, str):
@@ -1624,6 +1646,7 @@ def drive(cfg: dict, reconfigs: list, api_addr: str, gbin: str, gt: str, out_dir
         started = time.monotonic()
         reply = api.call(rc.get("method", "Rescale"), rc["request"])
         results.append({"data_nodes": rc.get("data_nodes"), **({"plan": rc["plan"]} if "plan" in rc else {}),
+                        **({"migrate": rc["migrate"]} if "migrate" in rc else {}),
                         **({"rebuild": True} if rc.get("rebuild") else {}),
                         "trigger_seconds": round(started - t0, 3),
                         "elapsed_seconds": round(time.monotonic() - started, 3), "reply": reply})

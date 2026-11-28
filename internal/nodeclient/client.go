@@ -217,7 +217,9 @@ type FetchStats struct {
 // FetchExtraStats count FetchExtra's requests (U9): N, the vectors each may bring now (0: off);
 // Queued, one per query and holder while it was on; of those, Dropped ones (the queue was full,
 // or the fetch cache half full) and the Requests sent, Failed ones among them; Fetched, the
-// vectors they brought.
+// vectors they brought. A task migration's (a refill): Refill, the vectors a request the worker
+// sends on its own may bring now (0: none), Refills, those requests, WaitUs, its time waiting for
+// room in the fetch cache, and Done, whether no posting names the source any more.
 type FetchExtraStats struct {
 	N        uint64 `json:"n"`
 	Queued   uint64 `json:"queued"`
@@ -226,6 +228,10 @@ type FetchExtraStats struct {
 	Failed   uint64 `json:"failed"`
 	Fetched  uint64 `json:"fetched"`
 	Us       uint64 `json:"us"`
+	Refill   uint64 `json:"refill"`
+	Refills  uint64 `json:"refills"`
+	WaitUs   uint64 `json:"wait_us"`
+	Done     bool   `json:"done"`
 }
 
 // GraphInfo is the node's navigation graph (U14 major epochs patch it).
@@ -700,10 +706,14 @@ func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
 // FetchExtra has the node follow each request a query's fetch sends to one of the holders from
 // (every holder if empty) with one more, in the background, of up to n vectors of the lists the
 // query fetched through (FetchExtra, U9). n = 0 turns it off, and returns once the extra request
-// in flight has ended.
-func (c *Client) FetchExtra(ctx context.Context, n uint32, from []uint16) error {
+// in flight has ended. With refill > 0, a task migration (from not empty), every vector still
+// only at those holders comes: a request short of n takes the holder's other postings, the node
+// sends requests of up to refill vectors on its own while none is queued, until no posting names
+// the holders (Info's Fetch.Extra.Done).
+func (c *Client) FetchExtra(ctx context.Context, n, refill uint32, from []uint16) error {
 	var w frame.Writer
 	w.U32(n)
+	w.U32(refill)
 	w.U32(uint32(len(from)))
 	for _, id := range from {
 		w.U16(id)

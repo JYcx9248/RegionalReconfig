@@ -185,7 +185,15 @@ request claims what it asks for, as a query's fetch does, and waits for no other
 that misses one of its vectors meanwhile waits for that request, and fails if it fails, as after
 any fetch it waited for. Turning it off (n = 0) empties the queue and returns once the request in
 flight has ended. The stats count them (`fetch.extra`: queued, dropped, requests, failed,
-fetched -- also in `fetched` -- and the worker's time). Nothing is
+fetched -- also in `fetched` -- and the worker's time). With a refill (`FETCH_EXTRA`'s second
+field, > 0: a task migration, whose source is not drained) every vector still only at the named
+holders comes: a request that finds fewer than n in its lists takes the rest from the holder's
+other postings, from where its last request left off, in partition and posting order
+(`FillFromCursor`: the postings naming it whose vector is on the SSD are made to say "here" on the
+way); while nothing is queued the worker sends requests of up to refill vectors on its own, a
+holder at a time; at the cache's half it waits for the writer (`RoomForExtra`) instead of dropping
+the request; and once a whole pass meets no posting naming the holders whose vector is missing,
+it stops and INFO says so (`fetch.extra.done`, with `refill`, `refills` and `wait_us`). Nothing is
 dropped: the vectors of partitions that move away stay, like cached PQ codes, so the old owner
 can serve the peers whose postings name it, and a partition that comes back needs no transfer.
 

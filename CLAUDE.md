@@ -168,7 +168,16 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   more vectors of the query's lists follow each fetch request to the same holder, in the
   background (`SetFetchExtra`, `FETCH_EXTRA`; dropped past a queue bound or with the fetch cache
   half full), in a scale-in from the nodes that leave until the drain ends and in a full rebuild
-  at the old nodes until it returns -- never in a scale-out (the controller's `fetchExtra`). A RERANK fetches before it takes an engine worker, and holds a
+  at the old nodes until it returns -- never in a scale-out (the controller's `fetchExtra`).
+  A task migration (`"Migrate": {"From": "n4", "To": "n5"}`, `rtier-client rescale -migrate`,
+  2026-11-26) moves every partition of one data node to another and does not drain the source:
+  it stays the holder. With FetchExtra 0 the new owner only fetches on demand and the source
+  stays up (Koala's fetch-on-demand); with N > 0 everything still at the source comes in the
+  background (Koala's eventual migration): N more after each fetch from it, its other postings
+  once the query's lists run out, and, while no query's request is queued, requests of the
+  re-rank depth + N of the new owner's own, waiting for the writer at the fetch cache's half,
+  until no posting names it -- then the migration returns and the source is offline
+  (`migrate_seconds`). `scripts/analysis/migration_figure.py` draws E6 as Koala's Fig. 12. A RERANK fetches before it takes an engine worker, and holds a
   connection slot of its own at the aggregator (`nodeclient`): FILTERs wait behind it in
   neither place.
   Concurrent misses of one vector wait for one fetch, and a stream's or a drain's pull

@@ -187,6 +187,10 @@ type DrainRawReq struct {
 type FetchExtraReq struct {
 	Extra int                `json:"extra"`
 	From  []placement.NodeID `json:"from,omitempty"`
+	// Refill > 0: a task migration's -- every vector still only at From comes, the data node
+	// sending requests of up to Refill vectors on its own while no query's is queued
+	// (nodeclient.FetchExtra).
+	Refill int `json:"refill,omitempty"`
 }
 
 // StageGraphReq asks the agent to fetch and load the navigation graph. Priority is the
@@ -307,16 +311,37 @@ type NodeStatus struct {
 	GraphPatch uint32 `json:"graph_patch,omitempty"`
 	// Generation: the index generation the node runs (U14 full rebuild).
 	Generation uint32 `json:"generation,omitempty"`
+	// ExtraDone: in a task migration (FetchExtra with a refill), no posting of the data node names
+	// the source any more. ExtraFetched: the raw vectors FetchExtra brought since it started.
+	ExtraDone    bool   `json:"extra_done,omitempty"`
+	ExtraFetched uint64 `json:"extra_fetched,omitempty"`
 }
 
-// RescaleReq asks for a reconfiguration in one of two forms: DataNodes, a number of data
-// nodes for the controller's placement policy to spread the partitions over, or Plan, the
-// placement itself. With DryRun the controller works out the placement and what would move
-// (the reply's Plan, Added, Removed, Moved) and changes nothing.
+// RescaleReq asks for a reconfiguration in one of three forms: DataNodes, a number of data
+// nodes for the controller's placement policy to spread the partitions over; Plan, the
+// placement itself; or Migrate, a task migration. With DryRun the controller works out the
+// placement and what would move (the reply's Plan, Added, Removed, Moved) and changes nothing.
 type RescaleReq struct {
-	DataNodes int   `json:"data_nodes,omitempty"`
-	Plan      *Plan `json:"plan,omitempty"`
-	DryRun    bool  `json:"dry_run,omitempty"`
+	DataNodes int      `json:"data_nodes,omitempty"`
+	Plan      *Plan    `json:"plan,omitempty"`
+	Migrate   *Migrate `json:"migrate,omitempty"`
+	DryRun    bool     `json:"dry_run,omitempty"`
+}
+
+// Migrate is a task migration: every partition of data node From goes to node To -- a
+// registered idle node, which joins, or another data node -- and From stops being a data node,
+// entry and aggregator at the flip. It is not drained: it stays the holder of its raw vectors,
+// which To fetches on demand, and with FetchExtra N > 0 To also brings the rest in the
+// background (the queries' lists first, then the other postings), in requests of up to N
+// vectors that follow its fetches and, while none is queued, of RequestMax + N of its own --
+// RequestMax, the most vectors one fetch of a query brings (the queries' re-rank depth). The
+// migration returns once no posting names From: From is then offline as far as the system is
+// concerned. With FetchExtra 0 it returns after the flip, and From stays a holder (the reply's
+// Holding). Nodes by name or ID, as in a plan.
+type Migrate struct {
+	From       string `json:"from"`
+	To         string `json:"to"`
+	RequestMax int    `json:"request_max,omitempty"`
 }
 
 // Plan is a reconfiguration plan: the placement a reconfiguration ends in, as the partitions
@@ -367,6 +392,15 @@ type RescaleReply struct {
 	DrainVectors int64   `json:"drain_vectors,omitempty"`
 	DrainBytes   int64   `json:"drain_bytes,omitempty"`
 	DrainSeconds float64 `json:"drain_seconds,omitempty"`
+	// A task migration (Migrate): MigrateSeconds, how long after the flip the last posting naming
+	// the source came to name its new owner -- its raw vectors all moved, on demand and with
+	// FetchExtra, so the source could go offline -- and MigrateVectors, the vectors FetchExtra
+	// brought meanwhile (those fetched on demand are in RawFetched). Holding: nodes that left the
+	// placement but still hold raw vectors other nodes' postings name (a migration with
+	// FetchExtra 0): they must stay up.
+	MigrateSeconds float64            `json:"migrate_seconds,omitempty"`
+	MigrateVectors int64              `json:"migrate_vectors,omitempty"`
+	Holding        []placement.NodeID `json:"holding,omitempty"`
 	// GraphBytes: navigation graphs copied to the new entries (in the background, see
 	// EntryFlips), counted once every pull has ended.
 	GraphBytes int64 `json:"graph_bytes,omitempty"`

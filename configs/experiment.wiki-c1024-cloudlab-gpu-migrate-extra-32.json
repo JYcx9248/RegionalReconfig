@@ -1,0 +1,83 @@
+{
+  "Comment": "CloudLab c240g5, Wikipedia: task migration (E6) at 90 s, every partition of n4 to n5, a node that joins, under lazy with FetchExtra 32. n4 is not drained: it stays the holder of its raw vectors, and n5 also brings the rest in the background (Koala's eventual migration): 32 more after each of its fetches from n4, and requests of Load.N + 32 = 232 of its own while none is queued, until no posting names n4 -- then the migration returns and n4 is offline. The load stays at the 4 -> 8 runs' first rate, 560 q/s (0.6 x C4 938, 2026-11-20), for 1200 s. StageTimeout 1h: the background part waits for n5's writer, about 7-8.6K 4 KB vectors a second.",
+  "WorkDir": "/data-ssd/chenxu/work/wiki-c1024",
+  "IndexDir": "/data-ssd/chenxu/work/wiki-c1024/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/data/wiki-c1024.fbin",
+  "Queries": "/data-ssd/chenxu/data/wiki-queries.fbin",
+  "GroundTruth": "/data-ssd/chenxu/data/wiki-c1024-gt.ibin",
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/wiki-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000"
+  ],
+  "Nodes": 5,
+  "InitialNodes": 4,
+  "Protocol": "lazy",
+  "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 64,
+    "N": 200,
+    "Rate": "560",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 1200,
+    "WarmupSeconds": 30
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "Migrate": {
+        "From": "n4",
+        "To": "n5"
+      }
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5",
+      "10.10.1.6",
+      "10.10.1.7",
+      "10.10.1.8",
+      "10.10.1.9"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  },
+  "FetchExtra": 32,
+  "StageTimeout": "1h"
+}

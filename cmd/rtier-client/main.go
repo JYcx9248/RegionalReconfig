@@ -4,6 +4,7 @@
 //	rtier-client [-api ADDR] wait-ready [-timeout 5m]
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] N           # N data nodes, placed by the policy
 //	rtier-client [-api ADDR] rescale [-dry-run] [-save-plan OUT] -plan FILE  # the placement FILE names
+//	rtier-client [-api ADDR] rescale [-dry-run] -migrate FROM:TO [-request-max N]  # a task migration
 //	rtier-client [-api ADDR] design             # open design questions (placeholders)
 //	rtier-client [-api ADDR] rebuild -index DIR -partitions DIR [-spares N] [-placement affinity|random]
 //	             [-warmup N] [-warmup-concurrency C] [-stop-the-world] [-work-dir DIR] [-max-candidates N]
@@ -73,7 +74,7 @@ import (
 func main() {
 	api := flag.String("api", "127.0.0.1:7101", "controller API address")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE | rebuild ... | design | query ... | search-local ... | pq-share ... | max-candidates ... | save-raw -node ADDR | save-pq -node ADDR -file PATH")
+		fmt.Fprintln(os.Stderr, "usage: rtier-client [-api ADDR] status | wait-ready | rescale [-dry-run] [-save-plan OUT] N|-plan FILE|-migrate FROM:TO | rebuild ... | design | query ... | search-local ... | pq-share ... | max-candidates ... | save-raw -node ADDR | save-pq -node ADDR -file PATH")
 	}
 	flag.Parse()
 	if flag.NArg() < 1 {
@@ -97,11 +98,21 @@ func main() {
 	case "rescale":
 		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 		planPath := fs.String("plan", "", "reconfigure to the placement this plan file names")
+		migrate := fs.String("migrate", "", "FROM:TO, a task migration: every partition of data node FROM to node TO, "+
+			"FROM not drained (by name or ID)")
+		requestMax := fs.Int("request-max", 200, "with -migrate: the most vectors one fetch of a query brings, "+
+			"the queries' re-rank depth (with FetchExtra N, the migration's own requests bring this + N)")
 		dryRun := fs.Bool("dry-run", false, "work out the plan and what would move, change nothing")
 		savePlan := fs.String("save-plan", "", "write the reply's plan to this file")
 		fs.Parse(args)
 		req := protocol.RescaleReq{DryRun: *dryRun}
 		switch {
+		case *migrate != "" && *planPath == "" && fs.NArg() == 0:
+			from, to, ok := strings.Cut(*migrate, ":")
+			if !ok || from == "" || to == "" {
+				log.Fatalf("-migrate %q: want FROM:TO", *migrate)
+			}
+			req.Migrate = &protocol.Migrate{From: from, To: to, RequestMax: *requestMax}
 		case *planPath != "" && fs.NArg() == 0:
 			p, err := readPlan(*planPath)
 			if err != nil {
@@ -115,7 +126,8 @@ func main() {
 			}
 			req.DataNodes = n
 		default:
-			log.Fatal("usage: rescale [-dry-run] [-save-plan OUT] N | rescale [-dry-run] [-save-plan OUT] -plan FILE")
+			log.Fatal("usage: rescale [-dry-run] [-save-plan OUT] N | rescale [-dry-run] [-save-plan OUT] -plan FILE | " +
+				"rescale [-dry-run] -migrate FROM:TO [-request-max N]")
 		}
 		var rep protocol.RescaleReply
 		call(ctx, *api, protocol.RescaleA, req, &rep, 24*time.Hour)

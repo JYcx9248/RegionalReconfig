@@ -2285,13 +2285,13 @@ void TestFetchExtra() {
   CHECK(dst->fetch_stats().extra_queued == 0 && dst->fetch_stats().extra == 0);
 
   // On for holder 1 only: a fetch from holder 9 brings nothing more.
-  dst->SetFetchExtra(8, {1});
+  dst->SetFetchExtra(8, {1}, 0);
   const std::vector<uint32_t> a2 = slice(ids3, 5, 5), l2 = ListsNaming(f, 3, a2);
   CHECK(check(a2, l2));
   CHECK(dst->fetch_stats().extra_queued == 0 && dst->fetch_stats().extra == 8);
 
   // On for holder 9: the query's answer comes while its extra request is held at the holder.
-  dst->SetFetchExtra(8, {9});
+  dst->SetFetchExtra(8, {9}, 0);
   gate(true);
   const std::vector<uint32_t> a3 = slice(ids3, 10, 10), l3 = ListsNaming(f, 3, a3);
   std::atomic<bool> a3_done{false};
@@ -2342,7 +2342,7 @@ void TestFetchExtra() {
   CHECK(dst->RawAbsent(held.data(), held.size()).empty());
 
   // Per request: a query whose misses lie at two holders is followed by one extra request to each.
-  dst->SetFetchExtra(4, {});
+  dst->SetFetchExtra(4, {}, 0);
   const std::vector<uint32_t> c2 = slice(ids2, 0, 5);
   std::vector<uint32_t> c3;  // not here yet
   for (size_t i = ids3.size(); i-- > 0 && c3.size() < 5;) {
@@ -2372,7 +2372,7 @@ void TestFetchExtra() {
   }
 
   // Off: the call returns with nothing in flight, and fetches bring only what they need.
-  dst->SetFetchExtra(0, {});
+  dst->SetFetchExtra(0, {}, 0);
   const std::vector<uint32_t> d = slice(ids3, 20, 5), ld = ListsNaming(f, 3, d);
   CHECK(check(d, ld));
   fs = dst->fetch_stats();
@@ -2390,11 +2390,99 @@ void TestFetchExtra() {
   auto small = NodeEngine::Open(o);
   LinkPeers(small.get(), 3, {{9, src2.get()}});
   StageFrom(f, small.get(), src2.get(), {3});
-  small->SetFetchExtra(8, {});
+  small->SetFetchExtra(8, {}, 0);
   CHECK(rerank(small.get(), 0, a3, l3) == rerank(src.get(), 0, a3, l3));
-  small->SetFetchExtra(0, {});
+  small->SetFetchExtra(0, {}, 0);
   fs = small->fetch_stats();
   CHECK(fs.extra_queued == 1 && fs.extra_dropped == 1 && fs.extra_requests == 0 && fs.extra_fetched == 0);
+}
+
+// FetchExtra with a refill (a task migration, U9): every vector still at the holder comes in the
+// background, without a query -- the worker's own requests take the postings in order -- each
+// once, and then no posting names the holder; queries alongside get the same answers; a fetch
+// cache too small for a request makes the worker wait for the writer, not drop it; off stops it.
+void TestFetchExtraMigrate() {
+  Fixture& f = GetFixture();
+  auto src = OpenNode(f, {0, 1, 2, 3}, true);  // holder 1: the migration's source, which stays
+  src->SetNodes(1, {});
+  const uint32_t vb = src->raw_stats(false).vec_bytes;
+  std::atomic<int> delay_ms{0};  // per fetch from the source
+  auto open_dst = [&](uint64_t cache_bytes) {
+    NodeOptions o;
+    o.index_dir = f.index_nopages;
+    o.partitions_dir = f.parts;
+    o.num_workers = 2;
+    o.max_nprobe = 64;
+    o.max_rerank = 4096;
+    o.direct_io = false;
+    if (cache_bytes) o.fetch_cache_bytes = cache_bytes;
+    auto e = NodeEngine::Open(o);
+    e->SetNodes(2, {{1, "node-1"}});
+    e->SetRawFetcher([&](const std::string&, const uint32_t* locs, size_t n, uint8_t* out) {
+      if (const int d = delay_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(d));
+      src->RawGet(locs, n, out);
+    });
+    StageFrom(f, e.get(), src.get(), {2, 3});
+    return e;
+  };
+  const std::vector<uint32_t> locs = Named(f, {2, 3}).second;
+  auto wait_done = [](NodeEngine* e) {
+    for (int i = 0; i < 3000; ++i) {
+      if (e->fetch_stats().extra_done) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+  };
+
+  // No query: the worker's own requests bring every vector, each once, and stop.
+  auto dst = open_dst(0);
+  CHECK(dst->RawAbsent(locs.data(), locs.size()).size() == locs.size());
+  dst->SetFetchExtra(4, {1}, 16);
+  CHECK(wait_done(dst.get()));
+  FetchStats fs = dst->fetch_stats();
+  CHECK(dst->RawAbsent(locs.data(), locs.size()).empty());
+  CHECK(fs.extra_fetched == locs.size() && fs.extra_dropped == 0 && fs.extra_failed == 0);
+  CHECK(fs.extra_refill == 16 && fs.extra_refills >= (locs.size() + 15) / 16);
+  // No posting names the holder any more: nothing to repoint, nothing to pull.
+  const HeldBy hb = dst->RawHeldBy(1);
+  CHECK(hb.repointed == 0 && hb.missing.locs.empty());
+  // Queries need no fetch, and no request follows.
+  const uint64_t requests = fs.extra_requests, fetches = dst->raw_stats(true).fetches;
+  for (uint32_t qi = 0; qi < 5; ++qi) CHECK(SameRerank(f, qi, dst.get(), src.get(), {2, 3}));
+  CHECK(dst->raw_stats(true).fetches == fetches && dst->fetch_stats().extra_requests == requests);
+  dst->SetFetchExtra(0, {}, 0);
+  fs = dst->fetch_stats();
+  CHECK(fs.extra_done == 0 && fs.extra_refill == 0);
+
+  // Queries alongside: the same answers while the vectors come, and then all are here.
+  auto dst2 = open_dst(0);
+  dst2->SetFetchExtra(4, {1}, 8);
+  for (uint32_t qi = 0; qi < 10; ++qi) CHECK(SameRerank(f, qi, dst2.get(), src.get(), {2, 3}));
+  CHECK(wait_done(dst2.get()));
+  CHECK(dst2->RawAbsent(locs.data(), locs.size()).empty() && dst2->fetch_stats().extra_failed == 0);
+  dst2->SetFetchExtra(0, {}, 0);
+
+  // A fetch cache of 8 vectors: requests shrink to 4, half of it, and wait for the writer.
+  auto small = open_dst(8ull * vb);
+  small->SetFetchExtra(4, {1}, 16);
+  CHECK(wait_done(small.get()));
+  fs = small->fetch_stats();
+  CHECK(small->RawAbsent(locs.data(), locs.size()).empty() && fs.extra_dropped == 0 && fs.extra_failed == 0);
+  small->SetFetchExtra(0, {}, 0);
+
+  // Off before it is done: the call returns with no request in flight, and none follows.
+  delay_ms = 2;
+  auto off = open_dst(0);
+  off->SetFetchExtra(4, {1}, 4);
+  for (int i = 0; i < 1000 && off->fetch_stats().extra_requests < 3; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  off->SetFetchExtra(0, {}, 0);
+  const uint64_t sent = off->fetch_stats().extra_requests;
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  fs = off->fetch_stats();
+  CHECK(sent >= 3 && fs.extra_requests == sent && fs.extra_done == 0);
+  CHECK(!off->RawAbsent(locs.data(), locs.size()).empty());
+  delay_ms = 0;
 }
 
 // Drops a file's pages from the page cache; false where that is not possible (tmpfs keeps a
@@ -3911,6 +3999,7 @@ int main() {
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"fetch_extra", TestFetchExtra},
+      {"fetch_extra_migrate", TestFetchExtraMigrate},
       {"read_budget", TestReadBudget},
       {"graph_transfer", TestGraphTransfer},
       {"graph_patches", TestGraphPatches},

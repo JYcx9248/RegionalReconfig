@@ -305,12 +305,23 @@ var Open = map[string]Question{
 			"nodes that leave, until the drain ends, and in a full rebuild to the old nodes' " +
 			"fetches in the next generation, until the rebuild returns and the spares go; never " +
 			"in a scale-out, nor at the nodes a plan adds while others leave (one place decides: " +
-			"the controller's fetchExtra). Open: whether a scale-out ablation goes into the " +
-			"evaluation, and chunks (U12)",
-		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw, fetchExtra), " +
+			"the controller's fetchExtra). Decided (2026-11-26): a task migration (Migrate: every " +
+			"partition of one data node to another) drains nothing -- its source stays the holder, " +
+			"and its vectors come on demand and with FetchExtra, as Koala's fetch-on-demand and " +
+			"eventual migration (its Fig. 12). With FetchExtra 0 the migration returns after the " +
+			"flip and the source must stay up; with N > 0 every vector still at the source comes in " +
+			"the background, at every data node: a request short of N in the query's lists takes the " +
+			"source's other postings, the node sends requests of the queries' re-rank depth + N of " +
+			"its own while none is queued, and at the fetch cache's half it waits for the writer " +
+			"rather than drop one -- until no posting names the source, when the migration returns " +
+			"and the source is offline as far as the system is concerned (migrateRaw). The queries' " +
+			"own fetches go first and wait for none of it. Open: whether a scale-out ablation goes " +
+			"into the evaluation, whether a scale-in also moves its leaving nodes' vectors this way " +
+			"instead of the drain, and chunks (U12)",
+		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw, migrateRaw, fetchExtra), " +
 			"internal/controller/rebuild.go (rebuild), " +
 			"internal/agent/control.go (StageRaw, DrainRaw, FetchExtra), engine/src/node_engine.cpp " +
-			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull, QueueExtra, PullExtra), " +
+			"(EnsureRawInLists, FetchForQuery, RawHeldBy, RawPull, QueueExtra, PullExtra, FillFromCursor), " +
 			"engine/node/server.cpp (PeerPool, RERANK, FETCH_EXTRA)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +

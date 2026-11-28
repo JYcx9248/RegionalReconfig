@@ -197,7 +197,7 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	if err != nil {
 		return reply, err
 	}
-	evac, err := c.copyThenFlip(ctx, time.Now(), cur, next, placement.Diff(cur.Placement, next), spares, nil, false, rawOnDemand)
+	evac, err := c.copyThenFlip(ctx, time.Now(), cur, next, placement.Diff(cur.Placement, next), spares, nil, false, rawOnDemand, nil)
 	reply.Evacuation = evac
 	if evac != nil {
 		reply.ToEpoch = evac.ToEpoch
@@ -255,7 +255,7 @@ func (c *Controller) rebuild(ctx context.Context, req protocol.RebuildReq) (*pro
 	// The old nodes' fetches in the next generation, from the warm-up on, bring FetchExtra more
 	// until the spares go (fetchExtra); the spares' own fetches never do. The next generation's
 	// postings name old nodes only.
-	extraOff, err := c.fetchExtra(ctx, old, nil)
+	extraOff, err := c.fetchExtra(ctx, old, nil, 0)
 	if err != nil {
 		return reply, err
 	}

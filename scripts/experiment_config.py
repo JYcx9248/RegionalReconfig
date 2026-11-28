@@ -23,6 +23,7 @@ all but RUNNER_KEYS, which the runners set from the run itself.
       "Calibrate": {"Rates", "SecondsPerRate"},
       "Updates": {"Headroom", "ListHeadroom", "MaxListLen"},
       "Reconfigurations": [{"TriggerTimeSeconds": 90, "DataNodes": 4}, {..., "Plan": P},
+                           {..., "Migrate": {"From": "n4", "To": "n5"}},
                            {..., "Rebuild": {"Index": DIR, "Partitions": DIR}},
                            {..., "Update": {"Inserts": FILE, "Deletes": FILE, "SplitLen": N, ...}}]
     }
@@ -68,7 +69,7 @@ SCHEMA = {
     "Calibrate": {"Rates": None, "SecondsPerRate": None},
     "Updates": {"Headroom": None, "ListHeadroom": None, "MaxListLen": None},
     "Reconfigurations": {
-        "TriggerTimeSeconds": None, "DataNodes": None, "Plan": "opaque",
+        "TriggerTimeSeconds": None, "DataNodes": None, "Plan": "opaque", "Migrate": {"From": None, "To": None},
         "Rebuild": {"Index": None, "Partitions": None, "Spares": None, "Placement": None, "Seed": None,
                     "Warmup": None, "WarmupConcurrency": None, "StopTheWorld": None},
         "Update": {"Inserts": None, "Deletes": None, "Split": None, "Merge": None, "SplitLen": None,

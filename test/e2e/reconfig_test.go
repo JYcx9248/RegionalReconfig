@@ -270,6 +270,10 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 	if req.Plan != nil {
 		what, dataNodes = fmt.Sprintf("plan %v", req.Plan.Owners), len(req.Plan.Owners)
 	}
+	if req.Migrate != nil { // a task migration keeps the number of data nodes
+		what, dataNodes = fmt.Sprintf("migration %s -> %s", req.Migrate.From, req.Migrate.To),
+			len(cl.ctl.Status().Table.Placement.Nodes())
+	}
 	cl.observe()
 	before := cl.ctl.Status().Table.Placement
 	rawBefore := rawStats(t, cl)
