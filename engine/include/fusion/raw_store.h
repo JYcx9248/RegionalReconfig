@@ -17,6 +17,8 @@
 // serve its vectors to the peers whose postings name it.
 //
 // Re-ranking reads whole pages through pages(), with O_DIRECT when the file system supports it.
+// With a read cache (SetCache, fusion/raw_cache.h), re-ranking's reads and Get's look there first,
+// and an install drops the pages it wrote there before it sets their presence bits.
 // Installs run one at a time. Fetched vectors -- a few scattered vectors per page, installed by
 // the engine's background writer while queries read the same file -- are written as whole pages
 // with O_DIRECT: a page that already holds vectors is read back first (batched), so its present
@@ -49,6 +51,7 @@
 #include "fusion/common.h"
 #include "fusion/layout.h"
 #include "fusion/page_reader.h"
+#include "fusion/raw_cache.h"
 
 namespace fusion {
 
@@ -125,6 +128,11 @@ class RawStore {
   // and the Get reads the page cache does not serve (a cached one costs nothing, as with cgroup
   // io.max). Set before the store is used.
   void SetReadBudget(ReadBudget* budget) { budget_ = budget; }
+  // A read cache of `bytes` in front of the store (fusion/raw_cache.h; less than a page: none):
+  // Get looks there first and keeps the pages it reads; a page reader made with cache() does the
+  // same for re-ranking; Put drops the pages it writes. Set before the store is used.
+  void SetCache(uint64_t bytes);
+  RawCache* cache() const { return cache_.get(); }
   void CountFetch() { fetches_.fetch_add(1, std::memory_order_relaxed); }
   // Vectors a node served to peers from memory (fetched, not on the SSD yet), counted like Get's.
   void CountServed(size_t n) { served_.fetch_add(n, std::memory_order_relaxed); }
@@ -148,6 +156,7 @@ class RawStore {
   std::unique_ptr<DirectIo> io_;  // under put_mu_
   uint8_t* chunk_ = nullptr;      // under put_mu_: kChunkPages page-aligned pages
   ReadBudget* budget_ = nullptr;
+  std::unique_ptr<RawCache> cache_;  // null: none
   std::unique_ptr<std::atomic<uint64_t>[]> bits_;  // one bit per location
   std::atomic<uint64_t> present_{0}, from_index_{0}, streamed_{0}, fetched_{0}, added_{0}, fetches_{0},
       skipped_{0}, served_{0};

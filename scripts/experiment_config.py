@@ -16,7 +16,7 @@ all but RUNNER_KEYS, which the runners set from the run itself.
       "Assignment": FILE | "Partition": {"Generator": "gp", "Partitions": 64, "KaMinPar": PATH, ...},
       "BuildArgs": ["--pq-m", "64"],         # fusion_build's flags
       "Nodes", "InitialNodes", "Protocol", "Placement", "StageTimeout", ...,   # config.yaml's keys too
-      "Backend", "GPUs", "NodeArgs", "PQCapacity", "FetchCacheShare", ...,
+      "Backend", "GPUs", "NodeArgs", "PQCapacity", "FetchCacheShare", "RawCacheShare", ...,
       "NodeResources": {...}, "Emulation": {...},
       "Hosts": {"Nodes": [HOST, {"SSH": DEST, "Addr": ADDRESS}, ...], ...},   # run_cluster.py only
       "Load": {"Rate", "RateSteps", "Users", "DurationSeconds", ...},
@@ -58,7 +58,7 @@ SCHEMA = {
                   "Weights": None, "KaMinPar": None, "Threads": None},
     "BuildArgs": None,
     "Nodes": None, "ReadyTimeoutSeconds": None, "PQCapacity": None, "PQHeadroom": None,
-    "Backend": None, "GPUs": None, "NodeArgs": None, "FetchCacheShare": None,
+    "Backend": None, "GPUs": None, "NodeArgs": None, "FetchCacheShare": None, "RawCacheShare": None,
     "NodeResources": {"CPUsPerNode": None, "FirstCPU": None, "MemoryMax": None, "IOReadIOPSMax": None,
                       "IOReadBandwidthMax": None, "ReadIOPSPerNode": None},
     "Emulation": {"Netns": None, "Delay": None, "Rate": None},

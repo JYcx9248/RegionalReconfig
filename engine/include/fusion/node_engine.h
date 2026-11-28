@@ -110,6 +110,10 @@ struct NodeOptions {
   // use (--fetch-cache-share, an experiment's "FetchCacheShare"), so that one setting fits
   // every machine; 2 GB without one.
   uint64_t fetch_cache_bytes = 2ull << 30;
+  // The read cache of raw-vector pages in front of the raw store (fusion/raw_cache.h): what it may
+  // hold, 0 = none. rtier_node gives it 5% of the memory the node may use unless told otherwise
+  // (--raw-cache-share, an experiment's "RawCacheShare").
+  uint64_t raw_cache_bytes = 0;
   // Longest posting list a request may gather (0 = the manifest's): inserts make lists longer,
   // and without max_candidates the filter's candidate buffers are sized by it.
   uint32_t max_list_len = 0;
@@ -539,6 +543,7 @@ class NodeEngine {
   virtual RawStats raw_stats(bool settle) const = 0;
   virtual FetchStats fetch_stats() const = 0;
   virtual ReadBudgetStats read_budget_stats() const = 0;  // zeros without --read-iops
+  virtual RawCacheStats raw_cache_stats() const = 0;      // zeros without a read cache
   // How the node fetches raw vectors on demand (without one it cannot).
   virtual void SetRawFetcher(RawFetcher fetcher) = 0;
 

@@ -1804,13 +1804,16 @@ void TestPQEvictUnderLoad() {
 }
 
 // direct: installs write whole pages with O_DIRECT (reading back a page that already holds
-// vectors); otherwise buffered writes of the vectors alone.
-void RawStoreCase(bool direct) {
+// vectors); otherwise buffered writes of the vectors alone. cache_pages: a read cache of that many
+// pages in front (fusion/raw_cache.h), which must change no answer: installs into pages it holds
+// drop them, and with 2 pages it evicts as it goes.
+void RawStoreCase(bool direct, uint32_t cache_pages = 0) {
   RawLayout L;
   L.vec_bytes = 1000;  // 4 per 4 KB page, 96 bytes unused at the end of each
   L.vectors_per_page = 4;
   L.num_pages = 5;  // 20 locations
   RawStore s("", L, direct);
+  s.SetCache(static_cast<uint64_t>(cache_pages) * L.page_size);
   if (direct && !s.pages().direct()) std::printf("    no O_DIRECT in TMPDIR: buffered installs only\n");
   auto vec = [](uint32_t loc) {
     std::vector<uint8_t> v(1000);
@@ -1858,7 +1861,7 @@ void RawStoreCase(bool direct) {
   }
   CHECK(threw);
   // Re-ranking reads whole pages from the same file: page 1 holds locations 4, 5 and 6.
-  auto reader = MakePageReader(s.pages(), IoBackend::kPread, 4);
+  auto reader = CachedPageReader(MakePageReader(s.pages(), IoBackend::kPread, 4), s.cache());
   AlignedBuffer page = AllocAligned(4096, 4096);
   const uint32_t one = 1;
   uint8_t* bufs[1] = {page.get()};
@@ -1879,15 +1882,29 @@ void RawStoreCase(bool direct) {
   std::vector<uint64_t> mask(1, 0);
   for (uint32_t loc : {3u, 7u, 8u, 11u, 19u}) mask[0] |= uint64_t{1} << loc;
   CHECK(s.CountAbsent(mask) == 3);
+  // With room for every page: the first Get read pages 0, 1 and 3 and kept them, re-ranking found
+  // page 1 there; the installs dropped pages 1, 0 and 3, so the second Get read its 4 pages, and
+  // re-ranking found page 0 there. Each install that dropped a page dropped it once.
+  if (cache_pages >= L.num_pages) {
+    const RawCacheStats cs = s.cache()->Stats();
+    CHECK(cs.capacity == static_cast<uint64_t>(cache_pages) * L.page_size && cs.peer_misses == 7 &&
+          cs.peer_hits == 0 && cs.hits == 2 && cs.misses == 0 && cs.dropped == 3 && cs.evicted == 0 &&
+          cs.bytes == 4ull * L.page_size);
+  } else if (cache_pages) {
+    CHECK(s.cache()->Stats().bytes <= 2ull * L.page_size && s.cache()->Stats().evicted > 0);
+  }
 }
 
-// A Get spread over many pages (600), with repeated locations, comes back complete and in order.
-void RawStoreManyPages(bool direct) {
+// A Get spread over many pages (600), with repeated locations, comes back complete and in order --
+// also through a read cache, twice: one of 100 pages evicts as it goes, one of 700 serves the
+// second Get without a miss.
+void RawStoreManyPages(bool direct, uint32_t cache_pages = 0) {
   RawLayout L;
   L.vec_bytes = 1000;
   L.vectors_per_page = 4;
   L.num_pages = 600;
   RawStore s("", L, direct);
+  s.SetCache(static_cast<uint64_t>(cache_pages) * L.page_size);
   std::vector<uint32_t> all(L.locations());
   std::iota(all.begin(), all.end(), 0u);
   auto vec = [](uint32_t loc, uint8_t* out) {
@@ -1899,13 +1916,25 @@ void RawStoreManyPages(bool direct) {
   std::vector<uint32_t> want;
   for (uint32_t i = 0; i < 1500; ++i) want.push_back((i * 7919u) % L.locations());  // spread, repeats
   std::vector<uint8_t> out(want.size() * 1000), ref(1000);
-  s.Get(want.data(), want.size(), out.data());
-  bool same = true;
-  for (size_t i = 0; i < want.size(); ++i) {
-    vec(want[i], ref.data());
-    same = same && std::memcmp(out.data() + i * 1000, ref.data(), 1000) == 0;
+  RawCacheStats first;
+  for (int round = 0; round < (cache_pages ? 2 : 1); ++round) {
+    std::fill(out.begin(), out.end(), 0);
+    s.Get(want.data(), want.size(), out.data());
+    bool same = true;
+    for (size_t i = 0; i < want.size(); ++i) {
+      vec(want[i], ref.data());
+      same = same && std::memcmp(out.data() + i * 1000, ref.data(), 1000) == 0;
+    }
+    CHECK(same);
+    if (round == 0 && cache_pages) first = s.cache()->Stats();
   }
-  CHECK(same);
+  if (cache_pages >= L.num_pages) {
+    const RawCacheStats cs = s.cache()->Stats();
+    CHECK(cs.peer_misses == first.peer_misses && cs.peer_hits > first.peer_hits && cs.evicted == 0);
+  } else if (cache_pages) {
+    const RawCacheStats cs = s.cache()->Stats();
+    CHECK(cs.bytes == static_cast<uint64_t>(cache_pages) * L.page_size && cs.evicted > 0);
+  }
 }
 
 // A store's snapshot (an experiment's warmup): SaveBitmap writes the presence bits next to the
@@ -1996,11 +2025,96 @@ void RawStoreSnapshot(bool direct) {
   CHECK(Throws([&] { RawStore s("", L, direct, true); }));
 }
 
+// The read cache by itself (fusion/raw_cache.h): a kept page comes back as kept; CLOCK passes over
+// the pages hit since it last came by, clearing their bits, and evicts the first one not hit; an
+// install's Invalidate drops a page and voids the ticket of a read begun before it, not of one
+// begun after; less than a page is no cache.
+void TestRawCache() {
+  const uint32_t ps = 4096;
+  auto page = [&](uint32_t p, int seed) { return std::vector<uint8_t>(ps, static_cast<uint8_t>(p * 7 + seed)); };
+  std::vector<uint8_t> out(ps);
+  RawCache c(4 * ps + 100, ps);  // 4 pages, one shard
+  CHECK(c.enabled() && c.Stats().capacity == 4ull * ps && !c.Lookup(1, out.data(), ReadClass::kOwn));
+  for (uint32_t p = 1; p <= 4; ++p) {
+    const uint64_t ticket = c.Version(p);
+    c.Insert(p, page(p, 0).data(), ticket);
+  }
+  CHECK(c.Stats().bytes == 4ull * ps);
+  CHECK(c.Lookup(1, out.data(), ReadClass::kOwn) && out == page(1, 0));
+  CHECK(c.Lookup(2, out.data(), ReadClass::kPeer) && out == page(2, 0));
+  c.Insert(5, page(5, 0).data(), c.Version(5));  // passes 1 and 2, evicts 3
+  CHECK(!c.Lookup(3, out.data(), ReadClass::kOwn));
+  CHECK(c.Lookup(1, out.data(), ReadClass::kOwn) && c.Lookup(2, out.data(), ReadClass::kOwn) &&
+        c.Lookup(4, out.data(), ReadClass::kOwn) && c.Lookup(5, out.data(), ReadClass::kOwn) && out == page(5, 0));
+  const uint64_t before = c.Version(4);
+  c.Invalidate(4);
+  CHECK(!c.Lookup(4, out.data(), ReadClass::kOwn) && c.Stats().bytes == 3ull * ps);
+  c.Insert(4, page(4, 1).data(), before);  // read before the install: not kept
+  CHECK(!c.Lookup(4, out.data(), ReadClass::kOwn));
+  c.Insert(4, page(4, 2).data(), c.Version(4));  // read after it: kept, in the frame it emptied
+  CHECK(c.Lookup(4, out.data(), ReadClass::kOwn) && out == page(4, 2));
+  const RawCacheStats s = c.Stats();
+  CHECK(s.bytes == 4ull * ps && s.hits == 6 && s.misses == 4 && s.peer_hits == 1 && s.peer_misses == 0 &&
+        s.evicted == 1 && s.dropped == 1);
+  RawCache off(ps - 1, ps);
+  off.Insert(1, page(1, 0).data(), off.Version(1));
+  off.Invalidate(1);
+  CHECK(!off.enabled() && !off.Lookup(1, out.data(), ReadClass::kOwn) && off.Stats().capacity == 0 &&
+        off.Stats().misses == 0);
+}
+
+// The read cache in a node (NodeOptions::raw_cache_bytes): re-ranking the same candidates again
+// reads nothing from the device -- the read budget counts no more reads -- and the answers are a
+// plain node's.
+void TestNodeReadCache() {
+  Fixture& f = GetFixture();
+  auto plain = OpenNode(f, {0, 1, 2, 3}, true);
+  NodeOptions o;
+  o.index_dir = f.index;
+  o.partitions_dir = f.parts;
+  o.num_workers = 2;
+  o.max_nprobe = 64;
+  o.max_rerank = 4096;
+  o.direct_io = false;
+  o.raw_cache_bytes = 1 << 20;
+  auto cached = NodeEngine::Open(o);
+  cached->LoadGraph(JoinPath(f.index, files::kGraph));
+  for (uint32_t p : {0u, 1u, 2u, 3u})
+    cached->LoadPartition(p, JoinPath(f.parts, partfiles::SegmentName(p)), PQSource::kIndex);
+  const std::vector<uint32_t> ids = Named(f, {2}).first;
+  const std::vector<uint32_t> cand(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), 50));
+  const std::vector<uint32_t> lists = ListsNaming(f, 2, cand);
+  auto rerank = [&](NodeEngine* at) {
+    std::vector<uint32_t> out_ids(5);
+    std::vector<float> out_dists(5);
+    RerankStats st;
+    const uint32_t n = at->Rerank(0, &f.queries[0], cand.data(), static_cast<uint32_t>(cand.size()), 5, lists.data(),
+                                  nullptr, static_cast<uint32_t>(lists.size()), out_ids.data(), out_dists.data(), &st);
+    out_ids.resize(n);
+    out_dists.resize(n);
+    return std::make_pair(out_ids, out_dists);
+  };
+  const auto first = rerank(cached.get());
+  const uint64_t reads = cached->read_budget_stats().charged;
+  const auto again = rerank(cached.get());
+  const RawCacheStats cs = cached->raw_cache_stats();
+  CHECK(first == rerank(plain.get()) && again == first && reads > 0 && cached->read_budget_stats().charged == reads &&
+        cs.hits > 0 && cs.misses > 0 && cs.capacity == (1u << 20) && plain->raw_cache_stats().capacity == 0);
+}
+
 void TestRawStore() {
   RawStoreCase(false);
   RawStoreCase(true);
+  for (uint32_t pages : {2u, 64u}) {
+    RawStoreCase(false, pages);
+    RawStoreCase(true, pages);
+  }
   RawStoreManyPages(false);
   RawStoreManyPages(true);
+  for (uint32_t pages : {100u, 700u}) {
+    RawStoreManyPages(false, pages);
+    RawStoreManyPages(true, pages);
+  }
   RawStoreSnapshot(false);
   RawStoreSnapshot(true);
 }
@@ -4163,6 +4277,8 @@ int main() {
       {"pq_store_no_host_copy", TestPQStoreNoHostCopy},
       {"gpu_codes", TestGpuCodes},
       {"node_pq_snapshot", TestNodePQSnapshot},
+      {"raw_cache", TestRawCache},
+      {"node_read_cache", TestNodeReadCache},
       {"raw_store", TestRawStore},
       {"raw_migration", TestRawMigration},
       {"fetch_extra", TestFetchExtra},

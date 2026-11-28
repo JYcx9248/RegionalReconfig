@@ -97,6 +97,7 @@ class NodeServer {
   std::string OpsJson() const;
   std::string GraphJson() const;
   std::string FetchJson() const;
+  std::string RawCacheJson() const;  // the read cache (fusion/raw_cache.h): INFO and the stats log
 
   fusion::NodeEngine* engine_;
   std::atomic<bool> stop_{false};

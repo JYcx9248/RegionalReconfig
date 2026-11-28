@@ -1143,7 +1143,7 @@ std::string NodeServer::InfoJson(bool settle) const {
       raw.vec_bytes, u(raw.locations), u(raw.present), u(raw.cached), u(raw.pending), u(raw.from_index),
       u(raw.streamed), u(raw.fetched), u(raw.added), u(raw.fetches), u(raw.skipped), u(raw.served),
       u(raw.restored));
-  s += ",\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() + "}";
+  s += ",\"fetch\":" + FetchJson() + ",\"raw_cache\":" + RawCacheJson() + ",\"ops\":" + OpsJson() + "}";
   return s;
 }
 
@@ -1192,9 +1192,18 @@ std::string NodeServer::FetchJson() const {
       u(f.extra_refill), u(f.extra_refills), u(f.extra_wait_us), f.extra_done ? "true" : "false");
 }
 
+std::string NodeServer::RawCacheJson() const {
+  const fusion::RawCacheStats c = engine_->raw_cache_stats();
+  auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+  return fusion::StrFormat(
+      "{\"capacity\":%llu,\"bytes\":%llu,\"hits\":%llu,\"misses\":%llu,\"peer_hits\":%llu,\"peer_misses\":%llu,"
+      "\"evicted\":%llu,\"dropped\":%llu}",
+      u(c.capacity), u(c.bytes), u(c.hits), u(c.misses), u(c.peer_hits), u(c.peer_misses), u(c.evicted), u(c.dropped));
+}
+
 std::string NodeServer::StatsJson() const {
   const fusion::ReadBudgetStats r = engine_->read_budget_stats();
-  return "{\"fetch\":" + FetchJson() + ",\"ops\":" + OpsJson() +
+  return "{\"fetch\":" + FetchJson() + ",\"raw_cache\":" + RawCacheJson() + ",\"ops\":" + OpsJson() +
          fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"depth\":%u,\"charged\":%llu,\"peer\":%llu,\"wait_us\":%llu}"
                            ",\"raw_bytes\":{\"sent\":%llu,\"received\":%llu}}",
                            static_cast<unsigned long long>(r.reads_per_sec), r.depth,

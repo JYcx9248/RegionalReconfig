@@ -102,7 +102,12 @@ re-ranked from memory, and a background writer installs them on the SSD with who
 writes, off the query path -- up to a bound on what waits for it, past which a fetching query
 installs its own. An experiment sets that bound as a share of each data node's memory
 (`"FetchCacheShare"`, 5% in the CloudLab GPU experiments; 2 GB without it): a write buffer, not a
-read cache, holding what was fetched and not yet written. Nothing else moves and a scale-out does
+read cache, holding what was fetched and not yet written. The read cache is separate
+(2026-11-28): each data node keeps the raw-vector pages it reads in memory, in front of its raw
+vectors as of a black box -- re-ranking's reads and those it serves other nodes (fetches, streams,
+drains) look there first and keep what they read, with CLOCK eviction, and an install drops the
+pages it rewrote. Its size is a share of the node's memory (`"RawCacheShare"`, 5% by default, 0 for
+none); the stats log's `raw_cache` counts its hits and misses, own and peer, separately. Nothing else moves and a scale-out does
 not wait for raw vectors; `raw_fetched` in the rescale reply counts what queries fetched while it
 ran, and each node reports `raw.fetched` (installed or still in memory), `raw.pending` (named by
 its partitions, not needed so far) and `raw.present` in its metrics. A scale-in does stream:

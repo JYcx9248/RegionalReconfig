@@ -225,6 +225,12 @@ cgroup's limit (NodeResources' MemoryMax here) or else its machine's. A share, s
 setting fits every machine; without one the bound is 2 GB. It is a write buffer, not a read
 cache: it holds what was fetched and not yet written, whatever the bound.
 
+"RawCacheShare": 0.05 sizes each data node's read cache of raw-vector pages, in front of its raw
+vectors as of a black box: re-ranking's reads and those it serves to other nodes (a query's fetch,
+a stream's or a drain's pull) look there first and keep what they read (rtier_node
+--raw-cache-share, fusion/raw_cache.h). A share of the memory the node may use, as
+FetchCacheShare's; 0.05 without one, 0 for none.
+
 Placeholders of decided design questions (see `bin/rtier-client design`) fail with "undecided":
   U5  "Strategy": "two-phase", the default, is the decided one (exactly the single-node
       answer); "proportional-quota" is the placeholder.
@@ -1158,7 +1164,7 @@ def revision(out_dir: str) -> None:
 
 def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: str) -> list:
     """rtier_node's flags beyond the ones every node has: NodeArgs, the read budget, the fetch
-    cache's bound, room for updates, the PQ budget."""
+    cache's bound, the read cache's size, room for updates, the PQ budget."""
     res = cfg.get("NodeResources") or {}
     args = cfg.get("NodeArgs", []) + (["--read-iops", str(res["ReadIOPSPerNode"])]
                                       if res.get("ReadIOPSPerNode") else [])
@@ -1167,6 +1173,11 @@ def node_args_of(cfg: dict, index: str, parts: str, reconfigs: list, out_dir: st
         if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0 < share <= 1:
             sys.exit(f"FetchCacheShare is {share!r}: a share of each data node's memory, in (0, 1]")
         args += ["--fetch-cache-share", repr(float(share))]
+    share = cfg.get("RawCacheShare")
+    if share is not None:
+        if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0 <= share < 1:
+            sys.exit(f"RawCacheShare is {share!r}: a share of each data node's memory, in [0, 1)")
+        args += ["--raw-cache-share", repr(float(share))]
     args += update_args(cfg, index, parts)
     args += candidate_args(cfg, parts, args, reconfigs, out_dir)
     return args + pq_args(cfg, index, parts, args, reconfigs, out_dir)

@@ -189,7 +189,12 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   bound is a share of the node's memory (`"FetchCacheShare"`, `rtier_node --fetch-cache-share`:
   its cgroup's limit, else the machine's; 5% in the CloudLab GPU experiments since 2026-11-16,
   2 GB without it). INFO never waits for it (`nodeclient.InfoSettled` does,
-  for tests). A scale-in drains the leaving nodes before it returns (`drainRaw`: each remaining
+  for tests). In front of the raw vectors, as of a black box, each node keeps a read cache of
+  their pages in memory (`fusion/raw_cache.h`, 2026-11-28): re-ranking's reads and the ones it
+  serves peers (fetches, streams, drains) look there first and keep what they read (CLOCK; a hit
+  costs no device read); an install drops the pages it wrote before it sets their presence bits.
+  Its size is a share of the node's memory (`"RawCacheShare"`, `rtier_node --raw-cache-share`; 5%
+  by default, 0 for none). A scale-in drains the leaving nodes before it returns (`drainRaw`: each remaining
   node takes over the vectors only a leaving node holds, `RAW_HELD_BY` then `RAW_PULL`), so they
   can go offline. No node drops a raw vector it has held. Only bootstrap reads the index's page
   file, and not on a warmup snapshot (below).

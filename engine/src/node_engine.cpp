@@ -313,13 +313,16 @@ class NodeEngineImpl : public NodeEngine {
     raw_layout.num_pages = std::max<uint64_t>(raw_layout.num_pages, o.max_pages);
     FUSION_CHECK(!o.raw_reuse || !o.raw_file.empty(), "raw vectors to reuse need their file (--raw-file)");
     raw_ = std::make_unique<RawStore>(o.raw_file, raw_layout, o.direct_io, o.raw_reuse);
+    raw_->SetCache(o.raw_cache_bytes);
     // Every device read is counted; with --peer-reads-first, at most --io-depth are at the device
     // at once, peers' first; only --read-iops limits their rate (fusion/read_budget.h).
     budget_ = std::make_unique<ReadBudget>(o.read_iops, o.peer_reads_first, o.io_depth);
     raw_->SetReadBudget(budget_.get());
     for (int i = 0; i < o.num_workers; ++i) {
       auto w = std::make_unique<Worker>();
-      w->reader = ChargedPageReader(MakePageReader(raw_->pages(), o.io, o.io_depth), budget_.get());
+      // A hit in the read cache reaches neither the read budget nor the device.
+      w->reader = CachedPageReader(ChargedPageReader(MakePageReader(raw_->pages(), o.io, o.io_depth), budget_.get()),
+                                   raw_->cache());
       w->scratch = std::make_unique<RerankScratch>(o.max_rerank, man.raw.page_size);
       w->qf.resize(dim_);
       w->locs.resize(o.max_rerank);
@@ -1691,6 +1694,8 @@ class NodeEngineImpl : public NodeEngine {
   ReadBudgetStats read_budget_stats() const override {
     return budget_ ? budget_->Stats() : ReadBudgetStats{};
   }
+
+  RawCacheStats raw_cache_stats() const override { return raw_->cache() ? raw_->cache()->Stats() : RawCacheStats{}; }
 
   void SetRawFetcher(RawFetcher fetcher) override {
     std::lock_guard<std::mutex> l(raw_mu_);

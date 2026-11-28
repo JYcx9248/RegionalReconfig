@@ -388,6 +388,22 @@ func TestReconfigUnderLoad(t *testing.T) {
 				t.Errorf("new node's raw vectors %+v: want them all from peers -- one per PQ code, or with "+
 					"lazy only those queries needed", raw)
 			}
+			// Every data node runs with its read cache (rtier_node's default, 5% of memory), and the
+			// queries' reads hit it: the answers above came through it.
+			var hits uint64
+			for id, n := range cl.ctl.Status().Table.Nodes {
+				info, err := nodeclient.New(n.NodeAddr, 1).Info(cl.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.RawCache.Capacity == 0 {
+					t.Errorf("node %d runs without a read cache", id)
+				}
+				hits += info.RawCache.Hits + info.RawCache.PeerHits
+			}
+			if hits == 0 {
+				t.Error("no read cache hit on any node")
+			}
 
 			rescale(t, cl, 2) // scale-in: remaining nodes pull only codes they do not have
 			time.Sleep(300 * time.Millisecond)

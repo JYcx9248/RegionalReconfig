@@ -74,6 +74,7 @@ add_library(fusion STATIC
   src/graph_image.cpp
   src/node_engine.cpp
   src/pq_store.cpp
+  src/raw_cache.cpp
   src/raw_store.cpp
   src/read_budget.cpp
 )

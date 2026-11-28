@@ -384,6 +384,17 @@ size_t RawStore::Put(const uint32_t* locs, size_t n, const uint8_t* vecs, RawOri
   } else {
     PutBuffered(locs, vecs, order);
   }
+  // The read cache's copies of the pages written are out of date: dropped before the bits say
+  // the new vectors are there, so that a reader who sees a bit cannot get a copy without its
+  // vector (and a read begun before the write cannot put one back: fusion/raw_cache.h).
+  if (cache_) {
+    uint32_t last = UINT32_MAX;
+    for (size_t i : order) {
+      const uint32_t page = layout_.page(locs[i]);
+      if (page != last) cache_->Invalidate(page);  // order is sorted by location
+      last = page;
+    }
+  }
   size_t installed = 0;
   for (size_t i : order) {
     const uint32_t loc = locs[i];
@@ -503,6 +514,9 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
     runs.push_back({first_pos, count, layout_.offset(loc), layout_.page(loc), false});
   });
   std::vector<uint8_t> got(uniq.size() * vb);  // uniq position u at u * vb
+  RawCache* const cache = cache_ && cache_->enabled() ? cache_.get() : nullptr;
+  const uint32_t ps = layout_.page_size;
+  std::vector<uint8_t> pages;  // with a read cache: this window's pages, whole
   // A request's device reads are in flight together: a read-ahead hint for every run the page
   // cache lacks, then the reads, which find their pages arrived or arriving. Read one after
   // another, each waited out the device's latency -- a peer's RAW_GET of 200 scattered vectors
@@ -510,6 +524,51 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
   // purpose: reading with O_DIRECT lost the page-cache hits and the read-ahead (engine/README.md).
   for (size_t w = 0; w < runs.size(); w += kReadsInFlight) {
     const size_t end = std::min(runs.size(), w + kReadsInFlight);
+    if (cache) {
+      // With a read cache (fusion/raw_cache.h), a page at a time -- a page's runs come in a row --
+      // from the cache, else whole from the page cache or the device, and kept: the cache sees
+      // the store's pages, not a request's slices of them. A whole page costs the device what a
+      // slice of it does.
+      struct PageRead {
+        size_t first, last;  // its runs
+        uint32_t page;
+        uint64_t ticket;
+      };
+      std::vector<PageRead> reads;
+      for (size_t k = w; k < end;) {
+        size_t j = k;
+        while (j + 1 < end && runs[j + 1].page == runs[k].page) ++j;
+        reads.push_back({k, j, runs[k].page, 0});
+        k = j + 1;
+      }
+      pages.resize(reads.size() * ps);
+      std::vector<size_t> device;  // positions into reads: one device read each
+      for (size_t i = 0; i < reads.size(); ++i) {
+        PageRead& p = reads[i];
+        uint8_t* page = pages.data() + i * ps;
+        if (cache->Lookup(p.page, page, ReadClass::kPeer)) continue;
+        p.ticket = cache->Version(p.page);  // before the read
+        if (budget_ && PreadCached(fd_, page, ps, static_cast<uint64_t>(p.page) * ps)) {
+          cache->Insert(p.page, page, p.ticket);
+          continue;
+        }
+        device.push_back(i);
+      }
+      const auto a = Admit(budget_, device.size(), ReadClass::kPeer);
+      for (size_t i : device)
+        ::posix_fadvise(fd_, static_cast<off_t>(static_cast<uint64_t>(reads[i].page) * ps), ps, POSIX_FADV_WILLNEED);
+      for (size_t i : device) {
+        uint8_t* page = pages.data() + i * ps;
+        PreadAll(fd_, page, ps, static_cast<uint64_t>(reads[i].page) * ps, path_);
+        cache->Insert(reads[i].page, page, reads[i].ticket);
+      }
+      for (size_t i = 0; i < reads.size(); ++i)
+        for (size_t k = reads[i].first; k <= reads[i].last; ++k)
+          std::memcpy(got.data() + runs[k].first * vb,
+                      pages.data() + i * ps + (runs[k].off - static_cast<uint64_t>(runs[k].page) * ps),
+                      runs[k].count * vb);
+      continue;
+    }
     // A page holds several runs where the asked vectors on it are not adjacent, and they come
     // in a row (runs are sorted): once one has started the page's read, the others wait for it
     // in their own read, neither probed (the page is not in the cache yet) nor counted again.
@@ -539,6 +598,10 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
     if (order[p] != uniq[u]) std::memcpy(out + order[p] * vb, out + uniq[u] * vb, vb);
   }
   served_.fetch_add(n, std::memory_order_relaxed);
+}
+
+void RawStore::SetCache(uint64_t bytes) {
+  cache_ = bytes >= layout_.page_size ? std::make_unique<RawCache>(bytes, layout_.page_size) : nullptr;
 }
 
 RawStats RawStore::Stats() const {

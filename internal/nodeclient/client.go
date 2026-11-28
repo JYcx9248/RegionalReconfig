@@ -205,6 +205,7 @@ type Info struct {
 	PQ            PQStats            `json:"pq"`
 	Raw           RawStats           `json:"raw"`
 	Fetch         FetchStats         `json:"fetch"`
+	RawCache      RawCacheStats      `json:"raw_cache"`
 	Ops           map[string]OpStats `json:"ops"`
 }
 
@@ -232,6 +233,20 @@ type FetchExtraStats struct {
 	Refills  uint64 `json:"refills"`
 	WaitUs   uint64 `json:"wait_us"`
 	Done     bool   `json:"done"`
+}
+
+// RawCacheStats is the node's read cache of raw-vector pages (fusion/raw_cache.h): what it may hold
+// and holds, in bytes; in pages, its hits and misses for the node's own reads (re-ranking) and for
+// those it serves to peers (RAW_GET), the pages it evicted and those installs dropped.
+type RawCacheStats struct {
+	Capacity   uint64 `json:"capacity"`
+	Bytes      uint64 `json:"bytes"`
+	Hits       uint64 `json:"hits"`
+	Misses     uint64 `json:"misses"`
+	PeerHits   uint64 `json:"peer_hits"`
+	PeerMisses uint64 `json:"peer_misses"`
+	Evicted    uint64 `json:"evicted"`
+	Dropped    uint64 `json:"dropped"`
 }
 
 // GraphInfo is the node's navigation graph (U14 major epochs patch it).

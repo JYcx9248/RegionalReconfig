@@ -65,6 +65,10 @@ static void Usage() {
                          in memory for the writer before a fetching query installs its own -- as
                          a share of the memory this node may use: its cgroup's limit, else the
                          machine's (an experiment's "FetchCacheShare"; default: 2 GB)
+  --raw-cache-share F    the read cache of raw-vector pages in front of the node's raw vectors
+                         (re-ranking's reads and those it serves to peers), as a share of the
+                         memory this node may use (an experiment's "RawCacheShare"; default 0.05,
+                         0 = none; fusion/raw_cache.h)
   --max-list-len N       longest posting list a request may gather, with room for inserts
                          (default: the partitions' longest)
   --max-candidates N     the filter's candidate buffers, in postings per request, for lists that
@@ -131,6 +135,20 @@ int main(int argc, char** argv) {
       o.fetch_cache_bytes = std::max<uint64_t>(static_cast<uint64_t>(share * static_cast<double>(memory)), 1);
       Log("fetch cache: at most %.2f GB, %g of the %.2f GB this node may use", o.fetch_cache_bytes / 1e9, share,
           memory / 1e9);
+    }
+    {
+      // On by default: a share of what the node may use, so that one setting fits every machine.
+      const bool given = a.Has("raw-cache-share");
+      const double share = given ? std::stod(a.Str("raw-cache-share", "")) : 0.05;
+      FUSION_CHECK(share >= 0 && share < 1, "--raw-cache-share %g: want a share of memory in [0, 1)", share);
+      const uint64_t memory = share > 0 ? MemoryLimitBytes() : 0;
+      FUSION_CHECK(memory > 0 || share == 0 || !given, "--raw-cache-share: the memory this node may use is unknown");
+      o.raw_cache_bytes = static_cast<uint64_t>(share * static_cast<double>(memory));
+      if (o.raw_cache_bytes)
+        Log("raw-vector read cache: %.2f GB, %g of the %.2f GB this node may use", o.raw_cache_bytes / 1e9, share,
+            memory / 1e9);
+      else
+        Log("raw-vector read cache: none%s", share > 0 ? " (the memory this node may use is unknown)" : "");
     }
     o.max_list_len = static_cast<uint32_t>(a.U64("max-list-len", 0));
     const uint64_t max_cand = a.U64("max-candidates", 0);
