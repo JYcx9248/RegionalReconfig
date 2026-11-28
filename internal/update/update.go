@@ -8,7 +8,9 @@ package update
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sort"
+	"sync/atomic"
 
 	"rtier/internal/epoch"
 	"rtier/internal/nodeclient"
@@ -97,10 +99,20 @@ type Insert struct {
 // assignBatch bounds one ASSIGN call (its frame).
 const assignBatch = 4096
 
+// RouteStreams is how many ASSIGN calls Route keeps in flight: half of this machine's CPUs. The
+// router runs here, next to the update controller (StartRouter, or the experiment runner's own),
+// and the router runs each call on a connection thread of its own, as it does NAVIGATE. The
+// other half stays with what shares the machine -- in an experiment, the cluster's controller and
+// the load generator. One call at a time, a batch took hours: ASSIGN is the build's search on the
+// graph for every vector, about 5 ms of a core each on Wikipedia (1024 dimensions, 1.6M heads),
+// so the 775K inserts of a 5% batch need over an hour of one core.
+func RouteStreams() int { return max(1, runtime.NumCPU()/2) }
+
 // Route gives each of the vectors in vecs (vecBytes each, in the index's element type) an ID
 // and a location from alloc, and routes it with the router node's ASSIGN: the lists the index's
 // build would have given it, by the build's own rule on the navigation graph, so that inserted
-// vectors are spread over lists the way built ones are, and its PQ code.
+// vectors are spread over lists the way built ones are, and its PQ code. The calls run side by
+// side (RouteStreams), each over its own vectors, so the result is the same as one at a time.
 func Route(ctx context.Context, router *nodeclient.Client, alloc *Allocator, vecs []byte, vecBytes int) ([]Insert, error) {
 	if vecBytes <= 0 || len(vecs)%vecBytes != 0 {
 		return nil, fmt.Errorf("update: %d bytes are not vectors of %d bytes", len(vecs), vecBytes)
@@ -110,18 +122,31 @@ func Route(ctx context.Context, router *nodeclient.Client, alloc *Allocator, vec
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Insert, 0, n)
-	for i := 0; i < n; i += assignBatch {
-		j := min(n, i+assignBatch)
-		as, err := router.Assign(ctx, vecs[i*vecBytes:j*vecBytes], j-i)
-		if err != nil {
-			return nil, err
-		}
-		for k, a := range as {
-			if len(a.Lists) == 0 {
-				return nil, fmt.Errorf("update: the router gave vector %d no list", i+k)
+	calls := (n + assignBatch - 1) / assignBatch
+	got := make([][]nodeclient.Assignment, calls)
+	var next atomic.Int64
+	err = parallel(ctx, min(calls, RouteStreams()), func(ctx context.Context, _ int) error {
+		for c := int(next.Add(1) - 1); c < calls; c = int(next.Add(1) - 1) {
+			i, j := c*assignBatch, min(n, (c+1)*assignBatch)
+			as, err := router.Assign(ctx, vecs[i*vecBytes:j*vecBytes], j-i)
+			if err != nil {
+				return err
 			}
-			out = append(out, Insert{ID: ids[i+k], Loc: locs[i+k], Lists: a.Lists, Code: a.Code})
+			got[c] = as
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Insert, 0, n)
+	for c, as := range got {
+		for k, a := range as {
+			i := c*assignBatch + k
+			if len(a.Lists) == 0 {
+				return nil, fmt.Errorf("update: the router gave vector %d no list", i)
+			}
+			out = append(out, Insert{ID: ids[i], Loc: locs[i], Lists: a.Lists, Code: a.Code})
 		}
 	}
 	return out, nil

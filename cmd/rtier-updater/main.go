@@ -261,7 +261,8 @@ func run(o options, rec *record) error {
 			defer stop()
 			log.Printf("router: %s on %s at %s", bin, o.index, addr)
 		}
-		u.Router = nodeclient.New(addr, 2)
+		// A connection for each ASSIGN that routing keeps in flight.
+		u.Router = nodeclient.New(addr, max(2, update.RouteStreams()))
 		defer u.Router.Close()
 	}
 	if n > 0 || len(del) > 0 {

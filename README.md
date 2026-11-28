@@ -286,7 +286,10 @@ nodes carry it out:
 2. It gives each insert an ID and a location and routes it by the build's own rule (`ASSIGN`: the
    lists the build would have chosen, and the PQ code) on its own router: an `rtier_node` with the
    index's navigation graph and codebook and nothing else, never a serving node, whose navigation
-   CPU queries need. Then it checks that every owner has room.
+   CPU queries need. It keeps as many `ASSIGN`s in flight as half of its machine's CPUs, where the
+   router runs (`update.RouteStreams`): each searches the graph for every vector, about 5 ms of a
+   core on Wikipedia, and one call at a time a 5% batch (775K inserts) did not end within 30 min.
+   Then it checks that every owner has room.
 3. It sends the codes and raw vectors to the owners' data nodes (`PQ_PUT`, `RAW_ADD`), which
    serve the vectors from memory and write them after the fetched ones, within
    `--update-write-mbps` (writes are not charged to the read budget yet).

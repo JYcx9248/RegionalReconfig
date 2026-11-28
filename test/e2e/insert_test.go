@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,6 +132,70 @@ func TestInsertRouting(t *testing.T) {
 	}
 	if !bytes.Equal(read(), vecs) {
 		t.Fatal("inserted vectors read back differently from the SSD")
+	}
+}
+
+// TestRouteSideBySide routes more vectors than one ASSIGN takes, so that Route's calls run side
+// by side on the update controller's router: every vector of the index, routed as if inserted,
+// still gets the build's lists and PQ code, and the IDs and locations that follow the index's,
+// in file order.
+func TestRouteSideBySide(t *testing.T) {
+	f := getFixture(t)
+	m, err := partitioning.LoadManifest(f.parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(f.dir, fmt.Sprintf("router-%d.log", nodeSeq.Add(1)))
+	logf, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raddr, stopRouter, err := update.StartRouter(filepath.Join(f.bin, "rtier_node"), f.index, f.parts, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := stopRouter()
+		logf.Close()
+		out, _ := os.ReadFile(logPath)
+		if err != nil || strings.Contains(string(out), "Sanitizer") || strings.Contains(string(out), "runtime error:") {
+			t.Errorf("router: %v (log %s)", err, logPath)
+		}
+	}()
+	router := nodeclient.New(raddr, max(2, update.RouteStreams()))
+	defer router.Close()
+
+	base, err := vecio.ReadBin(filepath.Join(f.dir, "base.fbin"), numVectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vb := len(base.Row(0))
+	vecs := make([]byte, 0, numVectors*vb)
+	for i := 0; i < numVectors; i++ {
+		vecs = append(vecs, base.Row(i)...)
+	}
+	alloc, err := update.NewAllocator(numVectors, 2*numVectors, m.Locations(), m.Locations()+numVectors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, err := update.Route(context.Background(), router, alloc, vecs, vb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ins) != numVectors {
+		t.Fatalf("%d of %d vectors routed", len(ins), numVectors)
+	}
+	built := builtLists(t, filepath.Join(f.index, "postings.bin"), numVectors)
+	codes := builtCodes(t, filepath.Join(f.index, "pq_codes.bin"), numVectors)
+	for i, x := range ins {
+		got := append([]uint32(nil), x.Lists...)
+		sort.Slice(got, func(a, b int) bool { return got[a] < got[b] })
+		if !reflect.DeepEqual(got, built[i]) || !bytes.Equal(x.Code, codes[i]) {
+			t.Fatalf("vector %d routed to lists %v with PQ code %x; the build gave %v, %x", i, got, x.Code, built[i], codes[i])
+		}
+		if x.ID != uint32(numVectors+i) || x.Loc != uint32(m.Locations())+uint32(i) {
+			t.Fatalf("insert %d got ID %d, location %d", i, x.ID, x.Loc)
+		}
 	}
 }
 
