@@ -76,7 +76,7 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
 | `test/e2e` | end-to-end tests |
 | `config.yaml` | the system configuration (defaults committed; the runners rewrite it before each run) |
 | `configs/` | experiments (JSON, one file each) |
-| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid), `score_answers.py` (recall per data version of a run with update batches), `run_one.sh` (one run on a clean node state, on one machine or a cluster; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
+| `scripts/` | `run_local.py` and `run_cluster.py` experiments, `experiment_config.py` (the experiment format), `plot_run.py`, `compare_runs.py` (mean latency per run, overlaid; `--per-node`: a line per data node, for skew mitigation; `analysis/skew_figure.py` the paper's skew figure, as Koala's Fig. 11: throughput, each node's page reads and re-ranked candidates, backlog), `score_answers.py` (recall per data version of a run with update batches), `run_one.sh` (one run on a clean node state, on one machine or a cluster; `evict_cache.py`), `node_reads.py`, `emulation/netns.sh`, `cloudlab/` (profile and node setup), `testing/` (placeholders, the GP partitioner, `fake_ssh`) |
 
 ## Conventions
 

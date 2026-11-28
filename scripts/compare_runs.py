@@ -14,7 +14,8 @@ and runs that share a label are pooled into one line: their queries are merged, 
 mean covers every run's queries sent in it. Pool only runs with the same schedule (the
 reconfigurations start within about a window of each other). Writes:
 
-  OUT.svg   the mean latency of the answered queries per window, one line per label, and under
+  OUT.svg   the mean latency of the answered queries per window (with the open-loop load the
+            answered queries and the backlog instead, below), one line per label, and under
             it one strip per label marking the reconfigurations of each of its runs: runs need
             not trigger them at the same moment (the end-to-end test starts each one when the
             previous returned). A dashed line marks each trigger, and a dotted one, in a line's
@@ -40,7 +41,9 @@ one). The
 means in OUT.json are by the time a query was sent (a query belongs to the period it arrived
 in) and cover every query, the peak window by the figure's windows. With the open-loop load (no "users" in latency.csv) the
 figure has no users panel: it draws the offered rate as a bold dashed line over the answered
-queries per second, and adds the backlog: queries sent and not answered yet. Lines whose runs ran
+queries per second, and adds the backlog: queries sent and not answered yet. It draws no latency
+panel then: a query's latency is mostly its wait in that backlog (OUT.csv and OUT.json keep the
+means). Lines whose runs ran
 different loads (keepup-all's lazy, held longer than the baselines) each get their own offered
 rate, named by where it stopped; the others in lighter dashes where they leave the first: a line's
 backlog balances against its own load, against 0 once that load has stopped. It grows whenever the offered rate exceeds what the cluster answers, and after a
@@ -53,11 +56,20 @@ has nothing to do with reconfiguration). Means cover answered queries only,
 so they compare runs only when no query failed: a refused query that gave up is missing from
 them (see "RetryForSeconds" in run_local.py; the end-to-end test's clients always wait).
 
+--per-node draws one label's runs with a line per data node instead (skew mitigation: the
+aggregate hides which node carries the load): each node's page reads per second, the requests it
+holds and their latency, from its stats-<node>.jsonl, averaged per node over the runs; the
+reconfigurations and transfers in neutral ink, the colours being the nodes'. OUT.csv then has the
+nodes' windows, and OUT.json each node's means before the first trigger and in the load's last
+minute.
+
 No dependencies: the SVG is written here, in light and dark.
 """
 
 import argparse
+import bisect
 import csv
+import glob
 import json
 import math
 import os
@@ -329,13 +341,110 @@ def mb(v):
     return "%.1f MB" % (v / 1e6) if v >= 1e5 else "%.0f KB" % (v / 1e3)
 
 
+def node_stats(d):
+    """Each data node's counters over a run (stats-<node>.jsonl, rtier_node --stats-file, one record
+    a second), on latency.csv's time axis (clock.json's load_start): {node: (times, [cumulative
+    values])}. The values: page reads (reads.charged, its queries' and the reads it served to peers'
+    fetches), then FILTER and RERANK requests, each with the microseconds they spent in the node from
+    arrival to reply (ops busy_us: waiting for an engine worker, a RERANK's fetches and reads
+    included), then the candidates its RERANKs re-ranked (fetch.rerank_disk + rerank_mem: each of a
+    query's candidates is re-ranked at one node)."""
+    try:
+        zero = json.load(open(os.path.join(d, "clock.json")))["load_start"]
+    except (OSError, ValueError, KeyError):
+        sys.exit("%s: no clock.json, so its nodes' stats have no time axis in common with its queries" % d)
+    out = {}
+    for path in glob.glob(os.path.join(d, "stats-*.jsonl")):
+        ts, vs = [], []
+        with open(path) as f:
+            for line in f:
+                r = json.loads(line) if line.strip() else {}
+                if "reads" not in r or "ops" not in r or "fetch" not in r:  # reads: since 2026-11-12
+                    continue
+                o, fc = r["ops"], r["fetch"]
+                ts.append(r["t"] - zero)
+                vs.append((r["reads"]["charged"], o["filter"]["count"], o["filter"]["busy_us"],
+                           o["rerank"]["count"], o["rerank"]["busy_us"], fc["rerank_disk"] + fc["rerank_mem"]))
+        if len(ts) > 1:
+            out[os.path.basename(path)[len("stats-"):-len(".jsonl")]] = (ts, vs)
+    if not out:
+        sys.exit("%s: no stats-<node>.jsonl with read and request counters" % d)
+    return out
+
+
+def cum_at(ts, vs, t):
+    """Cumulative counters at time t, linear between the records around it; None outside them."""
+    if t < ts[0] or t > ts[-1]:
+        return None
+    i = min(bisect.bisect_right(ts, t), len(ts) - 1)
+    a, b = ts[i - 1], ts[i]
+    f = (t - a) / (b - a) if b > a else 1.0
+    return [x + f * (y - x) for x, y in zip(vs[i - 1], vs[i])]
+
+
+def node_flows(runs_stats, width, n):
+    """Per node and window, the mean over the pooled runs that have the node: page reads per second;
+    the requests in the node, waiting or served (Little: FILTER and RERANK microseconds per
+    microsecond); the mean latency of its FILTERs plus that of its RERANKs in ms, a query's time at
+    the node (None in a window that served neither); and the candidates it re-ranked per second.
+    Nodes by name, n1 before n10."""
+    names = sorted({k for s in runs_stats for k in s}, key=lambda x: (len(x), x))
+    out = {}
+    for name in names:
+        ws = []
+        for k in range(n):
+            t0, t1 = k * width, (k + 1) * width
+            vals = []
+            for s in runs_stats:
+                if name not in s:
+                    continue
+                a, b = cum_at(*s[name], t0), cum_at(*s[name], t1)
+                if a is None or b is None:
+                    continue
+                d = [y - x for x, y in zip(a, b)]
+                parts = [us / c / 1000.0 for c, us in ((d[1], d[2]), (d[3], d[4])) if c > 0.5]
+                vals.append((d[0] / width, (d[2] + d[4]) / (width * 1e6), sum(parts) if parts else None,
+                             d[5] / width))
+            mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
+            ws.append({"t": t0, "reads": mean([v[0] for v in vals]), "held": mean([v[1] for v in vals]),
+                       "ms": mean([v[2] for v in vals if v[2] is not None]), "cands": mean([v[3] for v in vals])})
+        out[name] = ws
+    return out
+
+
+def node_summary(nf, width, periods):
+    """Per period (name, t0, t1): each node's mean page reads per second, requests and latency over
+    the windows inside it, its share of the reads, and the busiest node's reads against an even
+    share."""
+    out = {}
+    for pname, t0, t1 in periods:
+        per = {}
+        for name, ws in nf.items():
+            inside = [w for w in ws if w["t"] >= t0 - 1e-9 and w["t"] + width <= t1 + 1e-9]
+            avg = lambda k: (lambda xs: sum(xs) / len(xs) if xs else None)(  # noqa: E731
+                [w[k] for w in inside if w[k] is not None])
+            per[name] = {"reads_per_s": avg("reads"), "requests": avg("held"), "latency_ms": avg("ms")}
+        total = sum(p["reads_per_s"] or 0 for p in per.values())
+        for p in per.values():
+            p["reads_share"] = round(p["reads_per_s"] / total, 4) if total and p["reads_per_s"] else None
+            for k in ("reads_per_s", "requests", "latency_ms"):
+                p[k] = round(p[k], 2) if p[k] is not None else None
+        shares = [p["reads_share"] for p in per.values() if p["reads_share"]]
+        out[pname] = {"from_s": round(t0, 3), "to_s": round(t1, 3), "nodes": per,
+                      "busiest_vs_even": round(max(shares) * len(per), 3) if shares else None}
+    return out
+
+
 def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_latency=False,
-                 flows=None, offered=None, stopped=None):
+                 flows=None, offered=None, stopped=None, nodes=None):
     """lines: [(label, slot, pooled windows, [reconfigurations of each run], runs)]; users:
     [(t, n)] per window or None; moved: {label: bytes by component, mean over its runs} or {};
     flows: {label: flow()}; offered: [(name, [(t, rate)] per window)] with the open-loop load, one
     per load the lines ran, else None (then no backlog panel); stopped: when the load stopped,
-    where the axis ends, or None. One time axis (t_min to span) for every panel."""
+    where the axis ends, or None. One time axis (t_min to span) for every panel. nodes (--per-node,
+    one label): {"names", "slots", "width", "flows": node_flows()}: the panels draw a line per data
+    node instead, and the reconfigurations and transfers are drawn in neutral ink, the colours being
+    the nodes'."""
     plot_w = W - LEFT - RIGHT
     x = lambda t: LEFT + plot_w * ((t - t_min) / (span - t_min) if span > t_min else 0)
     panels = []  # (title, unit, height, series [(slot, None or "alt", [(t, v)])], dashed legend)
@@ -361,9 +470,24 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         panels.append(("backlog: queries sent, not answered yet", "queries", 120,
                        [(slot, [(w["t"] + width, w["backlog"]) for w in flows[label] if w["t"] + width <= span])
                         for label, slot, _, _, _ in lines]))
-    panels.append(("mean latency of the answered queries" + (" (log scale)" if log_latency else ""), "ms", 210,
-                   [(slot, [(w["t"] + width / 2, w["mean_us"] / 1000.0 if w["mean_us"] else None) for w in win])
-                    for _, slot, win, _, _ in lines]))
+    # Under the open-loop load a query's latency is mostly its wait in the backlog, which the panel
+    # above draws: a mean per window adds nothing to it (2026-11-26). The closed loop has no backlog,
+    # its users wait instead, so there the latency is the figure's measure.
+    if not offered:
+        panels.append(("mean latency of the answered queries" + (" (log scale)" if log_latency else ""), "ms", 210,
+                       [(slot, [(w["t"] + width / 2, w["mean_us"] / 1000.0 if w["mean_us"] else None) for w in win])
+                        for _, slot, win, _, _ in lines]))
+    if nodes:  # the same three panels, a line per data node: where the load sat, and what it cost there
+        nw = nodes["width"]
+
+        def per_node(key):
+            return [(slot, [(w["t"] + nw / 2, w[key]) for w in nodes["flows"][name] if w["t"] + nw <= span])
+                    for name, slot in zip(nodes["names"], nodes["slots"])]
+        panels = [("page reads per second at each node: its queries' and its peers' fetches", "reads/s", 170,
+                   per_node("reads")),
+                  ("requests at each node: FILTERs and RERANKs waiting or served", "requests", 120, per_node("held")),
+                  ("mean latency of a FILTER plus a RERANK at each node" + (" (log scale)" if log_latency else ""),
+                   "ms", 210, per_node("ms"))]
     title_lines = textwrap.wrap(title, TITLE_CHARS) if title else []
     below = 18 * (len(title_lines) - 1) if title_lines else 0  # each wrapped line moves the rest down
     tops, yy = [], (TOP + below if title else 10) + 24  # no title: a paper figure, its caption carries it
@@ -381,6 +505,8 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                  ".axis { stroke: %s; }" % axis, ".hit line { stroke: %s; }" % ink2, ".cu { stroke: %s; }" % ink2]
         rules += [".c%d { stroke: %s; } .f%d { fill: %s; }" % (i, c[mode], i, c[mode])
                   for i, c in enumerate(PALETTE)]
+        if nodes:  # only here, so that the other figures keep their stylesheet byte for byte
+            rules.append(".fu { fill: %s; }" % ink2)
         return "\n".join("  " + r for r in rules)
 
     # Colours are written out per class (no CSS variables) so that converters such as
@@ -443,7 +569,7 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
 
     for pi, ((ptitle, unit, ph, series), y0) in enumerate(zip(panels, tops)):
         values = [v for _, pts in series for _, v in pts if v is not None]
-        if log_latency and pi == len(panels) - 1 and values:
+        if log_latency and unit == "ms" and values:
             # Latency spans milliseconds to a stop-and-copy pause of seconds: decades.
             lo = 10 ** math.floor(math.log10(min(v for v in values if v > 0)))
             hi = 10 ** math.ceil(math.log10(max(values)))
@@ -468,7 +594,8 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
         for t, cls in trig_cls:  # under the data
             svg.append('<line class="%s" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>' % (cls, x(t), y0, x(t), y0 + ph))
         for t, slot in flips:
-            svg.append('<line class="flip c%d" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>' % (slot, x(t), y0, x(t), y0 + ph))
+            svg.append('<line class="flip %s" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>'
+                       % ("cu" if nodes else "c%d" % slot, x(t), y0, x(t), y0 + ph))
         for slot, pts in series:
             if slot == "alt":  # another load's offered rate, where it leaves the first: a step path per stretch
                 d = []
@@ -524,23 +651,24 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                % (LEFT + plot_w / 2, axis_y + 36, esc("seconds since the load started" + (
                    ", until it stopped at %s s" % fmt(stopped) if stopped is not None else ""))))
 
-    ly0 = tops[1 if users else 0]  # legend beside the first panel with one line per run
-    for i, (label, slot, _, _, _) in enumerate(lines):
+    ly0 = tops[1 if users and not nodes else 0]  # legend beside the first panel with one line per run
+    legend = list(zip(nodes["names"], nodes["slots"])) if nodes else [(label, slot) for label, slot, _, _, _ in lines]
+    for i, (label, slot) in enumerate(legend):
         lx, ly = W - RIGHT + 16, ly0 + 10 + i * 18
         svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(label)))
     nrates = len(offered or [])
     for i, (name, _) in enumerate(offered or []):
-        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + i) * 18
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(legend) + i) * 18
         svg.append('<line class="line cu sched"%s x1="%d" y1="%d" x2="%d" y2="%d"/>'
                    % (' style="%s"' % ALT_RATE if i else "", lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ly, esc(name)))
     if trig_cls:
-        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + nrates) * 18
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(legend) + nrates) * 18
         svg.append('<line class="line trig cu" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">trigger</text>' % (lx + 22, ly))
     if flips:
-        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(lines) + nrates + (1 if trig_cls else 0)) * 18
+        lx, ly = W - RIGHT + 16, ly0 + 10 + (len(legend) + nrates + (1 if trig_cls else 0)) * 18
         svg.append('<line class="line flip cu" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (lx, ly - 4, lx + 16, ly - 4))
         svg.append('<text class="legend" x="%d" y="%d">flip</text>' % (lx + 22, ly))
 
@@ -569,9 +697,9 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                 # stops at the axis' end and the label says when it ended.
                 x0, x1 = x(t0), min(max(x(t0 + dur), x(t0) + 3), x(span))
                 begin, end, last = min(begin, x0), max(end, x1), max(last, t0 + dur)
-                svg.append('<rect class="span f%d" x="%.1f" y="%d" width="%.1f" height="8" rx="2">'
+                svg.append('<rect class="span %s" x="%.1f" y="%d" width="%.1f" height="8" rx="2">'
                            '<title>%s: %s, %.2f s from %.2f s</title></rect>'
-                           % (slot, x0, ry + 2, x1 - x0, esc(label), esc(name), dur, t0))
+                           % ("fu" if nodes else "f%d" % slot, x0, ry + 2, x1 - x0, esc(label), esc(name), dur, t0))
             name = esc(runs_rcs[0][j][2].replace("rescale to ", "→"))
             ts = flip_of.get((i, j))
             if ts:  # the runs' flips: their mean when they agree within a second, else the range
@@ -602,7 +730,8 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
                 svg.append('<text class="tick" x="%.1f" y="%d" text-anchor="end">%s</text>' % (end, ry, text))
                 right["above"] = end
         lx = W - RIGHT + 16
-        svg.append('<line class="line c%d" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (slot, lx, ry + 6, lx + 16, ry + 6))
+        svg.append('<line class="line %s" x1="%d" y1="%d" x2="%d" y2="%d"/>'
+                   % ("cu" if nodes else "c%d" % slot, lx, ry + 6, lx + 16, ry + 6))
         svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (lx + 22, ry + 10, esc(label)))
 
     # Data moved by each pipeline: one bar per label, the parts spelled out beside it.
@@ -617,32 +746,42 @@ def svg_document(lines, t_min, span, width, title, subtitle, users, moved, log_l
             parts, total = moved[label], sum(moved[label].values())
             by = bars_top + i * 34
             svg.append('<text class="legend" x="%d" y="%d">%s</text>' % (LEFT, by + 10, esc(label)))
-            svg.append('<rect class="span f%d" x="%d" y="%d" width="%.1f" height="12" rx="2"/>'
-                       % (slot, bx, by, max(2.0, bw * total / biggest)))
+            svg.append('<rect class="span %s" x="%d" y="%d" width="%.1f" height="12" rx="2"/>'
+                       % ("fu" if nodes else "f%d" % slot, bx, by, max(2.0, bw * total / biggest)))
             detail = " · ".join("%s %s" % (name, mb(parts[k])) for k, name in PARTS if parts[k])
             svg.append('<text class="tick" x="%d" y="%d"><tspan font-weight="600">%s</tspan></text>'
                        % (bx + bw + 10, by + 10, esc(mb(total))))
             svg.append('<text class="tick" x="%d" y="%d">%s</text>' % (bx, by + 26, esc(detail)))
 
     # Hover: a crosshair per window over every panel, one readout with every line.
-    n = max(len(win) for _, _, win, _, _ in lines)
+    hw = nodes["width"] if nodes else width
+    n = max(len(f) for f in nodes["flows"].values()) if nodes else max(len(win) for _, _, win, _, _ in lines)
     for k in range(n):
-        t = k * width
-        if t + width <= t_min:
+        t = k * hw
+        if t + hw <= t_min or (nodes and t >= span):
             continue
-        text = ["%.2f–%.2f s" % (t, t + width)]
-        if users and k < len(users) and users[k][1] is not None:
+        text = ["%.2f–%.2f s" % (t, t + hw)]
+        if nodes:
+            val = lambda v, f: f % v if v is not None else "–"  # noqa: E731
+            for name in nodes["names"]:
+                w = nodes["flows"][name][k] if k < len(nodes["flows"][name]) else {}
+                text.append("%s: %s reads/s, %s requests, %s" % (
+                    name, val(w.get("reads"), "%.0f"), val(w.get("held"), "%.1f"), val(w.get("ms"), "%.2f ms")))
+        if users and not nodes and k < len(users) and users[k][1] is not None:
             text.append("users: %d" % users[k][1])
-        for name, pts in offered or []:
+        for name, pts in [] if nodes else offered or []:
             if k < len(pts):
                 text.append("%s: %.0f q/s" % (name, pts[k][1]))
-        for label, _, win, _, runs in lines:
+        for label, _, win, _, runs in [] if nodes else lines:
             w = win[k] if k < len(win) else None
             f = flows[label][k] if k < len(flows[label]) else None
-            text.append("%s: %s, %s%s" % (label, "%.0f q/s" % f["answered"] if f else "–",
-                                          "%.2f ms" % (w["mean_us"] / 1000.0) if w and w["mean_us"] else "–",
-                                          ", backlog %.0f" % f["backlog"] if f and offered else ""))
-        x0, x1 = x(max(t, t_min)), x(min(t + width, span))
+            parts = ["%.0f q/s" % f["answered"] if f else "–"]
+            if offered:  # the readout shows what the panels draw
+                parts += ["backlog %.0f" % f["backlog"]] if f else []
+            else:
+                parts.append("%.2f ms" % (w["mean_us"] / 1000.0) if w and w["mean_us"] else "–")
+            text.append("%s: %s" % (label, ", ".join(parts)))
+        x0, x1 = x(max(t, t_min)), x(min(t + hw, span))
         svg.append('<g class="hit"><title>%s</title><rect x="%.1f" y="%d" width="%.1f" height="%d"/>'
                    '<line x1="%.1f" y1="%d" x2="%.1f" y2="%d"/></g>'
                    % (esc("\n".join(text)), x0, tops[0], max(x1 - x0, 1), axis_y - tops[0],
@@ -668,12 +807,17 @@ def main():
     ap.add_argument("--out", help="output path without extension (default: latency-mean next to the runs)")
     ap.add_argument("--title", default="Mean latency over time",
                     help="the title; \"\" for none, and no subtitle either (a paper figure, whose caption carries them)")
-    ap.add_argument("--log-latency", action="store_true", help="latency panel on a log scale")
+    ap.add_argument("--log-latency", action="store_true",
+                    help="latency panel on a log scale (closed loop and --per-node: the open-loop figure has none)")
     ap.add_argument("--slo-ms", type=float, default=200.0,
                     help="open loop: count the queries answered later than this (default 200 ms)")
     ap.add_argument("--skip", type=float, default=None,
                     help="leave out the queries sent in the first SKIP seconds of each run (warm-up; "
                     "default: \"WarmupSeconds\" in the first run's experiment.json, else 0)")
+    ap.add_argument("--per-node", action="store_true",
+                    help="one line per data node instead of one per label (skew mitigation): each node's page "
+                    "reads per second, the requests it holds and their latency, from its stats-<node>.jsonl, per "
+                    "--window seconds of at least 1 (the stats' interval); one label, its runs' nodes averaged")
     args = ap.parse_args()
 
     names = args.labels.split(",") if args.labels else [os.path.basename(os.path.abspath(d)) for d in args.runs]
@@ -689,9 +833,12 @@ def main():
                               .get("Load", {}).get("WarmupSeconds", 0))
         except (OSError, ValueError):
             args.skip = 0.0
+    if args.per_node and len(labels) != 1:
+        sys.exit("--per-node draws a line per data node of one label's runs: give the runs of one label")
     out = args.out or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.runs[0])))
                                    if len(groups[labels[0]]) > 1 else
-                                   os.path.dirname(os.path.abspath(args.runs[0])), "latency-mean")
+                                   os.path.dirname(os.path.abspath(args.runs[0])),
+                                   "per-node" if args.per_node else "latency-mean")
 
     lines, summary, users, moved, flows = [], [], None, {}, {}
     sched = offered_schedule(args.runs[0])
@@ -757,31 +904,66 @@ def main():
             same = all(s == loads[0][0] for s, _, _ in loads)  # then they differ only in where they stopped
             offered = [("offered to %s s" % fmt(e) if same else "offered: " + ", ".join(ls), rates(s, e))
                        for s, e, ls in loads]
+    nodes = None
+    if args.per_node:
+        # The nodes' counters come once a second: a window shorter than that would only interpolate.
+        nw = max(args.window, 1.0)
+        nf = node_flows([node_stats(d) for d in groups[labels[0]]], nw, int(math.ceil(span / nw)))
+        if len(nf) > len(PALETTE):
+            sys.exit("%d data nodes, more than the palette's %d colours" % (len(nf), len(PALETTE)))
+        nodes = {"names": list(nf), "slots": list(range(len(nf))), "width": nw, "flows": nf}
+        periods = []
+        rcs0 = lines[0][3]
+        if rcs0 and rcs0[0]:  # the 30 s before the first trigger, and the load's last minute
+            trig = sum(rcs[0][0] for rcs in rcs0) / len(rcs0)
+            periods.append(("before_trigger", max(args.skip, trig - 30), trig))
+        periods.append(("last_minute", max(args.skip, span - 60), span))
+        summary[0]["per_node"] = node_summary(nf, nw, periods)
     counts = {len(groups[l]) for l in labels}
-    subtitle = "per %s ms window: %s" % (fmt(args.window * 1000), "answers and their latency when they came"
-                                         if args.latency_at == "answer" else "answers when they came, latency by send time")
-    if counts != {1}:
-        subtitle += ", pooled over %s runs per line" % (counts.pop() if len(counts) == 1 else "the")
+    if nodes:
+        subtitle = "per %g s window, from each data node's stats" % nodes["width"]
+        if counts != {1}:
+            subtitle += ", the mean of %d runs per node" % counts.pop()
+    else:
+        subtitle = "per %s ms window: %s" % (fmt(args.window * 1000), "answers when they came" if offered else (
+            "answers and their latency when they came" if args.latency_at == "answer"
+            else "answers when they came, latency by send time"))
+        if counts != {1}:
+            subtitle += ", pooled over %s runs per line" % (counts.pop() if len(counts) == 1 else "the")
     if args.skip:
         subtitle += "; first %s ms left out (warm-up)" % fmt(args.skip * 1000)
     with open(out + ".svg", "w") as f:
         f.write(svg_document(lines, args.skip, span, args.window, args.title, subtitle, users, moved,
-                             args.log_latency, flows, offered, end if args.until == "load" and span >= end else None))
+                             args.log_latency, flows, None if nodes else offered,
+                             end if args.until == "load" and span >= end else None, nodes))
     with open(out + ".csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["t_s"] + [c for l in labels for c in (l + " mean_us", l + " queries sent",
-                                                          l + " answered_per_s", l + " backlog")])
-        for k in range(max(len(win) for _, _, win, _, _ in lines)):
-            if (k + 1) * args.window <= args.skip:
-                continue
-            row = ["%.3f" % (k * args.window)]
-            for label, _, win, _, runs in lines:
-                x = win[k] if k < len(win) else None
-                f = flows[label][k] if k < len(flows[label]) else None
-                row += ["%.1f" % x["mean_us"] if x and x["mean_us"] else "",
-                        "%d" % round(x["offered"] * args.window / runs) if x else "",
-                        "%.1f" % f["answered"] if f else "", "%.1f" % f["backlog"] if f else ""]
-            w.writerow(row)
+        if nodes:
+            w.writerow(["t_s"] + [c for name in nodes["names"]
+                                  for c in (name + " reads_per_s", name + " requests", name + " latency_ms")])
+            for k in range(int(math.ceil(span / nodes["width"]))):
+                t = k * nodes["width"]
+                if t + nodes["width"] <= args.skip:
+                    continue
+                row = ["%.3f" % t]
+                for name in nodes["names"]:
+                    x = nodes["flows"][name][k]
+                    row += ["%.1f" % x[c] if x[c] is not None else "" for c in ("reads", "held", "ms")]
+                w.writerow(row)
+        else:
+            w.writerow(["t_s"] + [c for l in labels for c in (l + " mean_us", l + " queries sent",
+                                                              l + " answered_per_s", l + " backlog")])
+            for k in range(max(len(win) for _, _, win, _, _ in lines)):
+                if (k + 1) * args.window <= args.skip:
+                    continue
+                row = ["%.3f" % (k * args.window)]
+                for label, _, win, _, runs in lines:
+                    x = win[k] if k < len(win) else None
+                    f = flows[label][k] if k < len(flows[label]) else None
+                    row += ["%.1f" % x["mean_us"] if x and x["mean_us"] else "",
+                            "%d" % round(x["offered"] * args.window / runs) if x else "",
+                            "%.1f" % f["answered"] if f else "", "%.1f" % f["backlog"] if f else ""]
+                w.writerow(row)
     with open(out + ".json", "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -810,6 +992,13 @@ def main():
             tb = s["transferred_bytes"]
             print("  transferred per run: %s (%s)" % (mb(tb["total"]), ", ".join(
                 "%s %s" % (name, mb(tb[k])) for k, name in PARTS if tb[k])))
+        for pname, p in s.get("per_node", {}).items():
+            print("  %s (%.0f-%.0f s): busiest node %sx an even share of the reads; %s" % (
+                pname.replace("_", " "), p["from_s"], p["to_s"], p["busiest_vs_even"], "; ".join(
+                    "%s %.0f reads/s, %.1f requests, %s" % (
+                        n, v["reads_per_s"] or 0, v["requests"] or 0,
+                        "%.1f ms" % v["latency_ms"] if v["latency_ms"] is not None else "–")
+                    for n, v in p["nodes"].items())))
     print("wrote %s.svg, .csv, .json" % out)
 
 

@@ -744,9 +744,24 @@ its send time, long before it ran when it waited in a backlog (`--latency-at sen
 view: what a query sent then waited). The time axis ends where the load stopped
 (`"DurationSeconds"`), so that every line covers the same period: a backlog that the cluster
 serves only after it (copy-then-flip under overload) is what the backlog panel ends with, and
-`--until answer` draws on to the last answer. Runs that share a directory name are pooled, or a name from `--labels`. A protocol keeps
+`--until answer` draws on to the last answer. Under the open-loop load the figure draws the offered
+and answered queries per second and the backlog, and no latency panel: a query's latency there is
+mostly its wait in the backlog (OUT.csv and OUT.json keep the means). Runs that share a directory name are pooled, or a name from `--labels`. A protocol keeps
 its own colour; `--slots` picks the palette slot of each label instead, for lines that are not
-protocols, such as one protocol before and after a change. The end-to-end test gives the smallest
+protocols, such as one protocol before and after a change. `--per-node` draws one label's runs
+with a line per data node instead, for skew mitigation, where the aggregate hides which node
+carries the load: each node's page reads per second (its queries' and those it serves to peers'
+fetches), the FILTER and RERANK requests it holds, waiting or served, and the mean latency of a
+FILTER plus a RERANK there, from its `stats-<node>.jsonl` (one record a second, so windows of at
+least 1 s; repetitions averaged per node), with each node's share of the reads before the first
+trigger and in the load's last minute in OUT.json. `scripts/analysis/skew_figure.py` draws the
+paper's version in one row at the page's width, as Koala's Figure 11 with more panels, since a query
+of ours goes to several nodes and their lines do not add up to the cluster's throughput: the offered
+and answered queries per second, each node's load, and the backlog. A node's load is its page reads
+(`--node-metric reads`: what its disk pays, an old owner's reads for the partitions it gave away
+included) or the candidates it re-ranked (`candidates`: each is re-ranked at one node, so this is the
+work the placement gives the node, and it moves at the flip); the paper's figure gives both, a panel
+each, on one range (`--node-metric reads --node-metric candidates`). The end-to-end test gives the smallest
 version: with `RTIER_E2E_TIMELINE` set, `TestReconfigUnderLoad` writes each protocol's
 queries and rescales (2 → 3 → 2 → 3 under closed-loop load) in the formats of the load
 generator and `run_local.py`. Run each protocol in its own process, so that none of them
