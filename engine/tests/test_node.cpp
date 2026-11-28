@@ -1897,14 +1897,17 @@ void RawStoreCase(bool direct, uint32_t cache_pages = 0) {
 
 // A Get spread over many pages (600), with repeated locations, comes back complete and in order --
 // also through a read cache, twice: one of 100 pages evicts as it goes, one of 700 serves the
-// second Get without a miss.
-void RawStoreManyPages(bool direct, uint32_t cache_pages = 0) {
+// second Get without a miss -- and with the node's own reads first, where a Get admits its reads
+// a batch of peer_batch() at a time (here one).
+void RawStoreManyPages(bool direct, uint32_t cache_pages = 0, bool own_first = false) {
   RawLayout L;
   L.vec_bytes = 1000;
   L.vectors_per_page = 4;
   L.num_pages = 600;
   RawStore s("", L, direct);
   s.SetCache(static_cast<uint64_t>(cache_pages) * L.page_size);
+  ReadBudget budget(0, ReadOrder::kOwnFirst, 8);
+  if (own_first) s.SetReadBudget(&budget);
   std::vector<uint32_t> all(L.locations());
   std::iota(all.begin(), all.end(), 0u);
   auto vec = [](uint32_t loc, uint8_t* out) {
@@ -2115,6 +2118,9 @@ void TestRawStore() {
     RawStoreManyPages(false, pages);
     RawStoreManyPages(true, pages);
   }
+  RawStoreManyPages(false, 0, true);
+  RawStoreManyPages(true, 0, true);
+  RawStoreManyPages(true, 100, true);
   RawStoreSnapshot(false);
   RawStoreSnapshot(true);
 }
@@ -2810,7 +2816,7 @@ void TestReadBudget() {
   // Peers first (--peer-reads-first): a peer's reads do not wait behind the own reads queued
   // before them, which they do in arrival order; among themselves they keep the rate.
   for (const bool first : {false, true}) {
-    ReadBudget b(1000, first);
+    ReadBudget b(1000, first ? ReadOrder::kPeersFirst : ReadOrder::kArrival);
     b.Charge(static_cast<uint64_t>(1000 * ReadBudget::kBurstSeconds));  // the idle burst, used up
     std::thread own([&b] { b.Charge(400); });                           // 400 ms of own reads
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -2821,7 +2827,7 @@ void TestReadBudget() {
     CHECK(first ? s < 0.1 : s >= 0.35);
   }
   {
-    ReadBudget b(1000, true);
+    ReadBudget b(1000, ReadOrder::kPeersFirst);
     const auto t0 = Clock::now();
     b.Charge(100, ReadClass::kPeer);  // the burst
     b.Charge(200, ReadClass::kPeer);  // 200 ms past it
@@ -2829,7 +2835,7 @@ void TestReadBudget() {
   }
   {
     // No rate, no order: the reads are counted, by class, and nothing waits.
-    ReadBudget b(0, false, 1);
+    ReadBudget b(0, ReadOrder::kArrival, 1);
     const ReadBudget::Admission x = b.Admit(5);
     const auto t0 = Clock::now();
     const ReadBudget::Admission y = b.Admit(3, ReadClass::kPeer);
@@ -2841,7 +2847,7 @@ void TestReadBudget() {
   {
     // Peers first with no rate: one read at the device at once (depth 1), and a peer's read goes in
     // ahead of an own read that waited longer. The own read goes in once the peer's is done.
-    ReadBudget b(0, true, 1);
+    ReadBudget b(0, ReadOrder::kPeersFirst, 1);
     std::atomic<int> seq{0};
     int own_at = 0, peer_at = 0;
     auto held = std::make_unique<ReadBudget::Admission>(b.Admit(4));  // more than the depth: all of it
@@ -2863,6 +2869,35 @@ void TestReadBudget() {
     const ReadBudgetStats st = b.Stats();
     CHECK(both_waited && peer_at == 1 && own_at == 2 && st.depth == 1 && st.charged == 6 && st.peer == 1 &&
           st.wait_us >= 100000);
+  }
+  {
+    // Own first, the other way round: an own read goes in ahead of a peer's read that waited
+    // longer, and the peer's once the own one is done. A peer's request is then cut into batches
+    // of depth / 8 reads (at least one).
+    ReadBudget b(0, ReadOrder::kOwnFirst, 1);
+    std::atomic<int> seq{0};
+    int own_at = 0, peer_at = 0;
+    auto held = std::make_unique<ReadBudget::Admission>(b.Admit(4));
+    std::thread peer([&] {
+      const ReadBudget::Admission a = b.Admit(1, ReadClass::kPeer);
+      peer_at = ++seq;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::thread own([&] {
+      const ReadBudget::Admission a = b.Admit(1);
+      own_at = ++seq;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));  // at the device a while
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool both_waited = seq.load() == 0;
+    held.reset();
+    own.join();
+    peer.join();
+    const ReadBudgetStats st = b.Stats();
+    CHECK(both_waited && own_at == 1 && peer_at == 2 && st.depth == 1 && st.charged == 6 && st.peer == 1 &&
+          b.peer_batch() == 1 && ReadBudget(0, ReadOrder::kOwnFirst, 64).peer_batch() == 8 &&
+          ReadBudget(0, ReadOrder::kPeersFirst, 64).peer_batch() == UINT32_MAX &&
+          ReadBudget(0).peer_batch() == UINT32_MAX);
   }
   {
     RawLayout L;

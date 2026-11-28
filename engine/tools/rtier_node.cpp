@@ -44,8 +44,8 @@ static void Usage() {
                          pq_codes.bin, which a node opens only to read a code from it
   --layout L             bucket | id (default: the layout the partitions were written for)
   --io B                 auto | uring | aio | pread (default auto)
-  --io-depth D           (default 64): each reader's queue depth, and with --peer-reads-first the
-                         device reads the node has at the device at once
+  --io-depth D           (default 64): each reader's queue depth, and with --peer-reads-first or
+                         --own-reads-first the device reads the node has at the device at once
   --no-direct            buffered instead of O_DIRECT reads
   --read-iops N          device reads per second this node may issue (default 0 = no limit): a
                          node's own share of an SSD that several nodes use, where no cgroup can
@@ -55,6 +55,10 @@ static void Usage() {
                          copy-then-flip whose stream goes first. Needs no --read-iops: at most
                          --io-depth reads at the device at once, a peer's let in first
                          (fusion/read_budget.h)
+  --own-reads-first      the other way round: this node's own reads (its queries' re-ranking)
+                         go first, and the reads it serves to other nodes get what they leave,
+                         a few at a time: a baseline, copy-then-flip whose stream yields to the
+                         queries (fusion/read_budget.h)
   --max-vectors N        vector-ID space, with room for inserted vectors (U14; default: the
                          index's vectors)
   --max-pages N          page-file pages, with room for inserted vectors' locations (default: the
@@ -89,7 +93,7 @@ static void Usage() {
 }
 
 int main(int argc, char** argv) {
-  const std::set<std::string> flags = {"no-direct", "raw-reuse", "peer-reads-first", "help"};
+  const std::set<std::string> flags = {"no-direct", "raw-reuse", "peer-reads-first", "own-reads-first", "help"};
   // Descriptors grow with the cluster: a connection from each aggregator's client, one to each
   // holder per concurrent fetch. A login shell's soft limit, often 1024, runs out at a few dozen
   // nodes; the hard limit is the node's to use.
@@ -123,6 +127,8 @@ int main(int argc, char** argv) {
     o.direct_io = !a.Flag("no-direct");
     o.read_iops = a.U64("read-iops", 0);
     o.peer_reads_first = a.Flag("peer-reads-first");
+    o.own_reads_first = a.Flag("own-reads-first");
+    FUSION_CHECK(!(o.peer_reads_first && o.own_reads_first), "--peer-reads-first or --own-reads-first, not both");
     o.max_vectors = a.U64("max-vectors", 0);
     o.max_pages = a.U64("max-pages", 0);
     o.update_buffer_bytes = a.U64("update-buffer-mb", 256) << 20;

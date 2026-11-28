@@ -1,0 +1,84 @@
+{
+  "Comment": "CloudLab c240g5: as experiment.amazon-300m-cloudlab-gpu-4to8-copy-then-flip.json, but with its stream behind the queries: every node runs with --own-reads-first, so an old node serves the stream's reads (RAW_GET) only when its own queries leave room on the device, a few at a time (fusion/read_budget.h). A baseline, the other end of copy-then-flip's trade-off from the stream-first files: the queries keep the 4 nodes' capacity, and the flip waits until the load lets the stream through -- where the load stays above C4, until it ends and the backlog has drained. Everything else, rates included, is that file's; its Comment: CloudLab c240g5, Amazon 300M: 4 -> 8 at 90 s under copy-then-flip. The copy may outlast the load; the run then keeps what it measured. Set the rates from the two capacities: Rate about 0.6 x C4 (4to8-calibrate-4), RateSteps 60:exactly twice Rate, below C8 (4to8-calibrate-8), the same in every protocol's file. Here 530 and 1060 q/s, from C4 890 and C8 1393 (2026-11-20). NProbe 128 and N 200 are the pilot's (recall 0.85 on its 782K documents) until a recall sweep on this index. StageTimeout 2h: copy-then-flip writes about 100 GB to each new node's S3500, over half an hour, past config.yaml's 30 minutes.",
+  "WorkDir": "/data-ssd/chenxu/work/amazon-300m",
+  "IndexDir": "/data-ssd/chenxu/work/amazon-300m/index",
+  "EngineBin": "engine/build",
+  "GoBin": "bin",
+  "Base": "/data-ssd/chenxu/amazon/vec/corpus-300m.i8bin",
+  "Queries": "/data-ssd/chenxu/amazon/vec/queries-2m.i8bin",
+  "GroundTruth": "/data-ssd/chenxu/amazon/vec/corpus-300m-gt.ibin",
+  "GroundTruthStride": 200,
+  "SnapshotDir": "/data-ssd/chenxu/warmupdata/amazon-300m-4nodes",
+  "Partition": {
+    "Generator": "gp",
+    "Partitions": 64,
+    "KaMinPar": "/netsys/chenxu/tools/gp-build/gp_kaminpar",
+    "Threads": 32
+  },
+  "BuildArgs": [
+    "--centroid-ratio",
+    "0.01",
+    "--pq-m",
+    "64",
+    "--threads",
+    "64"
+  ],
+  "Placement": "even-reversible-graph",
+  "Strategy": "two-phase",
+  "MetricsInterval": "500ms",
+  "ReadyTimeoutSeconds": 3600,
+  "NodeArgs": [
+    "--workers",
+    "8",
+    "--max-nprobe",
+    "256",
+    "--max-rerank",
+    "1000",
+    "--own-reads-first"
+  ],
+  "Nodes": 8,
+  "InitialNodes": 4,
+  "Protocol": "copy-then-flip",
+  "StageTimeout": "2h",
+  "TransferRateBytesPerSec": 0,
+  "FetchCacheShare": 0.05,
+  "Backend": "gpu",
+  "Load": {
+    "K": 10,
+    "Arrivals": "poisson",
+    "NProbe": 128,
+    "N": 200,
+    "Rate": "530",
+    "RateSteps": "60:1060",
+    "RetryForSeconds": 30,
+    "DurationSeconds": 360,
+    "WarmupSeconds": 30
+  },
+  "Reconfigurations": [
+    {
+      "TriggerTimeSeconds": 90,
+      "DataNodes": 8
+    }
+  ],
+  "GPUs": [
+    0
+  ],
+  "RequireSnapshot": true,
+  "Hosts": {
+    "Nodes": [
+      "10.10.1.2",
+      "10.10.1.3",
+      "10.10.1.4",
+      "10.10.1.5",
+      "10.10.1.6",
+      "10.10.1.7",
+      "10.10.1.8",
+      "10.10.1.9"
+    ],
+    "User": "ycx9248",
+    "SSHOptions": [
+      "-o",
+      "StrictHostKeyChecking=accept-new"
+    ]
+  }
+}

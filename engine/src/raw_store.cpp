@@ -522,8 +522,11 @@ void RawStore::Get(const uint32_t* locs, size_t n, uint8_t* out) {
   // another, each waited out the device's latency -- a peer's RAW_GET of 200 scattered vectors
   // took 18-21 ms on BIGANN-20M -- while the device serves many reads at once. Buffered on
   // purpose: reading with O_DIRECT lost the page-cache hits and the read-ahead (engine/README.md).
-  for (size_t w = 0; w < runs.size(); w += kReadsInFlight) {
-    const size_t end = std::min(runs.size(), w + kReadsInFlight);
+  // With the node's own reads first, a peer's reads go to the device a few at a time, each batch
+  // admitted alone (ReadBudget::peer_batch), so that the queries wait for at most one batch.
+  const size_t window = budget_ ? std::min<size_t>(kReadsInFlight, budget_->peer_batch()) : kReadsInFlight;
+  for (size_t w = 0; w < runs.size(); w += window) {
+    const size_t end = std::min(runs.size(), w + window);
     if (cache) {
       // With a read cache (fusion/raw_cache.h), a page at a time -- a page's runs come in a row --
       // from the cache, else whole from the page cache or the device, and kept: the cache sees

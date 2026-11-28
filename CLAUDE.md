@@ -269,7 +269,13 @@ RTIER_ENGINE_BIN=$PWD/engine/build go test -race ./...   # go test directly: e2e
   a node still counts its device reads (stats `reads`: `charged`, `peer`), and copy-then-flip's
   stream-first baseline (`--peer-reads-first`) orders them without a rate: at most `--io-depth`
   reads at the device at once, a peer's let in before the node's own. The runs before used the
-  budget, and stream-first then ordered the budget's queue.
+  budget, and stream-first then ordered the budget's queue. Its queries-first baseline
+  (`--own-reads-first`, 2026-11-28; the `*-copy-then-flip-queries-first` files) orders them the
+  other way round: the stream gets what the queries leave of the device, a batch of
+  `--io-depth`/8 reads at a time, so an old owner the queries keep busy streams nothing until the
+  load falls. Without an order, copy-then-flip's stream takes about its share by queue depth (a
+  `RAW_GET` puts up to 256 reads at the device at once): it runs near its unloaded pace and the
+  queries lose 20-30% while it copies.
 - **Cluster runs** (`run_cluster.py`, as Koala deploys): this machine runs the stages, the
   controller and the load generator; it checks every host and leaves it clean (no earlier
   node directory; where sudo asks no password, an empty page cache, swappiness 1 and Ubuntu's

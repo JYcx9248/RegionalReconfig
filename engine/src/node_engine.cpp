@@ -316,7 +316,12 @@ class NodeEngineImpl : public NodeEngine {
     raw_->SetCache(o.raw_cache_bytes);
     // Every device read is counted; with --peer-reads-first, at most --io-depth are at the device
     // at once, peers' first; only --read-iops limits their rate (fusion/read_budget.h).
-    budget_ = std::make_unique<ReadBudget>(o.read_iops, o.peer_reads_first, o.io_depth);
+    FUSION_CHECK(!(o.peer_reads_first && o.own_reads_first), "peers' reads first or the node's own first, not both");
+    budget_ = std::make_unique<ReadBudget>(o.read_iops,
+                                           o.peer_reads_first  ? ReadOrder::kPeersFirst
+                                           : o.own_reads_first ? ReadOrder::kOwnFirst
+                                                               : ReadOrder::kArrival,
+                                           o.io_depth);
     raw_->SetReadBudget(budget_.get());
     for (int i = 0; i < o.num_workers; ++i) {
       auto w = std::make_unique<Worker>();
@@ -1907,12 +1912,13 @@ class NodeEngineImpl : public NodeEngine {
                    raw.present * raw.vec_bytes / mb, (unsigned long long)raw.pending,
                    layout_name_.c_str(), raw_->path().c_str(),
                    raw_->pages().direct() ? "direct" : "buffered");
-    if (opts_.read_iops || opts_.peer_reads_first)
+    if (opts_.read_iops || opts_.peer_reads_first || opts_.own_reads_first)
       s += StrFormat("  device reads     : %s%s\n",
                      opts_.read_iops ? StrFormat("%llu a second", (unsigned long long)opts_.read_iops).c_str()
                                      : "no limit",
-                     opts_.peer_reads_first ? StrFormat(", peers' first, %u at the device at once", opts_.io_depth).c_str()
-                                            : "");
+                     opts_.peer_reads_first  ? StrFormat(", peers' first, %u at the device at once", opts_.io_depth).c_str()
+                     : opts_.own_reads_first ? StrFormat(", own first, %u at the device at once", opts_.io_depth).c_str()
+                                             : "");
     s += StrFormat("  fetch cache      : at most %.1f MB of fetched raw vectors waiting for the writer\n",
                    opts_.fetch_cache_bytes / mb);
     s += StrFormat("  workers          : %d, max candidates/request %u (%s)\n", num_workers(), max_candidates_,

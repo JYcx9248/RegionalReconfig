@@ -149,7 +149,12 @@ migration is just its plan.
 Holders stay valid because no node drops a raw vector it has held; a disk budget would need the
 same hand-off first. Baselines: `"lazy-stream"` also streams the rest in after the flip
 (`StageRaw`; the rescale waits for it and reports `raw_vectors` / `raw_seconds`),
-`"copy-then-flip"` streams them before the flip, `"stop-and-copy"` while paused. Streams and the
+`"copy-then-flip"` streams them before the flip, `"stop-and-copy"` while paused. An old owner's
+device serves copy-then-flip's stream and its own queries at once, and where the queries already
+keep it busy, every read the stream takes is one the queries lose. Its two variants set the order
+(`rtier_node --peer-reads-first` and `--own-reads-first`, `fusion/read_budget.h`): the stream
+first, which flips as early as the copy allows and costs the queries most, or the queries first,
+which keeps their capacity and flips only once the load lets the stream through. Streams and the
 drain run data node to data node by default (`RAW_PULL`), unpaced like the queries' fetches;
 only through the agents (`RawPath: agent`, the default when the agents are paced) do they take a
 token-bucket class: `RawPriority` (background by default) after the flip and for the drain,

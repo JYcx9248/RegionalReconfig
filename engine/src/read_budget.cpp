@@ -29,13 +29,15 @@ class Charged final : public PageReader {
 
 }  // namespace
 
-ReadBudget::ReadBudget(uint64_t reads_per_sec, bool peers_first, uint32_t depth)
+ReadBudget::ReadBudget(uint64_t reads_per_sec, ReadOrder order, uint32_t depth)
     : rate_(reads_per_sec),
       interval_ns_(reads_per_sec ? 1e9 / static_cast<double>(reads_per_sec) : 0.0),
       burst_ns_(kBurstSeconds * 1e9),
-      peers_first_(peers_first),
-      depth_(peers_first ? depth : 0) {
-  FUSION_CHECK(!peers_first || reads_per_sec || depth, "peers first needs a rate or a depth to order reads in");
+      order_(order),
+      first_(order == ReadOrder::kOwnFirst ? ReadClass::kOwn : ReadClass::kPeer),
+      depth_(order == ReadOrder::kArrival ? 0 : depth) {
+  FUSION_CHECK(order == ReadOrder::kArrival || reads_per_sec || depth,
+               "an order of reads needs a rate or a depth to order them in");
 }
 
 ReadBudget::Admission::~Admission() {
@@ -50,12 +52,12 @@ ReadBudget::Admission ReadBudget::Admit(uint64_t reads, ReadClass c) {
     held = static_cast<uint32_t>(std::min<uint64_t>(reads, depth_));
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> l(order_mu_);
-    if (c == ReadClass::kPeer) {
-      ++peers_waiting_;
+    if (c == first_) {
+      ++first_waiting_;
       order_cv_.wait(l, [&] { return in_flight_ + held <= depth_; });
-      --peers_waiting_;
+      --first_waiting_;
     } else {
-      order_cv_.wait(l, [&] { return peers_waiting_ == 0 && in_flight_ + held <= depth_; });
+      order_cv_.wait(l, [&] { return first_waiting_ == 0 && in_flight_ + held <= depth_; });
     }
     in_flight_ += held;
     l.unlock();
@@ -87,9 +89,9 @@ void ReadBudget::Charge(uint64_t reads, ReadClass c) {
     std::lock_guard<std::mutex> l(mu_);
     tat_ns_ = std::max(tat_ns_, now) + cost;  // every read: the own ones after it wait for it
     release = tat_ns_ - burst_ns_;
-    if (peers_first_ && c == ReadClass::kPeer) {
-      peer_tat_ns_ = std::max(peer_tat_ns_, now) + cost;
-      release = peer_tat_ns_ - burst_ns_;
+    if (order_ != ReadOrder::kArrival && c == first_) {
+      first_tat_ns_ = std::max(first_tat_ns_, now) + cost;
+      release = first_tat_ns_ - burst_ns_;
     }
   }
   if (release > now) {

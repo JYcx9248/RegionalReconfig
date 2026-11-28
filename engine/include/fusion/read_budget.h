@@ -22,19 +22,25 @@
 // (BIGANN-10M, 2 nodes at 62% of 40K reads/s: p99 latency 30-60 ms instead of 7-10 ms). Since
 // 2026-11-12 no experiment sets a rate: a cluster's nodes have a device each.
 //
-// Peers first (rtier_node --peer-reads-first) is for a baseline: copy-then-flip whose stream
-// takes the device ahead of the queries, the reads RAW_GET serves other nodes (a stream's pulls,
-// a fetch) before the node's own (re-ranking, the writer's read-backs). With no rate, the order is
-// all there is to set: at most `depth` reads (--io-depth) are at the device at once, and a peer's
-// reads go in ahead of every own read still waiting, so the queries get what the transfer leaves
-// of the device. depth is about the device's queue (32 for a SATA SSD's NCQ, more on NVMe): below
-// it the device idles, far above it the own reads queue in the kernel ahead of the peers' again.
-// Own reads already admitted keep their turn, so for at most depth reads the device sees both. A
-// request of more reads than depth takes the whole depth. With a rate too, the peer reads are also
-// spaced only after the peer reads charged before them. Off by default: every read in arrival
-// order, none waiting for another.
+// Two orders are for copy-then-flip's baselines, whose stream reads the old owners' devices while
+// their queries do. Peers first (rtier_node --peer-reads-first): the stream takes the device ahead
+// of the queries, the reads RAW_GET serves other nodes (a stream's pulls, a fetch) before the
+// node's own (re-ranking, the writer's read-backs). Own first (--own-reads-first): the other way
+// round, the stream gets what the queries leave of the device -- on an old owner whose queries
+// keep it busy, nothing until they let up, so the flip waits for the load to fall. With no rate,
+// the order is all there is to set: at most `depth` reads (--io-depth) are at the device at once,
+// and the first class's reads go in ahead of every read of the other class still waiting. depth
+// is about the device's queue (32 for a SATA SSD's NCQ, more on NVMe): below it the device idles,
+// far above it the waiting reads queue in the kernel, in arrival order again. Reads already
+// admitted keep their turn, so for at most depth reads the device sees both classes. A request of
+// more reads than depth takes the whole depth; with own first a peer's request is cut into
+// batches of peer_batch() reads (RawStore::Get), each admitted alone, so that the queries wait for
+// at most a batch of the stream's. With a rate too, the first class's reads are also spaced only
+// after those of its own charged before them. Off by default: every read in arrival order, none
+// waiting for another.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -47,10 +53,12 @@ namespace fusion {
 
 // Whose reads a charge is: the node's own, or a peer's (served by RAW_GET).
 enum class ReadClass { kOwn, kPeer };
+// Which class goes first, if any (the order above).
+enum class ReadOrder { kArrival, kPeersFirst, kOwnFirst };
 
 struct ReadBudgetStats {
   uint64_t reads_per_sec = 0;  // the rate; 0: no limit
-  uint32_t depth = 0;          // peers first: reads at the device at once; 0: no order
+  uint32_t depth = 0;          // an order: reads at the device at once; 0: none
   uint64_t charged = 0;        // cumulative: device reads, both classes
   uint64_t peer = 0;           // cumulative: those served to other nodes (RAW_GET)
   uint64_t wait_us = 0;        // cumulative: time callers waited, for the rate or their turn
@@ -60,8 +68,8 @@ class ReadBudget {
  public:
   static constexpr double kBurstSeconds = 0.1;
 
-  // reads_per_sec 0: no rate. peers_first with depth > 0: the order above.
-  explicit ReadBudget(uint64_t reads_per_sec, bool peers_first = false, uint32_t depth = 0);
+  // reads_per_sec 0: no rate. An order with depth > 0: the order above.
+  explicit ReadBudget(uint64_t reads_per_sec, ReadOrder order = ReadOrder::kArrival, uint32_t depth = 0);
 
   // Reads at the device: from Admit until it goes out of scope (the reads done).
   class Admission {
@@ -79,13 +87,18 @@ class ReadBudget {
     uint32_t held_;  // places at the device this admission holds
   };
 
-  // Waits for the reads' turn (peers first), then for the rate; counts them. Hold the result
-  // while the reads run.
+  // Waits for the reads' turn (an order), then for the rate; counts them. Hold the result while
+  // the reads run.
   Admission Admit(uint64_t reads, ReadClass c = ReadClass::kOwn);
   // The rate alone, and the count: for reads that need no turn.
   void Charge(uint64_t reads, ReadClass c = ReadClass::kOwn);
   ReadBudgetStats Stats() const;
   uint64_t rate() const { return rate_; }
+  // The most reads a peer's request admits at once: with own first, a few, so that the queries
+  // never wait long behind the stream; otherwise as many as it has.
+  uint32_t peer_batch() const {
+    return order_ == ReadOrder::kOwnFirst && depth_ ? std::max<uint32_t>(1, depth_ / 8) : UINT32_MAX;
+  }
 
  private:
   void Release(uint32_t held);
@@ -93,15 +106,16 @@ class ReadBudget {
   const uint64_t rate_;
   const double interval_ns_;  // 1 s / rate
   const double burst_ns_;
-  const bool peers_first_;
-  const uint32_t depth_;  // 0: no order
+  const ReadOrder order_;
+  const ReadClass first_;  // with an order: the class that goes first
+  const uint32_t depth_;   // 0: no order
   std::mutex mu_;
-  double tat_ns_ = 0;       // when the reads charged so far are paid for, on the steady clock
-  double peer_tat_ns_ = 0;  // peers first: when the peer reads charged so far are paid for
+  double tat_ns_ = 0;        // when the reads charged so far are paid for, on the steady clock
+  double first_tat_ns_ = 0;  // an order: when the first class's reads charged so far are paid for
   std::mutex order_mu_;
   std::condition_variable order_cv_;
   uint32_t in_flight_ = 0;      // places held at the device
-  uint32_t peers_waiting_ = 0;  // peer admissions waiting for their turn
+  uint32_t first_waiting_ = 0;  // admissions of the first class waiting for their turn
   std::atomic<uint64_t> charged_{0}, peer_{0}, wait_ns_{0};
 };
 
