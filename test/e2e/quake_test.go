@@ -38,6 +38,9 @@ func TestQuakeMaintenance(t *testing.T) {
 		"--max-pages", strconv.FormatUint(m.NumPages+1024/m.VectorsPerPage+2, 10),
 		"--max-list-len", strconv.Itoa(4 * m.MaxListLen), "--graph-headroom", "1"}
 	cl := newCluster(t, f, "lazy", 2, func(c *config.Controller) { c.AllowUpdates = true })
+	// Quake's cost model counts the lists of a window of recent client queries, which the entries
+	// keep only when asked (QuerySample is 0 by default since the rebuild's warm-up went).
+	cl.agentCfg = func(_ string, c *config.Agent) { c.QuerySample = 1024 }
 	cl.addNode("n1", query.TwoPhase{}, room...)
 	cl.addNode("n2", query.TwoPhase{}, room...)
 	if err := cl.wait(cl.ctl.Ready, 60*time.Second); err != nil {
