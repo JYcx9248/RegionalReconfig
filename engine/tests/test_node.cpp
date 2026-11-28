@@ -241,8 +241,9 @@ Fixture& GetFixture() {
 
 std::unique_ptr<NodeEngine> OpenNode(const Fixture& f, const std::vector<uint32_t>& parts,
                                      bool graph, const std::string& index_dir = "",
-                                     uint64_t read_iops = 0, int workers = 2) {
+                                     uint64_t read_iops = 0, int workers = 2, uint32_t holder_load_ms = 0) {
   NodeOptions o;
+  if (holder_load_ms) o.holder_load_ms = holder_load_ms;
   o.index_dir = index_dir.empty() ? f.index : index_dir;
   o.partitions_dir = f.parts;
   o.num_workers = workers;
@@ -2620,6 +2621,110 @@ void TestHolderBitmapsAtOnce() {
   CHECK(threw && !apart && bal->fetch_stats().holder_bitmaps == 3);
 }
 
+// The choice by load (protocol lazy-balanced-global): as in TestHolderChoice, `bal` takes partition
+// 2 from src (node 1), whose postings it names, and src2 (node 9) holds those vectors too. bal
+// polls both while it fetches -- here a stand-in HOLDER_LOAD reports each one's reads in flight as
+// the test sets them -- and sends a fetch to src2 only when src has more than twice src2's reads in
+// flight, and one more: even with nothing in flight, where the fewest in flight would keep src, and
+// never when the two are about as busy or src is the less busy. Without a recent poll the fewest
+// in flight decides; the poller stops ten intervals after bal's last fetch and starts again with
+// the next one.
+void TestHolderChoiceByLoad() {
+  Fixture& f = GetFixture();
+  auto src = OpenNode(f, {0, 1, 2, 3}, true);
+  src->SetNodes(1, {});
+  auto src2 = OpenNode(f, {2, 3}, false);
+  src2->SetNodes(9, {});
+  constexpr uint32_t kInterval = 50;  // ms: a poll is fresh for 100 ms, the poller stops after 500 ms
+  auto bal = OpenNode(f, {}, false, f.index_nopages, 0, 4, kInterval);
+  bal->SetNodes(13, {{1, "node-1"}, {9, "node-9"}});
+  bal->SetRawFetcher([&](const std::string& peer, const uint32_t* locs, size_t n, uint8_t* out) {
+    (peer == "node-1" ? src : src2)->RawGet(locs, n, out);
+  });
+  bal->SetBitmapFetcher([&](const std::string& peer) { return (peer == "node-1" ? src : src2)->RawBitmap(); });
+  std::mutex mu;
+  std::condition_variable cv;
+  std::map<std::string, double> busy;  // each peer's reads in flight, as the test sets them
+  std::map<std::string, uint64_t> read_ns, at_ns, polls;
+  bal->SetLoadFetcher([&](const std::string& peer) {
+    std::lock_guard<std::mutex> l(mu);
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (at_ns[peer]) read_ns[peer] += static_cast<uint64_t>(busy[peer] * static_cast<double>(now - at_ns[peer]));
+    at_ns[peer] = now;
+    ++polls[peer];
+    cv.notify_all();
+    HolderLoad h;
+    h.at_ns = now;
+    h.read_ns = read_ns[peer];
+    return h;
+  });
+  auto set_busy = [&](double at1, double at9) {
+    std::lock_guard<std::mutex> l(mu);
+    busy["node-1"] = at1;
+    busy["node-9"] = at9;
+  };
+  auto polled = [&] {
+    std::lock_guard<std::mutex> l(mu);
+    return std::min(polls["node-1"], polls["node-9"]);
+  };
+  auto wait_polls = [&](uint64_t n) {  // n more polls of each, so that the last two show set_busy's
+    std::unique_lock<std::mutex> l(mu);
+    const uint64_t to = std::min(polls["node-1"], polls["node-9"]) + n;
+    return cv.wait_for(l, std::chrono::seconds(10),
+                       [&] { return std::min(polls["node-1"], polls["node-9"]) >= to; });
+  };
+  StageFrom(f, bal.get(), src.get(), {2});
+  const size_t words = (bal->raw_stats(false).locations + 63) / 64;
+  // Both bitmaps, as a scale-out's destinations read those of every node that stays: the poller
+  // polls the holders whose bitmaps it holds, so it needs src's too.
+  CHECK(bal->LoadHolderBitmaps({1, 9}, true) == 2 * words * 8 && bal->fetch_stats().holder_bitmaps == 2);
+
+  const std::vector<uint32_t> ids = Named(f, {2}).first;
+  CHECK(ids.size() >= 60);
+  auto slice = [&](size_t from, size_t n) { return std::vector<uint32_t>(ids.begin() + from, ids.begin() + from + n); };
+  const float* q = &f.queries[0];
+  auto rerank = [&](NodeEngine* at, const std::vector<uint32_t>& cand) {
+    const std::vector<uint32_t> lists = ListsNaming(f, 2, cand);
+    std::vector<uint32_t> out_ids(5);
+    std::vector<float> out_dists(5);
+    RerankStats st;
+    const uint32_t n = at->Rerank(0, q, cand.data(), static_cast<uint32_t>(cand.size()), 5, lists.data(), nullptr,
+                                  static_cast<uint32_t>(lists.size()), out_ids.data(), out_dists.data(), &st);
+    out_ids.resize(n);
+    out_dists.resize(n);
+    return std::make_pair(out_ids, out_dists);
+  };
+  auto exact = [&](const std::vector<uint32_t>& cand) { return rerank(bal.get(), cand) == rerank(src.get(), cand); };
+  auto served2 = [&] { return src2->raw_stats(true).served; };
+
+  // No poll yet: the fewest in flight, none anywhere, keeps src although it is the busy one. The
+  // fetch wakes the poller.
+  set_busy(50, 0);
+  CHECK(exact(slice(0, 10)) && bal->fetch_stats().rerouted == 0 && served2() == 0);
+  // Polled: src has over twice src2's reads in flight, and one more: src2.
+  CHECK(wait_polls(2) && exact(slice(10, 10)) && bal->fetch_stats().rerouted == 10 && served2() == 10);
+  // About as busy (3 against 2): the recorded holder, so that the call stays whole.
+  set_busy(3, 2);
+  CHECK(wait_polls(2) && exact(slice(20, 10)) && bal->fetch_stats().rerouted == 10 && served2() == 10);
+  // src the less busy: src.
+  set_busy(0, 50);
+  CHECK(wait_polls(2) && exact(slice(30, 10)) && bal->fetch_stats().rerouted == 10 && served2() == 10);
+  // No fetch for ten intervals: the poller stops.
+  std::this_thread::sleep_for(std::chrono::milliseconds(12 * kInterval));
+  const uint64_t asleep = polled();
+  std::this_thread::sleep_for(std::chrono::milliseconds(6 * kInterval));
+  CHECK(polled() == asleep);
+  // Its polls are stale then: the fewest in flight decides again (src), and the poller wakes.
+  set_busy(50, 0);
+  CHECK(exact(slice(40, 10)) && bal->fetch_stats().rerouted == 10 && served2() == 10);
+  CHECK(wait_polls(2) && exact(slice(50, 10)) && bal->fetch_stats().rerouted == 20 && served2() == 20);
+  const FetchStats fs = bal->fetch_stats();
+  CHECK(fs.load_calls >= 4 && fs.load_polls >= 2 * polled() && fs.from.size() == 2 && fs.from[1].node == 9 &&
+        fs.from[1].query == 20);
+}
+
 // FetchExtra (U9): with n on for a holder, each request a query's fetch sends to it is followed,
 // in the background, by one of up to n more vectors of the lists the query fetched through whose
 // postings name that holder -- the first ones in list order that are not here. The query does not
@@ -3021,6 +3126,21 @@ void TestReadBudget() {
           st.wait_us == 0);
   }
   {
+    // How busy the device is (HOLDER_LOAD): the reads in flight, and their time summed -- over the
+    // time between two samples, the mean number in flight. 6 reads for 50 ms between them.
+    ReadBudget b(0);
+    const ReadBudgetStats s0 = b.Stats();
+    {
+      const ReadBudget::Admission x = b.Admit(4);
+      const ReadBudget::Admission y = b.Admit(2, ReadClass::kPeer);
+      CHECK(b.Stats().in_flight == 6);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const ReadBudgetStats s1 = b.Stats();
+    const double mean = static_cast<double>(s1.read_ns - s0.read_ns) / static_cast<double>(s1.at_ns - s0.at_ns);
+    CHECK(s1.in_flight == 0 && s1.read_ns >= 6ull * 50000000 && mean > 4 && mean <= 6);
+  }
+  {
     // Peers first with no rate: one read at the device at once (depth 1), and a peer's read goes in
     // ahead of an own read that waited longer. The own read goes in once the peer's is done.
     ReadBudget b(0, ReadOrder::kPeersFirst, 1);
@@ -3289,6 +3409,16 @@ void TestWire() {
   const std::string info(r.body.begin(), r.body.end());
   CHECK(info.find("\"dim\":16") != std::string::npos);
   CHECK(info.find("\"graph_loaded\":true") != std::string::npos);
+  // HOLDER_LOAD (lazy-balanced-global polls it): asked here, and through a peer pool as another
+  // node asks; nothing is reading.
+  r = Call(fd, rtier::kHolderLoad, empty, 99);
+  CHECK(r.status == rtier::kOk && r.body.size() == 3 * sizeof(uint64_t));
+  {
+    rtier::PeerPool pool;
+    const fusion::HolderLoad h1 = pool.HolderLoad("127.0.0.1:" + std::to_string(port));
+    const fusion::HolderLoad h2 = pool.HolderLoad("127.0.0.1:" + std::to_string(port));
+    CHECK(h1.at_ns > 0 && h2.at_ns > h1.at_ns && h2.read_ns >= h1.read_ns && h2.in_flight == 0);
+  }
 
   rtier::BodyWriter nav;
   nav.Put<uint32_t>(8);
@@ -4512,6 +4642,7 @@ int main() {
       {"raw_migration", TestRawMigration},
       {"holder_choice", TestHolderChoice},
       {"holder_bitmaps_at_once", TestHolderBitmapsAtOnce},
+      {"holder_choice_by_load", TestHolderChoiceByLoad},
       {"fetch_extra", TestFetchExtra},
       {"fetch_extra_migrate", TestFetchExtraMigrate},
       {"read_budget", TestReadBudget},

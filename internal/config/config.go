@@ -61,7 +61,7 @@ type Controller struct {
 	InitialEntries int      `yaml:"InitialEntries"` // entries among them; 0 = all
 	NewNodeRoles   []string `yaml:"NewNodeRoles"`   // roles of nodes added by scale-out
 	Placement      string   `yaml:"Placement"`      // "even-reversible-graph" (default) | "even-reversible" | "even-reversible-blocks" | "even" | "weighted" (U3)
-	Protocol       string   `yaml:"Protocol"`       // "lazy" | "lazy-balanced" | "lazy-stream" | "copy-then-flip" | "stop-and-copy" (U9)
+	Protocol       string   `yaml:"Protocol"`       // "lazy" | "lazy-balanced" | "lazy-balanced-global" | "lazy-stream" | "copy-then-flip" | "stop-and-copy" (U9)
 	EpochStore     string   `yaml:"EpochStore"`     // "memory" | "etcd" (U10)
 	MetricsPath    string   `yaml:"MetricsPath"`    // JSON-lines sink
 	CallTimeout    Duration `yaml:"CallTimeout"`    // short control calls

@@ -161,6 +161,9 @@ type StagePartitionsReq struct {
 	// these nodes' presence bitmaps, so that a fetch can ask any node holding a vector, not only
 	// the one its posting records.
 	HolderBitmaps []placement.NodeID `json:"holder_bitmaps,omitempty"`
+	// HolderLoad (protocol lazy-balanced-global): the choice among those holders goes by how busy
+	// their devices are, as the data node polls them while it fetches.
+	HolderLoad bool `json:"holder_load,omitempty"`
 }
 
 // StageReply reports what a staging step moved. Bytes counts everything received (segment

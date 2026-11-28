@@ -191,7 +191,7 @@ func (a *Agent) handleStagePartitions(ctx context.Context, body json.RawMessage)
 	reply.Bytes += reply.PQBytes
 	// 4. lazy-balanced: the other holders' bitmaps, read by the data node from them directly.
 	if ids := a.otherNodes(req.HolderBitmaps); len(ids) > 0 {
-		n, err := a.localBulk.HolderBitmaps(ctx, ids)
+		n, err := a.localBulk.HolderBitmaps(ctx, ids, req.HolderLoad)
 		if err != nil {
 			return nil, fmt.Errorf("reading the holders' bitmaps: %w", err)
 		}

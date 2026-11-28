@@ -216,11 +216,13 @@ func checkResidency(t *testing.T, cl *cluster) {
 
 // rawComplete: whether a protocol leaves every node with all the raw vectors of its partitions.
 // The lazy protocol moves one only when a query needs it (U9); the rest stay with the old owner.
-func rawComplete(protocol string) bool { return protocol != "lazy" && protocol != "lazy-balanced" }
+func rawComplete(protocol string) bool {
+	return !strings.HasPrefix(protocol, "lazy") || protocol == "lazy-stream"
+}
 
 // fetchesOnDemand: whether a protocol's new owners fetch raw vectors when queries need them.
 func fetchesOnDemand(protocol string) bool {
-	return protocol == "lazy" || protocol == "lazy-balanced" || protocol == "lazy-stream"
+	return strings.HasPrefix(protocol, "lazy")
 }
 
 // pqExpected is the number of PQ codes a reconfiguration from old to next has to pull: for each
@@ -356,7 +358,7 @@ func reconfigure(t *testing.T, cl *cluster, req protocol.RescaleReq) *protocol.R
 
 func TestReconfigUnderLoad(t *testing.T) {
 	f := getFixture(t)
-	for _, protocol := range []string{"lazy", "lazy-balanced", "lazy-stream", "copy-then-flip", "stop-and-copy"} {
+	for _, protocol := range []string{"lazy", "lazy-balanced", "lazy-balanced-global", "lazy-stream", "copy-then-flip", "stop-and-copy"} {
 		t.Run(protocol, func(t *testing.T) {
 			cl := newCluster(t, f, protocol, 2)
 			cl.addNode("n1", query.TwoPhase{})
@@ -373,8 +375,8 @@ func TestReconfigUnderLoad(t *testing.T) {
 			if out.ToEpoch != out.FromEpoch+2 || len(out.Moved) == 0 || out.Bytes == 0 || out.PQCodes == 0 {
 				t.Errorf("scale-out reply %+v: want a data flip and an entry flip, moved partitions and PQ codes", out)
 			}
-			// lazy-balanced: the new node read both old nodes' bitmaps, a bit per location each.
-			if protocol == "lazy-balanced" {
+			// lazy-balanced(-global): the new node read both old nodes' bitmaps, a bit per location each.
+			if strings.HasPrefix(protocol, "lazy-balanced") {
 				info, err := nodeclient.New(cl.ctl.Status().Table.Nodes[out.Added[0]].NodeAddr, 1).Info(cl.ctx)
 				if err != nil {
 					t.Fatal(err)
@@ -404,6 +406,12 @@ func TestReconfigUnderLoad(t *testing.T) {
 				(!rawComplete(protocol) && (raw.Streamed != 0 || raw.Present > newInfo.PQ.Resident)) {
 				t.Errorf("new node's raw vectors %+v: want them all from peers -- one per PQ code, or with "+
 					"lazy only those queries needed", raw)
+			}
+			// lazy-balanced-global: a node that fetched polled its holders; nothing else polls.
+			if polls := newInfo.Fetch.LoadPolls; (protocol == "lazy-balanced-global" && newInfo.Raw.Fetched > 0 && polls == 0) ||
+				(protocol != "lazy-balanced-global" && polls != 0) {
+				t.Errorf("protocol %s: the new node fetched %d raw vectors and polled its holders %d times",
+					protocol, newInfo.Raw.Fetched, polls)
 			}
 			// Every data node runs with its read cache (rtier_node's default, 5% of memory), and the
 			// queries' reads hit it: the answers above came through it.

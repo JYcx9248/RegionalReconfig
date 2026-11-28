@@ -41,7 +41,7 @@ ReadBudget::ReadBudget(uint64_t reads_per_sec, ReadOrder order, uint32_t depth)
 }
 
 ReadBudget::Admission::~Admission() {
-  if (b_ && held_) b_->Release(held_);
+  if (b_) b_->Done(held_, reads_);
 }
 
 ReadBudget::Admission ReadBudget::Admit(uint64_t reads, ReadClass c) {
@@ -66,7 +66,21 @@ ReadBudget::Admission ReadBudget::Admit(uint64_t reads, ReadClass c) {
                        std::memory_order_relaxed);
   }
   Charge(reads, c);
-  return Admission(this, held);
+  if (reads) Fly(reads, true);
+  return Admission(this, held, reads);
+}
+
+void ReadBudget::Done(uint32_t held, uint64_t reads) {
+  if (held) Release(held);
+  if (reads) Fly(reads, false);
+}
+
+void ReadBudget::Fly(uint64_t reads, bool start) {
+  const uint64_t now = static_cast<uint64_t>(NowNs());
+  std::lock_guard<std::mutex> l(fly_mu_);
+  if (fly_at_ns_ && now > fly_at_ns_) fly_read_ns_ += fly_reads_ * (now - fly_at_ns_);
+  fly_at_ns_ = std::max(fly_at_ns_, now);
+  fly_reads_ = start ? fly_reads_ + reads : fly_reads_ - reads;
 }
 
 void ReadBudget::Release(uint32_t held) {
@@ -108,6 +122,11 @@ ReadBudgetStats ReadBudget::Stats() const {
   s.charged = charged_.load(std::memory_order_relaxed);
   s.peer = peer_.load(std::memory_order_relaxed);
   s.wait_us = wait_ns_.load(std::memory_order_relaxed) / 1000;
+  const uint64_t now = static_cast<uint64_t>(NowNs());
+  std::lock_guard<std::mutex> l(fly_mu_);
+  s.in_flight = fly_reads_;
+  s.read_ns = fly_read_ns_ + (fly_at_ns_ && now > fly_at_ns_ ? fly_reads_ * (now - fly_at_ns_) : 0);
+  s.at_ns = std::max(now, fly_at_ns_);
   return s;
 }
 

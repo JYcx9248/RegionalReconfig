@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -339,6 +340,12 @@ class NodeEngineImpl : public NodeEngine {
   }
 
   ~NodeEngineImpl() override {
+    {
+      std::lock_guard<std::mutex> l(load_mu_);
+      stop_poller_ = true;
+    }
+    load_cv_.notify_all();
+    if (load_poller_.joinable()) load_poller_.join();
     {
       std::lock_guard<std::mutex> l(extra_mu_);
       stop_extra_ = true;
@@ -1688,6 +1695,8 @@ class NodeEngineImpl : public NodeEngine {
       std::lock_guard<std::mutex> l(raw_mu_);
       f.holder_bitmaps = holder_bits_.size();
     }
+    f.load_polls = get(fc_.load_polls);
+    f.load_calls = get(fc_.load_calls);
     f.written = get(fc_.written);
     f.write_us = get(fc_.write_us);
     f.sync_installed = get(fc_.sync_installed);
@@ -1734,7 +1743,12 @@ class NodeEngineImpl : public NodeEngine {
     bitmap_fetcher_ = std::move(fetcher);
   }
 
-  uint64_t LoadHolderBitmaps(const std::vector<uint16_t>& nodes) override {
+  void SetLoadFetcher(LoadFetcher fetcher) override {
+    std::lock_guard<std::mutex> l(load_call_mu_);  // waits for a poll in progress: the server goes next
+    load_fetcher_ = std::move(fetcher);
+  }
+
+  uint64_t LoadHolderBitmaps(const std::vector<uint16_t>& nodes, bool by_load) override {
     std::vector<std::pair<uint16_t, std::string>> where;
     BitmapFetcher fetch;
     {
@@ -1766,8 +1780,15 @@ class NodeEngineImpl : public NodeEngine {
       bytes += bits->size() * sizeof(uint64_t);
       got.emplace_back(where[i].first, std::move(bits));
     }
-    std::lock_guard<std::mutex> l(raw_mu_);
-    for (auto& [id, bits] : got) holder_bits_[id] = std::move(bits);
+    {
+      std::lock_guard<std::mutex> l(raw_mu_);
+      for (auto& [id, bits] : got) holder_bits_[id] = std::move(bits);
+    }
+    by_load_.store(by_load);
+    if (by_load) {
+      std::lock_guard<std::mutex> l(load_mu_);
+      if (!load_poller_.joinable() && !stop_poller_) load_poller_ = std::thread([this] { PollLoads(); });
+    }
     return bytes;
   }
 
@@ -2882,13 +2903,29 @@ class NodeEngineImpl : public NodeEngine {
   // read too (LoadHolderBitmaps), the one with the fewest of this node's fetches in flight as the
   // call starts -- the recorded holder on a tie. So with no fetch in flight anywhere a call asks
   // what its postings record, as without bitmaps, and does not split itself over the holders: the
-  // choice follows backlogs, and only those. The vectors given to a holder count in asked_ until
-  // the request ends (Unask); *chosen counts those given through a bitmap. The bitmaps are looked
-  // at under asked_mu_, so that a holder's leaving (RawHeldByStream) either comes before this call
-  // sees its bitmap or waits for its requests.
+  // choice follows backlogs, and only those. By load (lazy-balanced-global), where this node has
+  // a recent poll of the recorded holder and of another holder of the vector, the polls decide
+  // instead: the least busy of those, if the recorded one has more than twice its reads in flight
+  // and one more, else the recorded one. This node's own count sees neither the holder's queries
+  // nor the other nodes' fetches, so it sends fetches to a holder whose device is full as readily
+  // as to an idle one (on Amazon 300M, 2026-11-20, other new nodes moved ~1K reads/s onto the
+  // busiest old node); the margin keeps a call whole -- a split call reads a shared page once per
+  // holder -- when the holders are about as busy. The vectors given to a holder count in asked_
+  // until the request ends (Unask); *chosen counts those given through a bitmap. The bitmaps are
+  // looked at under asked_mu_, so that a holder's leaving (RawHeldByStream) either comes before
+  // this call sees its bitmap or waits for its requests.
   void AssignHolders(const std::vector<uint32_t>& miss, const std::vector<std::pair<size_t, uint16_t>>& held,
                      std::map<uint16_t, std::vector<size_t>>* by, std::map<uint16_t, uint64_t>* chosen) {
     if (held.empty()) return;
+    std::unordered_map<uint16_t, double> load;  // the holders' recent polls (by load only)
+    if (by_load_.load()) {
+      MarkFetching();
+      const int64_t now = SteadyNs();
+      const int64_t fresh = 2 * LoadIntervalNs();
+      std::lock_guard<std::mutex> l(load_mu_);
+      for (const auto& [id, ls] : loads_)
+        if (ls.valid && now - ls.got_ns <= fresh) load.emplace(id, ls.queue);
+    }
     std::lock_guard<std::mutex> l(asked_mu_);
     std::vector<std::pair<uint16_t, std::shared_ptr<const std::vector<uint64_t>>>> others;
     {
@@ -2899,17 +2936,40 @@ class NodeEngineImpl : public NodeEngine {
       const auto it = asked_.find(id);
       return it == asked_.end() ? uint64_t{0} : it->second.all;
     };
+    auto has = [&](const std::vector<uint64_t>& bits, uint32_t loc) {
+      return (loc >> 6) < bits.size() && ((bits[loc >> 6] >> (loc & 63)) & 1);
+    };
     uint64_t rerouted = 0;
+    bool by_polls = false;
     for (const auto& [i, h] : held) {
       const uint32_t loc = miss[i];
       uint16_t best = h;
-      uint64_t least = others.empty() ? 0 : in_flight(h);
-      for (const auto& [id, bits] : others) {
-        if (id == h || (loc >> 6) >= bits->size() || !(((*bits)[loc >> 6] >> (loc & 63)) & 1)) continue;
-        const uint64_t n = in_flight(id);
-        if (n < least) {
-          best = id;
-          least = n;
+      // By load: the least busy other holder of the vector that has a recent poll, if the
+      // recorded holder has one too.
+      const auto lh = load.find(h);
+      uint16_t other = h;
+      double other_busy = 0;
+      if (lh != load.end())
+        for (const auto& [id, bits] : others) {
+          if (id == h || !has(*bits, loc)) continue;
+          const auto lo = load.find(id);
+          if (lo != load.end() && (other == h || lo->second < other_busy)) {
+            other = id;
+            other_busy = lo->second;
+          }
+        }
+      if (other != h) {
+        by_polls = true;
+        if (lh->second > 2 * other_busy + 1) best = other;
+      } else {
+        uint64_t least = others.empty() ? 0 : in_flight(h);
+        for (const auto& [id, bits] : others) {
+          if (id == h || !has(*bits, loc)) continue;
+          const uint64_t n = in_flight(id);
+          if (n < least) {
+            best = id;
+            least = n;
+          }
         }
       }
       if (best != h) {
@@ -2921,6 +2981,93 @@ class NodeEngineImpl : public NodeEngine {
     for (const auto& [id, is] : *by) asked_[id].all += is.size();  // after the choices: as the call started
     for (const auto& [id, n] : *chosen) asked_[id].chosen += n;
     if (rerouted) fc_.rerouted.fetch_add(rerouted, std::memory_order_relaxed);
+    if (by_polls) fc_.load_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static int64_t SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+  int64_t LoadIntervalNs() const { return static_cast<int64_t>(std::max<uint32_t>(opts_.holder_load_ms, 1)) * 1000000; }
+
+  // A call with a choice to make: the poller polls from now on, if it was asleep.
+  void MarkFetching() {
+    last_fetch_ns_.store(SteadyNs());
+    if (poller_idle_.load()) {
+      std::lock_guard<std::mutex> l(load_mu_);
+      load_cv_.notify_all();
+    }
+  }
+
+  // The poller (by load): every interval while this node fetches, each holder whose bitmap it
+  // holds; asleep from ten intervals after the last call with a choice. A holder that leaves
+  // (RawHeldByStream) loses its bitmap, so it is polled no more.
+  void PollLoads() {
+    const int64_t interval = LoadIntervalNs();
+    std::unique_lock<std::mutex> l(load_mu_);
+    while (!stop_poller_) {
+      poller_idle_.store(true);  // before the look at last_fetch_ns_ (MarkFetching: the other way round)
+      load_cv_.wait(l, [&] { return stop_poller_ || SteadyNs() - last_fetch_ns_.load() < 10 * interval; });
+      poller_idle_.store(false);
+      if (stop_poller_) break;
+      l.unlock();
+      PollOnce(interval);
+      l.lock();
+      load_cv_.wait_for(l, std::chrono::nanoseconds(interval), [&] { return stop_poller_; });
+    }
+  }
+
+  void PollOnce(int64_t interval) {
+    std::vector<std::pair<uint16_t, std::string>> where;
+    {
+      std::lock_guard<std::mutex> l(raw_mu_);
+      for (const auto& kv : holder_bits_) {
+        const auto it = book_.find(kv.first);
+        if (it != book_.end()) where.emplace_back(kv.first, it->second);
+      }
+    }
+    std::vector<std::pair<uint16_t, std::optional<HolderLoad>>> got;
+    std::map<uint16_t, std::string> errors;
+    {
+      std::lock_guard<std::mutex> c(load_call_mu_);
+      if (!load_fetcher_) return;
+      for (const auto& [id, addr] : where) {
+        std::optional<HolderLoad> r;
+        try {
+          r = load_fetcher_(addr);
+        } catch (const std::exception& e) {
+          errors[id] = addr + ": " + e.what();
+        }
+        got.emplace_back(id, r);
+        fc_.load_polls.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    const int64_t now = SteadyNs();
+    std::lock_guard<std::mutex> l(load_mu_);
+    for (auto it = loads_.begin(); it != loads_.end();) {  // holders whose bitmap went
+      const bool kept = std::any_of(where.begin(), where.end(), [&](const auto& w) { return w.first == it->first; });
+      it = kept ? std::next(it) : loads_.erase(it);
+    }
+    for (const auto& [id, r] : got) {
+      LoadSample& ls = loads_[id];
+      if (!r) {
+        const uint64_t failures = ls.failures + 1;
+        if ((failures & (failures - 1)) == 0)
+          Log("polling node %u (%llu failed so far): %s", id, static_cast<unsigned long long>(failures),
+              errors[id].c_str());
+        ls = LoadSample{};
+        ls.failures = failures;
+        continue;
+      }
+      ls.valid = ls.at_ns != 0 && r->at_ns > ls.at_ns && r->at_ns - ls.at_ns <= static_cast<uint64_t>(4 * interval) &&
+                 r->read_ns >= ls.read_ns;
+      if (ls.valid) {
+        ls.queue = static_cast<double>(r->read_ns - ls.read_ns) / static_cast<double>(r->at_ns - ls.at_ns);
+        ls.got_ns = now;
+      }
+      ls.at_ns = r->at_ns;
+      ls.read_ns = r->read_ns;
+    }
   }
 
   // A request of n vectors to holder, chosen of them through its bitmap, has ended.
@@ -3252,6 +3399,28 @@ class NodeEngineImpl : public NodeEngine {
   // read from them, by node ID; and how to read them.
   std::unordered_map<uint16_t, std::shared_ptr<const std::vector<uint64_t>>> holder_bits_;
   BitmapFetcher bitmap_fetcher_;
+  // The choice by load (LoadHolderBitmaps by_load, protocol lazy-balanced-global): each holder's
+  // last two polls, as the poller keeps them (under load_mu_), and the poller itself, which polls
+  // while this node fetches -- AssignHolders marks each call that has a choice to make (last_fetch_ns_)
+  // -- and sleeps from ten intervals after the last one, so that a node done fetching asks nothing
+  // of the holders until it fetches again. A poll that fails leaves that holder without one.
+  struct LoadSample {
+    uint64_t at_ns = 0, read_ns = 0;  // the holder's last reply (its clock)
+    double queue = 0;                 // its mean reads in flight between its last two replies
+    bool valid = false;               // queue is set: the two replies were at most 4 intervals apart
+    int64_t got_ns = 0;               // when queue was set (this node's clock)
+    uint64_t failures = 0;            // polls of it that failed (logged at powers of two)
+  };
+  std::atomic<bool> by_load_{false};
+  std::mutex load_call_mu_;  // held while polling, so that SetLoadFetcher waits for the poll
+  LoadFetcher load_fetcher_;
+  std::mutex load_mu_;
+  std::condition_variable load_cv_;  // fetching again, or stopping
+  std::unordered_map<uint16_t, LoadSample> loads_;
+  std::atomic<int64_t> last_fetch_ns_{0};
+  std::atomic<bool> poller_idle_{false};
+  bool stop_poller_ = false;
+  std::thread load_poller_;
   // The vectors this node has asked of each holder and not received yet, by node ID: how far
   // behind that holder is. `chosen` counts those asked through a bitmap, which RawHeldByStream
   // waits for before the holder leaves. Under asked_mu_.
@@ -3290,7 +3459,8 @@ class NodeEngineImpl : public NodeEngine {
         sync_installed{0}, sync_us{0}, drain_calls{0}, drain_waiting{0}, drain_us{0},
         rerank_disk{0}, rerank_mem{0}, pending_recounts{0}, pending_us{0}, added{0},
         added_written{0}, added_wait_us{0}, extra_queued{0}, extra_dropped{0}, extra_requests{0},
-        extra_failed{0}, extra_fetched{0}, extra_us{0}, extra_refills{0}, extra_wait_us{0};
+        extra_failed{0}, extra_fetched{0}, extra_us{0}, extra_refills{0}, extra_wait_us{0}, load_polls{0},
+        load_calls{0};
   };
   mutable FetchCounters fc_;
   bool stop_writer_ = false;

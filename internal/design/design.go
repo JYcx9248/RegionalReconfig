@@ -320,15 +320,19 @@ var Open = map[string]Question{
 			"of the fetching node's fetches in flight as it starts, not always the one its posting " +
 			"records -- the destinations read the presence bitmaps of the nodes that stay before the " +
 			"flip (HOLDER_BITMAPS), and a drain drops a leaving node's bitmap and waits for the " +
-			"fetches sent through it. Open: whether a scale-out ablation goes into the evaluation, " +
+			"fetches sent through it. Measured too (2026-11-28, protocol \"lazy-balanced-global\", for " +
+			"the PI's question of what knowing the old nodes' load buys): the choice by the holders' " +
+			"devices, which the destination polls while it fetches (HOLDER_LOAD, its reads in " +
+			"flight), moving a fetch only off a holder with more than twice the reads in flight of " +
+			"another, and one more. Open: whether a scale-out ablation goes into the evaluation, " +
 			"whether a scale-in also moves its leaving nodes' vectors this way instead of the drain, " +
 			"whether lazy-balanced relieves a hot old owner enough to keep, and chunks (U12)",
 		"internal/controller/reconfig.go (copyThenFlip, stageRaw, drainRaw, migrateRaw, fetchExtra), " +
 			"internal/controller/rebuild.go (rebuild), " +
 			"internal/agent/control.go (StagePartitions, StageRaw, DrainRaw, FetchExtra), " +
 			"engine/src/node_engine.cpp (EnsureRawInLists, FetchForQuery, AssignHolders, " +
-			"LoadHolderBitmaps, RawHeldBy, RawPull, QueueExtra, PullExtra, FillFromCursor), " +
-			"engine/node/server.cpp (PeerPool, RERANK, HOLDER_BITMAPS, FETCH_EXTRA)"},
+			"LoadHolderBitmaps, RawHeldBy, RawPull, QueueExtra, PullExtra, FillFromCursor, PollLoads), " +
+			"engine/node/server.cpp (PeerPool, RERANK, HOLDER_BITMAPS, HOLDER_LOAD, FETCH_EXTRA)"},
 	"U10": {"U10", "Epoch store for the atomic flip",
 		"an etcd transaction (as discussed) vs. the controller-local compare-and-swap that the " +
 			"single-machine prototype uses. What happens when the controller fails mid-flip is out of " +

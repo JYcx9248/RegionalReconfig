@@ -45,6 +45,9 @@ class PeerPool {
   // The presence bitmap of the data node at addr (its RAW_BITMAP), for lazy-balanced's choice of
   // holder (fusion::NodeEngine::LoadHolderBitmaps). Throws std::runtime_error on failure.
   std::vector<uint64_t> RawBitmap(const std::string& addr);
+  // How busy the data node at addr is (its HOLDER_LOAD), for lazy-balanced-global's choice of
+  // holder (fusion::NodeEngine::SetLoadFetcher). Throws std::runtime_error on failure.
+  fusion::HolderLoad HolderLoad(const std::string& addr);
 
  private:
   // One request on a pooled connection; throws on failure or a status other than OK.

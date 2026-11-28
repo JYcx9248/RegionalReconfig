@@ -111,6 +111,9 @@ struct NodeOptions {
   // use (--fetch-cache-share, an experiment's "FetchCacheShare"), so that one setting fits
   // every machine; 2 GB without one.
   uint64_t fetch_cache_bytes = 2ull << 30;
+  // Protocol lazy-balanced-global: how often a node that is fetching polls the holders whose
+  // bitmaps it holds (LoadHolderBitmaps by load).
+  uint32_t holder_load_ms = 100;
   // The read cache of raw-vector pages in front of the raw store (fusion/raw_cache.h): what it may
   // hold, 0 = none. rtier_node gives it 5% of the memory the node may use unless told otherwise
   // (--raw-cache-share, an experiment's "RawCacheShare").
@@ -221,6 +224,14 @@ using RawFetcher = std::function<void(const std::string& peer, const uint32_t* l
 // Reads the presence bitmap of the data node at `peer` (its RAW_BITMAP: one bit per location,
 // 64 per word). Throws on failure. The node server installs one.
 using BitmapFetcher = std::function<std::vector<uint64_t>(const std::string& peer)>;
+// How busy a data node's device is, as another node polls it (its HOLDER_LOAD: ReadBudgetStats'
+// at_ns, read_ns and in_flight). Between two polls, the growth of read_ns over that of at_ns is
+// the mean number of reads it had in flight.
+struct HolderLoad {
+  uint64_t at_ns = 0, read_ns = 0, in_flight = 0;
+};
+// Polls the data node at `peer` (its HOLDER_LOAD). Throws on failure. The node server installs one.
+using LoadFetcher = std::function<HolderLoad(const std::string& peer)>;
 
 // Raw-vector locations held by one node, each with a posting list here that names it
 // (parallel arrays).
@@ -271,6 +282,8 @@ struct FetchStats {
                                  // records, which had more of this node's fetches in flight
                                  // (LoadHolderBitmaps)
   uint64_t holder_bitmaps = 0;   // now: other nodes' presence bitmaps held (LoadHolderBitmaps)
+  uint64_t load_polls = 0;       // holders polled (HOLDER_LOAD), by load only
+  uint64_t load_calls = 0;       // fetch calls whose choice went by the holders' polled reads
   uint64_t written = 0;          // installed on the SSD by the writer
   uint64_t write_batches = 0;
   uint64_t write_us = 0;         // writer time in RawStore::Put
@@ -573,10 +586,16 @@ class NodeEngine {
   // holder slowed by its own queries keeps more of them in flight, so the fetches move to holders
   // with reads to spare. A bitmap read earlier only misses vectors,
   // since no node drops a raw vector it has held: it never names a node that cannot serve one.
-  // Returns the bytes read.
-  virtual uint64_t LoadHolderBitmaps(const std::vector<uint16_t>& nodes) = 0;
+  // by_load (protocol lazy-balanced-global): the choice goes by how busy each holder's device is
+  // instead, as the node polls them (HOLDER_LOAD, every NodeOptions::holder_load_ms while it is
+  // fetching): a fetch goes to another holder only if the recorded one has more than twice its
+  // reads in flight, and one more. Without a recent poll of the recorded holder and of another
+  // holder of the vector, the fewest in flight decides, as without by_load. Returns the bytes read.
+  virtual uint64_t LoadHolderBitmaps(const std::vector<uint16_t>& nodes, bool by_load = false) = 0;
   // How the node reads other nodes' bitmaps (without one, LoadHolderBitmaps fails).
   virtual void SetBitmapFetcher(BitmapFetcher fetcher) = 0;
+  // How the node polls other nodes' reads (without one, a choice by load never has a poll).
+  virtual void SetLoadFetcher(LoadFetcher fetcher) = 0;
 
   // Primitives. `query` points to dim() elements of dtype(). Worker `w` must be used by one
   // thread at a time. ef = 0 means 2 * nprobe (as in fusion::Engine). Navigate searches the

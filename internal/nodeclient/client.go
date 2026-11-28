@@ -70,6 +70,9 @@ const (
 	opFetchExtra     uint8 = 0x49
 )
 
+// holderByLoad is HOLDER_BITMAPS' flag for a choice by the holders' load (engine/node/wire.h).
+const holderByLoad uint32 = 1
+
 // NewestGraph asks NAVIGATE for the newest graph version the node has (a staged patch's, else
 // its graph's).
 const NewestGraph uint32 = 0xFFFFFFFF
@@ -210,10 +213,14 @@ type Info struct {
 	Ops           map[string]OpStats `json:"ops"`
 }
 
-// FetchStats are the node's fetches on demand (fusion::FetchStats), of which only the extras
-// are read here.
+// FetchStats are the node's fetches on demand (fusion::FetchStats), of which only the extras and
+// the polls of the holders' load are read here.
 type FetchStats struct {
 	Extra FetchExtraStats `json:"extra"`
+	// LoadPolls: the holders this node polled (HOLDER_LOAD; lazy-balanced-global); LoadCalls: its
+	// fetch calls whose choice of holder went by those polls.
+	LoadPolls uint64 `json:"load_polls"`
+	LoadCalls uint64 `json:"load_calls"`
 }
 
 // FetchExtraStats count FetchExtra's requests (U9): N, the vectors each may bring now (0: off);
@@ -721,15 +728,21 @@ func (c *Client) RawBitmap(ctx context.Context) (Bitmap, error) {
 
 // HolderBitmaps has the node read the presence bitmaps of the data nodes ids itself (their
 // RAW_BITMAP, at the addresses SetNodes gave): protocol lazy-balanced, where a fetch asks
-// whichever holder of a vector has the fewest of the node's fetches in flight. Each replaces the
-// bitmap read from that node before. It returns the bytes read.
-func (c *Client) HolderBitmaps(ctx context.Context, ids []uint16) (uint64, error) {
+// whichever holder of a vector has the fewest of the node's fetches in flight -- or, byLoad
+// (lazy-balanced-global), the least busy one as the node polls their devices while it fetches
+// (HOLDER_LOAD). Each replaces the bitmap read from that node before. It returns the bytes read.
+func (c *Client) HolderBitmaps(ctx context.Context, ids []uint16, byLoad bool) (uint64, error) {
 	var w frame.Writer
 	w.U32(uint32(len(ids)))
 	for _, id := range ids {
 		w.U16(id)
 		w.U16(0)
 	}
+	var flags uint32
+	if byLoad {
+		flags |= holderByLoad
+	}
+	w.U32(flags)
 	b, err := c.do(ctx, opHolderBitmaps, 0, w.B)
 	if err != nil {
 		return 0, err

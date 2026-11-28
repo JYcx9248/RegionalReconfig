@@ -73,11 +73,16 @@
 //                   0 = not given, which a node with --max-candidates refuses)
 //   RAW_BITMAP      -                                         -> u64 locations, u64 words[]
 //                   (the raw vectors the node holds, one bit per location)
-//   HOLDER_BITMAPS  u32 n, (u16 id, u16 pad)[n]               -> u64 bytes
+//   HOLDER_BITMAPS  u32 n, (u16 id, u16 pad)[n] [, u32 flags] -> u64 bytes
 //                   (protocol lazy-balanced: the node reads those data nodes' RAW_BITMAPs itself,
 //                   at the addresses SET_NODES gave, and from then on asks a missing vector of
 //                   whichever of its holders has the fewest of its fetches in flight; each
-//                   replaces the bitmap read from that node before. bytes: what it read)
+//                   replaces the bitmap read from that node before. bytes: what it read.
+//                   flags kHolderByLoad, protocol lazy-balanced-global: by how busy the holders
+//                   are instead, as it polls them while it fetches -- HOLDER_LOAD)
+//   HOLDER_LOAD     -                                         -> u64 at_ns, u64 read_ns, u64 in_flight
+//                   (how busy the node's device is: its steady clock, its reads' time in flight so
+//                   far, summed, and the reads in flight now; fusion::ReadBudgetStats)
 //   EVICT_PARTITION u32 partition                             -> u8 was_resident (every
 //                                                                version is evicted, and the
 //                                                                received ones are dropped)
@@ -280,7 +285,12 @@ enum Op : uint8_t {
   kSegmentInstall = 0x47,
   kHolderBitmaps = 0x48,
   kFetchExtra = 0x49,
+  // 0x4A: LISTS_OF on branch update-strategies
+  kHolderLoad = 0x4B,
 };
+
+// HOLDER_BITMAPS' flags.
+constexpr uint32_t kHolderByLoad = 1;
 
 enum Status : uint16_t {
   kOk = 0,

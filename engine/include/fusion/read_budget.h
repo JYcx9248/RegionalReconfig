@@ -62,6 +62,15 @@ struct ReadBudgetStats {
   uint64_t charged = 0;        // cumulative: device reads, both classes
   uint64_t peer = 0;           // cumulative: those served to other nodes (RAW_GET)
   uint64_t wait_us = 0;        // cumulative: time callers waited, for the rate or their turn
+  // How busy the device is, for another node choosing among holders (HOLDER_LOAD, protocol
+  // lazy-balanced-global): the reads admitted and not done yet (a batch from the end of its waits
+  // to the end of its reads), and their number integrated over time up to at_ns, when the sample
+  // was taken (steady clock). Between two samples read_ns grows by the mean number of reads in
+  // flight times the time between them, so it tells a device that keeps a queue -- an SSD at its
+  // limit -- from one that serves what comes, where utilization would show both 100% busy.
+  uint64_t in_flight = 0;
+  uint64_t read_ns = 0;
+  uint64_t at_ns = 0;
 };
 
 class ReadBudget {
@@ -74,7 +83,7 @@ class ReadBudget {
   // Reads at the device: from Admit until it goes out of scope (the reads done).
   class Admission {
    public:
-    Admission(Admission&& o) noexcept : b_(o.b_), held_(o.held_) { o.b_ = nullptr; }
+    Admission(Admission&& o) noexcept : b_(o.b_), held_(o.held_), reads_(o.reads_) { o.b_ = nullptr; }
     Admission(const Admission&) = delete;
     Admission& operator=(const Admission&) = delete;
     Admission& operator=(Admission&&) = delete;
@@ -82,9 +91,10 @@ class ReadBudget {
 
    private:
     friend class ReadBudget;
-    Admission(ReadBudget* b, uint32_t held) : b_(b), held_(held) {}
+    Admission(ReadBudget* b, uint32_t held, uint64_t reads) : b_(b), held_(held), reads_(reads) {}
     ReadBudget* b_;
-    uint32_t held_;  // places at the device this admission holds
+    uint32_t held_;   // places at the device this admission holds
+    uint64_t reads_;  // in flight until it ends
   };
 
   // Waits for the reads' turn (an order), then for the rate; counts them. Hold the result while
@@ -102,6 +112,8 @@ class ReadBudget {
 
  private:
   void Release(uint32_t held);
+  void Done(uint32_t held, uint64_t reads);
+  void Fly(uint64_t reads, bool start);  // in_flight_ up or down, read_ns_ brought up to now
 
   const uint64_t rate_;
   const double interval_ns_;  // 1 s / rate
@@ -117,6 +129,8 @@ class ReadBudget {
   uint32_t in_flight_ = 0;      // places held at the device
   uint32_t first_waiting_ = 0;  // admissions of the first class waiting for their turn
   std::atomic<uint64_t> charged_{0}, peer_{0}, wait_ns_{0};
+  mutable std::mutex fly_mu_;  // ReadBudgetStats::in_flight and read_ns, exact at fly_at_ns_
+  uint64_t fly_reads_ = 0, fly_read_ns_ = 0, fly_at_ns_ = 0;
 };
 
 // A page reader that admits every batch it reads (its turn, the rate, the count) before reading.

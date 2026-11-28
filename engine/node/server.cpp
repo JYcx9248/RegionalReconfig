@@ -137,6 +137,7 @@ const char* OpName(uint8_t op) {
     case kPatchDrop: return "patch_drop";
     case kSwitchGeneration: return "switch_generation";
     case kRawBitmap: return "raw_bitmap";
+    case kHolderLoad: return "holder_load";
     case kRawTraffic: return "raw_traffic";
     case kPQFromIndex: return "pq_from_index";
     case kRawSave: return "raw_save";
@@ -392,6 +393,20 @@ std::vector<uint64_t> PeerPool::RawBitmap(const std::string& addr) {
   return bits;
 }
 
+fusion::HolderLoad PeerPool::HolderLoad(const std::string& addr) {
+  Frame req;
+  req.type = kHolderLoad;
+  const Frame resp = Call(addr, std::move(req), "HOLDER_LOAD");
+  BodyReader r(resp.body.data(), resp.body.size());
+  if (r.remaining() != 3 * sizeof(uint64_t))
+    throw std::runtime_error(fusion::StrFormat("HOLDER_LOAD to %s: %zu bytes", addr.c_str(), r.remaining()));
+  fusion::HolderLoad h;
+  h.at_ns = r.Get<uint64_t>();
+  h.read_ns = r.Get<uint64_t>();
+  h.in_flight = r.Get<uint64_t>();
+  return h;
+}
+
 // ------------------------------------------------------------------------------ server
 NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
   for (int i = engine->num_workers() - 1; i >= 0; --i) free_workers_.push_back(i);
@@ -401,12 +416,14 @@ NodeServer::NodeServer(fusion::NodeEngine* engine) : engine_(engine) {
     raw_received_.fetch_add(static_cast<uint64_t>(n) * vb, std::memory_order_relaxed);
   });
   engine->SetBitmapFetcher([this](const std::string& peer) { return peers_.RawBitmap(peer); });
+  engine->SetLoadFetcher([this](const std::string& peer) { return peers_.HolderLoad(peer); });
 }
 
 NodeServer::~NodeServer() {
   Stop();
   engine_->SetRawFetcher(nullptr);  // peers_ goes away with the server
   engine_->SetBitmapFetcher(nullptr);
+  engine_->SetLoadFetcher(nullptr);  // waits for a poll in progress
 }
 
 int NodeServer::ListenTcp(const std::string& host, int port) {
@@ -662,13 +679,24 @@ Frame NodeServer::Handle(const Frame& req, const std::function<void(const Frame&
       }
       case kHolderBitmaps: {
         const uint32_t n = r.Get<uint32_t>();
-        Require(r.remaining() == static_cast<size_t>(n) * 4, "HOLDER_BITMAPS: a node ID and a pad each");
+        Require(r.remaining() == static_cast<size_t>(n) * 4 || r.remaining() == static_cast<size_t>(n) * 4 + 4,
+                "HOLDER_BITMAPS: a node ID and a pad each, then the flags");
         std::vector<uint16_t> ids(n);
         for (uint32_t i = 0; i < n; ++i) {
           ids[i] = r.Get<uint16_t>();
           r.Get<uint16_t>();  // pad
         }
-        w.Put<uint64_t>(e.LoadHolderBitmaps(ids));
+        const uint32_t flags = r.remaining() ? r.Get<uint32_t>() : 0;
+        Require((flags & ~kHolderByLoad) == 0, "HOLDER_BITMAPS: unknown flags");
+        w.Put<uint64_t>(e.LoadHolderBitmaps(ids, flags & kHolderByLoad));
+        break;
+      }
+      case kHolderLoad: {
+        Require(r.remaining() == 0, "trailing bytes in HOLDER_LOAD");
+        const fusion::ReadBudgetStats rb = e.read_budget_stats();
+        w.Put<uint64_t>(rb.at_ns);
+        w.Put<uint64_t>(rb.read_ns);
+        w.Put<uint64_t>(rb.in_flight);
         break;
       }
       case kFetchExtra: {
@@ -1211,6 +1239,7 @@ std::string NodeServer::FetchJson() const {
   std::string s = fusion::StrFormat(
       "{\"present\":%llu,\"cached\":%llu,\"queued\":%llu,\"queued_peak\":%llu,\"fetched\":%llu,"
       "\"fetch_calls\":%llu,\"coalesced\":%llu,\"fetch_us\":%llu,\"rerouted\":%llu,\"holder_bitmaps\":%llu,"
+      "\"load_polls\":%llu,\"load_calls\":%llu,"
       "\"written\":%llu,\"write_batches\":%llu,"
       "\"write_us\":%llu,\"sync_installed\":%llu,\"sync_us\":%llu,\"drain_calls\":%llu,"
       "\"drain_waiting\":%llu,\"drain_us\":%llu,\"rerank_disk\":%llu,\"rerank_mem\":%llu,"
@@ -1219,7 +1248,7 @@ std::string NodeServer::FetchJson() const {
       "\"extra\":{\"n\":%llu,\"queued\":%llu,\"dropped\":%llu,\"requests\":%llu,\"failed\":%llu,"
       "\"fetched\":%llu,\"us\":%llu,\"refill\":%llu,\"refills\":%llu,\"wait_us\":%llu,\"done\":%s},\"from\":{",
       u(f.present), u(f.cached), u(f.queued), u(f.queued_peak), u(f.fetched), u(f.fetch_calls),
-      u(f.coalesced), u(f.fetch_us), u(f.rerouted), u(f.holder_bitmaps), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
+      u(f.coalesced), u(f.fetch_us), u(f.rerouted), u(f.holder_bitmaps), u(f.load_polls), u(f.load_calls), u(f.written), u(f.write_batches), u(f.write_us), u(f.sync_installed),
       u(f.sync_us), u(f.drain_calls), u(f.drain_waiting), u(f.drain_us), u(f.rerank_disk),
       u(f.rerank_mem), u(f.pending_recounts), u(f.pending_us), u(f.added), u(f.added_queued),
       u(f.added_written), u(f.added_wait_us), u(f.cache_bound), u(f.extra), u(f.extra_queued),
@@ -1244,12 +1273,15 @@ std::string NodeServer::RawCacheJson() const {
 std::string NodeServer::StatsJson() const {
   const fusion::ReadBudgetStats r = engine_->read_budget_stats();
   return "{\"fetch\":" + FetchJson() + ",\"raw_cache\":" + RawCacheJson() + ",\"ops\":" + OpsJson() +
-         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"depth\":%u,\"charged\":%llu,\"peer\":%llu,\"wait_us\":%llu}"
+         fusion::StrFormat(",\"reads\":{\"budget\":%llu,\"depth\":%u,\"charged\":%llu,\"peer\":%llu,\"wait_us\":%llu,"
+                           "\"in_flight\":%llu,\"read_us\":%llu}"
                            ",\"raw_bytes\":{\"sent\":%llu,\"received\":%llu}}",
                            static_cast<unsigned long long>(r.reads_per_sec), r.depth,
                            static_cast<unsigned long long>(r.charged),
                            static_cast<unsigned long long>(r.peer),
                            static_cast<unsigned long long>(r.wait_us),
+                           static_cast<unsigned long long>(r.in_flight),
+                           static_cast<unsigned long long>(r.read_ns / 1000),
                            static_cast<unsigned long long>(raw_sent_.load(std::memory_order_relaxed)),
                            static_cast<unsigned long long>(raw_received_.load(std::memory_order_relaxed)));
 }

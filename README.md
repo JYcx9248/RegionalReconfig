@@ -161,7 +161,12 @@ records on a tie, so with no backlog anywhere it fetches as lazy does. Before th
 destination reads the presence bitmaps of the nodes that stay (`HOLDER_BITMAPS`, one bit per
 vector each; `bitmap_bytes` in the reply), so it knows every old holder of a vector, not only the
 old owner of its partition: a vector whose lists lie in partitions of several nodes is held by
-each of them. A fetch can then leave an old owner busy with its own queries for one with reads to
+each of them. `"lazy-balanced-global"` (2026-11-28, to measure what knowing the old nodes' load
+buys) chooses by how busy each holder's device is instead: while it fetches, the node polls every
+100 ms the holders whose bitmaps it read (`HOLDER_LOAD`: the reads in flight there, as a mean over
+the interval), and a fetch goes to another holder only if the recorded one has more than twice its
+reads in flight and one more; without recent polls it chooses as lazy-balanced does. The fetching
+node's own count sees neither a holder's queries nor the other new nodes' fetches. A fetch can then leave an old owner busy with its own queries for one with reads to
 spare (the nodes' stats count them: `fetch.rerouted`). A drain drops a leaving node's bitmap and
 waits for the fetches sent through it. Streams and the
 drain run data node to data node by default (`RAW_PULL`), unpaced like the queries' fetches;
@@ -590,7 +595,8 @@ when there are fewer GPUs than nodes). With `"NodeResources"`, the `"host"` reco
 included.
 
 `"Protocol"` picks the reconfiguration protocol (`lazy`, the default; `lazy-balanced`, lazy with
-the fetches spread over a vector's holders, under test; `lazy-stream`, `copy-then-flip` and
+the fetches spread over a vector's holders, under test, and `lazy-balanced-global`, the same by the
+holders' polled load; `lazy-stream`, `copy-then-flip` and
 `stop-and-copy` as baselines). `"RawStreams"`, `"RawBatchBytes"` and
 `"RawPath"` set how a stream pulls (`"RawPath"`: `node`, or `agent`, the default only when
 `"TransferRateBytesPerSec"` paces the agents), and `"RawPriority"` its class on the agent path.

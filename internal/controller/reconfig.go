@@ -324,6 +324,8 @@ func (c *Controller) run(ctx context.Context, cur *epoch.Table, t target, trigge
 		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemand, t.migrate)
 	case "lazy-balanced":
 		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemandBalanced, t.migrate)
+	case "lazy-balanced-global":
+		return c.copyThenFlip(ctx, triggered, cur, t.next, t.changes, t.added, t.removed, false, rawOnDemandBalancedLoad, t.migrate)
 	// The other protocols move every raw vector of the moved partitions themselves, so a migration
 	// is its plan: what the removed node held is all at the new owner, and its drain pulls nothing.
 	case "lazy-stream":
@@ -352,6 +354,12 @@ const (
 	// one), so a fetch of it can leave an old owner busy with its own queries for one with reads
 	// to spare.
 	rawOnDemandBalanced
+	// rawOnDemandBalancedLoad ("lazy-balanced-global"): as rawOnDemandBalanced, but the choice
+	// goes by how busy each holder's device is, as the destination polls them while it fetches
+	// (StagePartitionsReq.HolderLoad): the fetching node's own count sees neither a holder's
+	// queries nor the other nodes' fetches. A measurement of what knowing the old nodes' load
+	// buys (2026-11-28), not a design choice.
+	rawOnDemandBalancedLoad
 	// rawStreamAfterFlip ("lazy-stream", a baseline): on demand, and a stream brings the rest
 	// after the flip.
 	rawStreamAfterFlip
@@ -360,7 +368,7 @@ const (
 )
 
 // copyThenFlip is the reconfiguration protocol: "lazy" (the default) with rawOnDemand,
-// "lazy-balanced" with rawOnDemandBalanced, "lazy-stream" with rawStreamAfterFlip, "copy-then-flip" with rawBeforeFlip, and with
+// "lazy-balanced" with rawOnDemandBalanced, "lazy-balanced-global" with rawOnDemandBalancedLoad, "lazy-stream" with rawStreamAfterFlip, "copy-then-flip" with rawBeforeFlip, and with
 // stopTheWorld too the stop-and-copy baseline (Koala's stop-and-restart):
 //
 //  1. PREPARE  aggregators of the next epoch pre-connect to its data nodes, and its entries to
@@ -599,10 +607,10 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 
 	// 1. PREPARE -- data readiness: destinations pull the posting lists and the PQ codes they lack
 	// from current owners.
-	// With rawOnDemandBalanced they then read the bitmaps of the nodes that stay: the ones that
-	// leave are drained and go, and the ones that join hold nothing yet.
+	// With rawOnDemandBalanced(Load) they then read the bitmaps of the nodes that stay: the ones
+	// that leave are drained and go, and the ones that join hold nothing yet.
 	var holders []placement.NodeID
-	if raw == rawOnDemandBalanced {
+	if raw == rawOnDemandBalanced || raw == rawOnDemandBalancedLoad {
 		next := map[placement.NodeID]bool{}
 		for _, id := range draft.Placement.Nodes() {
 			next[id] = true
@@ -617,7 +625,8 @@ func (c *Controller) copyThenFlip(ctx context.Context, triggered time.Time, cur 
 	if err := forEach(destNodes, func(n *ManagedNode) error {
 		var st protocol.StageReply
 		err := n.call(ctx, c.stageTimeout(), protocol.StagePartitionsM,
-			protocol.StagePartitionsReq{Sources: sources[n.ID], Nodes: book, HolderBitmaps: holders}, &st)
+			protocol.StagePartitionsReq{Sources: sources[n.ID], Nodes: book, HolderBitmaps: holders,
+				HolderLoad: raw == rawOnDemandBalancedLoad}, &st)
 		moved.Add(st.Bytes)
 		pqCodes.Add(st.PQCodes)
 		pqBytes.Add(st.PQBytes)
